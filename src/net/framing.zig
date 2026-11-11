@@ -119,13 +119,6 @@ pub const Framing = union(enum) {
             else => "",
         };
     }
-
-    /// The bytes a frame of `len` payload bytes takes in all.
-    pub fn framedLen(f: Framing, len: usize) usize {
-        var buf: [max_prefix]u8 = undefined;
-        const p = f.prefix(len, &buf) catch return len;
-        return p.len + len + f.suffix().len;
-    }
 };
 
 /// The frames of one burst, in order: what a callbacks handler's `message`

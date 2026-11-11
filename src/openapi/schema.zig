@@ -63,16 +63,6 @@ pub fn schemaOf(comptime T: type) json.Node {
     }
 }
 
-/// The schema of a value of `T` with nothing by reference: every struct,
-/// enum and union stands inline. For parameters (a query enum lists its
-/// values in the parameter).
-pub fn inlineSchemaOf(comptime T: type) json.Node {
-    comptime {
-        @setEvalBranchQuota(quota);
-        return node(typeParts(T, false, typeName(T), &.{}, false));
-    }
-}
-
 /// The components a use of `T` refers to directly.
 pub fn depsOf(comptime T: type) []const json.RefFn {
     comptime {

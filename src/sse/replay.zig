@@ -32,19 +32,6 @@ pub const Payload = struct {
         return p;
     }
 
-    /// Room for the body to be filled by the caller.
-    pub fn createUninit(gpa: std.mem.Allocator, kind: Kind, len: usize) std.mem.Allocator.Error!*Payload {
-        const block = try gpa.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + len);
-        const p: *Payload = @ptrCast(block.ptr);
-        p.* = .{ .refs = .init(1), .seq = 0, .kind = kind, .id_len = 0, .id_buf = undefined, .len = len };
-        return p;
-    }
-
-    pub fn bodyMut(p: *Payload) []u8 {
-        const base: [*]u8 = @ptrCast(p);
-        return base[@sizeOf(Payload)..][0..p.len];
-    }
-
     pub fn body(p: *const Payload) []const u8 {
         const base: [*]const u8 = @ptrCast(p);
         return base[@sizeOf(Payload)..][0..p.len];

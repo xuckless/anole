@@ -1491,14 +1491,6 @@ pub const Subscriber = struct {
         if (launch) hub.startSender(io, sub);
     }
 
-    /// Bytes queued for this subscriber (the C ABI's accounting).
-    pub fn queuedBytes(sub: *Subscriber) usize {
-        const hub = sub.hub;
-        hub.mutex.lockUncancelable(hub.io);
-        defer hub.mutex.unlock(hub.io);
-        return sub.queued_bytes;
-    }
-
     /// Ends the stream after what is queued (`on_close` reason `.closed`).
     pub fn close(sub: *Subscriber) void {
         const hub = sub.hub;

@@ -1711,15 +1711,6 @@ pub const Response = struct {
         return &h1.parked;
     }
 
-    /// `_park` for a response already detached (`detach`), such as the C
-    /// ABI's requests on HTTP/2: the head goes out and the response parks,
-    /// with `d` still owned by the engine. Internal.
-    pub fn _parkDetached(d: *Detached, owner: Parked.Owner) error{ Unsupported, OutOfMemory, WriteFailed }!*Parked {
-        if (d.response._sink == null or d.engine.park == null) return error.Unsupported;
-        if (d.response._parked or d.response._headers_written) return error.Unsupported;
-        return d.response.parkAfterHead(d, owner);
-    }
-
     fn parkAfterHead(self: *Response, d: *Detached, owner: Parked.Owner) error{ OutOfMemory, WriteFailed }!*Parked {
         // The engine routes the body away from its ordinary queue first
         // (a parked stream has no buffer of its own), then the head is

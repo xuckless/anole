@@ -88,11 +88,6 @@ pub const Sqlite = struct {
         }
     };
 
-    fn sqlf(self: *Sqlite, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]const u8 {
-        _ = self;
-        return std.fmt.allocPrint(a, fmt, args);
-    }
-
     /// `fmt` with every `{p}` replaced by the prefix.
     fn text(self: *Sqlite, a: std.mem.Allocator, comptime fmt: []const u8) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;

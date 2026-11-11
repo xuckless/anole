@@ -105,11 +105,6 @@ pub const Parked = struct {
     /// `Shelf.long_park`).
     woke_from_long: bool = false,
 
-    /// Whether the connection is on a shelf now.
-    pub fn isParked(self: *const Parked) bool {
-        return self.shelf != null;
-    }
-
     /// From `VTable.expire`'s work, once done with the connection: shuts
     /// its socket down so that its poll comes back for the driver to close
     /// it, or closes it now if the poll is back already. On the shelf's

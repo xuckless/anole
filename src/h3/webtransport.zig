@@ -110,14 +110,6 @@ pub fn getVarint(b: []const u8) ?Varint {
     return .{ .value = v, .len = n };
 }
 
-fn readVarint(r: *std.Io.Reader) std.Io.Reader.Error!u64 {
-    const first = try r.takeByte();
-    const n = @as(usize, 1) << @intCast(first >> 6);
-    var v: u64 = first & 0x3f;
-    for (1..n) |_| v = v << 8 | try r.takeByte();
-    return v;
-}
-
 // -- A connection's WebTransport --------------------------------------------
 
 /// How `Core` reaches the connection it belongs to.

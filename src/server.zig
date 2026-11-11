@@ -73,13 +73,6 @@ fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const 
     try observe_runtime.writeConfigLines(w, rt);
     return aw.written();
 }
-
-/// `name` in `environ`; on Windows, where `Environ` holds UTF-16 with
-/// nothing to slice, in the C library's environment.
-fn envVar(environ: std.process.Environ, name: []const u8) ?[]const u8 {
-    if (comptime builtin.os.tag == .windows) return @import("db/url.zig").env(null, name);
-    return environ.getPosix(name);
-}
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
 const early_data = @import("early_data.zig");

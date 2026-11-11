@@ -194,7 +194,7 @@ src/smtp/root.zig	U3	5
 src/smtp/session.zig	U3	1
 src/sse/out.zig	L2	1
 src/sse/out.zig	U3	3
-src/sse/replay.zig	U3	7
+src/sse/replay.zig	U3	4
 src/sse/root.zig	C3	2
 src/sse/root.zig	L2	4
 src/sse/root.zig	U3	8

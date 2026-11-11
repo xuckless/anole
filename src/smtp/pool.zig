@@ -68,11 +68,4 @@ pub const Pool = struct {
         defer self.mutex.unlock(io);
         return self.open;
     }
-
-    /// How many sessions are idle now.
-    pub fn idleCount(self: *Pool, io: std.Io) usize {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.idle_len;
-    }
 };

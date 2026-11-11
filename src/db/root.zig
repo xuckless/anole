@@ -118,12 +118,6 @@ pub const System = enum {
     /// Mail over SMTP (`anole.smtp`).
     smtp,
 
-    /// NATS and Kafka are brokers: their spans are OpenTelemetry
-    /// *messaging* spans.
-    pub fn isMessaging(self: System) bool {
-        return self.kind() == .messaging;
-    }
-
     /// What kind of service it is, for its spans (`observe.zig`).
     pub fn kind(self: System) Kind {
         return switch (self) {

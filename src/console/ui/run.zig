@@ -290,10 +290,6 @@ fn renderFrame(app: *app_mod.App, scr: *screen.Screen, rend: *screen.Renderer, t
     try t.write(aw.written());
 }
 
-fn fixedNow() i64 {
-    return 1000;
-}
-
 test "run: a scripted session over pipes quits on /quit" {
     // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
     if (!sys.supported) return error.SkipZigTest;
