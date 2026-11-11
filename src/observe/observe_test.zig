@@ -520,8 +520,10 @@ test "observe: runtime gauges appear on /metrics" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_tasks{executor=\"0\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_run_queue{executor=\"0\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_stack_committed_bytes ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_io_engine{engine=\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "} 1\n") != null);
+    // The engine's own line: `anole_io_engine{engine="<name>"} 1`.
+    const engine_at = std.mem.indexOf(u8, metrics, "\nanole_io_engine{engine=\"") orelse return error.NoEngineLine;
+    const engine_line = std.mem.sliceTo(metrics[engine_at + 1 ..], '\n');
+    try std.testing.expect(std.mem.endsWith(u8, engine_line, "\"} 1"));
 }
 
 test "access log json: an error is named in error, and a request without an id has no request_id" {

@@ -30,6 +30,9 @@ pub fn ioEngine(rt: *zio.Runtime) []const u8 {
         if (rt.executors.items.len == 0) return "unknown";
         return @tagName(rt.executors.items[0].loop.backend.selectedEngine());
     }
+    // zio's Linux backend picks io_uring or epoll at run time; a zio that
+    // does not say which would otherwise name it "linux".
+    if (comptime zio.ev.backend == .linux) return "unknown";
     return @tagName(zio.ev.backend);
 }
 
