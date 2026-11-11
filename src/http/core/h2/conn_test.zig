@@ -14,6 +14,7 @@ const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const fuzz = @import("../fuzz.zig");
+const out_mod = @import("out.zig");
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -1148,6 +1149,170 @@ test "h2 conn: PING ACK" {
 }
 
 // ---------------------------------------------------------------------------
+// The M2 review's findings
+
+fn connCredit(c: *const C) i64 {
+    return @as(i64, c.recv_window) + c.recv_unacked;
+}
+
+test "h2 conn: a stream reset over its DATA gives the connection credit back" {
+    const t = try ready(.{});
+    defer t.destroy();
+    const before = connCredit(&t.c);
+    // Past the content-length mid-stream, short of it at END_STREAM, and a
+    // failing handler (which still gives back what it was given).
+    try t.feed(try t.headers(1, &postLen("3"), false));
+    try t.feed(try t.data(1, "abcd", false));
+    try t.feed(try t.headers(3, &postLen("100"), false));
+    try t.feed(try t.data(3, "abcdefgh", true));
+    t.rec.fail_data = true;
+    try t.feed(try t.headers(5, &post, false));
+    try t.feed(try t.data(5, "xyz", false));
+    try expectFrames(try t.drain(), &.{ rstWith(1, .protocol_error), rstWith(3, .protocol_error), rstWith(5, .internal_error) });
+    try expectEqual(before, connCredit(&t.c));
+}
+
+test "h2 conn: interim responses before the final one" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &post, false));
+    const s = t.stream(1);
+    try t.c.submitHead(s, 100, &.{}, false);
+    try t.c.submitHead(s, 103, &.{.{ .name = "link", .value = "</a.css>; rel=preload" }}, false);
+    try t.c.submitHead(s, 200, &.{}, false);
+    try t.c.submitData(s, &.{"done"}, true);
+    try expectError(error.StreamClosed, t.c.submitHead(s, 200, &.{}, false));
+    const out = try t.drain();
+    try expectFrames(out, &.{
+        .{ .type = .headers, .id = 1, .flags = F.end_headers },
+        .{ .type = .headers, .id = 1, .flags = F.end_headers },
+        .{ .type = .headers, .id = 1, .flags = F.end_headers },
+        .{ .type = .data, .id = 1, .flags = F.end_stream },
+    });
+    try expectEqualStrings("100", out[0].fields[0].value);
+    try expectEqualStrings("103", out[1].fields[0].value);
+    try expectEqualStrings("link", out[1].fields[1].name);
+    try expectEqualStrings("200", out[2].fields[0].value);
+    try expectEqualStrings("done", out[3].data);
+}
+
+test "h2 conn: out slices stay put while more is queued" {
+    // PLAN §3.3: the flush-token holder writes what `pending` returned
+    // while the reader and stream tasks queue more.
+    var o: out_mod.Out = .init(testing.allocator);
+    defer o.deinit();
+    const a = try o.writable(100);
+    @memset(a, 'a');
+    o.commit(100);
+    try o.borrow("borrowed");
+    var vecs: [4][]const u8 = undefined;
+    const v = o.iovecs(&vecs);
+    try expectEqual(2, v.len);
+    const first = v[0];
+    // "The write is in flight": queue several blocks' worth.
+    for (0..8) |_| {
+        const b = try o.writable(10000);
+        @memset(b, 'b');
+        o.commit(10000);
+    }
+    for (first) |x| try expectEqual('a', x);
+    try expectEqual(100, first.len);
+    o.advance(first.len + v[1].len);
+    var sent: usize = 0;
+    while (!o.idle()) {
+        const w = o.iovecs(&vecs);
+        var n: usize = 0;
+        for (w) |b| {
+            for (b) |x| try expectEqual('b', x);
+            n += b.len;
+        }
+        o.advance(n);
+        sent += n;
+    }
+    try expectEqual(80000, sent);
+}
+
+test "h2 conn: running out of memory while framing DATA queues nothing" {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const t = try T.createSplit(testing.allocator, failing.allocator(), .{});
+    defer t.destroy();
+    try t.handshake();
+    t.c.out.release();
+    try t.feed(try t.headers(1, &get, true));
+    try t.c.submitHead(t.stream(1), 200, &.{}, false);
+    // 64 parts: one DATA frame over 64 borrowed segments.
+    var parts: [64][]const u8 = undefined;
+    for (&parts) |*p| p.* = "x";
+    try t.c.submitData(t.stream(1), &parts, true);
+    const queued = t.c.out.queued_total;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var vecs: [128][]const u8 = undefined;
+    try expectError(error.OutOfMemory, t.c.pending(&vecs));
+    try expectEqual(queued, t.c.out.queued_total);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    const out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data, .flags = F.end_stream } });
+    try expectEqual(64, out[1].data.len);
+}
+
+test "h2 conn: a graceful drain's shutdown notice still admits streams" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    try t.c.shutdownNotice();
+    var out = try t.drain();
+    try expectFrames(out, &.{goawayWith(.no_error)});
+    try expectEqual(std.math.maxInt(u31), out[0].last_id);
+    // A request already in flight is still served.
+    try t.feed(try t.headers(3, &get, true));
+    try expectEqual(2, t.rec.count(.open));
+    try t.c.goaway(.no_error, "");
+    out = try t.drain();
+    try expectFrames(out, &.{goawayWith(.no_error)});
+    try expectEqual(3, out[0].last_id);
+    try t.feed(try t.headers(5, &get, true));
+    try expectEqual(2, t.rec.count(.open));
+}
+
+test "h2 conn: a warm connection's request and response allocate nothing" {
+    var counting: testing.FailingAllocator = .init(testing.allocator, .{});
+    const t = try T.createSplit(testing.allocator, counting.allocator(), .{});
+    defer t.destroy();
+    t.rec.answer = true;
+    t.rec.record = false;
+    try t.handshake();
+    // Two at once warm it up for two at once.
+    const warm = [_][]const u8{ try t.headers(1, &get, true), try t.headers(3, &get, true) };
+    try t.feed(try std.mem.concat(t.arena(), u8, &warm));
+    _ = try t.drain();
+    const in = [_][]const u8{ try t.headers(5, &get, true), try t.headers(7, &post, false), try t.data(7, "body", true) };
+    const before = counting.allocations;
+    for (in) |b| try t.feed(b);
+    const out = try t.drain();
+    try expectEqual(before, counting.allocations);
+    try expectFrames(out, &.{ .{ .type = .headers, .id = 5 }, .{ .type = .headers, .id = 7 }, .{ .type = .data, .id = 5 }, .{ .type = .data, .id = 7 } });
+}
+
+test "h2 conn: a head that can't fit 64 KiB is refused before the buffer grows" {
+    var peak: Peak = .{ .child = testing.allocator };
+    const t = try T.createSplit(testing.allocator, peak.allocator(), .{});
+    defer t.destroy();
+    try t.handshake();
+    try t.feed(try t.headers(1, &get, true));
+    const v = try t.arena().alloc(u8, 200 * 1024);
+    @memset(v, 'a');
+    const before = peak.peak;
+    try expectError(error.HeadersTooLarge, t.c.submitHead(t.stream(1), 200, &.{.{ .name = "x-debug", .value = v }}, true));
+    try expectError(error.HeadersTooLarge, t.c.submitHead(t.stream(1), 200, &.{.{ .name = v[0..120000], .value = "1" }}, true));
+    try expectEqual(before, peak.peak);
+    // Static entries' strings cost nothing toward it.
+    try t.c.submitHead(t.stream(1), 200, &.{.{ .name = "accept-encoding", .value = "gzip, deflate" }}, true);
+    try expectFrames(try t.drain(), &.{.{ .type = .headers }});
+}
+
+// ---------------------------------------------------------------------------
 // PLAN §8.2 item 2: no flow-control deadlock
 
 test "h2 conn: a large upload and a large download at once with small windows" {
@@ -2069,9 +2234,13 @@ fn fuzzOne(input: []const u8) anyerror!void {
             // Window and stream invariants (RFC 9113 §6.9).
             const c = &t.c;
             try expect(c.recv_window >= 0 and c.recv_window <= 65535);
+            // The send side: DATA framed within the connection window (the
+            // drain checked each frame against the peer's max_frame_size).
+            try expect(c.send_window >= 0 and c.send_window <= frame.max_window_size);
             try expect(c.table.size <= 16);
             var i: usize = 0;
             while (c.table.next(&i)) |s| {
+                try expect(s.send_window <= frame.max_window_size);
                 try expect(s.recv_window >= 0 and @as(i64, s.recv_window) + s.recv_unacked <= 1024);
                 try expect(s.state != .closed and s.state != .idle);
             }

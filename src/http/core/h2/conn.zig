@@ -34,10 +34,17 @@
 //!     first, and stays valid until onStreamClose);
 //!   * `onData(h, s, bytes, end_stream) Error!void`: request body bytes, a
 //!     slice of the read bytes valid during the call. The handler gives the
-//!     flow-control credit back with `consumed` once it is done with them;
+//!     flow-control credit back with `consumed` once it is done with them,
+//!     **also when it fails** (before returning, or later with `s` null):
+//!     Conn gives back only the bytes it doesn't deliver;
 //!   * `onStreamClose(h, s, code) void`: the stream is closed; `s` is
 //!     invalid once it returns. Never runs inside another callback: closes
-//!     are deferred to the end of the outermost Conn call;
+//!     are deferred to the end of the outermost Conn call. **On a normal
+//!     end it runs inside the `pending` call that framed the last DATA,
+//!     before the writer has written it**: the response's parts may still
+//!     be borrowed by `out`, so their owner waits for `borrowing()` false
+//!     or `out.sent_total >= out.mark()` (nghttp2 closes only once the
+//!     frame is sent, after copying the body);
 //!   * `onWindow(h, s) void`: send credit arrived for `s`, or for the
 //!     connection or every stream at once (null);
 //!   * `onGoaway(h, last_id, code) void`, `onPingAck(h, data) void`.
@@ -159,6 +166,27 @@ fn checkHandler(comptime H: type) void {
     }
 }
 
+/// The least `hdrs` can encode to with our static-only HPACK encoder: a
+/// string no static entry has is a literal, and Huffman codes take at
+/// least 5 bits an octet (RFC 7541 Appendix B).
+fn minEncoded(hdrs: []const hpack.Field) usize {
+    const longest = comptime blk: {
+        var name: usize = 0;
+        var value: usize = 0;
+        for (hpack.static_table) |f| {
+            name = @max(name, f.name.len);
+            value = @max(value, f.value.len);
+        }
+        break :blk .{ name, value };
+    };
+    var n: usize = 0;
+    for (hdrs) |f| {
+        if (f.name.len > longest[0]) n += f.name.len;
+        if (f.value.len > longest[1]) n += f.value.len;
+    }
+    return n * 5 / 8;
+}
+
 /// One queued submitData call: the caller's parts, by reference, framed
 /// lazily by `pending`.
 const Pending = struct {
@@ -227,8 +255,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         closing_last: ?*std.SinglyLinkedList.Node = null,
         /// Pending nodes alive (borrowed parts not yet framed).
         pending_nodes: usize = 0,
+        /// Spare Pending nodes, at most `max_spare`, so that a warm
+        /// connection's responses allocate nothing (PLAN §2.2, K1/K2).
+        spare: std.DoublyLinkedList = .{},
+        spare_len: u8 = 0,
         /// The caller's time in whole seconds, for the flood budgets.
         now_s: u64 = 0,
+
+        const max_spare = 32;
 
         const DataIn = struct {
             stream_id: u31,
@@ -300,6 +334,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             var i: usize = 0;
             while (c.table.next(&i)) |s| c.dropPending(s);
             if (c.block) |*b| b.buf.deinit(c.gpa);
+            while (c.spare.popFirst()) |node| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", node)));
             c.table.deinit();
             c.slab.deinit();
             c.out.deinit();
@@ -519,7 +554,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 // add up at END_STREAM. The half closes before the callback,
                 // so the handler's `consumed` earns the stream no
                 // WINDOW_UPDATE.
-                s.onRemoteEnd() catch return c.provokedReset(s, .protocol_error);
+                // The chunk isn't delivered: its connection credit goes
+                // back, as past the content-length above.
+                s.onRemoteEnd() catch {
+                    try c.consumeNow(null, dn);
+                    return c.provokedReset(s, .protocol_error);
+                };
                 c.endRemote(s);
             }
             c.handler.onData(s, chunk[0..dn], end) catch return c.handlerReset(s);
@@ -844,11 +884,25 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         fn dropPending(c: *Self, s: *Stream) void {
-            while (s.pending.popFirst()) |node| {
-                const p: *Pending = @fieldParentPtr("node", node);
-                c.gpa.destroy(p);
-                c.pending_nodes -= 1;
-            }
+            while (s.pending.popFirst()) |node| c.freePending(@fieldParentPtr("node", node));
+        }
+
+        fn newPending(c: *Self) Allocator.Error!*Pending {
+            const p: *Pending = if (c.spare.popFirst()) |node| blk: {
+                c.spare_len -= 1;
+                break :blk @fieldParentPtr("node", node);
+            } else try c.gpa.create(Pending);
+            c.pending_nodes += 1;
+            return p;
+        }
+
+        /// `p` is off its stream's list.
+        fn freePending(c: *Self, p: *Pending) void {
+            c.pending_nodes -= 1;
+            if (c.spare_len == max_spare) return c.gpa.destroy(p);
+            p.node = .{};
+            c.spare.prepend(&p.node);
+            c.spare_len += 1;
         }
 
         /// RST_STREAM now; the stream is closed at once (no CLOSING state),
@@ -1004,12 +1058,17 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// The response head: `:status` then `hdrs`, HEADERS split into
         /// CONTINUATIONs at the peer's SETTINGS_MAX_FRAME_SIZE, encoded now.
         /// With `end_stream` the stream may close (and `s` go) before this
-        /// returns, unless called from a callback.
+        /// returns, unless called from a callback. An interim (1xx) head may
+        /// come any number of times before the final one, never with
+        /// `end_stream` (RFC 9113 §8.1; today's engine sends 100 Continue).
         pub fn submitHead(c: *Self, s: *Stream, status: u16, hdrs: []const hpack.Field, end_stream: bool) SubmitError!void {
             c.enter();
             defer c.leave();
             if (!s.canSend() or s.flags.head_sent) return error.StreamClosed;
-            try c.writeHeaders(s.id, status, hdrs, end_stream);
+            const interim = status < 200;
+            std.debug.assert(!(interim and end_stream));
+            try c.writeHeaders(s.id, status, hdrs, end_stream and !interim);
+            if (interim) return;
             s.flags.head_sent = true;
             if (end_stream) {
                 s.flags.answered = true;
@@ -1028,14 +1087,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (!s.canSend() or !s.flags.head_sent or s.flags.answered) return error.StreamClosed;
             var total: u64 = 0;
             for (parts) |p| total += p.len;
-            const p = try c.gpa.create(Pending);
+            const p = try c.newPending();
             p.* = .{ .parts = parts, .left = total, .end_stream = end_stream };
             s.pending.append(&p.node);
-            c.pending_nodes += 1;
             if (total == 0 or s.send_window > 0) c.makeReady(s) catch |err| {
                 s.pending.remove(&p.node);
-                c.gpa.destroy(p);
-                c.pending_nodes -= 1;
+                c.freePending(p);
                 return err;
             };
             if (end_stream) s.flags.answered = true;
@@ -1047,7 +1104,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.enter();
             defer c.leave();
             if (!s.canSend() or !s.flags.head_sent or s.flags.answered) return error.StreamClosed;
-            if (hpack.Encoder.bound(hdrs) > 4 * max_headers_len) return error.HeadersTooLarge;
+            if (minEncoded(hdrs) > max_headers_len) return error.HeadersTooLarge;
             if (s.pending.last) |node| {
                 const p: *Pending = @fieldParentPtr("node", node);
                 p.trailers = hdrs;
@@ -1077,6 +1134,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.goaway_sent = code;
         }
 
+        /// The first GOAWAY of a graceful drain (RFC 9113 §6.8;
+        /// nghttp2_submit_shutdown_notice, which today's engine sends):
+        /// last-stream-id 2^31-1 and NO_ERROR, and new streams are still
+        /// admitted, so requests already in flight aren't lost. The final
+        /// `goaway` follows at least one round trip later.
+        pub fn shutdownNotice(c: *Self) Allocator.Error!void {
+            const b = try c.out.writable(frame.header_len + 8);
+            c.out.commit(frame.writeGoaway(b, std.math.maxInt(u31), .no_error, ""));
+        }
+
         pub fn ping(c: *Self, data: [8]u8) Allocator.Error!void {
             const b = try c.out.writable(frame.header_len + 8);
             c.out.commit(frame.writePing(b, false, data));
@@ -1085,7 +1152,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// What to write now: queued frames, plus DATA framed from the
         /// ready streams round-robin, a frame each per pass, cut to the
         /// windows and the peer's SETTINGS_MAX_FRAME_SIZE, until about
-        /// `vecs.len` segments are queued. Write them, then `advance`.
+        /// `vecs.len` segments are queued. Write them, then `advance`; the
+        /// slices stay valid until then, whatever else is queued meanwhile.
+        /// OutOfMemory leaves whole frames queued, but the connection
+        /// should still be closed.
         pub fn pending(c: *Self, vecs: [][]const u8) Allocator.Error![]const []const u8 {
             c.enter();
             defer c.leave();
@@ -1129,9 +1199,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                     if (c.send_window <= 0) return;
                     n = @intCast(@min(p.left, @as(u64, @intCast(s.send_window)), @as(u64, @intCast(c.send_window)), c.remote.max_frame_size));
                 }
+                // Still queued if it fails: nothing was framed.
+                try c.frameOne(s, p, n);
                 c.out.popReady();
                 s.flags.ready = false;
-                try c.frameOne(s, p, n);
                 if (s.state != .closed and s.pending.first != null) try c.makeReady(s);
             }
         }
@@ -1142,13 +1213,25 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const exhausted = n == p.left;
             const end = exhausted and p.end_stream and p.trailers == null;
             if (n > 0 or end) {
+                // Every segment the frame takes, before its header: a frame
+                // is queued whole or not at all.
+                var segs: usize = 1;
+                var rem_parts = n;
+                var at = p.part;
+                var off = p.off;
+                while (rem_parts > 0) : (at += 1) {
+                    rem_parts -= @min(p.parts[at].len - off, rem_parts);
+                    off = 0;
+                    segs += 1;
+                }
+                try c.out.reserve(segs);
                 const b = try c.out.writable(frame.header_len);
                 c.out.commit(frame.writeData(b, s.id, end, n, null));
                 var rem = n;
                 while (rem > 0) {
                     const part = p.parts[p.part];
                     const take = @min(part.len - p.off, rem);
-                    try c.out.borrow(part[p.off..][0..take]);
+                    c.out.borrow(part[p.off..][0..take]) catch unreachable; // reserved
                     p.off += take;
                     rem -= take;
                     if (p.off == part.len) {
@@ -1164,8 +1247,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const trailers = p.trailers;
             const end_stream = p.end_stream;
             s.pending.remove(&p.node);
-            c.gpa.destroy(p);
-            c.pending_nodes -= 1;
+            c.freePending(p);
             if (trailers) |t| {
                 c.writeHeaders(s.id, null, t, true) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -1189,10 +1271,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 st_buf[0] = .{ .name = ":status", .value = &digits };
                 st = &st_buf;
             }
+            // Past what could encode under the limit: refused before the
+            // buffer is sized for it.
+            if (minEncoded(hdrs) > max_headers_len) return error.HeadersTooLarge;
             const bound = hpack.Encoder.bound(st) + hpack.Encoder.bound(hdrs);
-            // Far past what could encode under the limit: refused before
-            // the buffer is sized for it.
-            if (bound > 4 * max_headers_len) return error.HeadersTooLarge;
             const mfs: usize = c.remote.max_frame_size;
             const room = bound + frame.header_len * (bound / mfs + 1);
             const buf = try c.out.writable(room);
