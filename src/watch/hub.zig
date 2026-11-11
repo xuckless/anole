@@ -70,9 +70,15 @@ pub fn Hub(comptime T: type) type {
         mutex: std.Io.Mutex = .init,
         entries: Entries = .initFill(.empty),
         state: State = .idle,
-        /// Serializes the writes (verbs, pings) on the connection.
+        /// Serializes the writes (verbs, pings) on the connection. Taken
+        /// before `mutex`, never after. The reader takes it before it
+        /// unpublishes a connection it frees, so a connection a writer read
+        /// under both stays alive until the write ends (#198).
         write_mutex: std.Io.Mutex = .init,
         group: std.Io.Group = .init,
+        /// The current connection's keep-alive, canceled (and waited for)
+        /// before the reader frees the connection (#198).
+        keepalive_group: std.Io.Group = .init,
         stopping: std.atomic.Value(bool) = .init(false),
         reader_task: ?placement.Task = null,
         backoff: resilience.Backoff = .{ .base = .fromMilliseconds(100), .max = .fromSeconds(5) },
@@ -93,6 +99,7 @@ pub fn Hub(comptime T: type) type {
             if (self.reader_task) |t| placement.cancelTask(t);
             self.mutex.unlock(self.io);
             self.group.cancel(self.io);
+            self.keepalive_group.cancel(self.io);
             if (self.state == .ready) T.close(self.state.ready, self.gpa);
             for (&self.entries.values) |*map| {
                 var it = map.valueIterator();
@@ -164,10 +171,8 @@ pub fn Hub(comptime T: type) type {
         fn sendVerb(self: *Self, on: bool, kind: Kind, name: []const u8) void {
             self.write_mutex.lockUncancelable(self.io);
             defer self.write_mutex.unlock(self.io);
-            const conn = switch (self.state) {
-                .ready => |c| c,
-                else => return,
-            };
+            const conn = self.current() orelse return;
+            testBeforeSend(self);
             T.send(conn, self.gpa, self.io, on, kind, name) catch |err| {
                 log.debug(T.log_name ++ ": {s} {s} failed: {t}", .{ if (on) T.verb else "UN" ++ T.verb, name, err });
                 // The reader sees the broken connection and reconnects.
@@ -215,7 +220,7 @@ pub fn Hub(comptime T: type) type {
                 self.statusAll(.connected);
                 if (lost) self.gapAll("the " ++ T.verb ++ " connection was lost and opened again");
                 log.info(T.log_name ++ ": " ++ T.ready_text, .{});
-                if (comptime T.keepalive != null) placement.concurrent(&self.group, self.io, .local, keepaliveTask, .{ self, conn }) catch {};
+                if (comptime T.keepalive != null) placement.concurrent(&self.keepalive_group, self.io, .local, keepaliveTask, .{ self, conn }) catch {};
                 self.readLoop(conn);
                 // Gone: close it, tell the watches, try again.
                 const idle = self.retire(conn);
@@ -282,17 +287,34 @@ pub fn Hub(comptime T: type) type {
             self.reader_task = null;
         }
 
-        /// Takes the lost `conn` out and frees it. True when no watch is
-        /// left: the hub is idle and the reader ends.
+        /// Takes the lost `conn` out and frees it, once its keep-alive and
+        /// a send in flight on it ended (#198). True when no watch is left:
+        /// the hub is idle and the reader ends.
         fn retire(self: *Self, conn: *T.Conn) bool {
+            // A send or ping blocked on it fails now.
+            T.stop(conn);
+            testOnRetire(self);
+            self.keepalive_group.cancel(self.io);
+            self.write_mutex.lockUncancelable(self.io);
             self.mutex.lockUncancelable(self.io);
             var idle = true;
             for (&self.entries.values) |*map| idle = idle and map.count() == 0;
             if (idle) self.goIdle() else self.state = .connecting;
             self.mutex.unlock(self.io);
-            T.stop(conn);
+            self.write_mutex.unlock(self.io);
             T.close(conn, self.gpa);
             return idle;
+        }
+
+        /// The published connection; under `write_mutex`, it stays alive
+        /// until that is unlocked.
+        fn current(self: *Self) ?*T.Conn {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return switch (self.state) {
+                .ready => |c| c,
+                else => null,
+            };
         }
 
         fn nowMs(self: *Self) i64 {
@@ -368,35 +390,30 @@ pub fn Hub(comptime T: type) type {
 
         /// Every `interval` a ping; no answer within `wait` means a dead
         /// connection, which `stop` turns into a read error for the reader.
+        /// `conn` outlives it: the reader cancels and waits for it before
+        /// freeing `conn` (#198).
         fn keepaliveTask(self: *Self, conn: *T.Conn) std.Io.Cancelable!void {
             const ka = T.keepalive.?;
             while (true) {
                 try self.io.sleep(ka.interval, .awake);
                 if (self.stopping.load(.acquire)) return;
-                if (!self.isCurrent(conn)) return;
                 const before = self.last_ready_ms.load(.acquire);
                 {
                     self.write_mutex.lockUncancelable(self.io);
                     defer self.write_mutex.unlock(self.io);
+                    testBeforeSend(self);
                     T.ping(conn) catch {
                         T.stop(conn);
                         return;
                     };
                 }
                 try self.io.sleep(ka.wait, .awake);
-                if (!self.isCurrent(conn)) return;
                 if (self.last_ready_ms.load(.acquire) == before) {
                     log.warn(T.log_name ++ ": the server did not answer a ping; closing the " ++ T.verb ++ " connection", .{});
                     T.stop(conn);
                     return;
                 }
             }
-        }
-
-        fn isCurrent(self: *Self, conn: *T.Conn) bool {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return self.state == .ready and self.state.ready == conn;
         }
 
         /// Tests: runs before each watch `gapAll` gives a gap, with the hub.
@@ -406,6 +423,27 @@ pub fn Hub(comptime T: type) type {
         fn testOnGap(hub: *Self) void {
             if (comptime !builtin.is_test) return;
             const hook = test_on_gap.load(.acquire) orelse return;
+            hook(hub);
+        }
+
+        /// Tests: runs once, between a send's or ping's read of the
+        /// connection and its use. Test builds only.
+        pub var test_before_send: if (builtin.is_test) std.atomic.Value(?*const fn (*Self) void) else void = if (builtin.is_test) .init(null) else {};
+
+        fn testBeforeSend(hub: *Self) void {
+            if (comptime !builtin.is_test) return;
+            const hook = test_before_send.swap(null, .acq_rel) orelse return;
+            hook(hub);
+        }
+
+        /// Tests: runs on the reader once it stopped a lost connection,
+        /// before it waits for the connection's other users and frees it.
+        /// Test builds only.
+        pub var test_on_retire: if (builtin.is_test) std.atomic.Value(?*const fn (*Self) void) else void = if (builtin.is_test) .init(null) else {};
+
+        fn testOnRetire(hub: *Self) void {
+            if (comptime !builtin.is_test) return;
+            const hook = test_on_retire.load(.acquire) orelse return;
             hook(hub);
         }
 
@@ -607,4 +645,70 @@ test "watch hub: the reader ends once no watch is left, and the next watch start
     try h.ensureRunning();
     client.reading[0].waitUncancelable(io);
     try std.testing.expect(h.state == .ready);
+}
+
+/// The #198 race: a send (or ping) has read the connection, then it is lost
+/// and the reader retires it before the send uses it.
+fn raceRetire(comptime ka: ?Keepalive, comptime by_verb: bool) !void {
+    const zio = @import("zio");
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const F = Fake(ka);
+    const H = Hub(F);
+    F.reset();
+    defer F.reset();
+    var client: F.Client = .{ .gpa = gpa, .io = io };
+    defer client.sent.deinit(gpa);
+    const h = try H.create(&client);
+    defer h.destroy();
+    h.backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1) };
+    const tw = try TestWatch.init(gpa, io);
+    defer tw.deinit();
+    const Race = struct {
+        var conn: ?*F.Conn = null;
+        /// On the sender, between its read of the connection and its use:
+        /// the connection is lost, and the sender goes on only once the
+        /// reader freed it, or stopped it and waits for the sender.
+        fn beforeSend(hub: *H) void {
+            conn = hub.client.conn;
+            F.stop(conn.?);
+            F.freed.waitUncancelable(hub.io);
+        }
+        fn onRetire(hub: *H) void {
+            F.freed.set(hub.io);
+        }
+    };
+    H.test_before_send.store(&Race.beforeSend, .release);
+    defer H.test_before_send.store(null, .release);
+    H.test_on_retire.store(&Race.onRetire, .release);
+    defer H.test_on_retire.store(null, .release);
+    try h.add(tw.w, &.{"a"}, .channel);
+    defer h.remove(tw.w, &.{ "a", "b" }, .channel);
+    if (by_verb) {
+        // The ping is off; the hook is armed for the LISTEN of "b".
+        try h.ensureRunning();
+        client.reading[0].waitUncancelable(io);
+        try h.add(tw.w, &.{"b"}, .channel);
+    } else {
+        // The keep-alive's first ping, at once, meets the hook.
+        try h.ensureRunning();
+    }
+    // The reader went on to a new connection.
+    client.reading[1].waitUncancelable(io);
+    try std.testing.expect(Race.conn != null);
+    try std.testing.expect(!F.used_freed.load(.acquire));
+}
+
+test "watch hub: a LISTEN racing the reader's reconnect never uses the connection it frees (#198)" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    try raceRetire(null, true);
+}
+
+test "watch hub: a keep-alive ping racing the reader's reconnect never uses the connection it frees (#198)" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    try raceRetire(.{ .interval = .fromNanoseconds(0), .wait = .fromSeconds(3600) }, false);
 }

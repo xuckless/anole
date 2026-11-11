@@ -105,6 +105,12 @@ breaking changes are listed anyway.
   the connection is open. The PostgreSQL hub, like the Redis one, now
   stops reconnecting once no watch is left, and starts again with the
   next.
+- **watch (PostgreSQL, Redis Pub/Sub)**: a LISTEN/SUBSCRIBE or
+  UNLISTEN/UNSUBSCRIBE sent as a watch started or stopped, or the
+  PostgreSQL keep-alive's ping, could write to the shared connection
+  after the hub's reader had freed it on a reconnect (#198). The reader
+  now waits for the send in flight and the keep-alive before it frees
+  the connection.
 - **SSE**: `Subscriber.close()` on a subscriber whose write had just
   failed queued an end and claimed a sender for the dead stream (#211).
   In the fallback (S3) nothing ran that sender, so ending the subscriber
