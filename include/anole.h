@@ -452,8 +452,14 @@ enum anole_event_type {
                               a limit, the drain cut it); nothing more is owed, and answer calls on
                               it get ANOLE_E_GONE */
   ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket, WebTransport
-                              stream, raw TCP connection or UDP socket that took ANOLE_BUSY (or
-                              was refused with ANOLE_E_AGAIN) has room (ev.handle) */
+                              stream, raw TCP connection, UDP socket, SSE subscriber or S3
+                              transfer that took ANOLE_BUSY (or was refused with ANOLE_E_AGAIN)
+                              has room (ev.handle). Edge-triggered: one event per wait, however
+                              many writes answered BUSY before it; the next BUSY arms another.
+                              It may come when nothing waits (rarely, after a refused write was
+                              retried and fit), and it also comes when the handle can take no
+                              more writes (the next write answers ANOLE_E_GONE): a binding emits
+                              its own 'drain' only while it is waiting */
   ANOLE_EV_SENT = 5,       /* anole_sent_event: a borrowed body is no longer read */
   ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request; subprotocol set); handle:
                               anole_ws. Routes with "accept": "auto" only (the default) */
@@ -613,7 +619,12 @@ enum anole_method {
    and duplicates kept) and then `anole_span params[2 * nparams]` (route
    parameters: name, value; values raw and percent-encoded as in the path:
    decode with decodeURIComponent / urllib.parse.unquote); the bytes the
-   spans point into come after. */
+   spans point into come after.
+   Pseudo-header fields (":authority", ":path", ...) never appear in
+   headers: HTTP/2 and HTTP/3 give ":authority" as a "host" header (when
+   the request had no Host field of its own; HTTP/2 refuses one that
+   differs), so "host" is there on every protocol, absent only on an
+   HTTP/1.0 request without one. The scheme is ANOLE_REQ_SECURE. */
 typedef struct anole_request_event {
   anole_event ev;          /*   0 */
   uint32_t route_id;       /*  16 the route's "handler" id */
@@ -952,6 +963,10 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
    common unregistered ones Anole knows), headers and body. Headers and,
    unless borrowed, the body are copied before this returns. Compression,
    the response cache and the access log run on Anole's side afterwards.
+   Content-Length is Anole's to write: leave it out and Anole sets it from
+   the body as sent (after compression). A Content-Length the consumer sets
+   is sent as given, turns compression off for this response, and must
+   equal len (a mismatch fails the response).
    Finishes the request. ANOLE_E_INVALID: a bad status, flag, header name
    or value, or Connection / Transfer-Encoding, which the server writes
    itself (nothing taken, the request is still owed); ANOLE_E_GONE. */

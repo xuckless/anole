@@ -259,7 +259,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_REQUEST` | `anole_request_event`, then header spans, parameter spans, bytes | `anole_req` | an answer: respond, respond_fd, stream_end, fail, abort or handle_release |
 | `ANOLE_EV_BODY` | `anole_event`: more request body (after `ANOLE_E_AGAIN`) | `anole_req` | none |
 | `ANOLE_EV_ABORT` | `anole_abort_event`: why (`reason`) and what the client was sent (`status`); nothing more is owed | `anole_req`, `anole_grpc_call` | ends it |
-| `ANOLE_EV_WRITABLE` | `anole_event`: a stream, call, WebSocket or WebTransport stream that took `ANOLE_BUSY` has room | `anole_req`, `anole_grpc_call`, `anole_ws`, `anole_wt_stream` | none |
+| `ANOLE_EV_WRITABLE` | `anole_event`: a stream, call, WebSocket, WebTransport stream, raw TCP connection, UDP socket, SSE subscriber or S3 transfer that took `ANOLE_BUSY` has room. Edge-triggered, one per wait; it may come spuriously or when the handle takes no more writes (the next write answers `ANOLE_E_GONE`) | `anole_req`, `anole_grpc_call`, `anole_ws`, `anole_wt_stream`, `anole_net_conn`, `anole_net_udp`, `anole_sse`, `anole_s3_transfer` | none |
 | `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | any (may be stale) | none |
 | `ANOLE_EV_WS_OPEN` | `anole_request_event` of the upgrade request | `anole_ws` | none |
 | `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` | none |
@@ -348,7 +348,10 @@ A request record (128 bytes, then variable parts) carries the route's
 `handler` id, the method (an enum and the name as sent), the HTTP version
 (11, 20, 30), the raw path and query, the headers (names lower-cased, order
 and duplicates kept; their spans start at `spans_off`, then the route
-parameters' spans: `anole_request_spans(r)`), the client's address (proxies
+parameters' spans: `anole_request_spans(r)`; pseudo-header fields never
+appear: HTTP/2 and HTTP/3 give `:authority` as a `host` header, so `host`
+is there on every protocol, absent only on an HTTP/1.0 request without one),
+the client's address (proxies
 applied), the listener's name, the request ID (the `request_id` middleware),
 a verified JWT's claims as JSON (the `jwt` middleware), the client's
 certificate as a span (`peer_cert`, mutual TLS), `timeout_us` (the time left
@@ -789,7 +792,11 @@ thread. A body past `limits.body_max` ends the request with 413.
 - `anole_req_respond(r, status, headers, n, body, len, flags)`: the whole answer.
   The body is copied, or borrowed with `ANOLE_BODY_BORROW` (bindings borrow
   bodies above 64 KiB and copy small ones). Compression, the response cache
-  and the access log run on Anole's side afterwards.
+  and the access log run on Anole's side afterwards. Content-Length is
+  Anole's to write: leave it out and Anole sets it from the body as sent
+  (after compression). One the consumer sets is sent as given, turns
+  compression off for this response, and must equal `len` (a mismatch fails
+  the response).
 - `anole_req_respond_fd(r, status, headers, n, fd, offset, len)`: part of a
   regular file, sent by Anole (`sendfile` where it can).
 - `anole_req_stream_start`, `anole_req_stream_write` (or `anole_req_stream_write_wait`
