@@ -218,8 +218,18 @@ pub const StreamSlot = struct {
     sending: std.ArrayList(u8) = .empty,
     sent_off: usize = 0,
     recv_done: bool = false,
-    send_done: bool = false,
-    fin_done: bool = false,
+    send: Send = .open,
+
+    /// The executor's view of the sending half.
+    const Send = enum {
+        /// Bytes (and the end, if asked for) may still go into the stream.
+        open,
+        /// The end went out after every byte.
+        finished,
+        /// Over without the end: reset by us, stopped by the peer, the
+        /// session gone, or no sending half at all (`uni_in`).
+        over,
+    };
 
     fn gen(s: *const StreamSlot) u32 {
         return @intCast(s.word.load(.acquire) >> 32);
@@ -277,8 +287,7 @@ pub const StreamSlot = struct {
         s.stream = null;
         s.sent_off = 0;
         s.recv_done = dir == .uni_out;
-        s.send_done = dir == .uni_in;
-        s.fin_done = false;
+        s.send = if (dir == .uni_in) .over else .open;
     }
 };
 
@@ -524,16 +533,20 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
 
     // Released with its end asked for: what was written still goes out
     // first, then the stream is let go.
-    if (released and (st.send_done or !fin)) {
+    const let_go = switch (st.send) {
+        .open => released and !fin,
+        .finished, .over => released,
+    };
+    if (let_go) {
         stream.release();
         st.stream = null;
         st.free();
         progress.* = true;
         return false;
     }
-    if (reset_code) |code| if (!st.send_done) {
+    if (reset_code) |code| if (st.send == .open) {
         stream.reset(code);
-        st.send_done = true;
+        st.send = .over;
         dropOutput(st, if (released) 0 else h);
         progress.* = true;
     };
@@ -544,7 +557,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
     };
 
     // Out.
-    if (!st.send_done) {
+    if (st.send == .open) {
         var wrote: usize = 0;
         var failed = false;
         while (st.sent_off < st.sending.items.len) {
@@ -567,16 +580,15 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         const all_out = st.bytes == 0;
         st.lock.unlock();
         if (writable and !released) postSmall(x, .writable, h);
-        if (!failed and fin and all_out and !st.fin_done) {
+        if (!failed and fin and all_out) {
             stream.closeSend() catch {};
-            st.fin_done = true;
-            st.send_done = true;
+            st.send = .finished;
             progress.* = true;
         }
         const send_err = Stream.Driver.sendError(stream);
-        if (!st.fin_done and (failed or send_err != null)) {
+        if (st.send == .open and (failed or send_err != null)) {
             // Stopped by the peer, or the session went.
-            st.send_done = true;
+            st.send = .over;
             dropOutput(st, if (released) 0 else h);
             if (!released and send_err != null and send_err.? == error.StreamStopped) {
                 postCode(x, .wt_stream_stop, h, stream.stopCode() orelse 0);
@@ -585,17 +597,17 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         }
     }
 
-    if (released) {
-        if (st.send_done) {
+    if (released) switch (st.send) {
+        .finished, .over => {
             stream.release();
             st.stream = null;
             st.free();
             progress.* = true;
             return false;
-        }
+        },
         // Nobody reads it any more.
-        return true;
-    }
+        .open => return true,
+    };
 
     // In: a chunk per round, so one stream does not hold up the others.
     if (!st.recv_done) {
