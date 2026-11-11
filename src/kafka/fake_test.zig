@@ -10,6 +10,7 @@ const kafka = @import("root.zig");
 const records = @import("records.zig");
 const FakeBroker = @import("testing.zig").FakeBroker;
 const wait = @import("anole_test_wait");
+const metrics = @import("../observe/metrics.zig");
 
 const testing = std.testing;
 const gpa = testing.allocator;
@@ -309,6 +310,58 @@ test "fake broker: a consumer group reads from the start, commits, and leaves" {
     // Leaving the group removed the member.
     try testing.expectEqual(@as(usize, 0), broker.memberCount("g1"));
     try testing.expectEqual(@as(?i64, 3), broker.committed("g1", "orders", 1));
+}
+
+fn consumedCount(reg: *metrics.Registry, client: []const u8, group: []const u8, topic: []const u8) !u64 {
+    const fam = try reg.counter("anole_kafka_consumed_total", "Records handed to consumer handlers.", &.{ "client", "group", "topic" });
+    return fam.with(&.{ client, group, topic }).value.load(.acquire);
+}
+
+test "fake broker: consumers added before and after start count their records in the client's metrics (#168)" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    try broker.preload("orders", 0, &.{
+        .{ .key = "a", .value = "1", .timestamp_ms = 1 },
+        .{ .key = "a", .value = "2", .timestamp_ms = 2 },
+        .{ .key = "a", .value = "3", .timestamp_ms = 3 },
+    });
+    Reads.seen.store(0, .release);
+    Reads.sum.store(0, .release);
+
+    var reg = metrics.Registry.init(gpa, io);
+    defer reg.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{}));
+    defer client.deinit();
+    // The documented order: consumers first, serving (`start`) after.
+    try client.consume({}, .{
+        .group = "gm1",
+        .topics = &.{"orders"},
+        .start = .earliest,
+        .heartbeat_interval = .fromMilliseconds(100),
+        .commit_interval = .fromMilliseconds(100),
+    }, Reads.on);
+    try client.start(&reg, null, null);
+    const Ctx = struct { reg: *metrics.Registry, client: []const u8, group: []const u8, topic: []const u8, want: u64 };
+    const reached = struct {
+        fn f(c: Ctx) !bool {
+            return (try consumedCount(c.reg, c.client, c.group, c.topic)) >= c.want;
+        }
+    }.f;
+    try wait.waitUntil(io, "the first consumer's records are counted", Ctx{ .reg = &reg, .client = client.name, .group = "gm1", .topic = "orders", .want = 3 }, reached);
+    try testing.expectEqual(@as(u64, 3), try consumedCount(&reg, client.name, "gm1", "orders"));
+    // And one made after `start`.
+    try client.consume({}, .{
+        .group = "gm2",
+        .topics = &.{"orders"},
+        .start = .earliest,
+        .heartbeat_interval = .fromMilliseconds(100),
+        .commit_interval = .fromMilliseconds(100),
+    }, Reads.on);
+    try wait.waitUntil(io, "the second consumer's records are counted", Ctx{ .reg = &reg, .client = client.name, .group = "gm2", .topic = "orders", .want = 3 }, reached);
+    try testing.expectEqual(@as(u64, 3), try consumedCount(&reg, client.name, "gm2", "orders"));
 }
 
 test "fake broker: two members share the partitions" {
