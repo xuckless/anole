@@ -874,6 +874,44 @@ pub fn addBinding(
     const alloc = router.arena.allocator();
     const binding = alloc.create(Binding) catch @panic("OOM");
     binding.* = .{ .template = template, .serve = serve, .options = options, .where = where };
+    const segments = template.segments();
+    attach(Ctx, target, method, template, segments.len, binding, no_wait, .by_verb);
+
+    // `**` matches zero or more segments, but the router's wildcard needs
+    // one: the prefix gets a route of its own, with its own copy of the
+    // binding, behind every binding that names the prefix exactly (as in
+    // Envoy's matcher). `/{a=**}:v` has no prefix a request could reach.
+    if (segments.len > 0 and segments[segments.len - 1] == .rest and !(segments.len == 1 and template.verb.len > 0)) {
+        const prefix_binding = alloc.create(Binding) catch @panic("OOM");
+        prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where };
+        attach(Ctx, target, method, template, segments.len - 1, prefix_binding, no_wait, .last);
+    }
+}
+
+/// Where `attach` puts a binding in its route's list.
+const Position = enum {
+    /// After the other bindings with a verb, before those without.
+    by_verb,
+    /// After all of them, and a clash with another route is not reported:
+    /// the route is one nobody asked for.
+    last,
+};
+
+/// Joins `binding` to the route for the first `count` segments of `template`,
+/// or makes it.
+fn attach(
+    comptime Ctx: type,
+    target: anytype,
+    method: dusty.Method,
+    template: *const Template,
+    count: usize,
+    binding: *Binding,
+    no_wait: bool,
+    position: Position,
+) void {
+    const router = server.routerOf(Ctx, target);
+    const alloc = router.arena.allocator();
+    const where = binding.where;
 
     // The router path: literals as they are, `*` as a parameter, `**` as a
     // wildcard; a verb rides on a last literal, and is checked by the
@@ -883,7 +921,7 @@ pub fn addBinding(
     // from the parameters).
     var path: std.ArrayList(u8) = .empty;
     var node = router.trees[@backingInt(method)];
-    const segments = template.segments();
+    const segments = template.segments()[0..count];
     for (segments, 0..) |segment, k| {
         path.append(alloc, '/') catch @panic("OOM");
         switch (segment) {
@@ -920,15 +958,17 @@ pub fn addBinding(
     if (node) |n| if (n.route) |opaque_route| {
         const route: *const dusty.Router(Ctx).Route = @ptrCast(@alignCast(opaque_route));
         if (route.action != &Dispatch(Ctx).handle) {
+            if (position == .last) return;
             router.conflicted("google.api.http on {s}: {s} {s} is already a route", .{ where, method.name(), route.info.path }) catch @panic("OOM");
             return;
         }
         if (!sameChain(Ctx, route.middlewares, server.chainOf(Ctx, target))) {
+            if (position == .last) return;
             router.conflicted("google.api.http on {s}: {s} {s} is already a route of a service registered with other middleware", .{ where, method.name(), route.info.path }) catch @panic("OOM");
             return;
         }
         const bindings: *Bindings = @ptrCast(@alignCast(@constCast(route.info.data.?)));
-        insert(bindings, binding, method);
+        insert(bindings, binding, method, position);
         return;
     };
     const bindings = alloc.create(Bindings) catch @panic("OOM");
@@ -943,7 +983,7 @@ fn sameChain(comptime Ctx: type, a: []const dusty.Middleware(Ctx), b: []const du
     return true;
 }
 
-fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method) void {
+fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method, position: Position) void {
     var it = bindings.first;
     while (it) |b| : (it = b.next) {
         if (b.template.sameShape(binding.template)) {
@@ -951,8 +991,7 @@ fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method) void {
         }
     }
     var link = &bindings.first;
-    if (binding.template.verb.len > 0) {
-        // After the other bindings with a verb, before those without.
+    if (position == .by_verb and binding.template.verb.len > 0) {
         while (link.*) |b| : (link = &b.next) if (b.template.verb.len == 0) break;
     } else {
         while (link.*) |b| link = &b.next;
@@ -1012,6 +1051,8 @@ test "templates match paths and capture variables" {
 
     const files = try Template.parse("/files/*/{path=**}");
     try std.testing.expectEqualStrings("a/b/c.txt", files.match("/files/x/a/b/c.txt", &out).?[0].raw);
+    // `**` matches no segment too; the router is what needs a route of its own for that.
+    try std.testing.expectEqualStrings("", files.match("/files/x", &out).?[0].raw);
     const single = try Template.parse("/v1/books/{name}");
     const s = single.match("/v1/books/a:b", &out).?;
     try std.testing.expectEqualStrings("a:b", s[0].raw);
@@ -1064,4 +1105,61 @@ test "transcode: JSON nested past the limit is refused; brackets inside strings 
     try std.testing.expect(!jsonDepthWithin("{\"a\":[1,{\"b\":2}]}", 2));
     try std.testing.expect(jsonDepthWithin("{\"a\":\"[[[[\"}", 1));
     try std.testing.expect(jsonDepthWithin("{\"a\":\"\\\"[[[[\"}", 1));
+}
+
+fn noServe(ctx: ?*anyopaque, req: *dusty.Request, res: *dusty.Response, captures: []const Capture, options: *const server.RegisterOptions) anyerror!void {
+    _ = .{ ctx, req, res, captures, options };
+}
+
+fn userHandler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+    _ = .{ req, res };
+}
+
+test "addBinding: a ** template also gets the route of its prefix, and a route there is left alone" {
+    const R = dusty.Router(void);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var router = R.init(std.testing.allocator);
+    defer router.deinit();
+    const options: server.RegisterOptions = .{};
+
+    const files = try Template.parse("/files/*/{path=**}");
+    addBinding(void, &router, .get, &files, noServe, &options, "files", false);
+    const info = try Template.parse("/info/{name=**}:stat");
+    addBinding(void, &router, .get, &info, noServe, &options, "info", false);
+    try std.testing.expect(router.conflict == null);
+
+    var req: dusty.Request = .{ .method = .get, .url = "/files/x", .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    const dispatch = (try router.findHandler(&req)).?;
+    try std.testing.expect(dispatch.action == &Dispatch(void).handle);
+    req.url = "/info:stat";
+    try std.testing.expect((try router.findHandler(&req)).?.action == &Dispatch(void).handle);
+    req.url = "/info";
+    try std.testing.expect((try router.findHandler(&req)) == null);
+
+    // A user's route at a prefix stays, with no conflict reported.
+    router.get("/docs/:id", userHandler);
+    const docs = try Template.parse("/docs/*/{path=**}");
+    addBinding(void, &router, .get, &docs, noServe, &options, "docs", false);
+    try std.testing.expect(router.conflict == null);
+    req.url = "/docs/x";
+    try std.testing.expect((try router.findHandler(&req)).?.action != &Dispatch(void).handle);
+    req.url = "/docs/x/a";
+    try std.testing.expect((try router.findHandler(&req)).?.action == &Dispatch(void).handle);
+}
+
+test "insert: a binding for the prefix of a ** template, added last, stays behind the exact ones before it" {
+    const fallback = try Template.parse("/files/{p=**}");
+    const exact = try Template.parse("/files");
+    const exact_verb = try Template.parse("/files:v");
+    var a: Binding = .{ .template = &fallback, .serve = noServe, .options = &.{}, .where = "a" };
+    var b: Binding = .{ .template = &exact, .serve = noServe, .options = &.{}, .where = "b" };
+    var c: Binding = .{ .template = &exact_verb, .serve = noServe, .options = &.{}, .where = "c" };
+    var list: Bindings = .{};
+    insert(&list, &b, .get, .by_verb);
+    insert(&list, &a, .get, .last);
+    insert(&list, &c, .get, .by_verb);
+    try std.testing.expectEqual(&c, list.first.?);
+    try std.testing.expectEqual(&b, c.next.?);
+    try std.testing.expectEqual(&a, b.next.?);
 }

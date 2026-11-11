@@ -490,7 +490,9 @@ rules:
 - A binding whose route is already someone else's (yours, or another
   method's gRPC route) panics at registration, as two bindings that match
   the same paths do.
-- `**` needs at least one segment here (Envoy also matches none).
+- `**` matches zero or more segments: `/files/{path=**}` also answers
+  `/files`, with `path` empty. An exact binding or route at that prefix wins
+  (a route of yours there is left alone, with no panic).
 - The router picks a route before the binding is asked: of `/v1/{name}:x`
   and `/v1/{name=**}`, `/v1/abc` reaches the first's route and is a 404.
 
