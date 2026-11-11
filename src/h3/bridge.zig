@@ -399,12 +399,15 @@ pub const BlockPool = struct {
         }
     }
 
-    /// When `trim` next has something to give back, if it may: never while
-    /// the pool keeps no more than `keep_min`. By the owner.
+    /// When `trim` next may have something to give back: never while the
+    /// free blocks are no more than it keeps at the least, `keep_min` or
+    /// the blocks live now (the peak of any window is at least that), so an
+    /// idle endpoint whose pooled streams hold more blocks than the floor
+    /// stops waking for it. By the owner.
     pub fn trimAt(p: *BlockPool) u64 {
         if (!p.adaptive) return std.math.maxInt(u64);
         p.acquire();
-        const idle = p.keep <= p.keep_min and p.free_count <= p.keep_min;
+        const idle = p.free_count <= @max(p.keep_min, p.live);
         p.lock.unlock();
         return if (idle) std.math.maxInt(u64) else p.window_start + window_ns;
     }
@@ -958,6 +961,30 @@ test "adaptive block pool keeps the last window's peak, then trims to its floor"
     try std.testing.expectEqual(@as(u32, 5), pool.pooled());
     pool.trim(t0 + 2 * BlockPool.window_ns);
     try std.testing.expectEqual(@as(u32, 2), pool.pooled());
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pool.trimAt());
+}
+
+test "adaptive block pool past its floor: keeps a 300-block peak for a window, then trims to the blocks still live, and stops waking" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.initAdaptive(gpa, 32);
+    defer pool.deinit();
+    const t0: u64 = 1000 * BlockPool.window_ns;
+    pool.trim(t0);
+    // 40 blocks stay live, as the first blocks of pooled streams do.
+    var held: [300]*Block = undefined;
+    for (&held) |*b| b.* = try pool.get();
+    for (held[40..]) |b| pool.put(b);
+    defer for (held[0..40]) |b| pool.put(b);
+    try std.testing.expectEqual(@as(u32, 260), pool.pooled());
+    try std.testing.expectEqual(t0 + BlockPool.window_ns, pool.trimAt());
+    // The next window keeps the peak of 300.
+    pool.trim(t0 + BlockPool.window_ns);
+    try std.testing.expectEqual(@as(u32, 260), pool.pooled());
+    try std.testing.expectEqual(t0 + 2 * BlockPool.window_ns, pool.trimAt());
+    // Idle: down to the 40 still live, past the floor, and nothing more
+    // to give back, so no further trim is due.
+    pool.trim(t0 + 2 * BlockPool.window_ns);
+    try std.testing.expectEqual(@as(u32, 40), pool.pooled());
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pool.trimAt());
 }
 

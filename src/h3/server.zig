@@ -649,7 +649,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
-                .blocks = .initAdaptive(gpa, 256),
+                .blocks = .initAdaptive(gpa, block_floor),
             };
             self.blocks.send = &shared.send_memory;
             self.inbox = .init(&self.inbox_buf);
@@ -719,6 +719,13 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// Streams kept at most per endpoint.
         const pool_max = 64;
+
+        /// The free send and receive blocks an idle endpoint keeps (128 KiB):
+        /// under load the pool keeps the last window's peak instead, so a
+        /// floor only sizes the first burst after an idle spell. It was 256
+        /// (1 MiB), held by every endpoint (one per executor) once a burst
+        /// had filled it (#78).
+        const block_floor = 32;
 
         /// Copies the block pool's counts into `stats`.
         pub fn sampleStats(self: *Self) void {
@@ -942,8 +949,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gen = self.drive_gen.load(.acquire);
                 if (self.dirty.load(.acquire) == null) {
                     const t = now(io);
-                    // The block pool's trim is due too, while it keeps
-                    // more than its floor.
+                    // The block pool's trim is due too, while it has
+                    // free blocks to give back.
                     const next = @min(self.nextTimer(), self.blocks.trimAt());
                     if (next > t) {
                         // Whatever the send blocks moved since the last
