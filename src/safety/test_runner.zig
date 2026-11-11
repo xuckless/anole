@@ -17,8 +17,10 @@
 //! runs one shard of the tests (`shard`) and ANOLE_TEST_DURATIONS records
 //! each test's duration (`durations`). The fuzzing
 //! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
-//! fuzzer's throughput). Re-copy it when moving to the next
-//! Zig version and apply the change again (`ANOLE:` marks it).
+//! fuzzer's throughput), and each fuzz input gets an Io of its own, its
+//! threads joined before the input's leak check (`test_one`). Re-copy it
+//! when moving to the next Zig version and apply the change again
+//! (`ANOLE:` marks it).
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -1309,6 +1311,21 @@ pub fn fuzz(
                 .check_write_after_free = true,
             });
             defer if (testing.allocator_instance.deinit() != 0) std.process.exit(1);
+            // ANOLE: the input's Io goes, its threads joined, before the
+            // leak check, as `.run_test` does for a test; the next input
+            // gets a new one. std.Io.Threaded frees a group's task only
+            // after waking the task that cancels or awaits the group
+            // (`Group.Task.start`), so with one Io across inputs a task the
+            // input ended could still be freeing from this allocator as it
+            // is checked and reset: a false leak, or "corrupted footer
+            // metadata in bucket" (#195).
+            defer {
+                testing.io_instance.deinit();
+                testing.io_instance = .init(testing.allocator, .{
+                    .argv0 = fuzz_runner.threaded_io.argv0,
+                    .environ = fuzz_runner.threaded_io.environ.process_environ,
+                });
+            }
             log_err_count = 0;
             testOne(ctx, @constCast(&testing.Smith{ .in = null })) catch |err| switch (err) {
                 error.SkipZigTest => return true,
