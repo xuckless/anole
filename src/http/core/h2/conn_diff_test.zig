@@ -45,9 +45,11 @@ const Field = hpack.Field;
 // ---------------------------------------------------------------------------
 // The two servers
 
-/// A deliberate change to Conn's answers, to show the comparison catches
-/// one (`status`) and normalizes another (`split`).
-const Plant = enum { none, status, split };
+/// A deliberate change to Conn's answers, to show the comparison
+/// normalizes one (`split`) and catches the others: a 201 (`status`), a
+/// 431 to a request under the limits (`status431`), and a PING after the
+/// peer's GOAWAY (`goaway_ping`), which no rule may excuse.
+const Plant = enum { none, status, split, status431, goaway_ping };
 
 /// Conn's side: every complete request answered 200 + "ok" from inside the
 /// callback, DATA credit given back at once.
@@ -69,10 +71,13 @@ const Handler = struct {
 
     pub fn onStreamClose(_: *Handler, _: *Stream, _: ErrorCode) void {}
     pub fn onWindow(_: *Handler, _: ?*Stream) void {}
-    pub fn onGoaway(_: *Handler, _: u31, _: ErrorCode) void {}
+    pub fn onGoaway(h: *Handler, _: u31, _: ErrorCode) void {
+        if (h.plant == .goaway_ping) h.c.ping(@splat(0xaa)) catch @panic("ping");
+    }
     pub fn onPingAck(_: *Handler, _: [8]u8) void {}
 
     fn respond(h: *Handler, s: *Stream) void {
+        if (h.plant == .status431) return h.c.submitHead(s, 431, &.{}, true) catch @panic("submitHead");
         h.c.submitHead(s, if (h.plant == .status) 201 else 200, &.{}, false) catch @panic("submitHead");
         if (h.plant == .split) {
             h.c.submitData(s, &.{"o"}, false) catch @panic("submitData");
@@ -559,32 +564,44 @@ fn classify(p: *Pair, a: Allocator, ours: *const Batch, theirs: *const Batch) !?
     if (reasonIs(og, "header block too costly")) return .{ .hpack_cost, true };
     if (reasonIs(og, "too many refused streams") or
         (ours.refused and theirsFirst(og, tg, .protocol_error))) return .{ .refused, true };
-    // After the peer's GOAWAY, whenever no stream is open, nghttp2 is
-    // closing (session_is_closing) and neither answers PING or SETTINGS nor
-    // sends what it had queued, until a new stream opens (INTENTIONAL.md,
-    // session 4).
-    if (p.cn.remote_last != std.math.maxInt(u31) and og == null and tg == null and
-        try within(a, theirs, ours, &p.excused)) return .{ .peer_goaway, false };
     // Both ended the connection the same way, and nghttp2 dropped what it
     // had queued while handling the frame (session_is_closing): every line
-    // it sent we sent too.
+    // it sent we sent too, and ours has only such frames besides.
     if (og != null and tg != null and og.?.code == tg.?.code and og.?.last == tg.?.last) {
-        if (try within(a, theirs, ours, &p.excused)) return .{ .queued_output, false };
+        if (try within(a, theirs, ours, &p.excused, .queued)) return .{ .queued_output, false };
     }
     return null;
 }
 
-/// Every line of `small` is in `big`: the connection's in order, and each
-/// stream's in order.
-fn within(a: Allocator, small: *const Batch, big: *const Batch, excused: *const Excused) !bool {
-    if (!inOrder(small.conn.items, big.conn.items)) return false;
+/// What `big` may have that `small` lacks: the frames nghttp2 drops while
+/// `session_is_closing` (INTENTIONAL.md, session 4: PING and SETTINGS
+/// ACKs, RST_STREAM), and at a connection error also the handler's
+/// responses it had queued (session 3), on streams it sent nothing on.
+const Extra = enum { closing, queued };
+
+/// Every line of `small` is in `big` (the connection's in order, and each
+/// stream's in order), and every other line of `big` is one `extra` allows.
+fn within(a: Allocator, small: *const Batch, big: *const Batch, excused: *const Excused, extra: Extra) !bool {
+    if (!inOrder(small.conn.items, big.conn.items, extra, false)) return false;
     var ids: std.AutoArrayHashMapUnmanaged(u31, void) = .empty;
+    for (big.lines.items) |l| try ids.put(a, l.id, {});
     for (small.lines.items) |l| try ids.put(a, l.id, {});
     for (ids.keys()) |id| {
         if (excused.contains(id)) continue;
-        if (!inOrder(try streamLines(a, small, id), try streamLines(a, big, id))) return false;
+        const sl = try streamLines(a, small, id);
+        if (!inOrder(sl, try streamLines(a, big, id), extra, sl.len == 0)) return false;
     }
     return true;
+}
+
+fn allowed(line: []const u8, extra: Extra, unanswered: bool) bool {
+    if (std.mem.startsWith(u8, line, "PING ack=1 ") or std.mem.eql(u8, line, "SETTINGS ACK") or
+        std.mem.startsWith(u8, line, "RST_STREAM ")) return true;
+    if (extra != .queued or !unanswered) return false;
+    for ([_][]const u8{ "HEADERS :status=200 es=0", "HEADERS :status=431 es=1", "DATA \"ok\" es=1" }) |r| {
+        if (std.mem.eql(u8, line, r)) return true;
+    }
+    return false;
 }
 
 fn streamLines(a: Allocator, b: *const Batch, id: u31) ![]const []const u8 {
@@ -593,14 +610,19 @@ fn streamLines(a: Allocator, b: *const Batch, id: u31) ![]const []const u8 {
     return l.items;
 }
 
-/// `small` is a subsequence of `big`.
-fn inOrder(small: []const []const u8, big: []const []const u8) bool {
+/// `small` is a subsequence of `big`, whose other lines `extra` allows
+/// (`unanswered`: `small` has none for this stream). The lines skipped are
+/// `big` less `small` whatever the alignment, so the greedy one will do.
+fn inOrder(small: []const []const u8, big: []const []const u8, extra: Extra, unanswered: bool) bool {
     var j: usize = 0;
     for (small) |line| {
-        while (j < big.len and !std.mem.eql(u8, big[j], line)) j += 1;
+        while (j < big.len and !std.mem.eql(u8, big[j], line)) : (j += 1) {
+            if (!allowed(big[j], extra, unanswered)) return false;
+        }
         if (j == big.len) return false;
         j += 1;
     }
+    for (big[j..]) |line| if (!allowed(line, extra, unanswered)) return false;
     return true;
 }
 
@@ -687,15 +709,22 @@ const Pair = struct {
         try p.ng_out.appendSlice(a, try p.ng.drain(a));
     }
 
+    /// After the peer's GOAWAY with no stream active nghttp2 wants to read
+    /// no more, and the engine closes the connection.
+    fn ngDone(p: *const Pair) bool {
+        return p.ng.fatal == null and p.theirs.goaway == null and c.nghttp2_session_want_read(p.ng.session) == 0;
+    }
+
     /// Drains both and compares the batch; a rule that stops returns it.
     fn compare(p: *Pair, a: Allocator, res: *Result) !bool {
         const ours = try p.ours.batch(a, p.ours_out.items);
         const theirs = try p.theirs.batch(a, p.ng_out.items);
         p.ours_out = .empty;
         p.ng_out = .empty;
-        // A 431 of ours where nghttp2 answered otherwise (it checks some
-        // fields before the list limit, INTENTIONAL.md, limits 6): that
-        // stream is left out from now on.
+        // A 431 of ours where nghttp2 reset the stream for a field it
+        // checks before the list limit (INTENTIONAL.md, limits 6), or
+        // answered 431 too: that stream is left out from now on. Any other
+        // answer of nghttp2's is a divergence.
         for (ours.status431.items) |id| {
             if (p.excused.contains(id)) continue;
             const x = try streamLines(a, &ours, id);
@@ -704,6 +733,13 @@ const Pair = struct {
                 if (!std.mem.eql(u8, l, m)) break false;
             } else true;
             if (same) continue;
+            var reset = false;
+            var answered = false;
+            for (y) |l| {
+                reset = reset or std.mem.eql(u8, l, "RST_STREAM protocol_error");
+                if (std.mem.startsWith(u8, l, "HEADERS :status=")) answered = answered or !std.mem.startsWith(u8, l, "HEADERS :status=431");
+            }
+            if (answered or !(reset or std.mem.indexOfScalar(u31, theirs.status431.items, id) != null)) continue;
             try p.excused.put(p.gpa, id, {});
             res.soft[@backingInt(Rule.head_431)] += 1;
         }
@@ -713,10 +749,10 @@ const Pair = struct {
         // After the peer's GOAWAY with no stream open nghttp2 is done
         // (want_read is 0, and want_write once its queue is empty; on the
         // way it drops the last frame it pops, session_is_closing), and the
-        // engine closes the connection (INTENTIONAL.md, session 4): what it
-        // sent must be in ours, and the rest isn't compared.
-        const done = p.ng.fatal == null and p.theirs.goaway == null and c.nghttp2_session_want_read(p.ng.session) == 0;
-        if (done and try within(a, &theirs, &ours, &p.excused)) {
+        // engine closes the connection (INTENTIONAL.md, session 4):
+        // `lockstep` feeds no more, what nghttp2 sent must be in ours, and
+        // ours may have besides only what nghttp2 drops while closing.
+        if (p.ngDone() and ours.goaway == null and try within(a, &theirs, &ours, &p.excused, .closing)) {
             res.rule = .peer_goaway;
             return true;
         }
@@ -787,8 +823,9 @@ fn lockstep(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8,
             const next = if (e < ends.len) @min(ends[e], stop) else stop;
             try p.feed(a, input[at..next]);
             at = next;
+            if (p.ngDone()) break;
         }
-        if (try p.compare(a, &res)) return res;
+        if (try p.compare(a, &res) or p.ngDone()) return res;
     }
     // The final state: open, GOAWAY (in the trace) or a fatal error, and
     // the last stream processed.
@@ -1020,9 +1057,26 @@ test "h2 conn diff: the harness catches a planted divergence" {
     const split = try lockstep(testing.allocator, a, .{}, input.items, &whole, .split);
     try testing.expectEqual(null, split.rule);
     try testing.expectEqual(Outcome.open, split.outcome);
-    // 201 for 200: caught.
-    std.debug.print("h2 conn diff: a planted divergence follows\n", .{});
+    // 201 for 200, and a 431 to requests under the limits: caught.
+    std.debug.print("h2 conn diff: planted divergences follow\n", .{});
     try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status));
+    try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status431));
+    // A PING of ours after the peer's GOAWAY, while a stream is open and
+    // once nghttp2 is done: neither peer_goaway nor its stop excuses a
+    // frame nghttp2 never drops.
+    const head = [_][]const u8{ conn.client_magic, try t.settings(&.{}), try t.settingsAck() };
+    for ([_][]const []const u8{
+        &.{ try t.headers(1, &conn_test.post, false), try t.goaway(0, .no_error), try t.data(1, "abc", true) },
+        &.{ try t.headers(1, &conn_test.get, true), try t.goaway(0, .no_error), try t.ping(false, @splat(1)) },
+    }) |frames| {
+        var in: std.ArrayList(u8) = .empty;
+        for (head) |f| try in.appendSlice(a, f);
+        for (frames) |f| try in.appendSlice(a, f);
+        const one = [_]usize{in.items.len};
+        const clean = try lockstep(testing.allocator, a, .{}, in.items, &one, .none);
+        try testing.expectEqual(Outcome.open, clean.outcome);
+        try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, in.items, &one, .goaway_ping));
+    }
 }
 
 // ---------------------------------------------------------------------------

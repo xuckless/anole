@@ -148,7 +148,9 @@ side's answers would depend on when its writer ran.
    Conn's `out` is a byte FIFO whose slices the writer may already hold
    (PLAN §3.3), so what it queued goes out before the GOAWAY. RFC 9113
    §5.4.1 asks only for the GOAWAY before the close. Accepted when both
-   sent the same GOAWAY and every frame nghttp2 sent, Conn sent too.
+   sent the same GOAWAY, every frame nghttp2 sent, Conn sent too, and
+   Conn's others are only PING and SETTINGS ACKs, RST_STREAMs, and the
+   handler's response on a stream nghttp2 sent nothing on.
 4. **After the peer's GOAWAY, nghttp2 is done whenever no stream is open**
    (rule `peer_goaway`). Its `session_is_closing` is then true (want_read
    is 0 once GOAWAY was received and no stream is active, and want_write
@@ -156,9 +158,11 @@ side's answers would depend on when its writer ran.
    (`nghttp2_session_on_ping_received`, `..._on_settings_received`), drops
    the last frame it pops, and the engine closes the connection
    (server/h2_nghttp2.zig, when neither wants to read or write). Conn
-   leaves the close to the transport (M3) and goes on answering. Accepted
-   when every frame nghttp2 sent, Conn sent too; once nghttp2 is done the
-   rest isn't compared.
+   leaves the close to the transport (M3) and goes on answering. The
+   harness feeds nothing after the frame that leaves nghttp2 done (the
+   engine reads no more), and accepts the batch when Conn sent no GOAWAY,
+   every frame nghttp2 sent Conn sent too, and Conn's others are only
+   what nghttp2 drops while closing: PING ACK, SETTINGS ACK, RST_STREAM.
 5. **DATA is charged to the receive windows for the whole frame at its
    header** (rule `window_per_frame`). nghttp2 charges each chunk as it
    reads it (`nghttp2_session_update_recv_{connection,stream}_window_size`
