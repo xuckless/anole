@@ -2947,8 +2947,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                     },
                     error.OutOfMemory => return error.OutOfMemory,
                 };
-                if (!too_many and request.headers.get("Host") == null and s.authority.len > 0) {
-                    request.headers.put("Host", s.authority) catch {
+                // One host, from `:authority` when it is there (RFC 9114
+                // §4.3.1), as over HTTP/2: a `host` field naming another
+                // makes the request malformed. nghttp3 has already refused
+                // a second or empty `host`, an empty `:authority`, and a
+                // request with neither; a `host` alone is the authority.
+                if (!too_many and s.authority.len > 0) {
+                    if (request.headers.get("Host")) |host| {
+                        if (!std.ascii.eqlIgnoreCase(host, s.authority)) {
+                            response.status = .bad_request;
+                            {
+                                try response.write();
+                                return .done;
+                            }
+                        }
+                    } else request.headers.add("Host", s.authority) catch {
                         too_many = true;
                     };
                 }

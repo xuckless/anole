@@ -109,6 +109,10 @@ breaking changes are listed anyway.
   `ANOLE_SERVER_SIGNALS`), a restart's hand-off or a failing listener
   posted none (#201). It is now posted when the server's drain starts,
   whatever started it, once per consumer.
+- **HTTP/3**: a request whose `host` field named another authority
+  than its `:authority` was served, with the `host` value as the host
+  (#202). It is now refused with 400, as over HTTP/2 (RFC 9114 §4.3.1);
+  the comparison ignores case, and a `host` alone is still the host.
 - **net (raw TCP)**: a connection whose write side was already ended
   (`conn.end()`, `ANOLE_NET_F_END`) and whose peer then stayed silent was
   not closed by the drain or by a later graceful close until the peer
