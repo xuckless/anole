@@ -1,0 +1,27 @@
+[06:10:43] scenario curl-load-tls
+[06:10:43] scenario curl-load-h2c
+[06:10:43] scenario curl-abort
+[06:10:44] scenario curl-upload
+[06:10:44] scenario curl-sse
+[06:10:47] scenario curl-header-30k
+30k header: 200
+[06:10:47] scenario curl-header-200k
+200k header: 000 (000 = curl refused or the connection ended)
+[06:10:47] scenario raw-continuation
+1 fragment: 0 CONTINUATION frames, header block 42 B -> HEADERS 200
+8 fragments (7 CONTINUATION): 7 CONTINUATION frames, header block 223 B -> HEADERS 200
+9 fragments (8 CONTINUATION): 8 CONTINUATION frames, header block 223 B -> HEADERS 200
+10 fragments (9 CONTINUATION): 9 CONTINUATION frames, header block 223 B -> no answer
+21 fragments (20 CONTINUATION): 20 CONTINUATION frames, header block 223 B -> no answer
+48 KiB value in full frames: 3 CONTINUATION frames, header block 49177 B -> HEADERS 200
+70 KiB value in full frames: 4 CONTINUATION frames, header block 71705 B -> GOAWAY code 9
+[06:10:51] scenario node-page
+[06:10:51] scenario node-download
+downloaded 67108864
+[06:10:51] scenario node-cancel
+[06:10:51] scenario node-upload
+uploaded 9
+[06:10:51] scenario node-ping-tool-driven
+[06:10:52] scenario grpc-go
+unary ok=1000 failed=0, cancelled=20 of 20
+[06:10:52] report: /tmp/claude-1000/h2w/r-cng/h2count.json

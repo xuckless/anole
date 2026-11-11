@@ -1859,6 +1859,23 @@ pub fn build(b: *std.Build) void {
     run_io.addPassthruArgs();
     b.step("run-io", "Run examples/io (pass a port after --, default 8081)").dependOn(&run_io.step);
 
+    // tools/h2count/site: the upstream of the HTTP/2 flood-budget calibration
+    // (tools/h2count/README.md). Not installed by default.
+    const h2count_site = b.addExecutable(.{
+        .name = "h2count-site",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/h2count/site/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        }),
+    });
+    b.step("h2count-site", "Build and install the h2count test site").dependOn(&b.addInstallArtifact(h2count_site, .{}).step);
+    test_step.dependOn(&h2count_site.step);
+    const run_h2count_site = b.addRunArtifact(h2count_site);
+    run_h2count_site.addPassthruArgs();
+    b.step("run-h2count-site", "Run the h2count test site (pass a port after --, default 8080)").dependOn(&run_h2count_site.step);
+
     // `zig build gen-proto`: Zig for Anole's own .proto files (the health
     // service, the test service), through zig-protobuf's protoc-gen-zig and
     // its pinned protoc. The output is committed; rerun after a proto or
