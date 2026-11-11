@@ -1465,6 +1465,33 @@
           "default": null,
           "description": "Open WebSockets at most, over every protocol; past it an upgrade is answered 503 with Retry-After. Null: no cap."
         },
+        "buffer_budget": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bytes per executor that request bodies collected whole and WebSocket messages being reassembled may hold; past it, 503 with Retry-After (a WebSocket message: close 1013). Null: a quarter of min(cgroup memory.max, RAM), at least 64 MiB, over the executors."
+        },
+        "max_tasks": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Request tasks per executor (connections being served, HTTP/2 and HTTP/3 streams); past it, accepts wait and streams are refused. Null: from vm.max_map_count on Linux, no cap elsewhere."
+        },
         "max_requests_per_connection": {
           "anyOf": [
             {

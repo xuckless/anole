@@ -93,7 +93,8 @@ pub const Message = WebSocket.Message;
 pub const MessageType = WebSocket.MessageType;
 /// A close status code: `.normal` (1000), `.going_away` (1001),
 /// `.policy_violation` (1008), `.too_large` (1009), `.internal_error`
-/// (1011) and the rest of RFC 6455's; any other number fits too.
+/// (1011), `.try_again_later` (1013: the server's buffer budget is spent)
+/// and the rest of RFC 6455's; any other number fits too.
 pub const CloseCode = WebSocket.CloseCode;
 /// A client-side WebSocket, from
 /// `anole.client(req).http.connectWebSocket(url, .{})` for a `ws://` or
@@ -677,6 +678,9 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     };
     if (h2) {
         socket._conn = .{ .stream = try H2Socket.accept(req, res, max_message, negotiated) };
+        // A message in pieces holds its bytes of the server's buffer
+        // budget until it is whole; past it, close 1013.
+        socket._conn.stream.budget = req._config._admission;
     } else {
         const ws = try alloc.create(WebSocket);
         errdefer if (owner != null) alloc.destroy(ws);
@@ -691,6 +695,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         if (owner != null) ws.msg_arena = .init(alloc);
         ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
+        ws.budget = req._config._admission;
         socket._conn = .{ .h1 = ws };
         // A callback socket sizes its window per run (`ReadWindow`).
         if (owner == null) if (res._conn) |conn| {
@@ -1938,6 +1943,7 @@ test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
     _ = @import("admission_test.zig");
+    _ = @import("budget_test.zig");
     // About parked callback sockets; idle parking is off on Windows.
     if (@import("builtin").os.tag != .windows) _ = @import("callbacks_test.zig");
     _ = @import("h2_fuzz_test.zig");

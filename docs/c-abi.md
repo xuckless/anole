@@ -737,6 +737,7 @@ none.
 | `limits.max_requests_per_connection` | null | `limits.max_requests_per_connection` |
 | `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
 | `limits.max_websockets` | null | `limits.max_websockets` (null: no cap; past it an upgrade gets 503 with Retry-After) |
+| `limits.buffer_budget`, `limits.max_tasks` | null, null | `limits.buffer_budget`, `limits.max_tasks` (null: from memory and `vm.max_map_count`; see [server.md](server.md#buffer-budget-and-task-cap)) |
 | `admission.enabled`, `util_enter`, `util_exit`, `sustain`, `min_shed_ms`, `lag_enter_ms`, `retry_after_s` | true, 0.85, 0.8, 3, 5000, 25, [5, 15] | `admission.*`, the WebSocket admission gate ([server.md](server.md#overload)); a refused upgrade on an `"accept": "consumer"` route never reaches the consumer |
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |

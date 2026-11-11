@@ -12,8 +12,11 @@
 //! `anole_admission_signal{executor,source}` (1 for where utilization comes
 //! from: "poll_wall", "task_clock" or "none"), `anole_websockets_admitted`,
 //! `anole_websockets_limit` (the frozen limit, -1 while nothing is frozen)
-//! and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`. Integer
-//! gauges, hence permille and microseconds.
+//! and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`; and the
+//! per-executor budgets' (#131): `anole_buffer_budget_held_bytes` (bytes
+//! bodies and WebSocket messages hold, over every executor) and
+//! `anole_requests_shed_total{reason="memory"|"tasks"}`. Integer gauges,
+//! hence permille and microseconds.
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
@@ -156,4 +159,9 @@ pub fn refreshAdmission(registry: *metrics.Registry, state: *const dusty.admissi
     const refused = registry.counter("anole_ws_upgrades_refused_total", "WebSocket upgrades answered 503 by the admission gate.", &.{"reason"}) catch return;
     refused.with(&.{"load"}).set(state.refused_load.load(.monotonic));
     refused.with(&.{"cap"}).set(state.refused_cap.load(.monotonic));
+    const held = registry.gauge("anole_buffer_budget_held_bytes", "Bytes request bodies and WebSocket messages hold of the buffer budget, over every executor.", &.{}) catch return;
+    held.with(&.{}).set(@intCast(@min(state.heldBytes(), std.math.maxInt(i64))));
+    const shed = registry.counter("anole_requests_shed_total", "Requests, streams and WebSocket messages refused for a per-executor budget: memory (503, close 1013) or tasks (a stream refused, an accept held).", &.{"reason"}) catch return;
+    shed.with(&.{"memory"}).set(state.refused_memory.load(.monotonic));
+    shed.with(&.{"tasks"}).set(state.refused_tasks.load(.monotonic));
 }

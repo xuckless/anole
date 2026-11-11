@@ -1371,6 +1371,47 @@ test "HTTP/2: a body past its content-length resets only its stream" {
     try std.testing.expectEqualStrings("hello", client.get(after).body.items);
 }
 
+test "HTTP/2: a body the buffer budget can't hold gets 503 on its stream, and the connection carries on" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .buffer_budget = 1024,
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    server.router.post("/len", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const b = try req.body();
+            try res.print(.text, "{d}", .{if (b) |x| x.len else 0});
+        }
+    }.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // Another holder fills the executor's budget (the slow senders of the
+    // HTTP/1.1 test, src/http/core/budget_test.zig).
+    const row = &server.admission.rows[0];
+    row.held_bytes.store(1024, .monotonic);
+    const len = [_]c.nghttp2_nv{TestClient.nv("content-length", "9")};
+    const refused = try client.requestHeaders("POST", "/len", &len, "123456789");
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 503), client.get(refused).status);
+    try std.testing.expectEqual(@as(u64, 1), server.admission.refused_memory.load(.monotonic));
+    const after = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(after).body.items);
+    // With the budget free, the same body passes and gives its share back.
+    row.held_bytes.store(0, .monotonic);
+    const ok = try client.requestHeaders("POST", "/len", &len, "123456789");
+    try client.run();
+    try std.testing.expectEqualStrings("9", client.get(ok).body.items);
+    try std.testing.expectEqual(@as(usize, 0), row.held_bytes.load(.monotonic));
+}
+
 test "HTTP/2: a body that overflows its queue resets only its stream, with INTERNAL_ERROR" {
     const io = std.testing.io;
     var fx: Fixture = undefined;

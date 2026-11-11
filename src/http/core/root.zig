@@ -194,6 +194,7 @@ test {
 // Import tests
 comptime {
     _ = @import("server_test.zig");
+    _ = @import("budget_test.zig");
     _ = @import("parked_test.zig");
     _ = @import("server/request_buffers.zig");
     _ = @import("drain_hooks.zig");

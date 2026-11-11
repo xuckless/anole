@@ -7,6 +7,20 @@ breaking changes are listed anyway.
 
 ### Added
 
+- **Per-executor buffer budget and task cap** (#131, #48):
+  `limits.buffer_budget` bounds the bytes request bodies collected whole
+  and WebSocket messages being reassembled hold per executor (default a
+  quarter of memory over the executors). A body with a `Content-Length`
+  past it gets 503 with `Retry-After` before any of it is read (and before
+  `100 Continue`); one of unknown length gets it partway; a WebSocket
+  message is closed 1013. `limits.max_tasks` caps request tasks per
+  executor below `vm.max_map_count` (Linux): accepts wait, streams get
+  REFUSED_STREAM / H3_REQUEST_REJECTED. `blocking.max_waiting` (Zig,
+  opt-in) fails a caller past the bound at once with
+  `error.ServiceUnavailable`. Both budgets are on the startup log and on
+  `/metrics` (`anole_requests_shed_total`,
+  `anole_buffer_budget_held_bytes`). Breaking: `auth.password.verify`
+  returns `error{ServiceUnavailable}!bool`.
 - **HTTP/3 handshake timeout** (#35): `http3.handshake_timeout` (JSON
   and C ABI: `handshake_timeout_ms`), 10 s by default. The server closes
   a QUIC connection whose handshake is not done in time, and drops the

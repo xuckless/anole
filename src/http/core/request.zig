@@ -14,6 +14,7 @@ pub const BodySource = @import("parser.zig").BodySource;
 const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
+const admission = @import("admission.zig");
 const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
@@ -166,6 +167,12 @@ pub const Request = struct {
     /// upgrade, so a path that gates early (the C ABI's accepted upgrades)
     /// isn't gated twice.
     _ws_admission: _WsAdmission = .none,
+    /// What `body` holds of the server's `buffer_budget` (#131), given back
+    /// by the server once the handler chain has run.
+    _body_held: admission.Held = .{},
+    /// The server refused this request for its own load (a body over the
+    /// budget): its 503 is logged at debug, not as a handler error.
+    _shed: bool = false,
     _body: ?[]const u8 = null,
     _body_read: bool = false,
     // Set up on the first body read that calls for decoding, and kept so a
@@ -212,6 +219,9 @@ pub const Request = struct {
     /// Clears the request for reuse on the same connection. Called by
     /// the server between requests; not for handlers.
     pub fn _reset(self: *Request) void {
+        // Given back where the chain ends (`Server.dispatch` and the
+        // HTTP/1.x loop); a reservation here would never be.
+        std.debug.assert(self._body_held.bytes == 0);
         // Field by field, rather than `self.* = .{...}`: a whole-struct
         // store writes the session's 512-byte entry table (a memset per
         // request), which `len = 0` makes unread anyway. The fields kept
@@ -360,20 +370,34 @@ pub const Request = struct {
 
     /// The whole body, in the request's arena, or null when there is none.
     /// The result is kept, so later calls return it again. Fails with
-    /// `error.BodyTooBig` (a 413) past `config.max_body_size`.
+    /// `error.BodyTooBig` (a 413) past `config.max_body_size`, and with
+    /// `error.ServiceUnavailable` (a 503 with `Retry-After`) when the
+    /// server's buffer budget can't hold it (`limits.buffer_budget`): a
+    /// body of known length before any of it is read (and before a
+    /// `100 Continue`), one of unknown length (chunked, or decoded) when
+    /// the budget runs out partway.
     pub fn body(self: *Request) !?[]const u8 {
         if (self._body_read) {
             return self._body;
         }
 
+        const budget: ?admission.Budget = if (self._config._admission) |a| .{ .state = a, .held = &self._body_held, .io = self.io } else null;
         // Nothing to stage: the body streams straight into the arena. The
         // declared length sizes it only while nothing is decoded; a decoder
         // makes it the wire length, not what comes out.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
         const hint = if (r.decode == null) self.content_length else null;
-        const result = allocRemainingHinted(&r.interface, self.arena, self._config.max_body_size, hint) catch |err| switch (err) {
+        // A known length takes all it will hold now, before the first byte
+        // is read, so a body admitted never fails for memory later
+        // (goose-http's gather budget): the length and the byte of room
+        // `allocRemainingHinted` reads the end into.
+        if (budget) |b| if (hint) |n| {
+            if (n > 0 and !b.growTo(@min(n, self._config.max_body_size) +| 1)) return self.shedBody();
+        };
+        const result = allocRemainingHinted(&r.interface, self.arena, self._config.max_body_size, hint, budget) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
+            error.Overloaded => return self.shedBody(),
             // The interface can only say that a read failed; the reader
             // holds what it was.
             error.ReadFailed => return r.err orelse error.Unexpected,
@@ -387,6 +411,23 @@ pub const Request = struct {
         }
         self._body = result;
         return result;
+    }
+
+    /// The answer to a body the buffer budget refused: 503 with a jittered
+    /// `Retry-After`, as a WebSocket upgrade the admission gate refuses
+    /// (`anole.websocket.overloaded`). Over HTTP/1.x the connection closes
+    /// after it rather than drain a body the server has no room for.
+    noinline fn shedBody(self: *Request) error{ServiceUnavailable} {
+        if (self._response) |res| {
+            if (self._config._admission) |a| {
+                var buf: [8]u8 = undefined;
+                const secs = std.fmt.bufPrint(&buf, "{d}", .{a.retryAfter(self.io)}) catch unreachable;
+                if (self.arena.dupe(u8, secs)) |v| res.header("Retry-After", v) catch {} else |_| {}
+            }
+            if (self.version_major < 2) res.keepalive = false;
+        }
+        self._shed = true;
+        return error.ServiceUnavailable;
     }
 
     /// A path parameter by name, null when the route has none of that name:
@@ -790,11 +831,16 @@ const body_reserve_max = 16 * 1024;
 /// hint, fall back to std's growth. The hint must describe the bytes
 /// `r` yields: no hint when something between the wire and `r`
 /// changes their length (a decoder).
-pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: usize, hint: ?usize) std.Io.Reader.LimitedAllocError![]u8 {
+///
+/// With a `budget` (the server's, #131), every growth of the buffer is
+/// granted by it first, and one it refuses fails with
+/// `error.Overloaded`; a caller that granted the whole length up front
+/// (`Request.body`) never sees that. Null, nothing is counted.
+pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: usize, hint: ?usize, budget: ?admission.Budget) AllocHintedError![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const declared: usize = if (hint) |n| (if (n <= limit) n else 0) else 0;
-    if (declared > 0) try aw.ensureTotalCapacityPrecise(@min(declared, body_reserve_max) + 1);
+    if (declared > 0) try growBody(&aw, @min(declared, body_reserve_max) + 1, budget);
     // As `allocRemaining`: one byte past `limit` is how it is exceeded.
     var remaining: std.Io.Limit = .limited(limit +| 1);
     while (remaining != .nothing) {
@@ -802,7 +848,13 @@ pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: us
         var step = remaining;
         if (w.end < declared) {
             if (w.end == w.buffer.len)
-                try aw.ensureTotalCapacityPrecise(@min(declared +| 1, std.ArrayList(u8).growCapacity(w.end + 1)));
+                try growBody(&aw, @min(declared +| 1, std.ArrayList(u8).growCapacity(w.end + 1)), budget);
+            step = step.min(.limited(w.buffer.len - w.end));
+        } else if (budget != null) {
+            // Past the declared length, std's growth, made here so the
+            // budget sees it, and never past the limit's one extra byte.
+            if (w.end == w.buffer.len)
+                try growBody(&aw, @min(limit +| 1, std.ArrayList(u8).growCapacity(w.end + 1)), budget);
             step = step.min(.limited(w.buffer.len - w.end));
         }
         const n = r.stream(w, step) catch |err| switch (err) {
@@ -813,6 +865,13 @@ pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: us
         remaining = remaining.subtract(n).?;
     }
     return error.StreamTooLong;
+}
+
+pub const AllocHintedError = std.Io.Reader.LimitedAllocError || error{Overloaded};
+
+fn growBody(aw: *std.Io.Writer.Allocating, capacity: usize, budget: ?admission.Budget) error{ OutOfMemory, Overloaded }!void {
+    if (budget) |b| if (!b.growTo(capacity)) return error.Overloaded;
+    try aw.ensureTotalCapacityPrecise(capacity);
 }
 
 const MultipartForm = struct {

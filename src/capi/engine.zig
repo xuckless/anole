@@ -1562,6 +1562,8 @@ pub const Engine = struct {
                 .max_requests_per_connection = cfg.limits.max_requests_per_connection,
                 .ws_max_message = cfg.limits.ws_max_message,
                 .max_websockets = cfg.limits.max_websockets,
+                .buffer_budget = cfg.limits.buffer_budget,
+                .max_tasks = cfg.limits.max_tasks,
             },
             .admission = .{
                 .enabled = cfg.admission.enabled,
@@ -2385,6 +2387,8 @@ fn planBody(e: *Engine, req: *http.Request, whole_only: bool) !BodyPlan {
     if (whole_only or (req.content_length != null and req.content_length.? <= e.inline_body_max)) {
         const whole = (req.body() catch |err| switch (err) {
             error.BodyTooBig => return .{ .refused = .payload_too_large },
+            // Past the buffer budget (#131): `body` set Retry-After.
+            error.ServiceUnavailable => return .{ .refused = .service_unavailable },
             error.Canceled => return error.Canceled,
             else => return .{ .refused = .bad_request },
         }) orelse "";

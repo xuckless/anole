@@ -53,6 +53,7 @@ const Sink = @import("../sink.zig").Sink;
 const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
+const admission = @import("../admission.zig");
 const gauges = @import("../gauges.zig");
 const block_cache = @import("../block_cache.zig");
 const Signal = @import("../signal.zig").Signal;
@@ -312,6 +313,9 @@ pub fn Engine(comptime Ctx: type) type {
             io: std.Io,
             allocator: std.mem.Allocator,
             config: ServerConfig.Http2,
+            /// The executor's row of the server's task cap (`max_tasks`),
+            /// which the writer and every stream task count against.
+            task_row: ?*admission.Row = null,
 
             /// Serializes every nghttp2_* call, and guards everything below.
             /// Held only for computation, never across I/O.
@@ -1186,6 +1190,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
                 .refused_tokens = server.config.http2.refused_stream_burst,
                 .refused_at = std.Io.Clock.awake.now(server.io).toSeconds(),
+                .task_row = server.admission.currentRow(server.io),
             };
             conn.spare_epoch = conn.trimEpoch();
             defer conn.ready.deinit(conn.allocator);
@@ -1273,7 +1278,13 @@ pub fn Engine(comptime Ctx: type) type {
             }
             conn.tasks = &group;
             // The writer and the streams stay on the connection's executor.
-            try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
+            // The writer counts against the task cap but is never refused
+            // for it: the streams are what get refused.
+            if (conn.task_row) |r| _ = server.admission.reserveTask(r, true);
+            placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn}) catch |err| {
+                if (conn.task_row) |r| server.admission.releaseTask(conn.io, r);
+                return err;
+            };
 
             var reader_failed = false;
             var peer_ended = false;
@@ -1555,6 +1566,7 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         fn writerLoop(conn: *Conn) std.Io.Cancelable!void {
+            defer if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
             // Nothing goes out once the writer is gone, so a handler blocked
             // on a full response queue is let go, and any handler still
             // working on a response is canceled.
@@ -1763,6 +1775,7 @@ pub fn Engine(comptime Ctx: type) type {
         // -- One stream: a request in, a response out --------------------
 
         fn runStream(conn: *Conn, stream: *Stream) std.Io.Cancelable!void {
+            defer if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
             // Published for `cancelHandler`, and taken back under the mutex
             // before the task ends, so a cancel never reaches a task that
             // is gone.
@@ -3020,8 +3033,17 @@ pub fn Engine(comptime Ctx: type) type {
             conn.holdBusy();
             stream.counted = true;
             if (stream.connect_protocol.len > 0) stream.setTunnelWindow();
-            placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream }) catch {
-                log.err("HTTP/2: no task for stream {d}", .{stream.id});
+            // At the task cap the stream is refused as one with no task to
+            // be had: REFUSED_STREAM, safe for the client to retry (RFC
+            // 9113 §8.7).
+            const slot = if (conn.task_row) |r| conn.server.admission.reserveTask(r, false) else true;
+            const spawned = if (!slot) error.TaskCap else placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream });
+            spawned catch |err| {
+                if (slot) if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
+                if (err == error.TaskCap)
+                    log.debug("HTTP/2: stream {d} refused at the task cap", .{stream.id})
+                else
+                    log.err("HTTP/2: no task for stream {d}", .{stream.id});
                 stream.reset = true;
                 stream.closeBody();
                 stream.release(.handler);
