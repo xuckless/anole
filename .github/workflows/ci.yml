@@ -650,9 +650,20 @@ jobs:
       # `zig build fuzz` is those alone. A plain `zig build test` runs them
       # on their seeds and fixed mutations; the whole unit suite under the
       # LLVM backend runs in release-checks.
+      # Zig 0.17's build runner fuzzes after the build's own steps and
+      # prints a target that crashes or leaks there ("run test ... failure",
+      # "terminated with signal", "exited with code") without counting it,
+      # so the build exits 0 (lib/compiler/Maker.zig, `Fuzz.waitAndPrintReport`
+      # after the failure count); the log decides (#195).
       - name: zig build fuzz --fuzz=200K
         timeout-minutes: 88
-        run: zig build fuzz -Dllvm=true --fuzz=200K --test-timeout 120s
+        run: |
+          set -o pipefail
+          zig build fuzz -Dllvm=true --fuzz=200K --test-timeout 120s 2>&1 | tee fuzz.log
+          if grep -E 'run test .* failure|terminated with signal|exited with code|timed out after|failed to rerun in fuzz mode' fuzz.log; then
+            echo "::error::a fuzz target failed (see above)"
+            exit 1
+          fi
 
   grpc-interop:
     # K2: catches gRPC against grpc-go in both directions, h2c and TLS, plus grpc's HTTP/2 checks.
