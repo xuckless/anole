@@ -923,6 +923,9 @@ pub const Config = struct {
         read_ahead: u32 = 256 * 1024,
         max_connections: ?u32 = null,
         log_connections: bool = false,
+        /// No `anole.net.Tcp.Options` field: a Zig handler's opt-out is a
+        /// `drain` callback (`net.TcpTable.close_on_drain`).
+        close_on_drain: bool = true,
     };
 
     /// `Listener.udp`: `anole.net.Udp.Options` (no sessions: a binding keeps
