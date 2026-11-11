@@ -489,9 +489,7 @@ pub const Conn = struct {
     pub fn queueChunk(c: *Conn, chunk: *OutChunk, frame: bool) SendError!Queued {
         const t = c.tc();
         const f = t.flags.load(.acquire);
-        if (f & (Flag.closed | Flag.dead | Flag.ended) != 0) {
-            return if (f & (Flag.closed | Flag.dead) != 0) error.Closed else error.Ended;
-        }
+        if (f & Flag.refused != 0) return Close.refusal(f);
         if (frame) {
             std.debug.assert(chunk.owned and chunk.off == Framing.max_prefix);
             const framing = t.service.options.framing;
@@ -1003,21 +1001,158 @@ const Fifo = struct {
     }
 };
 
-/// `TcpConn.flags`.
+/// `TcpConn.flags`: these bits, and the connection's `Close` state in bits
+/// `Close.shift` and up.
 const Flag = struct {
     /// Released: no send is taken, no helper spawned.
     const closed: u32 = 1 << 0;
-    /// Reset or failed: nothing more is written.
-    const dead: u32 = 1 << 1;
-    /// This side was ended (`end`, `close`): no send is taken.
-    const ended: u32 = 1 << 2;
     /// A send was told busy or QueueFull: `writable` follows the drain.
-    const want_writable: u32 = 1 << 3;
+    const want_writable: u32 = 1 << 1;
     /// The server's drain reached it: the driver starts `drain`.
-    const drain_pending: u32 = 1 << 4;
+    const drain_pending: u32 = 1 << 2;
     /// Windows: the reading task is to be canceled (by the driver, on the
     /// connection's executor).
-    const cancel_reader: u32 = 1 << 5;
+    const cancel_reader: u32 = 1 << 3;
+    /// A send is refused: released, or this side is no longer open (one
+    /// test: `Close.Local.open` is 0).
+    const refused: u32 = closed | Close.local_mask;
+};
+
+/// How a connection ends: this side's half (`Local`) and the peer's
+/// (`Peer`), independent, in `TcpConn.flags` beside the other bits. Moved
+/// only by `TcpConn.advance` (a compare-and-swap of the word, from any
+/// thread), so of two racing requests one takes effect and the other finds
+/// it done. `TcpConn.over` (the futex word the tasks wait on) is set when
+/// the state becomes `over()`, or by `release`.
+///
+/// Who moves it. Any thread: `end`, `close` (also the drain's), `reset`.
+/// The connection's executor: the FIN (`fin_sent`: the driver's direct
+/// write or the flusher), the linger (the flusher), the peer's FIN (the
+/// reading task), a failure (`abort`: the reading task, the flusher, a
+/// callback's task).
+///
+/// | Local \ event | end    | close      | fin_sent   | linger_start | linger_end | abort |
+/// |---------------|--------|------------|------------|--------------|------------|-------|
+/// | open          | ending | closing    | -          | -            | -          | dead  |
+/// | ending        | -      | closing    | ended      | -            | -          | dead  |
+/// | closing       | -      | -          | linger_due | -            | -          | dead  |
+/// | ended         | -      | linger_due | -          | -            | -          | dead  |
+/// | linger_due    | -      | -          | -          | lingering    | -          | dead  |
+/// | lingering     | -      | -          | -          | -            | shut       | dead  |
+/// | shut          | -      | -          | -          | -            | -          | dead  |
+/// | dead          | -      | -          | -          | -            | -          | -     |
+///
+/// "-": no change (the request lost, or does not apply). `peer_end` moves
+/// `Peer` from open to ended whatever `Local` is. `reset` is an abort
+/// that also sets SO_LINGER 0. Over: `Local` shut or dead, or this side's
+/// FIN sent (ended, linger_due, lingering) and the peer's end read.
+/// Separate questions with their own words: `paused` (reading held),
+/// `writable_pending`, `sched` (who writes), `Flag.closed` (released).
+const Close = packed struct(u4) {
+    local: Local = .open,
+    peer: Peer = .open,
+
+    const shift = 4;
+    const local_mask: u32 = 0b111 << shift;
+    const mask: u32 = 0b1111 << shift;
+
+    const Local = enum(u3) {
+        /// Sends are taken.
+        open = 0,
+        /// `end`: the FIN goes once the queue is out; reading goes on.
+        ending,
+        /// `close`: the FIN goes once the queue is out, then the linger.
+        closing,
+        /// The FIN went after an `end` (half-closed): reading goes on.
+        ended,
+        /// The FIN went and a close was asked: the linger is due (input is
+        /// dropped until the peer ends, at most `linger`).
+        linger_due,
+        /// The flusher waits for the peer's end, at most `linger`.
+        lingering,
+        /// The linger passed: the socket is shut down both ways.
+        shut,
+        /// Reset or failed: nothing more is written, the queue is dropped.
+        dead,
+    };
+
+    const Peer = enum(u1) { open, ended };
+
+    const Event = enum { end, close, fin_sent, linger_start, linger_end, peer_end, abort };
+
+    fn of(flags: u32) Close {
+        return @bitCast(@as(u4, @truncate(flags >> shift)));
+    }
+
+    fn into(s: Close, flags: u32) u32 {
+        return (flags & ~mask) | (@as(u32, @as(u4, @bitCast(s))) << shift);
+    }
+
+    fn eql(a: Close, b: Close) bool {
+        return @as(u4, @bitCast(a)) == @as(u4, @bitCast(b));
+    }
+
+    /// The table above.
+    fn next(s: Close, ev: Event) Close {
+        var n = s;
+        switch (ev) {
+            .end => if (s.local == .open) {
+                n.local = .ending;
+            },
+            .close => switch (s.local) {
+                .open, .ending => n.local = .closing,
+                .ended => n.local = .linger_due,
+                .closing, .linger_due, .lingering, .shut, .dead => {},
+            },
+            .fin_sent => switch (s.local) {
+                .ending => n.local = .ended,
+                .closing => n.local = .linger_due,
+                .open, .ended, .linger_due, .lingering, .shut, .dead => {},
+            },
+            .linger_start => if (s.local == .linger_due) {
+                n.local = .lingering;
+            },
+            .linger_end => if (s.local == .lingering) {
+                n.local = .shut;
+            },
+            .peer_end => n.peer = .ended,
+            .abort => n.local = .dead,
+        }
+        return n;
+    }
+
+    fn over(s: Close) bool {
+        return switch (s.local) {
+            .shut, .dead => true,
+            .ended, .linger_due, .lingering => s.peer == .ended,
+            .open, .ending, .closing => false,
+        };
+    }
+
+    /// A close was asked (by `close`, the drain or the reading side):
+    /// input is dropped.
+    fn closeAsked(s: Close) bool {
+        return switch (s.local) {
+            .closing, .linger_due, .lingering, .shut => true,
+            .open, .ending, .ended, .dead => false,
+        };
+    }
+
+    /// What a refused send answers (`Flag.refused` set in `flags`).
+    fn refusal(flags: u32) Conn.SendError {
+        if (flags & Flag.closed != 0 or of(flags).local == .dead) return error.Closed;
+        return error.Ended;
+    }
+
+    /// One move by `TcpConn.advance`.
+    const Change = struct {
+        from: Close,
+        to: Close,
+
+        fn becameOver(c: Change) bool {
+            return !c.from.over() and c.to.over();
+        }
+    };
 };
 
 /// `TcpConn.paused`. `ended` is sticky: set when the connection ends, it
@@ -1068,7 +1203,8 @@ const TcpConn = struct {
     local_cache: ?std.Io.net.IpAddress = null,
 
     // Writing, from any thread: atomics and the inbox, no lock.
-    /// `Flag` bits; fetchOr / load.
+    /// `Flag` bits (fetchOr / fetchAnd / load) and the `Close` state
+    /// (`advance`).
     flags: std.atomic.Value(u32) = .init(0),
     /// Bytes queued and not yet written (reserved, in the inbox, the outbox
     /// and the batch): reserved with a compare-and-swap bounded by
@@ -1102,13 +1238,8 @@ const TcpConn = struct {
     /// connection (T1), canceled and joined by `release`.
     group: std.Io.Group = .init,
 
-    // State flags.
-    end_requested: std.atomic.Value(bool) = .init(false),
-    end_done: std.atomic.Value(bool) = .init(false),
-    close_graceful: std.atomic.Value(bool) = .init(false),
-    peer_ended: std.atomic.Value(bool) = .init(false),
-    reset_requested: std.atomic.Value(bool) = .init(false),
-    /// Futex word: 1 once the connection's serving is to end.
+    /// Futex word: 1 once the connection's serving is to end (its `Close`
+    /// state became over, or it is released).
     over: std.atomic.Value(u32) = .init(0),
     /// `Paused`; a futex word for the task waiting for `resumeReading`.
     paused: std.atomic.Value(u32) = .init(Paused.reading),
@@ -1123,6 +1254,9 @@ const TcpConn = struct {
     /// hold no other lock). It goes once net gets a per-connection event
     /// mailbox run by one task (after S2, with the #85 relay work).
     cb_lock: safety.IoLock = .init,
+    /// The `open` callback failed: `serve` closes at once (set before the
+    /// first `serve`, on the connection's executor; not a `Close` state:
+    /// what that callback queued still goes out until `release`).
     ending: bool = false,
 
     // Reading (its task).
@@ -1342,7 +1476,33 @@ const TcpConn = struct {
     }
 
     fn isDead(t: *const TcpConn) bool {
-        return t.has(Flag.dead);
+        return t.closeState().local == .dead;
+    }
+
+    /// Released, reset or failed.
+    fn isGone(t: *const TcpConn) bool {
+        const f = t.flags.load(.acquire);
+        return f & Flag.closed != 0 or Close.of(f).local == .dead;
+    }
+
+    fn closeState(t: *const TcpConn) Close {
+        return Close.of(t.flags.load(.seq_cst));
+    }
+
+    /// Moves the `Close` state by `ev` (the table at `Close`), from any
+    /// thread: null when it does not change it (a racing request took
+    /// effect first, or `ev` does not apply). `.seq_cst`: an `end` or a
+    /// `close` pairs with a send's reservation then look (`pushChunk`).
+    /// The caller does what the change asks (a kick, `setOver` when it
+    /// `becameOver`).
+    fn advance(t: *TcpConn, ev: Close.Event) ?Close.Change {
+        var f = t.flags.load(.seq_cst);
+        while (true) {
+            const from = Close.of(f);
+            const to = from.next(ev);
+            if (to.eql(from)) return null;
+            f = t.flags.cmpxchgWeak(f, to.into(f), .seq_cst, .seq_cst) orelse return .{ .from = from, .to = to };
+        }
     }
 
     /// The caller runs on the connection's executor. Off zio (`exec` null,
@@ -1434,8 +1594,7 @@ const TcpConn = struct {
         var total: usize = 0;
         for (parts) |p| total += p.len;
         const f = t.flags.load(.acquire);
-        if (f & (Flag.closed | Flag.dead) != 0) return error.Closed;
-        if (f & Flag.ended != 0) return error.Ended;
+        if (f & Flag.refused != 0) return Close.refusal(f);
         if (total == 0) return .ok;
         if (total > t.service.options.write_max) return error.TooLarge;
         // On the connection's executor, with nothing from elsewhere ahead:
@@ -1488,13 +1647,13 @@ const TcpConn = struct {
         const n = c.len;
         if (n > t.service.options.write_max) return error.TooLarge;
         const busy = t.reserve(n) catch return error.QueueFull;
-        // Checked again after the reservation, which `requestEnd`'s flag
-        // pairs with (both `.seq_cst`): a send either sees the end, or is
-        // counted in `queued` before the end's FIN is decided.
+        // Checked again after the reservation, which `advance` pairs with
+        // (both `.seq_cst`): a send either sees the end, or is counted in
+        // `queued` before the end's FIN is decided.
         const f = t.flags.load(.seq_cst);
-        if (f & (Flag.closed | Flag.dead | Flag.ended) != 0) {
+        if (f & Flag.refused != 0) {
             t.unreserve(n);
-            return if (f & Flag.ended != 0 and f & (Flag.closed | Flag.dead) == 0) error.Ended else error.Closed;
+            return Close.refusal(f);
         }
         // (A refusal here is rare, a stop or end racing the send: its
         // `unreserve` wakes through the gate even under a caller's lock.)
@@ -1557,7 +1716,7 @@ const TcpConn = struct {
         return t.kickOf();
     }
 
-    /// Makes sure someone looks at the outbox (and the end flags). Once the
+    /// Makes sure someone looks at the outbox (and the close state). Once the
     /// connection is released, nobody needs to: `release` drops it.
     fn schedule(t: *TcpConn) void {
         if (t.scheduleKick()) |k| k.run();
@@ -1572,17 +1731,16 @@ const TcpConn = struct {
         if (t.requestEndKick(graceful)) |k| k.run();
     }
 
+    /// `end` (`graceful` false) or `close`. The kick is made whether or not
+    /// the state changed: a party that finds nothing to do lets go.
     fn requestEndKick(t: *TcpConn, graceful: bool) ?Kick {
-        _ = t.flags.fetchOr(Flag.ended, .seq_cst);
-        if (graceful) t.close_graceful.store(true, .release);
-        t.end_requested.store(true, .seq_cst);
+        _ = t.advance(if (graceful) .close else .end);
         return t.scheduleKick();
     }
 
     fn resetKick(t: *TcpConn) ?Kick {
         t.setReason(.local);
-        t.reset_requested.store(true, .release);
-        _ = t.flags.fetchOr(Flag.dead | Flag.ended, .seq_cst);
+        _ = t.advance(.abort);
         if (comptime native_os == .windows) {
             const lg: ws.Linger = .{ .onoff = 1, .linger = 0 };
             _ = ws.windows.setsockopt(ws.socket(t.connection.stream.socket.handle), ws.SOL_SOCKET, ws.SO_LINGER, @ptrCast(&lg), @sizeOf(ws.Linger));
@@ -1605,7 +1763,7 @@ const TcpConn = struct {
     /// more is written, the socket is shut down and the reading side ends.
     fn abort(t: *TcpConn, reason: CloseReason) void {
         t.setReason(reason);
-        _ = t.flags.fetchOr(Flag.dead | Flag.ended, .seq_cst);
+        _ = t.advance(.abort);
         t.shutdownSocket(.both);
         t.over.store(1, .release);
         t.wakeAll(&t.over);
@@ -1679,9 +1837,10 @@ const TcpConn = struct {
         return true;
     }
 
-    /// The end is due: asked for, not done, and nothing queued or reserved.
+    /// The FIN is due: asked for, not sent, and nothing queued or reserved.
     fn endDue(t: *TcpConn) bool {
-        return t.end_requested.load(.seq_cst) and !t.end_done.load(.acquire) and t.queued.load(.seq_cst) == 0;
+        const l = t.closeState().local;
+        return (l == .ending or l == .closing) and t.queued.load(.seq_cst) == 0;
     }
 
     /// The responsible party (`mine`) lets go. True when it took the outbox
@@ -1734,7 +1893,7 @@ const TcpConn = struct {
         // A kick for the drain, or a stale one: the outbox is someone else's.
         if (t.sched.load(.seq_cst) != Sched.driver) return;
         if (comptime native_os != .windows) {
-            if (t.connection.tls_conn == null and !t.close_graceful.load(.acquire)) return t.serviceDirect();
+            if (t.connection.tls_conn == null and !t.closeState().closeAsked()) return t.serviceDirect();
         }
         t.handOver();
     }
@@ -1966,8 +2125,7 @@ const TcpConn = struct {
     /// The local end is finished (FIN sent): the connection is over when
     /// the peer's side is too.
     fn endFinished(t: *TcpConn) void {
-        t.end_done.store(true, .seq_cst);
-        if (t.peer_ended.load(.seq_cst)) t.setOver();
+        if (t.advance(.fin_sent)) |c| if (c.becameOver()) t.setOver();
     }
 
     fn setOver(t: *TcpConn) void {
@@ -2067,15 +2225,23 @@ const TcpConn = struct {
         t.shutdownSocket(.send);
         t.endFinished();
         if (canceled) io.recancel();
-        if (!t.close_graceful.load(.acquire)) return;
-        // The reading side drops input until the peer ends: a bound on it.
+        t.lingerAfterFin(canceled);
+    }
+
+    /// A close's linger after its FIN, by the flusher, when one is due:
+    /// the reading side drops input until the peer ends, and this bounds
+    /// it. `canceled` (the server stopping) ends it at once.
+    fn lingerAfterFin(t: *TcpConn, canceled: bool) void {
+        const io = t.io;
+        if (t.advance(.linger_start) == null) return;
         if (!canceled and t.over.load(.acquire) == 0) {
             io.futexWaitTimeout(u32, &t.over.raw, 0, .{ .duration = .{ .raw = lingerFor(), .clock = .awake } }) catch io.recancel();
         }
-        if (t.over.load(.acquire) == 0) {
+        if (t.over.load(.acquire) != 0) return;
+        if (t.advance(.linger_end)) |c| if (c.becameOver()) {
             t.shutdownSocket(.both);
             t.setOver();
-        }
+        };
     }
 
     // -- Waiting on the outbox -------------------------------------------------
@@ -2091,7 +2257,8 @@ const TcpConn = struct {
         defer t.leaveWait();
         while (true) {
             const e = t.epoch.load(.seq_cst);
-            if (t.flags.load(.seq_cst) & (Flag.closed | Flag.dead) != 0) return error.Closed;
+            const f = t.flags.load(.seq_cst);
+            if (f & Flag.closed != 0 or Close.of(f).local == .dead) return error.Closed;
             if (t.queued.load(.seq_cst) < below) return;
             if (builtin.is_test) _ = test_write_waits.fetchAdd(1, .release);
             try t.io.futexWait(u32, &t.epoch.raw, e);
@@ -2154,14 +2321,15 @@ const TcpConn = struct {
     }
 
     /// The drain's default end (#107): as `close`, with reason `.drain`;
-    /// nothing when the handler closed or reset the connection already
-    /// (its own reason stands). One whose write side alone ended (`end`,
-    /// a half-close) is still closed. Never waits; the kick to make, or
-    /// null.
+    /// nothing when the handler closed or reset the connection already, or
+    /// it failed (its own reason stands): the close then changes nothing.
+    /// One whose write side alone ended (`end`, a half-close) is still
+    /// closed. Never waits; the kick to make, or null. On the connection's
+    /// executor, so nothing releases it between the close and its reason.
     fn drainEndKick(t: *TcpConn) ?Kick {
-        if (t.close_graceful.load(.acquire) or t.reset_requested.load(.acquire)) return null;
+        if (t.advance(.close) == null) return null;
         t.setReason(.drain);
-        return t.requestEndKick(true);
+        return t.scheduleKick();
     }
 
     /// A callback task's error. Canceled: released (`release` reports the
@@ -2240,7 +2408,8 @@ const TcpConn = struct {
                 t.waitResumed() catch |err| return t.readEnded(burst, err);
                 continue;
             }
-            if (t.close_graceful.load(.acquire) or t.ending) return t.finishGraceful(burst, r);
+            // (`ending` is not looked at here: `serve` closed for it.)
+            if (t.closeState().closeAsked()) return t.finishGraceful(burst, r);
             burst.deadline = sooner(t.lifetimeAt(), t.idleAt());
             burst.armDeadline();
             const input = burst.waitInput() catch |err| return t.readEnded(burst, err);
@@ -2260,7 +2429,7 @@ const TcpConn = struct {
             t.last_input = std.Io.Clock.Timestamp.now(t.io, .awake);
             t.bytes_in += bytes.len;
             if (t.listener.series) |m| m.bytes_in.add(bytes.len);
-            if (t.close_graceful.load(.acquire)) continue; // input is dropped
+            if (t.closeState().closeAsked()) continue; // input is dropped
             if (!(try t.deliver(bytes))) return .close;
             _ = o;
         }
@@ -2289,7 +2458,7 @@ const TcpConn = struct {
             defer t.callUnlock();
             f(t.service.state, &t.conn, input) catch |err| {
                 if (err == error.Canceled) return err;
-                if (!t.has(Flag.closed | Flag.dead)) log.warn("tcp {s}: handler failed: {t}", .{ t.info.listener.name, err });
+                if (!t.isGone()) log.warn("tcp {s}: handler failed: {t}", .{ t.info.listener.name, err });
                 t.abort(.failed);
                 return false;
             };
@@ -2335,7 +2504,9 @@ const TcpConn = struct {
     /// queued is out.
     fn peerEnded(t: *TcpConn, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         t.setReason(.peer);
-        t.peer_ended.store(true, .seq_cst);
+        // Over when this side's FIN went already (an `end` before the
+        // peer's): both sides are. Else the FIN, when it goes, makes it so.
+        const change = t.advance(.peer_end);
         const o = &t.service.options;
         if (o.half_open) {
             if (t.service.table.end) |f| {
@@ -2348,12 +2519,10 @@ const TcpConn = struct {
                     return .close;
                 };
             }
-            if (t.end_done.load(.seq_cst)) t.setOver();
         } else {
             t.requestEnd(false);
-            // Ended already (an `end` before the peer's): both sides are.
-            if (t.end_done.load(.seq_cst)) t.setOver();
         }
+        if (change) |c| if (c.becameOver()) t.setOver();
         burst.deadline = t.lifetimeAt();
         burst.armDeadline();
         while (t.over.load(.acquire) == 0) {
@@ -2372,10 +2541,7 @@ const TcpConn = struct {
     /// input is read and dropped until the peer ends or `linger` passes.
     fn finishGraceful(t: *TcpConn, burst: *dusty.Burst, r: *std.Io.Reader) anyerror!dusty.Burst.End {
         t.setReason(.local);
-        if (!t.end_requested.load(.acquire)) {
-            t.close_graceful.store(true, .release);
-            t.requestEnd(true);
-        }
+        t.requestEnd(true);
         burst.deadline = std.Io.Clock.Timestamp.now(t.io, .awake).addDuration(.{ .raw = linger, .clock = .awake });
         burst.armDeadline();
         while (t.over.load(.acquire) == 0) {
@@ -2426,7 +2592,7 @@ const TcpConn = struct {
             switch (err) {
                 error.Canceled => return err,
                 error.Closed, error.EndOfStream, error.IdleTimeout, error.WriteTimeout => {},
-                else => if (!t.has(Flag.closed | Flag.dead)) log.warn("tcp {s}: handler failed: {t}", .{ t.info.listener.name, err }),
+                else => if (!t.isGone()) log.warn("tcp {s}: handler failed: {t}", .{ t.info.listener.name, err }),
             }
             t.abort(switch (err) {
                 error.IdleTimeout => .idle,
@@ -2471,7 +2637,7 @@ const TcpConn = struct {
                 switch (err) {
                     error.EndOfStream => {
                         t.setReason(.peer);
-                        t.peer_ended.store(true, .release);
+                        if (t.advance(.peer_end)) |c| if (c.becameOver()) t.setOver();
                         return null;
                     },
                     error.ReadFailed => {
@@ -2637,4 +2803,50 @@ fn testHold(io: std.Io, comptime point: TestPoint) void {
     if (h.point != point) return;
     if (test_hold.cmpxchgStrong(h, null, .acq_rel, .monotonic) != null) return;
     h.stay(io);
+}
+
+test "net tcp: the close state's transition table, every state and event" {
+    const L = Close.Local;
+    const E = Close.Event;
+    // Rows in `Close.Local` order, columns in `Close.Event` order up to
+    // `peer_end` (which moves only `Peer`); `abort` always gives dead.
+    const table = [_][6]L{
+        //   end      close        fin_sent     linger_start linger_end abort
+        .{ .ending, .closing, .open, .open, .open, .dead }, // open
+        .{ .ending, .closing, .ended, .ending, .ending, .dead }, // ending
+        .{ .closing, .closing, .linger_due, .closing, .closing, .dead }, // closing
+        .{ .ended, .linger_due, .ended, .ended, .ended, .dead }, // ended
+        .{ .linger_due, .linger_due, .linger_due, .lingering, .linger_due, .dead }, // linger_due
+        .{ .lingering, .lingering, .lingering, .lingering, .shut, .dead }, // lingering
+        .{ .shut, .shut, .shut, .shut, .shut, .dead }, // shut
+        .{ .dead, .dead, .dead, .dead, .dead, .dead }, // dead
+    };
+    const events = [_]E{ .end, .close, .fin_sent, .linger_start, .linger_end, .abort };
+    for (std.enums.values(L), 0..) |l, i| {
+        for (std.enums.values(Close.Peer)) |p| {
+            const s: Close = .{ .local = l, .peer = p };
+            for (events, 0..) |ev, j| {
+                const n = s.next(ev);
+                try std.testing.expectEqual(table[i][j], n.local);
+                try std.testing.expectEqual(p, n.peer);
+            }
+            const pe = s.next(.peer_end);
+            try std.testing.expectEqual(l, pe.local);
+            try std.testing.expectEqual(Close.Peer.ended, pe.peer);
+            // Encoded in the flags word beside the other bits, and back.
+            const f = s.into(Flag.closed | Flag.want_writable | Flag.drain_pending | Flag.cancel_reader);
+            try std.testing.expect(Close.of(f).eql(s));
+            try std.testing.expectEqual(Flag.closed | Flag.want_writable | Flag.drain_pending | Flag.cancel_reader, f & ~Close.mask);
+            // A send is refused exactly when this side is not open.
+            try std.testing.expectEqual(l != .open, s.into(0) & Flag.refused != 0);
+            if (l != .open) try std.testing.expectEqual(if (l == .dead) error.Closed else error.Ended, Close.refusal(s.into(0)));
+            try std.testing.expectEqual(error.Closed, Close.refusal(s.into(Flag.closed)));
+            // Over: shut or dead, or both sides ended.
+            const both = p == .ended and (l == .ended or l == .linger_due or l == .lingering);
+            try std.testing.expectEqual(l == .shut or l == .dead or both, s.over());
+            try std.testing.expectEqual(l == .closing or l == .linger_due or l == .lingering or l == .shut, s.closeAsked());
+        }
+    }
+    // Open is 0: a fresh connection's word.
+    try std.testing.expect(Close.of(0).eql(.{}));
 }
