@@ -80,6 +80,22 @@ test "h2 limits: defaults" {
     try expectEqual(10000, l.glitch_burst);
     try expectEqual(330, l.glitch_rate);
     try expectEqual(32, l.max_settings);
+    try expectEqual(1 << 20, l.out_high);
     // The frame parser's default agrees.
     try expectEqual(@as(u32, l.max_settings), (@import("frame.zig").Options{}).max_settings);
+    // conn.zig's limits default to the config's, so each number lives in
+    // one place.
+    const config = @import("../config.zig");
+    const h2: config.ServerConfig.Http2 = .{};
+    const o: @import("conn.zig").Options = .{};
+    try expectEqual(h2.max_concurrent_streams, o.max_concurrent_streams);
+    try expectEqual(h2.stream_window, o.initial_window);
+    try expectEqual(h2.connection_window, o.connection_window);
+    try expectEqual(h2.max_header_list_size, o.max_header_list_size);
+    try expectEqual(h2.max_continuations, o.max_continuations);
+    try expectEqual(h2.stream_reset_burst, o.stream_reset_burst);
+    try expectEqual(h2.stream_reset_rate, o.stream_reset_rate);
+    try expectEqual(h2.refused_stream_burst, o.refused_stream_burst);
+    try expectEqual(h2.refused_stream_rate, o.refused_stream_rate);
+    try expectEqual((config.ServerConfig.Request{}).max_header_count, o.max_header_count);
 }
