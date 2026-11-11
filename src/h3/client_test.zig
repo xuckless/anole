@@ -291,6 +291,10 @@ const Fixture = struct {
         send_budget: ?usize = null,
         /// `Options.send_memory`; null: automatic.
         send_memory: ?usize = null,
+        /// `Options.handshake_timeout`, when set.
+        handshake_timeout: ?std.Io.Duration = null,
+        /// `Options.idle_timeout`, when set.
+        idle_timeout: ?std.Io.Duration = null,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -347,6 +351,8 @@ const Fixture = struct {
             .prefer_v2 = extra.prefer_v2,
             .send_budget = extra.send_budget orelse @import("server.zig").conn_budget,
             .send_memory = extra.send_memory,
+            .handshake_timeout = extra.handshake_timeout orelse .fromSeconds(10),
+            .idle_timeout = extra.idle_timeout orelse .fromSeconds(30),
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -1973,6 +1979,56 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     try wait.expectStays(io, "the replayed POST is not run", Unrun{ .posts = posts + 1 }, Unrun.cond, .fromMilliseconds(300));
     try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
     try std.testing.expectEqual(gets + 2, early_gets.load(.monotonic));
+}
+
+test "h3: a replayed 0-RTT POST held for the handshake ends at the handshake timeout" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    // The idle timeout is far past the test's waits: only the handshake
+    // timeout can end the replayed connection.
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{
+        .early_data = true,
+        .handshake_timeout = .fromSeconds(2),
+        .idle_timeout = .fromSeconds(600),
+    });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+
+    // A first connection for a ticket.
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        const b = try finish(try request(conn, "GET", "/early", .{}), gpa);
+        defer gpa.free(b);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
+    }
+
+    // A second, whose POST goes in 0-RTT; the flight is recorded.
+    const posts = early_posts.load(.monotonic);
+    relay.armGated();
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        const post_early = try request(conn, "POST", "/early-post", .{ .early = true });
+        try relay.openDownWhenEarly(io, f.ep, 0, 1);
+        const p = try finish(post_early, gpa);
+        defer gpa.free(p);
+        relay.disarm();
+    }
+    try wait.waitUntil(io, "connectionsGone", f.ep, connectionsGone);
+
+    // The replay holds the POST for a handshake that never completes. The
+    // connection goes away at the handshake timeout, and the POST never ran.
+    const held = f.ep.early_held.load(.monotonic);
+    try relay.replay();
+    try wait.waitAtLeast(io, "the replayed POST is held", &f.ep.early_held, held + 1);
+    try wait.waitUntil(io, "the replayed connection is gone", f.ep, connectionsGone);
+    try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
 }
 
 test "h3: a new connection given up after its first packet started a 0-RTT request is freed safely" {
