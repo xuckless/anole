@@ -58,8 +58,7 @@
         // without a park, charged to the task that overran (yieldIfOverrun;
         // #184; a77def3, 806b5e4).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#806b5e4fa82592564f4e788ab4797370e43a99a5",
-            .hash = "zio-0.19.0-xHbVVIMtLwDVv7QRh5xtsF5I6CLdB5cRG41W5o5Yn6M8",
+            .path = "../zio-t3",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
