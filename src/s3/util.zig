@@ -1,37 +1,12 @@
 //! Small helpers the S3 client shares: HTTP dates, Content-MD5.
 const std = @import("std");
+const dusty = @import("dusty");
 
 const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
 
 /// IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) to seconds since the epoch.
-pub fn parseHttpDate(value: []const u8) ?i64 {
-    const v = std.mem.trim(u8, value, " \t");
-    if (v.len != 29) return null;
-    if (v[3] != ',' or v[4] != ' ' or v[7] != ' ' or v[11] != ' ' or v[16] != ' ' or v[19] != ':' or v[22] != ':') return null;
-    if (!std.mem.eql(u8, v[25..], " GMT")) return null;
-    const day = std.fmt.parseInt(u8, v[5..7], 10) catch return null;
-    const month: u8 = for (month_names, 1..) |name, i| {
-        if (std.mem.eql(u8, v[8..11], name)) break @intCast(i);
-    } else return null;
-    const year = std.fmt.parseInt(u16, v[12..16], 10) catch return null;
-    const hour = std.fmt.parseInt(u8, v[17..19], 10) catch return null;
-    const minute = std.fmt.parseInt(u8, v[20..22], 10) catch return null;
-    const second = std.fmt.parseInt(u8, v[23..25], 10) catch return null;
-    if (day == 0 or day > std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(month)))) return null;
-    if (hour > 23 or minute > 59 or second > 60) return null;
-    return daysFromCivil(year, month, day) * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
-}
-
-fn daysFromCivil(year: u16, month: u8, day: u8) i64 {
-    const y: i64 = if (month <= 2) @as(i64, year) - 1 else year;
-    const era = @divFloor(y, 400);
-    const year_of_era = y - era * 400;
-    const month_from_march: i64 = (month + 9) % 12;
-    const day_of_year = @divFloor(153 * month_from_march + 2, 5) + day - 1;
-    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year;
-    return era * 146097 + day_of_era - 719468;
-}
+pub const parseHttpDate = dusty.parseHttpDate;
 
 /// `seconds` as an IMF-fixdate.
 pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {

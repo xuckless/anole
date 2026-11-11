@@ -220,7 +220,7 @@ fn callBound(d: *Db) ?std.Io.Duration {
 }
 
 /// `anole.db.Tls` from a connector's TLS keys.
-fn tlsOf(c: anytype) db.Tls {
+pub fn tlsOf(c: anytype) db.Tls {
     return .{
         .ca = if (c.ca_file) |f| .{ .file = f } else if (c.ca_pem) |pem| .{ .pem = pem } else null,
         .client_certificate = if (c.client_cert_file) |f|

@@ -2013,43 +2013,8 @@ fn decodeArray(comptime E: type, value: Value, type_oid: i32, arena: std.mem.All
 // ---------------------------------------------------------------------------
 // The caller's context, type-erased: a request or an `anole.db.Ctx`.
 
-const Ctx = struct {
-    io: std.Io,
-    arena: std.mem.Allocator,
-    any: *anyopaque,
-    record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
-    request: ?*const dusty.Request,
-    last: *const fn (any: *anyopaque) ?db.ErrorDetail,
-
-    /// The last error recorded on the context it stands for.
-    pub fn lastDetail(self: *const Ctx) ?db.ErrorDetail {
-        return self.last(self.any);
-    }
-
-    /// `internal.fail` on the context it stands for.
-    pub fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-        return self.record(self.any, map, detail);
-    }
-
-    fn failf(self: *const Ctx, map: db.ErrorMap, class: db.Class, comptime fmt: []const u8, args: anytype) db.Error {
-        const message = std.fmt.allocPrint(self.arena, fmt, args) catch "(message lost: out of memory)";
-        return self.fail(map, .{ .system = .postgresql, .class = class, .message = message });
-    }
-};
-
-fn erase(c: anytype) Ctx {
-    const C = @TypeOf(c);
-    if (C == *Ctx or C == *const Ctx) return c.*;
-    const R = struct {
-        fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
-        }
-        fn last(any: *anyopaque) ?db.ErrorDetail {
-            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
-        }
-    };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
-}
+const Ctx = internal.ErasedCtx(.postgresql);
+const erase = Ctx.erase;
 
 // ---------------------------------------------------------------------------
 // Tests. Those against a live server are in live_test.zig
@@ -2061,18 +2026,7 @@ test {
     _ = @import("live_test.zig");
 }
 
-/// An environment of `vars` ("NAME=value").
-fn environ(comptime vars: []const [:0]const u8) std.process.Environ {
-    const block = comptime blk: {
-        var out: [vars.len:null]?[*:0]const u8 = undefined;
-        for (vars, 0..) |v, i| out[i] = v.ptr;
-        break :blk out;
-    };
-    const S = struct {
-        const kept = block;
-    };
-    return .{ .block = .{ .slice = &S.kept } };
-}
+const environ = internal.testEnviron;
 
 test "pg: settings: libpq's defaults, a full URL and a Unix socket; the password stays out of the printed URL" {
     // Windows: `.environ` is not read there (db.realEnv asks the process

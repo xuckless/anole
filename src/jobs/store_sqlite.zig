@@ -7,6 +7,7 @@ const std = @import("std");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
 const store = @import("store.zig");
+const store_sql = @import("store_sql.zig");
 
 const sqlite = anole.sqlite;
 const db = anole.db;
@@ -90,15 +91,7 @@ pub const Sqlite = struct {
 
     /// `fmt` with every `{p}` replaced by the prefix.
     fn text(self: *Sqlite, a: std.mem.Allocator, comptime fmt: []const u8) ![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        var rest: []const u8 = fmt;
-        while (std.mem.indexOf(u8, rest, "{p}")) |i| {
-            try out.appendSlice(a, rest[0..i]);
-            try out.appendSlice(a, self.prefix);
-            rest = rest[i + 3 ..];
-        }
-        try out.appendSlice(a, rest);
-        return out.items;
+        return store_sql.expandPrefix(a, self.prefix, fmt);
     }
 
     fn w(self: *Sqlite) sqlite.Query {
@@ -116,7 +109,7 @@ pub const Sqlite = struct {
 
     // ---- values
 
-    fn int(v: V) i64 {
+    pub fn int(v: V) i64 {
         return switch (v) {
             .int => |i| i,
             .float => |f| @intFromFloat(f),
@@ -124,20 +117,20 @@ pub const Sqlite = struct {
             else => 0,
         };
     }
-    fn optInt(v: V) ?i64 {
+    pub fn optInt(v: V) ?i64 {
         return switch (v) {
             .null => null,
             else => int(v),
         };
     }
-    fn str(v: V) []const u8 {
+    pub fn str(v: V) []const u8 {
         return switch (v) {
             .text => |t| t,
             .blob => |t| t,
             else => "",
         };
     }
-    fn optTime(v: V) ?Time {
+    pub fn optTime(v: V) ?Time {
         return if (optInt(v)) |i| fromMs(i) else null;
     }
     fn optTimeV(t: ?Time) V {
@@ -147,41 +140,10 @@ pub const Sqlite = struct {
     const row_cols = "id, queue, kind, state, priority, attempt, max_attempts, args, meta, run_at_ms, created_at_ms, attempted_at_ms, finished_at_ms, worker, errors, timeout_ms";
 
     fn rowFrom(a: std.mem.Allocator, r: []const V) !store.Row {
-        const errors = std.json.parseFromSliceLeaky([]root.ErrorEntry, a, str(r[14]), .{ .ignore_unknown_fields = true }) catch &[_]root.ErrorEntry{};
-        const state = std.meta.stringToEnum(State, str(r[3])) orelse .available;
-        return .{
-            .id = int(r[0]),
-            .queue = str(r[1]),
-            .kind = str(r[2]),
-            .state = state,
-            .priority = @fromBackingInt(@intCast(@as(u8, @intCast(@min(3, @max(0, int(r[4]))))))),
-            .attempt = @intCast(int(r[5])),
-            .max_attempts = @intCast(int(r[6])),
-            .args_json = str(r[7]),
-            .meta_json = str(r[8]),
-            .run_at = fromMs(int(r[9])),
-            .created_at = fromMs(int(r[10])),
-            .attempted_at = optTime(r[11]),
-            .finished_at = optTime(r[12]),
-            .worker = if (r[13] == .null) null else str(r[13]),
-            .errors = errors,
-            .timeout_ms = if (optInt(r[15])) |t| @intCast(t) else null,
-        };
+        return store_sql.rowFrom(Sqlite, a, r);
     }
 
-    fn copyRow(arena: std.mem.Allocator, r: store.Row) !store.Row {
-        // `table` rows live in the scratch arena of the call; the caller's arena outlives it.
-        var out = r;
-        out.queue = try arena.dupe(u8, r.queue);
-        out.kind = try arena.dupe(u8, r.kind);
-        out.args_json = try arena.dupe(u8, r.args_json);
-        out.meta_json = try arena.dupe(u8, r.meta_json);
-        if (r.worker) |x| out.worker = try arena.dupe(u8, x);
-        const errs = try arena.alloc(root.ErrorEntry, r.errors.len);
-        for (r.errors, errs) |s, *d| d.* = .{ .attempt = s.attempt, .at = s.at, .@"error" = try arena.dupe(u8, s.@"error"), .message = try arena.dupe(u8, s.message) };
-        out.errors = errs;
-        return out;
-    }
+    const copyRow = store_sql.copyRow;
 
     // ---- insert
 

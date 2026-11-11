@@ -116,6 +116,9 @@ breaking changes are listed anyway.
   route there (#45).
 - **console**: `/config` shows the listeners that `listen` and
   `listenTls` set, not the ones at init (#96).
+- **gRPC client, NATS URLs**: a `%` followed by a sign and a hex digit
+  (`%+f`) was decoded as a byte instead of staying text; both now share
+  the core's percent-decoder, which accepts hex digits only (#217).
 - **docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
   that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
   and that WRITABLE ends a wait on a finished WebTransport stream only

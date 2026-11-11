@@ -854,8 +854,8 @@ fn serverList(a: std.mem.Allocator, opts: Options, login: *core.Options.Auth) ![
             rest = rest[at + 1 ..];
             if (first) {
                 if (std.mem.indexOfScalar(u8, info, ':')) |colon| {
-                    login.* = .{ .user_password = .{ .username = try percentDecode(a, info[0..colon]), .password = try percentDecode(a, info[colon + 1 ..]) } };
-                } else login.* = .{ .token = try percentDecode(a, info) };
+                    login.* = .{ .user_password = .{ .username = try dusty.percentDecodeLenient(a, info[0..colon]), .password = try dusty.percentDecodeLenient(a, info[colon + 1 ..]) } };
+                } else login.* = .{ .token = try dusty.percentDecodeLenient(a, info) };
             }
         }
         first = false;
@@ -863,23 +863,6 @@ fn serverList(a: std.mem.Allocator, opts: Options, login: *core.Options.Auth) ![
     }
     if (list.items.len == 0) return error.InvalidOptions;
     return list.items;
-}
-
-fn percentDecode(a: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, text, '%') == null) return text;
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] == '%' and i + 2 < text.len) {
-            if (std.fmt.parseInt(u8, text[i + 1 .. i + 3], 16)) |b| {
-                try out.append(a, b);
-                i += 2;
-                continue;
-            } else |_| {}
-        }
-        try out.append(a, text[i]);
-    }
-    return out.items;
 }
 
 fn anyTlsScheme(servers: []const []const u8) bool {

@@ -112,15 +112,25 @@ pub const Network = struct {
     }
 
     pub fn unmap(address: IpAddress) IpAddress {
-        const a = switch (address) {
-            .ip4 => return address,
-            .ip6 => |a| a,
-        };
-        const prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-        if (!std.mem.eql(u8, a.bytes[0..12], &prefix)) return address;
-        return .{ .ip4 = .{ .bytes = a.bytes[12..16].*, .port = a.port } };
+        return unmapIpv4(address);
     }
 };
+
+/// `address` as a client on the other end knows it: an IPv4-mapped IPv6
+/// address (`::ffff:127.0.0.1`, how a dual-stack socket sees an IPv4
+/// peer) becomes the IPv4 address itself, with the same port. Any other
+/// address is returned as it is. Requests' `remote_address` goes through
+/// it, so logs, rate limits and `X-Forwarded-For` see one client one way
+/// whichever socket it came in on.
+pub fn unmapIpv4(address: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    const a = switch (address) {
+        .ip4 => return address,
+        .ip6 => |a| a,
+    };
+    const prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (!std.mem.eql(u8, a.bytes[0..12], &prefix)) return address;
+    return .{ .ip4 = .{ .bytes = a.bytes[12..16].*, .port = a.port } };
+}
 
 /// Whether `peer` may send a PROXY header: inside one of `trusted`, or
 /// any peer when `trusted` is empty.

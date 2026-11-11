@@ -311,7 +311,7 @@ pub fn open(e: *Engine, app: *anole.App) !void {
             .addressing = std.meta.stringToEnum(s3.Addressing, sc.addressing) orelse .auto,
             .payload_signing = std.meta.stringToEnum(s3.Options.PayloadSigning, sc.payload_signing) orelse .auto,
             .name = c.name,
-            .tls = tlsOf(sc),
+            .tls = db_mod.tlsOf(sc),
             .timeout = optMs(c.timeout_ms),
             .min_throughput = sc.min_throughput,
             .connect_timeout = ms(sc.connect_timeout_ms),
@@ -353,19 +353,6 @@ pub fn open(e: *Engine, app: *anole.App) !void {
         st.client = client;
         st.open.store(true, .release);
     }
-}
-
-fn tlsOf(c: anytype) db.Tls {
-    return .{
-        .ca = if (c.ca_file) |f| .{ .file = f } else if (c.ca_pem) |pem| .{ .pem = pem } else null,
-        .client_certificate = if (c.client_cert_file) |f|
-            dusty.Cert.fromFiles(f, c.client_key_file.?)
-        else if (c.client_cert_pem) |pem|
-            dusty.Cert.fromPem(pem, c.client_key_pem.?)
-        else
-            null,
-        .insecure_skip_verify = c.insecure_skip_verify,
-    };
 }
 
 /// The drain started (`anole_server_drain`, once): no new upload starts;

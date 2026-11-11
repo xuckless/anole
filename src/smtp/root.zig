@@ -453,14 +453,14 @@ pub const Client = struct {
 
     fn rawAndDeliver(self: *Client, ctx: *const Ctx, envelope: Envelope, message: []const u8, opts: CallOptions) Error!Sent {
         const a = ctx.arena;
-        if (envelope.to.len == 0) return ctx.failf(self.errors, .invalid, "invalid_address", "the envelope has no recipients", .{});
-        if (envelope.to.len > 100) return ctx.failf(self.errors, .invalid, "too_many_recipients", "{d} recipients; at most 100 per message", .{envelope.to.len});
+        if (envelope.to.len == 0) return ctx.failCode(self.errors, .invalid, "invalid_address", "the envelope has no recipients", .{});
+        if (envelope.to.len > 100) return ctx.failCode(self.errors, .invalid, "too_many_recipients", "{d} recipients; at most 100 per message", .{envelope.to.len});
         var utf8 = false;
         const recipients = try a.alloc([]const u8, envelope.to.len);
         for (envelope.to, 0..) |t, i| {
             const m = address.parse(a, t) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidAddress => return ctx.failf(self.errors, .invalid, "invalid_address", "to: \"{f}\" is not a mailbox", .{std.zig.fmtString(t[0..@min(t.len, 80)])}),
+                error.InvalidAddress => return ctx.failCode(self.errors, .invalid, "invalid_address", "to: \"{f}\" is not a mailbox", .{std.zig.fmtString(t[0..@min(t.len, 80)])}),
             };
             recipients[i] = m.address;
             utf8 = utf8 or m.needsUtf8();
@@ -469,13 +469,13 @@ pub const Client = struct {
         if (envelope.from.len > 0) {
             const m = address.parse(a, envelope.from) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidAddress => return ctx.failf(self.errors, .invalid, "invalid_address", "from: \"{f}\" is not a mailbox", .{std.zig.fmtString(envelope.from[0..@min(envelope.from.len, 80)])}),
+                error.InvalidAddress => return ctx.failCode(self.errors, .invalid, "invalid_address", "from: \"{f}\" is not a mailbox", .{std.zig.fmtString(envelope.from[0..@min(envelope.from.len, 80)])}),
             };
             from = m.address;
             utf8 = utf8 or m.needsUtf8();
         }
         if (message.len > self.max_message_bytes)
-            return ctx.failf(self.errors, .invalid, "message_too_large", "the message is {d} bytes; the limit is {d} (Options.max_message_bytes)", .{ message.len, self.max_message_bytes });
+            return ctx.failCode(self.errors, .invalid, "message_too_large", "the message is {d} bytes; the limit is {d} (Options.max_message_bytes)", .{ message.len, self.max_message_bytes });
         const parts = try a.alloc(mime.Part, 1);
         parts[0] = .{ .bytes = message };
         const composed: mime.Composed = .{
@@ -511,7 +511,7 @@ pub const Client = struct {
 
     fn deliver(self: *Client, ctx: *const Ctx, composed: *const mime.Composed, opts: CallOptions) Error!Sent {
         if (self.draining.load(.acquire))
-            return ctx.failf(self.errors, .unavailable, "draining", "the server is shutting down; no new mail is sent", .{});
+            return ctx.failCode(self.errors, .unavailable, "draining", "the server is shutting down; no new mail is sent", .{});
         _ = self.inflight.fetchAdd(1, .acq_rel);
         defer _ = self.inflight.fetchSub(1, .acq_rel);
 
@@ -642,9 +642,9 @@ pub const Client = struct {
         return switch (cause) {
             error.Canceled => error.Canceled,
             error.OutOfMemory => error.OutOfMemory,
-            error.EndOfStream => ctx.failf(self.errors, .unavailable, "connection_closed", "{s}:{d} closed the connection", .{ self.settings.host, self.settings.port }),
-            error.AttachmentUnreadable => ctx.failf(self.errors, .other, "attachment_unreadable", "an attachment file could not be read while sending", .{}),
-            else => ctx.failf(self.errors, .unavailable, "connection_failed", "the connection to {s}:{d} broke: {t}", .{ self.settings.host, self.settings.port, cause }),
+            error.EndOfStream => ctx.failCode(self.errors, .unavailable, "connection_closed", "{s}:{d} closed the connection", .{ self.settings.host, self.settings.port }),
+            error.AttachmentUnreadable => ctx.failCode(self.errors, .other, "attachment_unreadable", "an attachment file could not be read while sending", .{}),
+            else => ctx.failCode(self.errors, .unavailable, "connection_failed", "the connection to {s}:{d} broke: {t}", .{ self.settings.host, self.settings.port, cause }),
         };
     }
 
@@ -695,7 +695,7 @@ pub const Client = struct {
                 pool.mutex.unlock(io);
                 return switch (err) {
                     error.Canceled => error.Canceled,
-                    error.Timeout => ctx.failf(self.errors, .unavailable, "pool_timeout", "no connection within {d} ms: all {d} of this executor's connections were busy", .{ self.acquire_timeout.toMilliseconds(), pool.max }),
+                    error.Timeout => ctx.failCode(self.errors, .unavailable, "pool_timeout", "no connection within {d} ms: all {d} of this executor's connections were busy", .{ self.acquire_timeout.toMilliseconds(), pool.max }),
                 };
             };
             self.observer.waiting(-1);
@@ -740,9 +740,9 @@ pub const Client = struct {
             return switch (err) {
                 error.Canceled => error.Canceled,
                 error.OutOfMemory => error.OutOfMemory,
-                error.Timeout => ctx.failf(self.errors, .unavailable, "connect_timeout", "{s}:{d} did not answer within {d} ms", .{ self.settings.host, self.settings.port, if (self.settings.connect_timeout) |t| t.toMilliseconds() else 0 }),
-                error.EndOfStream => ctx.failf(self.errors, .unavailable, "connection_closed", "{s}:{d} closed the connection while connecting", .{ self.settings.host, self.settings.port }),
-                else => ctx.failf(self.errors, .unavailable, "connect_failed", "cannot connect to {s}:{d}: {t}", .{ self.settings.host, self.settings.port, err }),
+                error.Timeout => ctx.failCode(self.errors, .unavailable, "connect_timeout", "{s}:{d} did not answer within {d} ms", .{ self.settings.host, self.settings.port, if (self.settings.connect_timeout) |t| t.toMilliseconds() else 0 }),
+                error.EndOfStream => ctx.failCode(self.errors, .unavailable, "connection_closed", "{s}:{d} closed the connection while connecting", .{ self.settings.host, self.settings.port }),
+                else => ctx.failCode(self.errors, .unavailable, "connect_failed", "cannot connect to {s}:{d}: {t}", .{ self.settings.host, self.settings.port, err }),
             };
         };
         s.pool = pool;
@@ -874,19 +874,7 @@ fn resolve(a: std.mem.Allocator, opts: Options) !session_mod.Settings {
 
 /// The context a call records its failures on, from a request or a
 /// `db.Ctx`; for the tests in this directory.
-pub fn erase(c: anytype) Ctx {
-    const C = @TypeOf(c);
-    if (C == *Ctx or C == *const Ctx) return c.*;
-    const R = struct {
-        fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
-        }
-        fn last(any: *anyopaque) ?db.ErrorDetail {
-            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
-        }
-    };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
-}
+pub const erase = Ctx.erase;
 
 test {
     _ = @import("core/date.zig");

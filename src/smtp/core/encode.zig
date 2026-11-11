@@ -6,6 +6,7 @@
 //! words and quoted phrases), quoted-printable and base64 bodies, the
 //! boundary and the Message-ID.
 const std = @import("std");
+const repeat = @import("../testutil.zig").repeat;
 
 const Writer = std.Io.Writer;
 
@@ -235,19 +236,6 @@ pub fn base64Size(raw: u64) u64 {
 }
 
 const testing = std.testing;
-
-/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    const Storage = struct {
-        const data: [s.len * n]u8 = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [s.len * n]u8 = undefined;
-            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
-            break :blk out;
-        };
-    };
-    return &Storage.data;
-}
 
 fn writeValue(w: *Writer, e: ValueEncoder) Writer.Error!void {
     try e.write(w);

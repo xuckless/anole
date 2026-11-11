@@ -171,6 +171,9 @@ pub const describeListener = @import("server.zig").describeListener;
 /// The open-file limit, and the connection cap worked out from it.
 pub const fd_limit = @import("fd_limit.zig");
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
+/// IMF-fixdate to seconds since the epoch (the S3 client shares it).
+pub const parseHttpDate = @import("server/static.zig").parseHttpDate;
+pub const percentDecodeLenient = @import("http.zig").percentDecodeLenient;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 

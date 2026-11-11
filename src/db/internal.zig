@@ -602,3 +602,74 @@ test "guarded: with retry a transient failure is run again until it succeeds; wi
     try testing.expectEqual(@as(u8, 7), try guarded(&ctx, &g, .{}, true, null, guard_test.run, .{&ctx}));
     try testing.expectEqual(@as(u32, 3), guard_test.calls);
 }
+
+// ---------------------------------------------------------------------------
+// The caller's context, type-erased
+
+/// A request or an `anole.db.Ctx` with its type erased, for a connector's
+/// non-generic internals. `system` tags the errors `failf` makes.
+pub fn ErasedCtx(comptime system: System) type {
+    const shared = @This();
+    return struct {
+        const Self = @This();
+
+        io: std.Io,
+        arena: std.mem.Allocator,
+        any: *anyopaque,
+        record: *const fn (any: *anyopaque, map: ErrorMap, detail: ErrorDetail) Error,
+        request: ?*const dusty.Request,
+        last: *const fn (any: *anyopaque) ?ErrorDetail,
+
+        /// `c` (a `*anole.Request` or a `*anole.db.Ctx`) erased.
+        pub fn erase(c: anytype) Self {
+            const C = @TypeOf(c);
+            if (C == *Self or C == *const Self) return c.*;
+            const R = struct {
+                fn record(any: *anyopaque, map: ErrorMap, detail: ErrorDetail) Error {
+                    // SAFETY: `any` is the `c` below, a `C`, which outlives the context.
+                    return shared.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+                }
+                fn last(any: *anyopaque) ?ErrorDetail {
+                    // SAFETY: as in `record`.
+                    return shared.lastError(@as(C, @ptrCast(@alignCast(any))));
+                }
+            };
+            // SAFETY: erases `c`'s type; `R.record` and `R.last` cast it back to `C`.
+            return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .last = R.last, .request = shared.requestOf(c) };
+        }
+
+        /// The last error recorded on the context it stands for.
+        pub fn lastDetail(self: *const Self) ?ErrorDetail {
+            return self.last(self.any);
+        }
+
+        /// `internal.fail` on the context it stands for.
+        pub fn fail(self: *const Self, map: ErrorMap, detail: ErrorDetail) Error {
+            return self.record(self.any, map, detail);
+        }
+
+        pub fn failf(self: *const Self, map: ErrorMap, class: db.Class, comptime fmt: []const u8, args: anytype) Error {
+            const message = std.fmt.allocPrint(self.arena, fmt, args) catch "(message lost: out of memory)";
+            return self.fail(map, .{ .system = system, .class = class, .message = message });
+        }
+
+        /// `failf` with an error code of the connector's own (`ErrorDetail.code`).
+        pub fn failCode(self: *const Self, map: ErrorMap, class: db.Class, code: []const u8, comptime fmt: []const u8, args: anytype) Error {
+            const message = std.fmt.allocPrint(self.arena, fmt, args) catch "(message lost: out of memory)";
+            return self.fail(map, .{ .system = system, .class = class, .code = code, .message = message });
+        }
+    };
+}
+
+/// For the connectors' tests: an environment of `vars` ("NAME=value").
+pub fn testEnviron(comptime vars: []const [:0]const u8) std.process.Environ {
+    const block = comptime blk: {
+        var out: [vars.len:null]?[*:0]const u8 = undefined;
+        for (vars, 0..) |v, i| out[i] = v.ptr;
+        break :blk out;
+    };
+    const S = struct {
+        const kept = block;
+    };
+    return .{ .block = .{ .slice = &S.kept } };
+}

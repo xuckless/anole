@@ -173,7 +173,7 @@ src/observe/trace.zig	T1	1
 src/observe/trace.zig	U3	10
 src/panic.zig	U3	1
 src/pg/root.zig	C3	2
-src/pg/root.zig	U3	13
+src/pg/root.zig	U3	10
 src/ratelimit/root.zig	T1	1
 src/ratelimit/root.zig	U3	2
 src/resilience/core.zig	U3	2
@@ -190,7 +190,7 @@ src/s3/xml.zig	U3	3
 src/sd_notify.zig	U3	4
 src/server.zig	U3	19
 src/session/root.zig	U3	10
-src/smtp/root.zig	U3	5
+src/smtp/root.zig	U3	2
 src/smtp/session.zig	U3	1
 src/sse/out.zig	L2	1
 src/sse/out.zig	U3	3
