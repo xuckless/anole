@@ -1069,6 +1069,15 @@ pub const ListenIpOptions = struct {
     ipv6_only: ?bool = null,
 };
 
+/// Sets TCP_NODELAY on a listening TCP socket that zio did not open, for the
+/// connections it accepts: they inherit it from the listener (Linux, macOS
+/// and the BSDs), and zio sets it only on listeners it opens itself, not per
+/// accepted socket (lalinsky/zio#870). Best effort, as zio's own.
+fn setNoDelay(fd: std.posix.fd_t) void {
+    const one: c_int = 1;
+    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
+}
+
 /// A listening TCP socket on `address`: `IpAddress.listen`, which has no
 /// option for IPV6_V6ONLY, unless `options.ipv6_only` sets it on an IPv6
 /// address. Then the socket is opened here, and made non-blocking under
@@ -1099,6 +1108,7 @@ pub fn listenIp(io: std.Io, address: std.Io.net.IpAddress, options: ListenIpOpti
         // Best-effort, as std's and zio's `listen`.
         if (@hasDecl(posix.SO, "REUSEPORT")) _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
     }
+    setNoDelay(fd);
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (c.bind(fd, &storage.any, len) != 0) return switch (posix.errno(@as(c_int, -1))) {
@@ -2069,8 +2079,11 @@ pub fn Server(comptime Ctx: type) type {
             }
             var storage: std.Io.Threaded.PosixAddress = undefined;
             var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-            const address: std.Io.net.IpAddress = if (c.getsockname(fd, &storage.any, &len) == 0 and
-                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6))
+            const is_ip = c.getsockname(fd, &storage.any, &len) == 0 and
+                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6);
+            // Systemd's sockets come without it (unless NoDelay=yes).
+            if (is_ip) setNoDelay(fd);
+            const address: std.Io.net.IpAddress = if (is_ip)
                 std.Io.Threaded.addressFromPosix(&storage)
             else switch (configured) {
                 .ip => |ip| ip,
