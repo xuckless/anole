@@ -254,9 +254,10 @@ const Done = struct {
     }
 };
 
-/// The records not yet retired, per flush generation, oldest first (#156).
-/// A batch belongs to the generation current when it was made, and each of
-/// its records counts there until the batch is retired. A flush closes the
+/// The batches not yet retired, per flush generation, oldest first (#156).
+/// A batch belongs to the generation current when it was made and counts
+/// there, once, from its first record until it is retired (its records all
+/// retire together, and a flush only asks whether any is left). A flush closes the
 /// current generation and waits only for it and the older ones: the Java
 /// producer's `RecordAccumulator.awaitFlushCompletion`, which waits for the
 /// batches incomplete when the flush began (a record that joins one of
@@ -270,9 +271,9 @@ const Done = struct {
 /// owns nothing here: the generation it closed belongs to its records, so
 /// a flush that times out or is canceled leaves the counts as they are.
 const FlushGens = struct {
-    /// Records pending per generation. Set by `init`; `.empty` only in a
-    /// producer that never appends (unit tests of the wait table).
-    counts: std.Deque(usize) = .empty,
+    /// Batches pending per generation. Set by `init`, the only way to make
+    /// one: an empty deque has no current generation.
+    counts: std.Deque(usize),
     /// The generation of `counts`' front.
     base: u64 = 0,
 
@@ -292,16 +293,15 @@ const FlushGens = struct {
         return g.base + g.counts.len - 1;
     }
 
-    /// A record joined a batch of generation `gen` (per record: one index
-    /// and an increment).
+    /// A batch of generation `gen` was made (with its first record).
     fn added(g: *FlushGens, gen: u64) void {
         g.counts.atPtr(@intCast(gen - g.base)).* += 1;
     }
 
-    /// `n` records of a batch of generation `gen` were retired. True when
-    /// a flush may be done: the front moved on, or nothing is pending.
-    fn retired(g: *FlushGens, gen: u64, n: usize) bool {
-        g.counts.atPtr(@intCast(gen - g.base)).* -= n;
+    /// A batch of generation `gen` was retired. True when a flush may be
+    /// done: the front moved on, or nothing is pending.
+    fn retired(g: *FlushGens, gen: u64) bool {
+        g.counts.atPtr(@intCast(gen - g.base)).* -= 1;
         var moved = false;
         while (g.counts.len > 1 and g.counts.front().? == 0) {
             _ = g.counts.popFront();
@@ -312,7 +312,7 @@ const FlushGens = struct {
     }
 
     /// A flush begins: the newest generation it waits for, or null when
-    /// nothing is pending. A current generation with records is closed (a
+    /// nothing is pending. A current generation with batches is closed (a
     /// new, empty one opened); an empty one is not, and the flush waits
     /// only for the older ones, so appends after it (which join the empty
     /// current one) never hold it. Out of memory: nothing changed.
@@ -326,7 +326,7 @@ const FlushGens = struct {
         return if (g.counts.len > 1) cur - 1 else null;
     }
 
-    /// Records of generation `upto` or older are pending.
+    /// Batches of generation `upto` or older are pending.
     fn pendingUpTo(g: *const FlushGens, upto: u64) bool {
         return upto >= g.base and g.counts.front().? > 0;
     }
@@ -414,7 +414,7 @@ pub const Producer = struct {
     senders: std.AutoHashMapUnmanaged(i32, *Sender) = .empty,
     buffered: usize = 0,
     /// The records not yet retired, by flush generation (#156).
-    gens: FlushGens = .{},
+    gens: FlushGens,
     flushing: u32 = 0,
     stopping: bool = false,
 
@@ -615,13 +615,13 @@ pub const Producer = struct {
             break :blk .{ .key = k2, .value = v2, .headers = hs, .timestamp_ms = rec.timestamp_ms };
         };
         // Nothing fails from here on.
+        if (fresh) self.gens.added(batch.gen);
         const ref: ?Wait.Ref = if (wait) self.waits.take() else null;
         batch.recs.appendAssumeCapacity(copy);
         batch.waits.appendAssumeCapacity(ref);
         batch.bytes += size;
         a.open = batch;
         self.buffered += size;
-        self.gens.added(batch.gen);
         if (self.tel.load(.acquire)) |t| t.buffer.set(@intCast(self.buffered));
         var sealed = false;
         if (batch.bytes >= self.cfg.batch_bytes) {
@@ -1368,7 +1368,7 @@ pub const Producer = struct {
             var moved = false;
             it = done.head;
             while (it) |b| : (it = b.next) {
-                if (self.gens.retired(b.gen, b.recs.items.len)) moved = true;
+                if (self.gens.retired(b.gen)) moved = true;
             }
             if (self.tel.load(.acquire)) |t| t.buffer.set(@intCast(self.buffered));
             if (moved) self.drained.broadcast(self.io);
@@ -1563,7 +1563,9 @@ test "kafka producer: [stress] waits, completions and abandons race" {
         // SAFETY: the wait table never reaches the cluster.
         .cluster = undefined,
         .cfg = .{},
+        .gens = try .init(testing.allocator),
     };
+    defer p.gens.deinit(testing.allocator);
     defer p.waits.deinit(testing.allocator);
     const pairs = 4;
     // SAFETY: every element is set on the next line.
@@ -1628,12 +1630,11 @@ test "kafka producer: a flush generation is pending until every batch of it and 
     const upto = (try g.begin(testing.allocator)).?;
     try testing.expectEqual(@as(u64, 0), upto);
     try testing.expectEqual(@as(u64, 1), g.current());
-    for (0..5) |_| g.added(1);
+    g.added(1);
     try testing.expect(g.pendingUpTo(upto));
-    // Two batches of one record each.
-    try testing.expect(!g.retired(0, 1));
+    try testing.expect(!g.retired(0));
     try testing.expect(g.pendingUpTo(upto));
-    try testing.expect(g.retired(0, 1));
+    try testing.expect(g.retired(0));
     try testing.expect(!g.pendingUpTo(upto));
     // Generation 1 is still pending, and still the current one.
     try testing.expect(g.pendingUpTo(1));
@@ -1653,17 +1654,17 @@ test "kafka producer: generations retired out of order free the flush of the old
     }
     try testing.expectEqual(@as(u64, 3), g.current());
     // Generation 2 first: nothing moves, every flush still waits.
-    try testing.expect(!g.retired(2, 1));
+    try testing.expect(!g.retired(2));
     for (flushes) |f| try testing.expect(g.pendingUpTo(f));
     try testing.expectEqual(@as(u64, 0), g.base);
     // Generation 0: its flush is done; 1 still holds the later two.
-    try testing.expect(g.retired(0, 1));
+    try testing.expect(g.retired(0));
     try testing.expect(!g.pendingUpTo(flushes[0]));
     try testing.expect(g.pendingUpTo(flushes[1]));
     try testing.expect(g.pendingUpTo(flushes[2]));
     try testing.expectEqual(@as(u64, 1), g.base);
     // Generation 1: the front passes the empty 2 as well, up to the current.
-    try testing.expect(g.retired(1, 1));
+    try testing.expect(g.retired(1));
     for (flushes) |f| try testing.expect(!g.pendingUpTo(f));
     try testing.expectEqual(@as(u64, 3), g.base);
     try testing.expectEqual(@as(usize, 1), g.counts.len);
@@ -1678,7 +1679,7 @@ test "kafka producer: a flush with nothing pending opens no generation" {
     // The same once everything is retired.
     g.added(0);
     _ = (try g.begin(testing.allocator)).?;
-    try testing.expect(g.retired(0, 1));
+    try testing.expect(g.retired(0));
     try testing.expectEqual(@as(?u64, null), try g.begin(testing.allocator));
     try testing.expectEqual(@as(usize, 1), g.counts.len);
 }
@@ -1692,8 +1693,8 @@ test "kafka producer: a flush right after another waits only for the older gener
     // flush waits for generation 0 alone.
     try testing.expectEqual(@as(?u64, 0), try g.begin(testing.allocator));
     try testing.expectEqual(@as(usize, 2), g.counts.len);
-    for (0..3) |_| g.added(1);
-    try testing.expect(g.retired(0, 1));
+    g.added(1);
+    try testing.expect(g.retired(0));
     try testing.expect(!g.pendingUpTo(0));
     try testing.expect(g.pendingUpTo(1));
 }
@@ -1704,7 +1705,6 @@ test "kafka producer: several flushers each wait for their own generation and th
     g.added(0);
     const first = (try g.begin(testing.allocator)).?;
     g.added(1);
-    g.added(1);
     const second = (try g.begin(testing.allocator)).?;
     // A third flusher right after the second shares its generation.
     const third = (try g.begin(testing.allocator)).?;
@@ -1712,10 +1712,10 @@ test "kafka producer: several flushers each wait for their own generation and th
     try testing.expectEqual(@as(u64, 1), second);
     try testing.expectEqual(@as(u64, 1), third);
     // The newer generation drains first: no flusher is done.
-    try testing.expect(!g.retired(1, 2));
+    try testing.expect(!g.retired(1));
     try testing.expect(g.pendingUpTo(first));
     try testing.expect(g.pendingUpTo(second));
-    try testing.expect(g.retired(0, 1));
+    try testing.expect(g.retired(0));
     try testing.expect(!g.pendingUpTo(first));
     try testing.expect(!g.pendingUpTo(second));
     try testing.expect(!g.pendingUpTo(third));
@@ -1724,13 +1724,14 @@ test "kafka producer: several flushers each wait for their own generation and th
 test "kafka producer: a record that joins an older open batch after a flush began holds that flush" {
     var g: FlushGens = try .init(testing.allocator);
     defer g.deinit(testing.allocator);
+    // Two batches of generation 0; the flush begins, then a record joins
+    // the open one (counting nothing: only a new batch is added).
+    g.added(0);
     g.added(0);
     const upto = (try g.begin(testing.allocator)).?;
-    // A batch made in generation 0 is still open and takes one more.
-    g.added(0);
-    try testing.expect(!g.retired(0, 1));
+    try testing.expect(!g.retired(0));
     try testing.expect(g.pendingUpTo(upto));
-    try testing.expect(g.retired(0, 1));
+    try testing.expect(g.retired(0));
     try testing.expect(!g.pendingUpTo(upto));
 }
 
@@ -1753,6 +1754,6 @@ test "kafka producer: a flush that cannot open a generation leaves the counts as
     // The flush then waits for the current generation, which still drains.
     try testing.expect(g.pendingUpTo(cur));
     var gen = g.base;
-    while (gen <= cur) : (gen += 1) _ = g.retired(gen, 1);
+    while (gen <= cur) : (gen += 1) _ = g.retired(gen);
     try testing.expect(!g.pendingUpTo(cur));
 }
