@@ -44,6 +44,23 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- **HTTP/1.x deadlines are swept once a second** (K10, #175): the
+  request-head, request, keep-alive, TLS-handshake, PROXY-header and
+  stream-write deadlines are now a timestamp on the connection that each
+  executor checks every second, instead of a timer armed and cleared per
+  step. They can fire up to about 1 s late (docs/server.md lists which
+  deadlines stay exact: handler deadlines, `Deadline.run`, HTTP/2, HTTP/3).
+  A request head's deadline counts from its first byte and never moves
+  later; bytes a slow reader accepts never extend a write deadline. About
+  11% fewer instructions per request on HTTP/1.1 `/json`.
+- **zio** is pinned at xuckless/zio 3c863fc: upstream lalinsky/zio main
+  (299a618) merged in, with its fixes for task and group-task
+  use-after-free races, a socket operation completing twice, and lost
+  cancels; on io_uring a full UDP batch is followed by a direct receive and
+  batches are sent directly (#106).
+- **TCP_NODELAY on listeners Anole opens or inherits** (dual-stack and
+  systemd-activated sockets): zio now sets it on the listener instead of on
+  each accepted connection, so Anole sets it on the sockets it opens itself.
 - **HTTP/3 idle block pool** (#78): an idle HTTP/3 endpoint keeps at
   least 32 free 4 KiB blocks, and as many as its pooled streams still
   hold (up to 64, 256 KiB), instead of a floor of 256 (1 MiB); under
