@@ -804,10 +804,12 @@ const Binding = struct {
         /// The route is the template's own path.
         exact,
         /// The route is the prefix before a template's trailing `**`, so
-        /// that `**` also matches zero segments. It stays behind every
-        /// exact binding of its route, registered before or after it (as
-        /// in Envoy's matcher), and a clash with a route that is not a
-        /// transcoding one is not reported: nobody asked for this route.
+        /// that `**` also matches zero segments. It is attached by
+        /// `Router.finish`, after every other route; it stays behind every
+        /// exact binding of its route (as in Envoy's matcher), and where
+        /// another route (not a transcoding one, of other middleware, or an
+        /// `any` route that would conflict) wants the prefix it is left
+        /// out, with no conflict reported: nobody asked for this route.
         rest_prefix,
     };
 
@@ -902,12 +904,44 @@ pub fn addBinding(
     // `**` matches zero or more segments, but the router's wildcard needs
     // one: the prefix gets a route of its own, with its own copy of the
     // binding, behind every binding that names the prefix exactly (as in
-    // Envoy's matcher). `/{a=**}:v` has no prefix a request could reach.
+    // Envoy's matcher). It is added once every other route is in
+    // (`Router.finish`), and only where none of them wants the prefix, so
+    // the order of registration does not matter. `/{a=**}:v` has no prefix
+    // a request could reach.
     if (segments.len > 0 and segments[segments.len - 1] == .rest and !(segments.len == 1 and template.verb.len > 0)) {
         const prefix_binding = alloc.create(Binding) catch @panic("OOM");
         prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .rest_prefix };
-        attach(Ctx, target, method, template, segments.len - 1, prefix_binding, no_wait);
+        const later = alloc.create(PrefixRoute(Ctx)) catch @panic("OOM");
+        const R = dusty.Router(Ctx);
+        later.* = .{
+            .group = if (@TypeOf(target) == *R) .{ .router = target, .prefix = "", .middlewares = &.{} } else target,
+            .method = method,
+            .binding = prefix_binding,
+            .no_wait = no_wait,
+        };
+        router.addDeferred(.{ .context = later, .run = PrefixRoute(Ctx).run });
     }
+}
+
+/// The route for the prefix of a `**` template, waiting for `Router.finish`.
+fn PrefixRoute(comptime Ctx: type) type {
+    return struct {
+        /// Where the binding was registered: the router itself is a group
+        /// with no prefix and no middleware of its own.
+        group: dusty.Router(Ctx).Group,
+        method: dusty.Method,
+        binding: *Binding,
+        no_wait: bool,
+
+        fn run(router: *dusty.Router(Ctx), context: *anyopaque) void {
+            // SAFETY: `addBinding` passed a `*PrefixRoute(Ctx)` as the context.
+            const self: *@This() = @ptrCast(@alignCast(context));
+            var group = self.group;
+            group.router = router;
+            const template = self.binding.template;
+            attach(Ctx, group, self.method, template, template.segments().len - 1, self.binding, self.no_wait);
+        }
+    };
 }
 
 /// Joins `binding` to the route for the first `count` segments of `template`,
@@ -983,6 +1017,8 @@ fn attach(
         insert(bindings, binding, method);
         return;
     };
+    // Nor does it take a path an `any` route wants.
+    if (binding.role == .rest_prefix and router.conflictsWithAny(path.items, method)) return;
     const bindings = alloc.create(Bindings) catch @panic("OOM");
     bindings.* = .{ .first = binding };
     server.addRoute(Ctx, target, method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = no_wait });
@@ -1138,6 +1174,7 @@ test "addBinding: a ** template also gets the route of its prefix, and a route t
     addBinding(void, &router, .get, &files, noServe, &options, "files", false);
     const info = try Template.parse("/info/{name=**}:stat");
     addBinding(void, &router, .get, &info, noServe, &options, "info", false);
+    router.finish();
     try std.testing.expect(router.conflict == null);
 
     var req: dusty.Request = .{ .method = .get, .url = "/files/x", .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
@@ -1152,6 +1189,7 @@ test "addBinding: a ** template also gets the route of its prefix, and a route t
     router.get("/docs/:id", userHandler);
     const docs = try Template.parse("/docs/*/{path=**}");
     addBinding(void, &router, .get, &docs, noServe, &options, "docs", false);
+    router.finish();
     try std.testing.expect(router.conflict == null);
     req.url = "/docs/x";
     try std.testing.expect((try router.findHandler(&req)).?.action != &Dispatch(void).handle);
@@ -1204,4 +1242,114 @@ test "insert: an exact binding registered after the prefix of a ** template stil
         if (x.template.match("/files", &captures) != null) break x;
     } else null;
     try std.testing.expectEqual(&b, winner.?);
+}
+
+fn userHandler2(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+    _ = .{ req, res };
+}
+
+/// The route `router` gives a GET for `url`, with `req`'s arena.
+fn routeFor(router: *const dusty.Router(void), arena: std.mem.Allocator, url: []const u8) !?dusty.Router(void).Route {
+    // SAFETY: `findHandler` reads neither the parser nor the transport.
+    var req: dusty.Request = .{ .method = .get, .url = url, .arena = arena, ._parser = undefined, ._transport = undefined };
+    return router.findHandler(&req);
+}
+
+test "addBinding: a route registered after a ** template keeps the prefix, with no conflict" {
+    const R = dusty.Router(void);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const options: server.RegisterOptions = .{};
+
+    // A user's route at the prefix, registered after the service.
+    {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        const files = try Template.parse("/files/{p=**}");
+        addBinding(void, &router, .get, &files, noServe, &options, "files", false);
+        router.get("/files", userHandler);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expect((try routeFor(&router, a, "/files")).?.action == &userHandler);
+        try std.testing.expect((try routeFor(&router, a, "/files/a/b")).?.action == &Dispatch(void).handle);
+    }
+    // The same at the root.
+    {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        const all = try Template.parse("/{a=**}");
+        addBinding(void, &router, .get, &all, noServe, &options, "all", false);
+        router.get("/", userHandler);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expect((try routeFor(&router, a, "/")).?.action == &userHandler);
+        try std.testing.expect((try routeFor(&router, a, "/x/y")).?.action == &Dispatch(void).handle);
+    }
+    // And with nothing else there, the prefix is the binding's.
+    {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        const all = try Template.parse("/{a=**}");
+        addBinding(void, &router, .get, &all, noServe, &options, "all", false);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expect((try routeFor(&router, a, "/")).?.action == &Dispatch(void).handle);
+    }
+}
+
+test "addBinding: a service with other middleware binding the prefix exactly, after a ** template, gets it" {
+    const R = dusty.Router(void);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var router = R.init(std.testing.allocator);
+    defer router.deinit();
+    const options: server.RegisterOptions = .{};
+
+    const Mw = struct {
+        pub fn execute(_: *const @This(), _: *dusty.Request, _: *dusty.Response, _: *dusty.Chain(void)) !void {}
+    };
+    var mw: Mw = .{};
+    const files = try Template.parse("/files/{p=**}");
+    addBinding(void, &router, .get, &files, noServe, &options, "files", false);
+    const other = router.group("", &.{dusty.Middleware(void).init(&mw)});
+    const exact = try Template.parse("/files");
+    addBinding(void, other, .get, &exact, noServe, &options, "exact", false);
+    router.finish();
+    try std.testing.expect(router.conflict == null);
+
+    const prefix = (try routeFor(&router, a, "/files")).?;
+    try std.testing.expect(prefix.action == &Dispatch(void).handle);
+    try std.testing.expectEqual(@as(usize, 1), prefix.middlewares.len);
+    const list: *const Bindings = @ptrCast(@alignCast(prefix.info.data.?));
+    try std.testing.expectEqualStrings("exact", list.first.?.where);
+    try std.testing.expectEqual(null, list.first.?.next);
+
+    const deeper = (try routeFor(&router, a, "/files/a")).?;
+    try std.testing.expect(deeper.action == &Dispatch(void).handle);
+    try std.testing.expectEqual(@as(usize, 0), deeper.middlewares.len);
+}
+
+test "addBinding: an any() route the prefix of a ** template would conflict with wins, registered before or after" {
+    const R = dusty.Router(void);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const options: server.RegisterOptions = .{};
+    const files = try Template.parse("/files/*/{p=**}");
+
+    for ([_]bool{ false, true }) |any_first| {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        if (any_first) router.any("/files/x", userHandler2);
+        addBinding(void, &router, .get, &files, noServe, &options, "files", false);
+        if (!any_first) router.any("/files/x", userHandler2);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expect((try routeFor(&router, a, "/files/x")).?.action == &userHandler2);
+        try std.testing.expect((try routeFor(&router, a, "/files/x/a")).?.action == &Dispatch(void).handle);
+        // The prefix route is left out altogether: it would shadow the any() route.
+        try std.testing.expect((try routeFor(&router, a, "/files/y")) == null);
+    }
 }
