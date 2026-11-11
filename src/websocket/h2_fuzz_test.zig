@@ -5,6 +5,7 @@
 //! socket writes back must be the same whether the bytes arrive at once or
 //! a few at a time.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec");
@@ -146,6 +147,26 @@ test "fuzz: WebSocket over HTTP/2, whole and in pieces" {
         "\x05\x88\x82\x00\x00\x00\x00\x03\xed",
         "\x05\x88\x81\x00\x00\x00\x00\x03",
     });
+}
+
+// A pong held for a batch starts the socket's flusher, a task on
+// `std.testing.io`'s threads, which `run` cancels as it ends. std.Io.Threaded
+// frees a group's task only after waking whoever cancels the group, so with
+// one Io across inputs the task could still be freeing from the test
+// allocator as the fuzz runner checks and resets it for the next input: a
+// false leak, or a corrupted bucket (#195). The runner gives each input an Io
+// of its own and joins its threads first, so an input starts with none.
+test "fuzz: a flusher an input started is gone before the next input" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(_: []const u8) !void {
+            if (builtin.fuzz) try std.testing.expectEqual(0, std.testing.io_instance.wait_group.state.load(.monotonic));
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            // Two masked empty pings: the first one's pong waits for the batch.
+            const t = try run(arena_state.allocator(), "\x89\x80\x00\x00\x00\x00\x89\x80\x00\x00\x00\x00", 12, H2Socket.buffer_len, false);
+            try std.testing.expectEqualStrings("\x8a\x00\x8a\x00", t.out);
+        }
+    }.check, &.{""});
 }
 
 test "H2Socket: a message, a ping and a close, whole and a byte at a time" {
