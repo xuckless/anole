@@ -213,6 +213,33 @@ const Client = struct {
         _ = c.nghttp2_session_resume_data(self.session, self.stream_id);
     }
 
+    /// Queues a masked frame of `len` (126..65535) bytes of 'x' under a zero
+    /// key, `first` its FIN bit and opcode: a fragment, which `sendFrame`
+    /// can't write.
+    fn sendRawFrame(self: *Client, first: u8, len: u16) !void {
+        // All sent: start over at the front.
+        if (self.out_sent == self.out_len) {
+            self.out_sent = 0;
+            self.out_len = 0;
+        }
+        var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
+        try w.writeAll(&.{ first, 0x80 | 126 });
+        try w.writeInt(u16, len, .big);
+        try w.writeAll(&.{ 0, 0, 0, 0 });
+        try w.splatByteAll('x', len);
+        self.out_len += w.buffered().len;
+        _ = c.nghttp2_session_resume_data(self.session, self.stream_id);
+    }
+
+    /// Sends what is queued on the stream.
+    fn sendQueued(self: *Client) !void {
+        try self.pumpUntilBounded("the queued frames sent", struct {
+            fn f(cl: *Client) bool {
+                return cl.out_sent == cl.out_len or cl.closed;
+            }
+        }.f);
+    }
+
     /// Reads until a whole server frame is in, and returns its payload.
     fn nextFrame(self: *Client, opcode: *wsc.Opcode, out: []u8) ![]u8 {
         while (true) {
@@ -770,6 +797,91 @@ test "WebSocket over HTTP/2: under an admission freeze the extended CONNECT gets
         }
     }.f);
     try std.testing.expectEqual(@as(u16, 200), client.status);
+}
+
+fn budgetEcho(ws: *websocket.Socket) !void {
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+}
+
+fn heldIs(server: *dusty.Server(void), n: usize) bool {
+    return server.admission.rows[0].held_bytes.load(.monotonic) == n;
+}
+
+fn waitHeld(io: std.Io, server: *dusty.Server(void), n: usize) !void {
+    const S = struct { s: *dusty.Server(void), n: usize };
+    try test_wait.waitUntil(io, "the bytes held of the buffer budget", S{ .s = server, .n = n }, struct {
+        fn f(x: S) bool {
+            return heldIs(x.s, x.n);
+        }
+    }.f);
+}
+
+/// Sends 33 fragments of 2000 bytes (no FIN): 464 bytes past the 64 KiB
+/// a socket keeps between messages.
+fn sendPieces(client: *Client) !void {
+    for (0..33) |i| {
+        try client.sendRawFrame(if (i == 0) 0x02 else 0x00, 2000);
+        try client.sendQueued();
+    }
+}
+
+test "WebSocket over HTTP/2: a small message passes a full buffer budget; one past the 64 KiB kept holds the rest, and past the budget is closed 1013" {
+    const gpa = std.testing.allocator;
+    // One executor, so every socket's bytes are on row 0.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
+        .buffer_budget = 1024,
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", websocket.route(void, budgetEcho, .{}));
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // Others (slow bodies, say) fill the executor's budget.
+    const row = &server.admission.rows[0];
+    row.held_bytes.store(1024, .monotonic);
+
+    var a: Client = undefined;
+    try a.init(io, server.address.ip);
+    defer a.deinit();
+    try a.open();
+    try std.testing.expectEqual(@as(u16, 200), a.status);
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try a.sendFrame(.text, "hi");
+    try std.testing.expectEqualStrings("hi", try a.nextFrame(&op, &buf));
+    try std.testing.expectEqual(@as(u64, 0), server.admission.refused_memory.load(.monotonic));
+
+    // A message past the 64 KiB kept needs the budget: closed 1013.
+    try sendPieces(&a);
+    const close = try a.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xf5 }, close);
+    try std.testing.expectEqual(@as(u64, 1), server.admission.refused_memory.load(.monotonic));
+    try waitHeld(io, &server, 1024);
+
+    // With the budget free, it holds what is past the 64 KiB until the
+    // socket goes, and gives it back then.
+    row.held_bytes.store(0, .monotonic);
+    var b: Client = undefined;
+    try b.init(io, server.address.ip);
+    var b_open = true;
+    defer if (b_open) b.deinit();
+    try b.open();
+    try sendPieces(&b);
+    try waitHeld(io, &server, 33 * 2000 - 64 * 1024);
+    b.deinit();
+    b_open = false;
+    try waitHeld(io, &server, 0);
 }
 
 var lobby: websocket.Rooms = undefined;

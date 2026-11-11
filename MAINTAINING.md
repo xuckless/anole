@@ -187,22 +187,50 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 - **zio**: after a change, run its suite in both scheduling modes
   (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
   runs pinned; add `--fast-accept`, which Anole builds with, and once
-  without it). Its changes: the pinned run queue kept one FIFO order across
-  the ring and its overflow (`anole-merge-fix`, on top of upstream #841,
-  whose push could leave overflowed tasks waiting forever behind more than
-  256 yielding tasks), and accepting on a busy executor (`accept-now`: a
-  direct accept with its own budget, and spawn backpressure every 64 spawns
-  instead of on every one; `accept-fairness`: both budgets grow to the
-  number of tasks that ran during the last trip to the back of the run
-  queue), all behind zio's `fast_accept` option except the run-queue fix, as
-  in lalinsky/zio#837, which Anole turns on in `build.zig` and
-  `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
-  them. `fast_send` (S2 D9 arm B, fork only, not offered upstream; user,
+  without it). Upstream base: lalinsky/zio main 299a618 (merged
+  2026-11-11, research/s2/t3/zio-merge.md (gitignored); the previous base was 035d245).
+  Upstream now carries its own versions of what were fork patches, and the
+  fork takes them: a free-stack cache per executor (#909; our spawn cache
+  keeps only task allocations, which upstream's task pool still locks for),
+  an accept that finishes inside `loop.add` returns without parking
+  (#872, `waitForIoPreferInline`), spawn backpressure counted per run of
+  the spawner (#873), streaming files on IOCP (#857, replacing ours), and
+  earlier the pinned overflow drain (#841), sendmmsg (#833, #843) and the
+  Windows ICMP fix (#849). Since #870 zio sets TCP_NODELAY on the
+  listeners it opens, not on each accepted socket: a listener Anole opens
+  or inherits sets it itself (`setNoDelay` in src/http/core/server.zig).
+  Fork-only changes still on top: the pinned run queue keeps one FIFO
+  order across the ring and its overflow (a push waits behind the overflow
+  queue; #841 alone could leave overflowed tasks behind more than 256
+  yielding ones); and behind `fast_accept`, accepting on a busy executor:
+  `acceptNow`, a direct accept(2) before the loop with a budget of its own
+  (128, or the number of tasks that ran during the acceptor's last trip to
+  the back of the run queue, `roundBudget`), then upstream's prefer-inline
+  accept; and spawn backpressure past a run queue of 13 every
+  `roundBudget(64)` spawns instead of upstream's 13 per run (an accept loop
+  spawns per connection, and 13 per pass over 25,000 busy connections
+  starves new ones). Without `fast_accept` both are upstream's. Also fork
+  only: recvmmsg with control messages, `currentTask`,
+  `Runtime.currentExecutor`, idle tasks giving back deep stack pages, and
+  operateInner's arms out of line. The bench suite's `conns` and `raw`
+  scenarios measure the accept path. them. `fast_send` (S2 D9 arm B, fork only, not offered upstream; user,
   2026-11-04): `net_write` tries a nonblocking send() before submitting the
   write (`sendNow` in io.zig, next to `acceptNow`), returns a short count
   as is, takes the loop path on WouldBlock or a pending cancel, and spends
   a tick-budget quantum per direct send; Anole turns it on beside
   `fast_accept`. Add `--fast-send` to the check.sh runs above.
+  UDP batches on io_uring (#106, 4652663; offer upstream as a sibling of
+  #872, the receive half needs no option): a socket whose last
+  `net_recvmmsg` filled every slot goes on a per-loop hint table (#872's
+  accept-hint table, renamed `FdHints`) and its next batch tries recvmmsg
+  directly inside `loop.add`; a short batch or EAGAIN drops the hint, so
+  only a socket whose queue stays full skips the ring. With `fast_send`,
+  `net_sendmmsg` tries sendmmsg directly and falls back to the SENDMSG
+  SQE on EAGAIN (the kernel retries it on writable). 3c863fc: an untimed
+  batch receive or send that finished inside `loop.add` returns at once
+  (`waitForIoPreferInline`, as accept), so a full socket gives several
+  batches per executor pass under the tick budget and `no_park_grace`,
+  not one park and backend poll per batch; a timed receive still parks.
   D10 (fork only, 4286fa0): a wait that completes without parking still
   yields once the executor's tick is spent and checks held locks
   (`yieldPointNoPark`), so inline sends can't starve the run queue (#184
@@ -213,7 +241,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   only, a77def3, 806b5e4): past a spent tick, the no-park yield point
   yields only after `no_park_grace` (16) more operations without a park,
   charged to the task that overran (`yieldIfOverrun`). Pinned at 806b5e4
-  on `anole-diag` (0.5.3).
+  on `anole-diag` (0.5.3); the merge of upstream 299a618 on top is d799693.
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is

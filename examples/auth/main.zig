@@ -88,7 +88,7 @@ fn login(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const form = try req.formData();
     const user = app.find(form.get("user") orelse "");
     const stored = if (user) |u| u.hash else app.dummy_hash;
-    const ok = auth.password.verify(app.gpa, req.io, stored, form.get("password") orelse "");
+    const ok = try auth.password.verify(app.gpa, req.io, stored, form.get("password") orelse "");
     if (!ok or user == null) return res.fail(.unauthorized, "wrong user or password");
     try req.session.set("user", user.?.name);
     try req.session.set("role", user.?.role);

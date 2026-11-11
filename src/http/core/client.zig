@@ -1454,7 +1454,7 @@ pub const ClientResponse = struct {
         // the head whatever Content-Length said, and a decoder changes the
         // length, so neither gets a hint.
         const hint: ?usize = if (r.decode == null and !self.parser.isBodyComplete()) self.parsed.content_length else null;
-        const result = allocRemainingHinted(&r.interface, self.arena, self.max_response_size, hint) catch |err| switch (err) {
+        const result = allocRemainingHinted(&r.interface, self.arena, self.max_response_size, hint, null) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             error.ReadFailed => return r.err orelse error.Unexpected,
             else => |e| return e,

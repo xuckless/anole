@@ -28,13 +28,16 @@ pub fn hashHere(gpa: std.mem.Allocator, io: std.Io, password: []const u8, out: [
 /// Whether `password` matches `stored` (Argon2 PHC, or bcrypt "$2b$...").
 /// A malformed `stored` is no match. If the request is canceled while it
 /// runs on the blocking pool, no match, and the cancelation stays pending
-/// for the request's next cancelation point.
-pub fn verify(gpa: std.mem.Allocator, io: std.Io, stored: []const u8, password: []const u8) bool {
+/// for the request's next cancelation point. `error.ServiceUnavailable`
+/// (a 503) when the pool has more callers waiting than its `max_waiting`:
+/// neither a match nor a mismatch.
+pub fn verify(gpa: std.mem.Allocator, io: std.Io, stored: []const u8, password: []const u8) error{ServiceUnavailable}!bool {
     return blocking.run(io, verifyHere, .{ gpa, io, stored, password }) catch |err| switch (err) {
         error.Canceled => {
             io.recancel();
             return false;
         },
+        error.ServiceUnavailable => |e| return e,
     };
 }
 
@@ -64,9 +67,9 @@ test "password: a hash verifies only its password, and needsRehash flags bcrypt 
     var buf: [128]u8 = undefined;
     const h = try hash(gpa, io, "correct horse", &buf);
     try std.testing.expect(std.mem.startsWith(u8, h, "$argon2id$"));
-    try std.testing.expect(verify(gpa, io, h, "correct horse"));
-    try std.testing.expect(!verify(gpa, io, h, "wrong horse"));
-    try std.testing.expect(!verify(gpa, io, "garbage", "x"));
+    try std.testing.expect(try verify(gpa, io, h, "correct horse"));
+    try std.testing.expect(!try verify(gpa, io, h, "wrong horse"));
+    try std.testing.expect(!try verify(gpa, io, "garbage", "x"));
     try std.testing.expect(!needsRehash(h));
     try std.testing.expect(needsRehash("$2b$10$abcdefghijklmnopqrstuuJ8x1ZY7aQ9w6pW5V4v3ZQ2l1X0y9z8."));
 }
@@ -84,13 +87,13 @@ test "hash and verify on a blocking pool, and a stored hash with p = 2" {
 
     var buf: [128]u8 = undefined;
     const h = try hash(gpa, io, "correct horse", &buf);
-    try std.testing.expect(verify(gpa, io, h, "correct horse"));
-    try std.testing.expect(!verify(gpa, io, h, "wrong horse"));
+    try std.testing.expect(try verify(gpa, io, h, "correct horse"));
+    try std.testing.expect(!try verify(gpa, io, h, "wrong horse"));
 
     // Hashes made elsewhere may ask for lanes in parallel; Argon2 then
     // spawns through `io` from the pool thread.
     var buf2: [128]u8 = undefined;
     const p2 = try argon2.strHash("pw", .{ .allocator = gpa, .params = .{ .t = 1, .m = 64, .p = 2 }, .mode = .argon2id }, &buf2, io);
-    try std.testing.expect(verify(gpa, io, p2, "pw"));
-    try std.testing.expect(!verify(gpa, io, p2, "px"));
+    try std.testing.expect(try verify(gpa, io, p2, "pw"));
+    try std.testing.expect(!try verify(gpa, io, p2, "px"));
 }

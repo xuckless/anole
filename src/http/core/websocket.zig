@@ -5,6 +5,7 @@
 const std = @import("std");
 const Transport = @import("transport.zig").Transport;
 const placement = @import("placement.zig");
+const admission = @import("admission.zig");
 const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
@@ -60,6 +61,11 @@ pub const WebSocket = struct {
     /// the caller's.
     rsv1_allowed: bool = false,
     fragmented_data: std.ArrayListUnmanaged(u8) = .empty,
+    /// The server's buffer budget (#131), which a message being reassembled
+    /// holds its bytes of until it is whole (`held`); null (the client)
+    /// counts nothing. A frame that fits the read buffer holds none.
+    budget: ?*admission.State = null,
+    held: admission.Held = .{},
     write_mutex: std.Io.Mutex = .init,
     /// When false, `send` and `ping` skip the flush after writing their
     /// frame, including when sent from other tasks, so frames collect in the
@@ -79,7 +85,7 @@ pub const WebSocket = struct {
     /// and test builds only.
     lent: if (safety.enabled) Lent else void = if (safety.enabled) .{} else {},
 
-    /// The largest message a socket accepts unless told otherwise: 16 MiB.
+    /// The largest message a socket accepts unless told otherwise: 1 MiB.
     pub const default_max_message_size: usize = 1024 * 1024; // 1 MiB
 
     /// A frame's opcode. Handlers see `.text` and `.binary` messages, and
@@ -126,6 +132,7 @@ pub const WebSocket = struct {
         too_large = 1009,
         mandatory_extension = 1010,
         internal_error = 1011,
+        try_again_later = 1013,
         _,
 
         /// Whether a peer may put this code in a close frame: RFC 6455
@@ -152,6 +159,9 @@ pub const WebSocket = struct {
         MaskedServerFrame,
         FragmentedControlFrame,
         InvalidClosePayload,
+        /// The server's buffer budget can't hold more of the message being
+        /// reassembled: closed with 1013 (Try Again Later).
+        TryAgainLater,
     };
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -321,12 +331,20 @@ pub const WebSocket = struct {
         };
     }
 
+    /// Holds `more` bytes of the server's buffer budget for the message
+    /// being read, or fails it with 1013.
+    fn hold(self: *WebSocket, more: usize) Error!void {
+        const a = self.budget orelse return;
+        if (!self.held.growTo(a, self.io, self.held.bytes + more)) return Error.TryAgainLater;
+    }
+
     /// The close code that answers a receive failure, or null for one that
     /// is not the peer's doing (out of memory, say).
     fn failureCloseCode(err: anyerror) ?CloseCode {
         return switch (err) {
             Error.MessageTooLarge => .too_large,
             Error.InvalidUtf8 => .invalid_payload,
+            Error.TryAgainLater => .try_again_later,
             Error.ReservedFlags,
             Error.LargeControlFrame,
             Error.InvalidOpcode,
@@ -446,6 +464,9 @@ pub const WebSocket = struct {
     }
 
     fn readMessage(self: *WebSocket) !Message {
+        // Whole or failed, the message holds no budget once this returns;
+        // its bytes stay in the message arena until the next receive.
+        defer self.held.release();
         self.fragmented_data = .empty;
         self.fragmented_type = null;
         self.fragmented_compressed = false;
@@ -510,6 +531,7 @@ pub const WebSocket = struct {
                     if (self.fragmented_data.items.len + frame.payload.len > self.max_message_size) {
                         return Error.MessageTooLarge;
                     }
+                    try self.hold(frame.payload.len);
                     try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     if (frame.fin) {
                         const msg_type = self.fragmented_type.?;
@@ -542,6 +564,7 @@ pub const WebSocket = struct {
                         self.fragmented_type = frame.opcode;
                         self.fragmented_compressed = frame.rsv1;
                         self.fragmented_data.clearRetainingCapacity();
+                        try self.hold(frame.payload.len);
                         try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     }
                 },
@@ -839,6 +862,9 @@ pub const WebSocket = struct {
             if (safety.enabled) self.lend(p);
             break :blk p;
         } else blk: {
+            // Known at the header, so held whole before a byte of it is
+            // read, like a body with a Content-Length.
+            try self.hold(n);
             const p = try safety.allocUninit(self.messageAllocator(), n);
             try r.readSliceAll(p);
             break :blk p;
@@ -1601,6 +1627,11 @@ fn expectFailureClose(frames: []const u8, max_message_size: usize, expected: any
     try std.testing.expectEqual(code, std.mem.readInt(u16, written[2..4], .big));
     // Sending is over.
     try std.testing.expectError(error.EndOfStream, ws.send(.text, "late"));
+}
+
+test "WebSocket: a message the buffer budget refused is closed 1013" {
+    try std.testing.expectEqual(@as(?WebSocket.CloseCode, .try_again_later), WebSocket.failureCloseCode(WebSocket.Error.TryAgainLater));
+    try std.testing.expectEqual(@as(u16, 1013), @backingInt(WebSocket.CloseCode.try_again_later));
 }
 
 test "WebSocket: a failed receive sends the close code that says why" {

@@ -34,6 +34,10 @@ pub const H2Socket = struct {
     /// goes back after it (`receiveMessage`).
     message: std.ArrayList(u8) = .empty,
     max_message_size: usize,
+    /// The server's buffer budget (#131): `message` holds its bytes past
+    /// `retained_message_max` of it while it is incomplete (`held`).
+    budget: ?*dusty.admission.State = null,
+    held: dusty.admission.Held = .{},
     /// Sending is over: a close went out.
     closed: bool = false,
     write_mutex: std.Io.Mutex = .init,
@@ -110,6 +114,8 @@ pub const H2Socket = struct {
     }
 
     fn receiveMessage(self: *H2Socket) !Message {
+        // Whole or failed, the message holds no budget once this returns.
+        defer self.held.release();
         if (self.message.capacity > retained_message_max) {
             self.message.clearAndFree(std.heap.c_allocator);
         } else self.message.clearRetainingCapacity();
@@ -149,6 +155,15 @@ pub const H2Socket = struct {
                     self.fail(.too_large);
                     return error.MessageTooLarge;
                 }
+                // The first `retained_message_max` bytes hold nothing: the
+                // socket keeps that much between messages anyway, as one
+                // over HTTP/1.1 keeps its read buffer, so a small message is
+                // never refused, however full the budget.
+                const total = self.message.items.len + payload.len;
+                if (total > retained_message_max) if (self.budget) |a| if (!self.held.growTo(a, self.io, total - retained_message_max)) {
+                    self.fail(.try_again_later);
+                    return error.TryAgainLater;
+                };
                 try self.message.appendSlice(std.heap.c_allocator, payload);
                 return null;
             },

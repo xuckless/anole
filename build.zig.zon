@@ -57,9 +57,20 @@
         // yield point past a spent tick yields only after 16 more operations
         // without a park, charged to the task that overran (yieldIfOverrun;
         // #184; a77def3, 806b5e4).
+        // Plus upstream main 299a618 (2026-11-11; merge d799693): upstream's
+        // free-stack cache per executor (#909) replaces the stack half of
+        // the spawn cache (task allocations stay), and its accept without
+        // parking (#872) and per-run spawn backpressure (#873) are the
+        // behaviour without `fast_accept` (Anole's direct accept and
+        // run-queue-sized budgets stay behind it); Windows streaming files
+        // on IOCP are upstream's (#857). zio sets TCP_NODELAY on the
+        // listeners it opens only (#870); Anole sets it on its own.
+        // On io_uring a datagram batch after a full one is received with a
+        // direct recvmmsg, and with `fast_send` a batch is sent with a direct
+        // sendmmsg before the ring (#106, 4652663).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#806b5e4fa82592564f4e788ab4797370e43a99a5",
-            .hash = "zio-0.19.0-xHbVVIMtLwDVv7QRh5xtsF5I6CLdB5cRG41W5o5Yn6M8",
+            .url = "git+https://github.com/xuckless/zio#3c863fc3f307015b78a2e9861ff2d23d912e1be9",
+            .hash = "zio-0.19.0-xHbVVKQ4MQD0Zp_ukQKtc_Rm5Bh2spEEialz-G-U9H-5",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

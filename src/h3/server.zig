@@ -391,14 +391,9 @@ pub const Stats = struct {
 };
 
 /// The send-memory limit when `Options.send_memory` is null: a quarter of
-/// the cgroup's limit or of RAM, whichever is lower, at least 64 MiB (as
-/// the JVM sizes its heap by default, MaxRAMPercentage=25); 1 GiB when
-/// neither can be read.
-pub fn autoSendMemory(cgroup_max: ?u64, ram: ?u64) u64 {
-    const min_limit: u64 = 64 << 20;
-    const memory = if (cgroup_max) |cg| (if (ram) |r| @min(cg, r) else cg) else ram orelse return 1 << 30;
-    return @max(min_limit, memory / 4);
-}
+/// the cgroup's limit or of RAM, whichever is lower, at least 64 MiB; 1 GiB
+/// when neither can be read (`cgroup.memoryQuarter`).
+pub const autoSendMemory = dusty.cgroup.memoryQuarter;
 
 /// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
 /// socket. On Linux a listener may have several (`Options.sockets`), each
@@ -649,7 +644,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
-                .blocks = .initAdaptive(gpa, 256),
+                .blocks = .initAdaptive(gpa, block_floor),
             };
             self.blocks.send = &shared.send_memory;
             self.inbox = .init(&self.inbox_buf);
@@ -719,6 +714,14 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// Streams kept at most per endpoint.
         const pool_max = 64;
+
+        /// The free send and receive blocks an idle endpoint keeps at the
+        /// least (128 KiB); it keeps as many as its pooled streams still
+        /// hold if that is more (up to `pool_max`), and under load the last
+        /// window's peak, so a floor only sizes the first burst after an
+        /// idle spell. It was 256 (1 MiB), held by every endpoint (one per
+        /// executor) once a burst had filled it (#78).
+        const block_floor = 32;
 
         /// Copies the block pool's counts into `stats`.
         pub fn sampleStats(self: *Self) void {
@@ -942,8 +945,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gen = self.drive_gen.load(.acquire);
                 if (self.dirty.load(.acquire) == null) {
                     const t = now(io);
-                    // The block pool's trim is due too, while it keeps
-                    // more than its floor.
+                    // The block pool's trim is due too, while it has
+                    // free blocks to give back.
                     const next = @min(self.nextTimer(), self.blocks.trimAt());
                     if (next > t) {
                         // Whatever the send blocks moved since the last
@@ -2421,11 +2424,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // 0-RTT: the handshake's flight and the ACK go at once.
                 if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
-                if (placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream})) |_| {
+                // At the task cap the stream is refused as one with no task
+                // to be had: H3_REQUEST_REJECTED, safe for the client to
+                // retry (RFC 9114 §4.1.1).
+                const adm = &conn.ep.http.admission;
+                stream.task_row = adm.currentRow(conn.ep.io);
+                const slot = if (stream.task_row) |r| adm.reserveTask(r, .stream) else true;
+                const spawned = if (!slot) error.TaskCap else placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream});
+                if (spawned) |_| {
                     _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
-                } else |_| {
+                } else |err| {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
-                    log.err("HTTP/3: no task for stream {d}", .{stream.id});
+                    if (slot) if (stream.task_row) |r| adm.releaseTask(conn.ep.io, r);
+                    stream.task_row = null;
+                    if (err == error.TaskCap)
+                        log.debug("HTTP/3: stream {d} refused at the task cap", .{stream.id})
+                    else
+                        log.err("HTTP/3: no task for stream {d}", .{stream.id});
                     stream.refs.handler = false;
                     stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
@@ -2524,6 +2539,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// taken back under the lock before the task ends. Null for
             /// inline and detached requests (they don't wait).
             task: ?placement.Task = null,
+            /// The row of the server's task cap (`max_tasks`) the task
+            /// counts against, given back when it ends.
+            task_row: ?*dusty.admission.Row = null,
             /// The request's content type says it carries messages (gRPC,
             /// gRPC-Web, Connect streaming): the larger send cap.
             message: bool = false,
@@ -2689,6 +2707,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = s.conn;
                 // Last: the driver may free the connection once none run.
                 defer _ = conn.tasks.fetchSub(1, .acq_rel);
+                // Read before the stream can go (its release, below).
+                const task_row = s.task_row;
+                defer if (task_row) |r| conn.ep.http.admission.releaseTask(conn.ep.io, r);
                 conn.lock();
                 s.task = placement.currentTask(conn.ep.io);
                 const gone = s.reset;
@@ -3105,6 +3126,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const old = exchangeOf(d);
             const ex = try old.response.arena.create(Exchange);
             ex.* = old.*;
+            // The body's share of the buffer budget moves with the request:
+            // `Server.dispatch` then gives back nothing of the old one, and
+            // the end of the exchange gives back what the copy holds (a body
+            // read after the handler returned included).
+            old.request._body_held = .{};
             ex.request._response = &ex.response;
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
@@ -3128,6 +3154,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// owner's task, or the task `detachedAttach` was for.
         fn detachedEnd(d: *dusty.Detached, result: anyerror!void) void {
             const ex = exchangeOf(d);
+            ex.request._body_held.release();
             const s = ex.sink_state.stream;
             const conn = s.conn;
             if (s.parked != null) {
@@ -3194,6 +3221,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (d.state != .detached) return;
             s.detached = null;
             d.abort();
+            ex.request._body_held.release();
             ex.response.deinit();
             s.release(.handler);
         }
@@ -3329,6 +3357,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const s = self.s;
                 const conn = s.conn;
                 const holds_handler = self.holds_handler;
+                self.ex.request._body_held.release();
                 self.ex.response.deinit();
                 conn.lock();
                 defer conn.unlock();
@@ -4353,18 +4382,8 @@ test "transport parameters: 256 concurrent requests per connection by default, a
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), params.max_ack_delay);
 }
 
-test "send memory: the automatic limit is a quarter of the lower of the cgroup's and RAM, at least 64 MiB" {
+test "send memory: the automatic limit, in blocks, rounded up" {
     const MiB: u64 = 1 << 20;
-    const GiB: u64 = 1 << 30;
-    // A quarter of RAM with no cgroup limit; of the cgroup's when lower.
-    try std.testing.expectEqual(8 * GiB, autoSendMemory(null, 32 * GiB));
-    try std.testing.expectEqual(512 * MiB, autoSendMemory(2 * GiB, 32 * GiB));
-    // A cgroup limit above RAM (or a huge one) leaves RAM's.
-    try std.testing.expectEqual(8 * GiB, autoSendMemory(1 << 62, 32 * GiB));
-    try std.testing.expectEqual(GiB, autoSendMemory(4 * GiB, null));
-    // At least 64 MiB; 1 GiB when neither is known.
-    try std.testing.expectEqual(64 * MiB, autoSendMemory(128 * MiB, 32 * GiB));
-    try std.testing.expectEqual(GiB, autoSendMemory(null, null));
-    // In blocks, rounded up.
+    // `cgroup.memoryQuarter`'s tests cover the formula.
     try std.testing.expectEqual(@as(i64, 16384), bridge.SendMemory.init(autoSendMemory(null, 256 * MiB)).limit.load(.monotonic));
 }

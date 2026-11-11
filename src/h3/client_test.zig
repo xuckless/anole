@@ -819,15 +819,22 @@ fn pressureEntered(ep: *Endpoint) bool {
     return ep.sendMemory().entries.load(.monotonic) >= 1;
 }
 
-/// Six streams, each at its floor, a partly filled block and the block it
-/// keeps, at most. Once a paused reader's credit has run out and the rest
-/// is acknowledged, its stream holds `send_floor` with or without pressure
-/// (`pathCap` of nothing in flight), so this is a sanity bound on what the
-/// paused streams keep, not a check of the pressure cap: that one only
-/// shows while data is in flight, and the `SendQueue.write` unit test in
-/// bridge.zig checks it deterministically.
+/// Six streams, each at its floor plus nghttp3's last pull, a partly
+/// filled block and the block it keeps, at most. Once a paused reader's
+/// credit has run out, nghttp3 still holds the last pull it took from the
+/// stream (one `vec[8]` of blocks, up to 32,704 B), which the credit keeps
+/// from being sent and so from being acknowledged: those bytes count as in
+/// flight, and `pathCap` adds `send_floor` on top (research/s2/h3-send-cap.md
+/// C5, C12: "up to ~96 KiB"). The old bound left the pull out and failed
+/// whenever a stream's credit ran out with a pull taken (1 to 8 blocks over;
+/// in ReleaseSafe a third of runs, more after the zio 299a618 merge changed
+/// the timing). This is a sanity bound on what the paused streams keep, not
+/// a check of the pressure cap: that one only shows while data is in
+/// flight, and the `SendQueue.write` unit test in bridge.zig checks it
+/// deterministically.
 fn heldToFloors(ep: *Endpoint) bool {
-    return ep.blocks.sendLiveCount() <= 6 * (bridge.send_floor / bridge.block_size + 2);
+    const pull_blocks = 8;
+    return ep.blocks.sendLiveCount() <= 6 * (bridge.send_floor / bridge.block_size + pull_blocks + 2);
 }
 
 fn pressureLeft(ep: *Endpoint) bool {

@@ -4685,6 +4685,68 @@ test "Server: serves on an inherited listening socket (fd)" {
     try std.testing.expect(std.mem.endsWith(u8, resp, "inherited"));
 }
 
+fn tcpNoDelay(fd: std.posix.fd_t) !bool {
+    var value: c_int = 0;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &len) != 0) return error.Unexpected;
+    return value != 0;
+}
+
+test "Server: an inherited listening socket gets TCP_NODELAY for the connections it accepts" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // inherited sockets are Unix only
+    const io = std.testing.io;
+    // Opened as systemd opens one (without NoDelay=): no TCP_NODELAY, which
+    // accepted sockets would inherit, and zio no longer sets it per accept.
+    const c = std.c;
+    const fd = c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    try std.testing.expect(fd >= 0);
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var len = std.Io.Threaded.addressToPosix(&addr, &storage);
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(fd, &storage.any, len));
+    try std.testing.expectEqual(@as(c_int, 0), c.listen(fd, 16));
+    len = @sizeOf(std.Io.Threaded.PosixAddress);
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(fd, &storage.any, &len));
+    const port = std.Io.Threaded.addressFromPosix(&storage).getPort();
+    try std.testing.expect(!try tcpNoDelay(fd));
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(port) } }, .fd = fd }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn h(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.h);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+    try std.testing.expect(try tcpNoDelay(fd));
+}
+
+test "listenIp: an IPv6-only listener it opens itself hands TCP_NODELAY to accepted sockets" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // zio's own listen there
+    const io = std.testing.io;
+    // ipv6_only makes listenIp open the socket itself rather than through
+    // the Io's listen, which sets TCP_NODELAY on its own listeners.
+    var listener = dusty.listenIp(io, .{ .ip6 = .loopback(0) }, .{ .ipv6_only = true }) catch |err| switch (err) {
+        error.AddressFamilyUnsupported, error.AddressUnavailable => return error.SkipZigTest, // no IPv6 here
+        else => return err,
+    };
+    defer listener.deinit(io);
+    try std.testing.expect(try tcpNoDelay(listener.socket.handle));
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+    try std.testing.expect(try tcpNoDelay(accepted.socket.handle));
+}
+
 test "Server: a response can carry more headers than a request may" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{

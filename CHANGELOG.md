@@ -7,6 +7,20 @@ breaking changes are listed anyway.
 
 ### Added
 
+- **Per-executor buffer budget and task cap** (#131, #48):
+  `limits.buffer_budget` bounds the bytes request bodies collected whole
+  and WebSocket messages being reassembled hold per executor (default a
+  quarter of memory over the executors). A body with a `Content-Length`
+  past it gets 503 with `Retry-After` before any of it is read (and before
+  `100 Continue`); one of unknown length gets it partway; a WebSocket
+  message is closed 1013. `limits.max_tasks` caps request tasks per
+  executor below `vm.max_map_count` (Linux): accepts wait a quarter below
+  it, streams get REFUSED_STREAM / H3_REQUEST_REJECTED at it. `blocking.max_waiting` (Zig,
+  opt-in) fails a caller past the bound at once with
+  `error.ServiceUnavailable`. Both budgets are on the startup log and on
+  `/metrics` (`anole_requests_shed_total`,
+  `anole_buffer_budget_held_bytes`). Breaking: `auth.password.verify`
+  returns `error{ServiceUnavailable}!bool`.
 - **HTTP/3 handshake timeout** (#35): `http3.handshake_timeout` (JSON
   and C ABI: `handshake_timeout_ms`), 10 s by default. The server closes
   a QUIC connection whose handshake is not done in time, and drops the
@@ -30,6 +44,32 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- **HTTP/1.x deadlines are swept once a second** (K10, #175): the
+  request-head, request, keep-alive, TLS-handshake, PROXY-header and
+  stream-write deadlines are now a timestamp on the connection that each
+  executor checks every second, instead of a timer armed and cleared per
+  step. They can fire up to about 1 s late (docs/server.md lists which
+  deadlines stay exact: handler deadlines, `Deadline.run`, HTTP/2, HTTP/3).
+  A request head's deadline counts from its first byte and never moves
+  later; bytes a slow reader accepts never extend a write deadline. About
+  3% fewer instructions per request on HTTP/1.1 `/json` (about 10% on a
+  bare hello server), and 3% on a handler that waits.
+- **zio** is pinned at xuckless/zio 3c863fc: upstream lalinsky/zio main
+  (299a618) merged in, with its fixes for task and group-task
+  use-after-free races, a socket operation completing twice, and lost
+  cancels; on io_uring a full UDP batch is followed by a direct receive and
+  batches are sent directly (#106).
+- **TCP_NODELAY on listeners Anole opens or inherits** (dual-stack and
+  systemd-activated sockets): zio now sets it on the listener instead of on
+  each accepted connection, so Anole sets it on the sockets it opens itself.
+- **HTTP/3 idle block pool** (#78): an idle HTTP/3 endpoint keeps at
+  least 32 free 4 KiB blocks, and as many as its pooled streams still
+  hold (up to 64, 256 KiB), instead of a floor of 256 (1 MiB); under
+  load the pool still keeps the last 2 s window's peak, and the rest goes
+  back to malloc. This lowers malloc in-use (about 0.5 MB per endpoint
+  after an `h2load --h3` burst), not settled RSS: glibc keeps the freed
+  chunks resident until a `malloc_trim`. An idle endpoint whose free
+  blocks are already down to that no longer wakes every 2 s to trim.
 - **C ABI raw TCP connections close at drain start** (#166): C ABI raw
   TCP listeners now close their connections at drain start, as callback
   handlers have since #107: what the consumer queued goes out, this side

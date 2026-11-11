@@ -292,6 +292,8 @@ anole_http_request_duration_seconds_count{method="GET",route="/chain/:id"} 1
 | `anole_websockets_admitted` | none | Open WebSockets the admission gate counts. |
 | `anole_websockets_limit` | none | The WebSocket count held under load; -1 while none is held. |
 | `anole_ws_upgrades_refused_total` | `reason` | Upgrades answered 503 by the gate: `load` (held) or `cap` (`limits.max_websockets`). |
+| `anole_buffer_budget_held_bytes` | none | Bytes request bodies and WebSocket messages hold of the buffer budget, over every executor ([Buffer budget](server.md#buffer-budget-and-task-cap)). |
+| `anole_requests_shed_total` | `reason` | Bodies answered 503 and WebSocket messages closed 1013 for `limits.buffer_budget` (`memory`), and streams refused or accepts held at `limits.max_tasks` (`tasks`). |
 
 The `anole_runtime_*` series come from zio's `diagnostics` option, which
 `anole.zio_options` turns on (one relaxed atomic add per task spawned and

@@ -49,6 +49,10 @@ pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// Internal, for tests on the real runtime: the per-executor shelf and its
+/// deadline sweep, and the timer that keeps a connection's deadlines.
+pub const _park = @import("server/park.zig");
+pub const _Timer = @import("deadline.zig").Timer;
 /// A wait point with a sleeper count, for one task's waits that others
 /// notify (HTTP/2 and HTTP/3 streams, their writers).
 pub const Signal = @import("signal.zig").Signal;
@@ -61,6 +65,8 @@ pub const admission = @import("admission.zig");
 /// Read-mostly data behind an atomic pointer with quiescent-state
 /// reclamation (SAFETY.md L7).
 pub const qsbr = @import("qsbr.zig");
+/// Internal, for tests on the real runtime: the per-thread encoders.
+pub const _encoders = @import("encoders.zig");
 /// Counters kept per executor and summed when read (SAFETY.md L6/L7).
 pub const exec_counter = @import("exec_counter.zig");
 /// A sealable multi-producer, single-consumer push list (SAFETY.md L7's
@@ -194,6 +200,7 @@ test {
 // Import tests
 comptime {
     _ = @import("server_test.zig");
+    _ = @import("budget_test.zig");
     _ = @import("parked_test.zig");
     _ = @import("server/request_buffers.zig");
     _ = @import("drain_hooks.zig");

@@ -1069,6 +1069,15 @@ pub const ListenIpOptions = struct {
     ipv6_only: ?bool = null,
 };
 
+/// Sets TCP_NODELAY on a listening TCP socket that zio did not open, for the
+/// connections it accepts: they inherit it from the listener (Linux, macOS
+/// and the BSDs), and zio sets it only on listeners it opens itself, not per
+/// accepted socket (lalinsky/zio#870). Best effort, as zio's own.
+fn setNoDelay(fd: std.posix.fd_t) void {
+    const one: c_int = 1;
+    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
+}
+
 /// A listening TCP socket on `address`: `IpAddress.listen`, which has no
 /// option for IPV6_V6ONLY, unless `options.ipv6_only` sets it on an IPv6
 /// address. Then the socket is opened here, and made non-blocking under
@@ -1099,6 +1108,7 @@ pub fn listenIp(io: std.Io, address: std.Io.net.IpAddress, options: ListenIpOpti
         // Best-effort, as std's and zio's `listen`.
         if (@hasDecl(posix.SO, "REUSEPORT")) _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
     }
+    setNoDelay(fd);
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (c.bind(fd, &storage.any, len) != 0) return switch (posix.errno(@as(c_int, -1))) {
@@ -1183,6 +1193,12 @@ pub fn describeListener(w: *std.Io.Writer, cfg: *const Listener, address: Addres
 fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
     const timer: *Timer = @ptrCast(@alignCast(context));
     timer.set(io, timeout);
+}
+
+fn setLazyRequestTimeout(context: *anyopaque, io: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
+    // SAFETY: `_timeout_context` is the connection's `Timer` (`handleRequests`).
+    const timer: *Timer = @ptrCast(@alignCast(context));
+    timer.setLazy(io, deadline);
 }
 
 fn claimRequestTimeout(context: *anyopaque) bool {
@@ -1482,8 +1498,18 @@ pub fn Server(comptime Ctx: type) type {
 
             fn wake(p: *park.Parked) anyerror!void {
                 const conn: *Conn = @fieldParentPtr("parked", p);
-                const group = conn.server.connections_group orelse return error.RuntimeShutdown;
-                try park.spawnLocal(group, resumeConnection, .{ conn.server, conn });
+                const server = conn.server;
+                const group = server.connections_group orelse return error.RuntimeShutdown;
+                // Counted against the task cap (`max_tasks`) but never
+                // refused for it: the connection was admitted, and its
+                // request is here already. Closing it would lose a request
+                // the client may not retry (RFC 9112 §9.3.1 covers only
+                // idempotent ones); accepts and streams are what wait or
+                // are refused.
+                const task_row = server.admission.currentRow(server.io);
+                if (task_row) |r| _ = server.admission.reserveTask(r, .forced);
+                errdefer if (task_row) |r| server.admission.releaseTask(server.io, r);
+                try park.spawnLocal(group, resumeConnection, .{ server, conn, task_row });
             }
 
             fn close(p: *park.Parked) void {
@@ -1617,17 +1643,59 @@ pub fn Server(comptime Ctx: type) type {
             self.static_prepared = true;
         }
 
-        /// Sizes the admission rows (one per executor, once) and points
+        /// Sizes the admission rows (one per executor, once), resolves the
+        /// per-executor budgets (`buffer_budget`, `max_tasks`) and points
         /// `config.request` at the state, which every request copies.
         fn prepareAdmission(self: *Self) !void {
             const a = &self.admission;
             a.cfg = self.config.admission;
             a.max_websockets = self.config.max_websockets;
+            const executors = placement.executorCount(self.io) orelse 1;
             if (a.rows.len == 0) {
-                a.rows = try self.allocator.alloc(admission.Row, placement.executorCount(self.io) orelse 1);
+                a.rows = try self.allocator.alloc(admission.Row, executors);
                 @memset(a.rows, .{});
             }
+            if (self.config.max_tasks) |n| if (n < admission.State.min_task_cap) {
+                self.logProtected(.err, "config.max_tasks is {d}, below {d}: an HTTP/2 connection holds two tasks, and its first stream needs a third", .{ n, admission.State.min_task_cap });
+                return error.NoTasksAllowed;
+            };
+            const budget = try resolveBudgets(self.io, self.config.buffer_budget, self.config.max_tasks, executors);
+            a.buffer_budget = budget.bytes;
+            a.task_cap = budget.tasks;
+            {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                if (budget.tasks == admission.no_limit) {
+                    log.info("buffer budget {d} KiB per executor ({s}); no task cap ({s})", .{ budget.bytes >> 10, budget.bytes_from, budget.tasks_from });
+                } else {
+                    log.info("buffer budget {d} KiB per executor ({s}); at most {d} request tasks per executor ({s})", .{ budget.bytes >> 10, budget.bytes_from, budget.tasks, budget.tasks_from });
+                }
+            }
             self.config.request._admission = a;
+        }
+
+        const Budgets = struct {
+            bytes: usize,
+            bytes_from: []const u8,
+            tasks: u32,
+            tasks_from: []const u8,
+        };
+
+        /// `buffer_budget` and `max_tasks`, or what memory and
+        /// `vm.max_map_count` make of them, per executor (#131, #48).
+        fn resolveBudgets(io: std.Io, bytes: ?usize, tasks: ?u32, executors: usize) std.Io.Cancelable!Budgets {
+            var b: Budgets = .{ .bytes = 0, .bytes_from = "set", .tasks = admission.no_limit, .tasks_from = "set" };
+            if (bytes) |n| b.bytes = n else {
+                const cgroup_max = try cgroup.memoryLimit(io);
+                const ram = std.process.totalSystemMemory() catch null;
+                b.bytes = @intCast(@min(cgroup.memoryQuarter(cgroup_max, ram) / @max(executors, 1), std.math.maxInt(usize)));
+                b.bytes_from = if (cgroup_max != null and (ram == null or cgroup_max.? <= ram.?)) "a quarter of the cgroup's memory.max over the executors" else if (ram != null) "a quarter of RAM over the executors" else "neither memory.max nor RAM could be read: 1 GiB over the executors";
+            }
+            if (tasks) |n| b.tasks = n else if (try cgroup.mapCount(io)) |m| {
+                b.tasks = cgroup.taskCap(m, executors);
+                b.tasks_from = "from vm.max_map_count and the mappings in use";
+            } else b.tasks_from = "vm.max_map_count does not apply here";
+            return b;
         }
 
         fn prepareStaticInner(self: *Self) !void {
@@ -1847,15 +1915,20 @@ pub fn Server(comptime Ctx: type) type {
             unreachable;
         }
 
-        /// A shelf for each executor and its driver task, when connections can
-        /// park: `timeout.idle_park` is set, and the `Io` is zio with pinned
-        /// executors. Empty otherwise.
+        /// A shelf for each executor and its driver task, when the `Io` is
+        /// zio with pinned executors: for idle connections to park on
+        /// (`timeout.idle_park`), and for the sweep that keeps the
+        /// deadlines of the connections served there (`park.Lazy`), which
+        /// runs whether they park or not. Empty otherwise.
         fn openShelves(self: *Self, sweepers: *std.Io.Group, executors: ?usize) []park.Shelf {
-            const idle_park = self.config.timeout.idle_park orelse return &.{};
-            if (idle_park.nanoseconds <= 0 or !park.usable(self.io)) return &.{};
+            if (!park.usable(self.io)) return &.{};
             const n = executors orelse return &.{};
             const shelves = self.allocator.alloc(park.Shelf, n) catch return &.{};
-            @memset(shelves, .{ .io = self.io, .long_park = idle_park });
+            // Nothing parks without `idle_park` (`parkAfter`), so the
+            // fallback is never read.
+            const idle_park = self.config.timeout.idle_park orelse park.sweep_interval;
+            const long_park = if (idle_park.nanoseconds > 0) idle_park else park.sweep_interval;
+            @memset(shelves, .{ .io = self.io, .long_park = long_park });
             for (shelves, 0..) |*shelf, i| {
                 park.spawnOn(sweepers, i, park.drive, .{ shelf, self.io }) catch |err| {
                     log.debug("Idle connections keep their tasks: {}", .{err});
@@ -1902,6 +1975,7 @@ pub fn Server(comptime Ctx: type) type {
         fn parkAfter(self: *const Self, wait_timeout: ?std.Io.Duration) ?std.Io.Duration {
             if (self.shelves.len == 0) return null;
             const after = self.config.timeout.idle_park orelse return null;
+            if (after.nanoseconds <= 0) return null;
             if (wait_timeout) |w| if (after.nanoseconds >= w.nanoseconds) return null;
             return after;
         }
@@ -2072,8 +2146,11 @@ pub fn Server(comptime Ctx: type) type {
             }
             var storage: std.Io.Threaded.PosixAddress = undefined;
             var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-            const address: std.Io.net.IpAddress = if (c.getsockname(fd, &storage.any, &len) == 0 and
-                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6))
+            const is_ip = c.getsockname(fd, &storage.any, &len) == 0 and
+                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6);
+            // Systemd's sockets come without it (unless NoDelay=yes).
+            if (is_ip) setNoDelay(fd);
+            const address: std.Io.net.IpAddress = if (is_ip)
                 std.Io.Threaded.addressFromPosix(&storage)
             else switch (configured) {
                 .ip => |ip| ip,
@@ -2348,14 +2425,25 @@ pub fn Server(comptime Ctx: type) type {
                     stream.close(self.io);
                     return err;
                 };
+                // Near the task cap (`max_tasks`, a quarter below it) the
+                // loop waits for one to end, holding this connection as the
+                // backlog holds the next ones, as at the connection cap.
+                const task_row = self.admission.currentRow(self.io);
+                if (task_row) |r| self.admission.waitTask(self.io, r) catch |err| {
+                    self.releaseListenerSlot(l);
+                    self.releaseConnectionSlot();
+                    stream.close(self.io);
+                    return err;
+                };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 // On the executor that accepted it, for its whole life.
                 const spawned: std.Io.ConcurrentError!void = if (builtin.is_test and test_fail_spawn.once.swap(false, .acq_rel))
                     error.ConcurrencyUnavailable
                 else
-                    placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream });
+                    placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream, task_row });
                 spawned catch |err| {
                     self.logProtected(.err, "Failed to spawn connection handler: {}", .{err});
+                    if (task_row) |r| self.admission.releaseTask(self.io, r);
                     self.finishRequest();
                     self.releaseListenerSlot(l);
                     self.releaseConnectionSlot();
@@ -2586,29 +2674,35 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Waits for the first byte of a request, with nothing in flight:
         /// the drain does not wait for a connection here, and the cancel
-        /// that follows it closes the socket cleanly. With `park_timer`,
-        /// that timer firing is the park delay passing, reported as `.idle`.
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_timer: ?*Timer) !RequestWait {
+        /// that follows it closes the socket cleanly. With `park_watch`, the
+        /// shelf's driver ending the wait is the park delay passing,
+        /// reported as `.idle` (`park.Watch`: no timer per wait).
+        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_watch: ?*park.Watch) !RequestWait {
             // A task started for a parked connection is not counted yet.
             if (busy.*) {
                 busy.* = false;
                 self.finishRequest();
             }
 
+            if (park_watch) |w| w.begin();
             connection.reader.fillMore() catch |err| switch (err) {
-                error.EndOfStream => return .peer_gone,
+                error.EndOfStream => {
+                    if (park_watch) |w| _ = w.end(false);
+                    return .peer_gone;
+                },
                 error.ReadFailed => {
                     const e = connection.getReadError() orelse error.Unexpected;
-                    // Nothing is in flight between requests, so a peer that
-                    // went away here has cost us nothing.
-                    if (Connection.isPeerGone(e)) return .peer_gone;
-                    if (e == error.Canceled) if (park_timer) |t| if (t.fired()) {
+                    if (park_watch) |w| if (w.end(e == error.Canceled)) {
                         connection.clearReadError();
                         return .idle;
                     };
+                    // Nothing is in flight between requests, so a peer that
+                    // went away here has cost us nothing.
+                    if (Connection.isPeerGone(e)) return .peer_gone;
                     return e;
                 },
             };
+            if (park_watch) |w| _ = w.end(false);
 
             const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
             busy.* = true;
@@ -2622,7 +2716,8 @@ pub fn Server(comptime Ctx: type) type {
             return .arrived;
         }
 
-        fn handleConnectionWrapper(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+        fn handleConnectionWrapper(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, task_row: ?*admission.Row) std.Io.Cancelable!void {
+            defer if (task_row) |r| self.admission.releaseTask(self.io, r);
             if (comptime have_auto_cancel) return runConnection(self, l, stream, null);
 
             if (self.config.timeout.request == null and self.config.timeout.keepalive == null) {
@@ -2673,6 +2768,12 @@ pub fn Server(comptime Ctx: type) type {
                 // the error log (nginx logs these at info, as the TLS
                 // handshake failures are).
                 log.info("Malformed request: {}", .{err});
+            } else if (err == error.WriteTimeout) {
+                // A peer that stops reading is the peer's doing too (nginx:
+                // "client timed out", at info). Whether the stream's write or
+                // the connection's last write meets the deadline depends on
+                // the platform's socket buffers, so this is not an error.
+                log.info("Peer stopped reading: {}", .{err});
             } else {
                 log.err("Connection error: {}", .{err});
             }
@@ -2788,16 +2889,19 @@ pub fn Server(comptime Ctx: type) type {
                 .connection = .{ .io = self.io, .stream = stream, .allocator = self.allocator, .buffers = &.{}, .read_buffer = &.{} },
                 // The first request's deadlines run from here, handshake
                 // included.
-                .accepted_at = .now(self.io, .awake),
+                .accepted_at = self.tickNow(),
             };
 
             var timer: Timer = .init(watch);
+            timer.register(self.shelfHere());
             const outcome = self.startConnection(conn, &timer, &busy) catch |err| {
                 timer.clear(self.io);
+                timer.unregister();
                 self.closeConn(conn);
                 return err;
             };
             timer.clear(self.io);
+            timer.unregister();
             self.settle(conn, outcome);
         }
 
@@ -2819,9 +2923,9 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 defer timer.clear(self.io);
                 if (l.config.raw != null)
-                    self.armDeadline(timer, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
+                    timer.setLazy(self.io, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
                 else
-                    self.armDeadline(timer, earlier(
+                    timer.setLazy(self.io, earlier(
                         deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
                         deadlineAfter(conn.accepted_at, self.config.timeout.request),
                     ));
@@ -2853,7 +2957,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     {
                         defer timer.clear(self.io);
-                        self.armTimer(timer, if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request);
+                        timer.setLazy(self.io, deadlineAfter(self.tickNow(), if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request));
 
                         connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
@@ -2980,20 +3084,24 @@ pub fn Server(comptime Ctx: type) type {
         /// The task started for a parked connection whose socket became
         /// readable, on the executor it parked on: serves it until it
         /// closes or parks again.
-        fn resumeConnection(self: *Self, conn: *Conn) void {
+        fn resumeConnection(self: *Self, conn: *Conn, task_row: ?*admission.Row) void {
+            defer if (task_row) |r| self.admission.releaseTask(self.io, r);
             // Not counted while parked: `waitForRequest` counts it again
             // once a request arrives.
             var busy = false;
             defer if (busy) self.finishRequest();
 
             var timer: Timer = .init(null);
+            timer.register(self.shelfHere());
             const outcome = self.serveRequests(conn, &timer, &busy) catch |err| {
                 timer.clear(self.io);
+                timer.unregister();
                 self.closeConn(conn);
                 logConnectionError(err);
                 return;
             };
             timer.clear(self.io);
+            timer.unregister();
             self.settle(conn, outcome);
         }
 
@@ -3083,19 +3191,10 @@ pub fn Server(comptime Ctx: type) type {
             return if (x.compare(.lt, y)) x else y;
         }
 
-        /// Arms the timer for `deadline`, or clears it for none.
-        fn armDeadline(self: *Self, timer: *Timer, deadline: ?std.Io.Clock.Timestamp) void {
-            if (deadline) |d| timer.set(self.io, .{ .deadline = d }) else timer.clear(self.io);
-        }
-
-        /// Cleared when `duration` is unset, so an earlier deadline does not
-        /// carry into a wait meant to be unbounded.
-        fn armTimer(self: *Self, timer: *Timer, duration: ?std.Io.Duration) void {
-            if (duration) |d| {
-                timer.set(self.io, .{ .duration = .{ .raw = d, .clock = .awake } });
-            } else {
-                timer.clear(self.io);
-            }
+        /// The awake clock as this executor last read it (`park.now`): what
+        /// the deadlines a shelf's sweep enforces are taken from.
+        fn tickNow(self: *const Self) std.Io.Clock.Timestamp {
+            return park.now(self.io).withClock(.awake);
         }
 
         /// Applies `ServerConfig.response` to a response the server built,
@@ -3173,6 +3272,12 @@ pub fn Server(comptime Ctx: type) type {
             };
             const t0 = hooks.begin(req.io);
             const result = executor.run();
+            // The body's share of the buffer budget, on every way out of
+            // the chain (an error, a cancel, a client gone); its bytes stay
+            // in the arena until the response is out, uncounted. A detached
+            // request's moved with it (`detachedRelocate`), and its engine
+            // gives it back when the exchange ends.
+            req._body_held.release();
             hooks.end(req, res, result, executor.answered, t0);
             return result;
         }
@@ -3206,10 +3311,12 @@ pub fn Server(comptime Ctx: type) type {
         /// the connection closes instead. Whether the connection can carry
         /// on.
         fn boundedDiscard(self: *Self, parser: *RequestParser, connection: *Connection, max: usize, timer: *Timer, request_deadline: ?std.Io.Clock.Timestamp) error{Canceled}!bool {
-            const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+            const now = self.tickNow();
             if (request_deadline) |d| if (now.compare(.gte, d)) return false;
-            const own = now.addDuration(.{ .raw = drainTimeout(&self.config), .clock = .awake });
-            self.armDeadline(timer, earlier(request_deadline, own));
+            const budget = drainTimeout(&self.config);
+            const deadline = earlier(request_deadline, now.addDuration(.{ .raw = budget, .clock = .awake }));
+            // Up to a second late, exact when sooner than that.
+            timer.setLazy(self.io, deadline);
             defer timer.clear(self.io);
             return discardBody(parser, connection, max) catch |err| switch (err) {
                 error.Canceled => if (timer.fired()) false else error.Canceled,
@@ -3236,6 +3343,13 @@ pub fn Server(comptime Ctx: type) type {
             // A connection woken after a long park parks again once it has
             // served a request (`park.Shelf.long_park`).
             var repark_after: ?usize = if (conn.parked.woke_from_long) conn.request_count + 1 else null;
+            // What ends a wait for the next request at the park delay, with
+            // no timer per wait: the shelf's driver (`park.Watch`). Without
+            // a shelf to watch it, the connection does not park.
+            var park_watch: park.Watch = .{};
+            const watch_shelf = if (self.parkAfter(null) == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null;
+            if (watch_shelf) |s| s.watch(&park_watch);
+            defer if (watch_shelf) |s| s.unwatch(&park_watch);
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
             // Last: the reader must not point into this frame once it is
@@ -3284,6 +3398,7 @@ pub fn Server(comptime Ctx: type) type {
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
+                ._set_lazy_timeout = setLazyRequestTimeout,
                 ._claim_timeout = claimRequestTimeout,
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
@@ -3303,9 +3418,6 @@ pub fn Server(comptime Ctx: type) type {
                 // deadline, and its request deadline runs from arrival. A
                 // request pipelined behind the last one is already here.
                 const first = conn.request_count == 0;
-                // Whether the wait below left a timer armed that the request
-                // itself must replace or clear.
-                var wait_armed = false;
                 if (connection.reader.bufferedLen() == 0) {
                     // A guard: a response is corked only while the next
                     // request is buffered, so nothing is owed here.
@@ -3319,18 +3431,22 @@ pub fn Server(comptime Ctx: type) type {
                         }
                     }
                     const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
-                    // Parking: the wait goes on for `idle_park` first, and a
-                    // connection with nothing by then parks. One woken after
-                    // a long park parks again as soon as it has answered
-                    // what woke it, as if the delay had passed.
-                    const park_after = self.parkAfter(wait_timeout);
+                    // The wait's deadline, up to a second late, for as long
+                    // as the connection waits: on this task, and parked.
+                    const wait_deadline = if (wait_timeout != null) deadlineAfter(self.tickNow(), wait_timeout) else null;
+                    timer.setLazy(self.io, wait_deadline);
+                    // Parking: the wait goes on for `idle_park` first (or up
+                    // to a quarter less, `park.Watch`), and a connection
+                    // with nothing by then parks. One woken after a long
+                    // park parks again as soon as it has answered what woke
+                    // it, as if the delay had passed.
+                    const park_after = if (watch_shelf != null) self.parkAfter(wait_timeout) else null;
                     const repark_now = if (repark_after) |n| conn.request_count >= n else false;
                     if (repark_now) repark_after = null;
-                    wait_armed = wait_timeout != null;
-                    var arrival: RequestWait = if (repark_now and park_after != null) .idle else arrival: {
-                        self.armTimer(timer, park_after orelse wait_timeout);
-                        break :arrival try self.waitForRequest(connection, busy, if (park_after != null) timer else null);
-                    };
+                    var arrival: RequestWait = if (repark_now and park_after != null)
+                        .idle
+                    else
+                        try self.waitForRequest(connection, busy, if (park_after != null) &park_watch else null);
                     if (arrival == .idle) {
                         const shelf = self.shelfHere();
                         if (shelf != null and !shelf.?.closed and connection.parkable()) {
@@ -3342,22 +3458,12 @@ pub fn Server(comptime Ctx: type) type {
                             }
                             // The wait's own deadline, which a parked
                             // connection keeps to the shelf's sweep.
-                            conn.parked.deadline = if (wait_timeout) |w|
-                                std.Io.Timestamp.now(self.io, .awake).addDuration(.fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds))
-                            else
-                                null;
+                            conn.parked.deadline = if (wait_deadline) |d| d.raw else null;
                             return .park;
                         }
                         // Something is in flight after all (a partial TLS
                         // record): the rest of the wait, on this task.
-                        self.armTimer(timer, if (wait_timeout) |w| .fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds) else null);
                         arrival = try self.waitForRequest(connection, busy, null);
-                    } else if (park_after != null) {
-                        // The park timer, gone before anything else can wait:
-                        // had it fired just as the request arrived, its
-                        // cancel would hit the next wait.
-                        timer.clear(self.io);
-                        wait_armed = false;
                     }
                     switch (arrival) {
                         .arrived => {},
@@ -3391,19 +3497,21 @@ pub fn Server(comptime Ctx: type) type {
                 // `timeout.read_header` of the same point, whichever is
                 // sooner; then the request deadline alone applies.
                 //
-                // A head that is already buffered whole (the usual case: it
-                // came in one read) is parsed without waiting, so it needs no
-                // header deadline: the timer is set once per request rather
-                // than twice, and without a request deadline the clock is not
-                // read at all. A wait timer still armed then lasts through
-                // the parse, which does not wait, and is replaced after it.
+                // Arrival is when the read that brought its first bytes
+                // returned, and the head deadline is set once, from it:
+                // more bytes of a trickled head never move it later
+                // (Slowloris). A head that is already buffered whole (the
+                // usual case: it came in one read) is parsed without
+                // waiting, so it needs no header deadline: the request's is
+                // set at once, in place of the wait's, and without one the
+                // clock is not read at all.
                 const head_buffered = headBuffered(connection.reader.buffered());
                 const needs_clock = self.config.timeout.request != null or
                     (!head_buffered and self.config.timeout.read_header != null);
-                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else .now(self.io, .awake);
+                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else self.tickNow();
                 const request_deadline = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
                 const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
-                if (!head_buffered) self.armDeadline(timer, header_deadline);
+                timer.setLazy(self.io, if (head_buffered) request_deadline else header_deadline);
                 conn.request_count += 1;
 
                 if (buffers == null) {
@@ -3475,10 +3583,8 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 // The head is in: from here the request deadline alone.
-                if (head_buffered) {
-                    if (request_deadline != null or wait_armed) self.armDeadline(timer, request_deadline);
-                } else if (header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
-                    self.armDeadline(timer, request_deadline);
+                if (!head_buffered and header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
+                    timer.setLazy(self.io, request_deadline);
                 }
 
                 // This is per request, not per connection: a keepalive
@@ -3589,6 +3695,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
+                request._body_held.release();
                 hooks.end(&request, &response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
                     error.ReadFailed => {
@@ -3623,6 +3730,10 @@ pub fn Server(comptime Ctx: type) type {
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
                         if (request._expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
+                        // Refused for the buffer budget (`Request.shedBody`):
+                        // the 503 goes out first, and the connection closes
+                        // rather than wait for a body there was no room for.
+                        if (request._shed) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.
@@ -3943,7 +4054,7 @@ fn feedConnection(io: std.Io, server: *Server(void), listener: *const @import("c
     try server.reserveConnectionSlot();
     // With the deadline watch the accept loop gives it, which also bounds
     // a lingering close rather than sleeping it out.
-    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream });
+    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream, null });
     var finished = false;
     defer if (!finished) future.cancel(io) catch {};
 

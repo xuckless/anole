@@ -410,7 +410,7 @@ baseline (m = 19 MiB, t = 2, p = 1).
 ```zig
 var buf: [128]u8 = undefined;
 const phc = try anole.auth.password.hash(gpa, io, plain, &buf);  // "$argon2id$v=19$m=19456,t=2,p=1$..."
-const ok = anole.auth.password.verify(gpa, req.io, stored, plain); // also takes bcrypt "$2b$..."
+const ok = try anole.auth.password.verify(gpa, req.io, stored, plain); // also takes bcrypt "$2b$..."
 if (ok and anole.auth.password.needsRehash(stored)) { ... hash again and store ... }
 ```
 
