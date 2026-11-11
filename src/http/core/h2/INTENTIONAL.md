@@ -110,3 +110,63 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    Borrowed DATA isn't counted: it is framed only at `pending`, so a peer
    that reads normally while one large frame is being written (a 16 MiB
    SETTINGS_MAX_FRAME_SIZE, or many iovecs) is never refused.
+
+## The session (conn.zig against an nghttp2 server session)
+
+`conn_diff_test.zig` (PLAN §5.3) feeds the same client bytes to Conn and
+to an nghttp2 server session set up as today's engine sets it up, and
+compares the output; the limits entries above are its rules
+`reset_budget` (1, 2), `empty_budget` (3), `continuations` (4),
+`block_bytes` (5), `head_431` (6) and `refused` (7, 8), and HPACK 2 and 3
+its `hpack_cost`. Both sides are drained after every frame, as if their
+writers kept up: nghttp2 closes a stream once its last frame is written
+(CLOSING until then, and judged by its earlier state), Conn once that frame
+is queued, and Conn frames DATA only when drained, so otherwise either
+side's answers would depend on when its writer ran.
+
+1. **Frame sizes, scheduling and HPACK bytes.** Not compared: header blocks
+   are decoded, DATA is concatenated per stream with END_STREAM's place,
+   and neither the interleaving of DATA across streams nor its place among
+   the control frames is compared (nghttp2 sends its urgent queue, then the
+   regular one, then DATA by its scheduler; Conn queues in order and frames
+   DATA at `pending`). The order of the responses is compared.
+2. **WINDOW_UPDATE batching.** nghttp2 sends a WINDOW_UPDATE as soon as
+   half the window is consumed, per DATA chunk, one queued at a time
+   (nghttp2_helper.c `nghttp2_should_send_window_update`,
+   `session_update_consumed_size`); Conn batches (`due`: half the window,
+   or the window spent and some consumed, as python-hyper/h2 does). The
+   totals per stream and for the connection are held to within half a
+   window of nghttp2's, never above it by more, never below while the
+   stream can still receive, and never an increment of 0. The same bound
+   holds between Conn's output for one input whole and cut: its batching
+   follows how the reads cut the DATA payloads.
+3. **Output already queued when the connection ends is still sent**
+   (rule `queued_output`). On a connection error nghttp2 drops what it had
+   queued while handling the frame (`session_is_closing` in
+   `nghttp2_session_prep_frame`'s predicates: the RST_STREAM before a
+   COMPRESSION_ERROR's GOAWAY, a response queued in the same callback);
+   Conn's `out` is a byte FIFO whose slices the writer may already hold
+   (PLAN §3.3), so what it queued goes out before the GOAWAY. RFC 9113
+   §5.4.1 asks only for the GOAWAY before the close. Accepted when both
+   sent the same GOAWAY and every frame nghttp2 sent, Conn sent too.
+4. **After the peer's GOAWAY, nghttp2 is done whenever no stream is open**
+   (rule `peer_goaway`). Its `session_is_closing` is then true (want_read
+   is 0 once GOAWAY was received and no stream is active, and want_write
+   once its queue is empty): it answers no PING or SETTINGS
+   (`nghttp2_session_on_ping_received`, `..._on_settings_received`), drops
+   the last frame it pops, and the engine closes the connection
+   (server/h2_nghttp2.zig, when neither wants to read or write). Conn
+   leaves the close to the transport (M3) and goes on answering. Accepted
+   when every frame nghttp2 sent, Conn sent too; once nghttp2 is done the
+   rest isn't compared.
+5. **DATA is charged to the receive windows for the whole frame at its
+   header** (rule `window_per_frame`). nghttp2 charges each chunk as it
+   reads it (`nghttp2_session_update_recv_{connection,stream}_window_size`
+   in NGHTTP2_IB_READ_DATA), so credit the handler gives back for a frame's
+   first bytes makes room for the rest when the reads cut it finely, and a
+   frame larger than the window is taken or refused depending on the cuts.
+   RFC 9113 §6.9.1: the frame's length is what must fit. Conn's answer no
+   longer depends on how the reads cut the frame (the differential's split
+   invariance found it; conn_test.zig "a DATA frame past the window is a
+   FLOW_CONTROL_ERROR however the reads cut it"). Accepted when Conn ends
+   with FLOW_CONTROL_ERROR, nghttp2 doesn't, and the input was cut.

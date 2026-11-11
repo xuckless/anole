@@ -263,7 +263,9 @@ src/http/core/h2/ (the HTTP/2 codecs and protocol core; so far the HPACK
 Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
 from nghttp2's lib/nghttp2_hd_huffman_data.c, and the HPACK codec from
 lib/nghttp2_hd.c; testdata/hpack_blocks.bin holds header blocks that
-tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus; streams.zig's
+tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus, and
+testdata/h2_sessions.bin that corpus's client streams whole, packed by
+tools/pack_h2_sessions.py; streams.zig's
 stream table from lib/nghttp2_map.c, its window and content-length checks from
 lib/nghttp2_stream.c and lib/nghttp2_http.c, and its closed-stream memory from
 the fork patch in lib/nghttp2_session.c; conn.zig's inbound state machine from
