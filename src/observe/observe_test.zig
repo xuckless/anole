@@ -470,6 +470,32 @@ test "tracing: OTEL_SERVICE_NAME from the process environment without .process" 
     try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
 }
 
+test "observe runtime: fallbackCause names the sysctl first, then an old kernel, then a refusal" {
+    const rtm = @import("runtime.zig");
+    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(null, .{ .major = 6, .minor = 12 }));
+    try std.testing.expectEqual(rtm.FallbackCause.disabled, rtm.fallbackCause(2, .{ .major = 6, .minor = 12 }));
+    try std.testing.expectEqual(rtm.FallbackCause.group_only, rtm.fallbackCause(1, .{ .major = 6, .minor = 12 }));
+    try std.testing.expectEqual(rtm.FallbackCause.kernel_too_old, rtm.fallbackCause(null, .{ .major = 5, .minor = 15 }));
+    try std.testing.expectEqual(rtm.FallbackCause.kernel_too_old, rtm.fallbackCause(0, .{ .major = 6, .minor = 0 }));
+    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(0, .{ .major = 6, .minor = 1 }));
+    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(0, null));
+    try std.testing.expectEqual(@as(?rtm.Kernel, .{ .major = 5, .minor = 15 }), rtm.parseKernel("5.15.0-91-generic\n"));
+    try std.testing.expectEqual(@as(?rtm.Kernel, .{ .major = 6, .minor = 12 }), rtm.parseKernel("6.12.5-200.fc41.x86_64"));
+    try std.testing.expectEqual(@as(?rtm.Kernel, null), rtm.parseKernel("garbage"));
+}
+
+test "observe runtime: ioEngine names the runtime's engine" {
+    const rtm = @import("runtime.zig");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const name = rtm.ioEngine(rt);
+    switch (@import("builtin").os.tag) {
+        .linux => try std.testing.expect(std.mem.eql(u8, name, "io_uring") or std.mem.eql(u8, name, "epoll")),
+        .macos => try std.testing.expectEqualStrings("kqueue", name),
+        else => try std.testing.expect(name.len > 0),
+    }
+}
+
 test "observe: runtime gauges appear on /metrics" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
@@ -494,6 +520,8 @@ test "observe: runtime gauges appear on /metrics" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_tasks{executor=\"0\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_run_queue{executor=\"0\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_stack_committed_bytes ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_io_engine{engine=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "} 1\n") != null);
 }
 
 test "access log json: an error is named in error, and a request without an id has no request_id" {

@@ -436,6 +436,7 @@ const Check = struct {
         try std.testing.expect(std.mem.find(u8, cfg.text, "http.address = \"127.0.0.1\"") != null);
         try std.testing.expect(std.mem.find(u8, cfg.text, "http.port = 0") != null);
         try std.testing.expect(std.mem.find(u8, cfg.text, "http = (unset)") == null);
+        try std.testing.expect(std.mem.find(u8, cfg.text, "io_engine = ") != null);
     }
 };
 

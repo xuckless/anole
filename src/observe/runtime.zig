@@ -1,7 +1,7 @@
 //! Runtime gauges for `/metrics`, refreshed on every scrape:
 //! `anole_runtime_tasks{executor}` (tasks alive), `anole_runtime_run_queue{executor}`,
 //! `anole_runtime_stack_committed_bytes`, `anole_connections{executor}` and
-//! `anole_streams{executor,protocol}`. The `anole_runtime_*` series need zio's
+//! `anole_streams{executor,protocol}`, plus `anole_io_engine{engine}`. The `anole_runtime_*` series need zio's
 //! `diagnostics` option (`anole.zio_options` sets it); the connection and
 //! stream counts do not.
 //!
@@ -15,9 +15,87 @@
 //! and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`. Integer
 //! gauges, hence permille and microseconds.
 const std = @import("std");
+const builtin = @import("builtin");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const metrics = @import("metrics.zig");
+const os = @import("../console/os.zig");
+
+/// The I/O engine `rt` runs on: "io_uring" or "epoll" on Linux (zio picks
+/// io_uring and falls back to epoll when the kernel refuses a ring), else the
+/// build's ("kqueue", "iocp", "poll"). Reads zio's choice from executor 0's
+/// loop, which `Runtime.init` has set up before it returns.
+pub fn ioEngine(rt: *zio.Runtime) []const u8 {
+    if (comptime @hasDecl(zio.ev.Backend, "selectedEngine")) {
+        if (rt.executors.items.len == 0) return "unknown";
+        return @tagName(rt.executors.items[0].loop.backend.selectedEngine());
+    }
+    return @tagName(zio.ev.backend);
+}
+
+/// Why io_uring is probably off when zio fell back to epoll. zio drops the
+/// real error of `io_uring_setup`, so this is a guess from what Anole can
+/// read; `refused` is what is left (a seccomp profile, a security module or a
+/// kernel built without io_uring).
+pub const FallbackCause = enum { disabled, group_only, kernel_too_old, refused };
+
+pub const Kernel = struct { major: u32, minor: u32 };
+
+/// `io_uring_disabled` is `kernel.io_uring_disabled` (null: no such sysctl,
+/// before Linux 6.6); `kernel` is null when its release could not be read.
+/// zio asks for DEFER_TASKRUN, so a kernel before 6.1 refuses its ring.
+pub fn fallbackCause(io_uring_disabled: ?u8, kernel: ?Kernel) FallbackCause {
+    if (io_uring_disabled) |d| switch (d) {
+        2 => return .disabled,
+        1 => return .group_only,
+        else => {},
+    };
+    if (kernel) |k| if (k.major < 6 or (k.major == 6 and k.minor < 1)) return .kernel_too_old;
+    return .refused;
+}
+
+/// The cause as a log/`/config` phrase, worded as likely.
+pub fn causeText(cause: FallbackCause) []const u8 {
+    return switch (cause) {
+        .disabled => "likely kernel.io_uring_disabled=2",
+        .group_only => "likely kernel.io_uring_disabled=1 and this process is not in kernel.io_uring_group",
+        .kernel_too_old => "likely a kernel older than 6.1, which Anole's runtime needs for io_uring",
+        .refused => "likely io_uring_setup was refused by a seccomp profile (Docker's default blocks io_uring) or a security module",
+    };
+}
+
+/// "5.15.0-91-generic" -> 5.15.
+pub fn parseKernel(release: []const u8) ?Kernel {
+    var it = std.mem.splitScalar(u8, std.mem.trim(u8, release, " \n"), '.');
+    const major = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const rest = it.next() orelse return null;
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    const minor = std.fmt.parseInt(u32, rest[0..end], 10) catch return null;
+    return .{ .major = major, .minor = minor };
+}
+
+/// The likely cause when `rt` wanted io_uring and runs on epoll (Linux, zio's
+/// automatic choice); null when it runs on io_uring or never chose. Reads
+/// procfs: startup only.
+pub fn ioUringFallback(rt: *zio.Runtime) ?FallbackCause {
+    if (comptime builtin.os.tag != .linux or zio.ev.backend != .linux) return null;
+    if (!std.mem.eql(u8, ioEngine(rt), "epoll")) return null;
+    var buf: [128]u8 = undefined;
+    const disabled: ?u8 = if (os.readSmall("/proc/sys/kernel/io_uring_disabled", &buf)) |t|
+        std.fmt.parseInt(u8, std.mem.trim(u8, t, " \n"), 10) catch null
+    else
+        null;
+    const kernel = if (os.readSmall("/proc/sys/kernel/osrelease", &buf)) |t| parseKernel(t) else null;
+    return fallbackCause(disabled, kernel);
+}
+
+/// `/config` lines for the runtime: the engine, and on a fallback the likely
+/// cause.
+pub fn writeConfigLines(w: *std.Io.Writer, rt: *zio.Runtime) std.Io.Writer.Error!void {
+    try w.print("io_engine = {s}\n", .{ioEngine(rt)});
+    if (ioUringFallback(rt)) |cause| try w.print("io_uring_unavailable = \"{s}\"\n", .{causeText(cause)});
+}
 
 /// Updates the runtime gauges in `registry` from the zio runtime behind its
 /// `io` and the HTTP engines' counters. Called by `Registry.render`.
@@ -34,6 +112,9 @@ pub fn refresh(registry: *metrics.Registry) void {
         streams.with(&.{ id, "h2" }).set(dusty.gauges.get(.h2_streams, i));
         streams.with(&.{ id, "h3" }).set(dusty.gauges.get(.h3_streams, i));
     }
+
+    const engine = registry.gauge("anole_io_engine", "1 for the I/O engine the runtime runs on (io_uring, epoll, kqueue, iocp, poll).", &.{"engine"}) catch return;
+    engine.with(&.{ioEngine(rt)}).set(1);
 
     if (n == 0 or rt.executorStats(0) == null) return;
     const tasks = registry.gauge("anole_runtime_tasks", "Tasks alive per executor (spawned minus finished).", &.{"executor"}) catch return;
