@@ -44,6 +44,8 @@ pub const Sink = @import("sink.zig").Sink;
 pub const Detached = @import("detach.zig").Detached;
 /// A streamed response no task holds (`Response._park`); internal, for `anole.sse`.
 pub const Parked = @import("parked.zig").Parked;
+/// A parked response's burst and peer-gone state, for the engines.
+pub const ParkedNotice = @import("parked.zig").Notice;
 /// `EventStream`'s encoder: one event as bytes.
 pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
@@ -205,6 +207,7 @@ comptime {
     _ = @import("server_test.zig");
     _ = @import("budget_test.zig");
     _ = @import("parked_test.zig");
+    _ = @import("parked.zig");
     _ = @import("server/request_buffers.zig");
     _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");

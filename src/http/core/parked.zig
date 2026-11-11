@@ -77,6 +77,167 @@ pub const Parked = struct {
     }
 };
 
+/// Where a parked response is between its owner's bursts and the peer
+/// leaving: whether a burst holds it, whether the owner was told `gone`
+/// (or is to be, at the burst's end), whether it is over. The engines
+/// (`H1Parked` here, `H3Parked` in src/h3/server.zig) hold one each and
+/// call the transitions under the lock they already have; the
+/// transitions only compute, and return what the caller must do.
+///
+///   idle --begin--> bursting --endBurst--> idle
+///   idle --peerGone--> gone_told (tell the owner now)
+///   bursting --peerGone--> bursting_gone --endBurst--> gone_told (tell then)
+///   any --finish (end, abort)--> over
+///
+/// A pair not drawn changes nothing and tells nothing: `begin` outside
+/// `idle` is refused, a second `peerGone` or one after `over` is dropped,
+/// and `endBurst` after `over` delivers nothing (the owner ended the
+/// response itself, so it is not told `gone` for it).
+pub const Notice = enum {
+    /// No burst; the peer is there (as far as the engine knows).
+    idle,
+    /// A burst holds the response.
+    bursting,
+    /// The peer left during the burst: the owner is told at `endBurst`.
+    bursting_gone,
+    /// The owner was told `gone` (once).
+    gone_told,
+    /// `end` or `abort` ran (or, on HTTP/1.1, a write failed with no
+    /// notice pending): no more writes, no `gone`.
+    over,
+
+    /// Starts a burst: false (no burst) unless `idle`.
+    pub fn begin(n: *Notice) bool {
+        if (n.* != .idle) return false;
+        n.* = .bursting;
+        return true;
+    }
+
+    /// Ends the burst: true when the owner is to be told `gone` now.
+    pub fn endBurst(n: *Notice) bool {
+        switch (n.*) {
+            .bursting => n.* = .idle,
+            .bursting_gone => {
+                n.* = .gone_told;
+                return true;
+            },
+            .idle, .gone_told, .over => {},
+        }
+        return false;
+    }
+
+    pub const OnGone = enum {
+        /// Nothing to do: told already, or over.
+        none,
+        /// A burst runs: the owner is told at its end (the engine may
+        /// cancel the burst's task, whose write is for nobody now).
+        deferred,
+        /// Tell the owner now (outside the lock).
+        tell,
+    };
+
+    /// The peer went away (connection closed, stream reset).
+    pub fn peerGone(n: *Notice) OnGone {
+        switch (n.*) {
+            .idle => {
+                n.* = .gone_told;
+                return .tell;
+            },
+            .bursting => {
+                n.* = .bursting_gone;
+                return .deferred;
+            },
+            .bursting_gone, .gone_told, .over => return .none,
+        }
+    }
+
+    /// `end` or `abort`: over from any state. True when it was over
+    /// already (the end's work is not to be done twice).
+    pub fn finish(n: *Notice) bool {
+        const already = n.* == .over;
+        n.* = .over;
+        return already;
+    }
+
+    /// HTTP/1.1, a write failed (the connection is shut down): no more
+    /// writes, as after `finish`, except that a notice pending from the
+    /// peer leaving stays due at `endBurst`.
+    pub fn writeFailed(n: *Notice) void {
+        if (n.* != .bursting_gone) n.* = .over;
+    }
+
+    /// A burst holds the response.
+    pub fn inBurst(n: Notice) bool {
+        return n == .bursting or n == .bursting_gone;
+    }
+};
+
+test "Notice: every (state, event) pair" {
+    const S = Notice;
+    const E = enum { begin, endBurst, peerGone, finish, writeFailed };
+    const Row = struct {
+        from: S,
+        event: E,
+        to: S,
+        /// begin: started; endBurst: tell; finish: already. Unused otherwise.
+        ret: bool = false,
+        gone: S.OnGone = .none,
+    };
+    const rows = [_]Row{
+        .{ .from = .idle, .event = .begin, .to = .bursting, .ret = true },
+        .{ .from = .bursting, .event = .begin, .to = .bursting },
+        .{ .from = .bursting_gone, .event = .begin, .to = .bursting_gone },
+        .{ .from = .gone_told, .event = .begin, .to = .gone_told },
+        .{ .from = .over, .event = .begin, .to = .over },
+
+        .{ .from = .idle, .event = .endBurst, .to = .idle },
+        .{ .from = .bursting, .event = .endBurst, .to = .idle },
+        .{ .from = .bursting_gone, .event = .endBurst, .to = .gone_told, .ret = true },
+        .{ .from = .gone_told, .event = .endBurst, .to = .gone_told },
+        .{ .from = .over, .event = .endBurst, .to = .over },
+
+        .{ .from = .idle, .event = .peerGone, .to = .gone_told, .gone = .tell },
+        .{ .from = .bursting, .event = .peerGone, .to = .bursting_gone, .gone = .deferred },
+        .{ .from = .bursting_gone, .event = .peerGone, .to = .bursting_gone },
+        .{ .from = .gone_told, .event = .peerGone, .to = .gone_told },
+        .{ .from = .over, .event = .peerGone, .to = .over },
+
+        .{ .from = .idle, .event = .finish, .to = .over },
+        .{ .from = .bursting, .event = .finish, .to = .over },
+        .{ .from = .bursting_gone, .event = .finish, .to = .over },
+        .{ .from = .gone_told, .event = .finish, .to = .over },
+        .{ .from = .over, .event = .finish, .to = .over, .ret = true },
+
+        .{ .from = .idle, .event = .writeFailed, .to = .over },
+        .{ .from = .bursting, .event = .writeFailed, .to = .over },
+        .{ .from = .bursting_gone, .event = .writeFailed, .to = .bursting_gone },
+        .{ .from = .gone_told, .event = .writeFailed, .to = .over },
+        .{ .from = .over, .event = .writeFailed, .to = .over },
+    };
+    // Every pair exactly once.
+    for (std.enums.values(S)) |s| {
+        for (std.enums.values(E)) |e| {
+            var count: usize = 0;
+            for (rows) |r| {
+                if (r.from == s and r.event == e) count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), count);
+        }
+    }
+    for (rows) |r| {
+        var n = r.from;
+        switch (r.event) {
+            .begin => try std.testing.expectEqual(r.ret, n.begin()),
+            .endBurst => try std.testing.expectEqual(r.ret, n.endBurst()),
+            .peerGone => try std.testing.expectEqual(r.gone, n.peerGone()),
+            .finish => try std.testing.expectEqual(r.ret, n.finish()),
+            .writeFailed => n.writeFailed(),
+        }
+        try std.testing.expectEqual(r.to, n);
+        try std.testing.expectEqual(r.to == .bursting or r.to == .bursting_gone, n.inBurst());
+    }
+}
+
 /// Windows: a TCP shutdown does not end a receive already waiting on the
 /// socket, so an abort also cancels the task that reads the connection.
 const abort_cancels_reader = builtin.os.tag == .windows;
@@ -97,15 +258,11 @@ pub const H1Parked = struct {
     /// Serializes writes (and `end`, `abort`) with each other; never held
     /// by the reading side.
     write_mutex: std.Io.Mutex = .init,
-    /// Guards the flags below. A spin lock: nothing under it waits.
+    /// Guards the fields below. A spin lock: nothing under it waits.
     lock: std.atomic.Mutex = .unlocked,
-    burst: bool = false,
+    notice: Notice = .idle,
     burst_task: ?placement.Task = null,
     reader_task: ?placement.Task = null,
-    gone_pending: bool = false,
-    gone_sent: bool = false,
-    /// `end` or `abort` ran: no more writes.
-    over: bool = false,
     /// The owner called `release`.
     released: std.Io.Event = .unset,
     owner_released: bool = false,
@@ -152,8 +309,7 @@ pub const H1Parked = struct {
         const self = fromParked(p);
         self.lockFlags();
         defer self.lock.unlock();
-        if (self.over or self.gone_sent or self.gone_pending) return false;
-        self.burst = true;
+        if (!self.notice.begin()) return false;
         self.burst_task = placement.currentTask(self.io);
         return true;
     }
@@ -167,13 +323,13 @@ pub const H1Parked = struct {
         self.write_mutex.lock(self.io) catch return error.Canceled;
         defer self.write_mutex.unlock(self.io);
         self.lockFlags();
-        const over = self.over;
+        const over = self.notice == .over;
         self.lock.unlock();
         if (over) return error.Gone;
         const result = self.chunkOut(parts);
         result catch |err| {
             self.lockFlags();
-            self.over = true;
+            self.notice.writeFailed();
             self.lock.unlock();
             self.shutdownBoth();
             return err;
@@ -210,13 +366,8 @@ pub const H1Parked = struct {
     fn endBurst(p: *Parked) void {
         const self = fromParked(p);
         self.lockFlags();
-        self.burst = false;
         self.burst_task = null;
-        const deliver = self.gone_pending and !self.gone_sent;
-        if (deliver) {
-            self.gone_pending = false;
-            self.gone_sent = true;
-        }
+        const deliver = self.notice.endBurst();
         self.lock.unlock();
         if (deliver) self.owner.gone(self.owner.ctx);
     }
@@ -226,9 +377,7 @@ pub const H1Parked = struct {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
         self.lockFlags();
-        const already = self.over;
-        self.over = true;
-        self.burst = false;
+        const already = self.notice.finish();
         self.burst_task = null;
         self.lock.unlock();
         if (already) return;
@@ -252,8 +401,7 @@ pub const H1Parked = struct {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
         self.lockFlags();
-        self.over = true;
-        self.burst = false;
+        _ = self.notice.finish();
         self.burst_task = null;
         self.lock.unlock();
         self.shutdownBoth();
@@ -284,21 +432,15 @@ pub const H1Parked = struct {
     /// `gone`, once, now or after the running burst.
     fn deliverGone(self: *H1Parked) void {
         self.lockFlags();
-        if (self.gone_sent or self.over) {
-            self.lock.unlock();
-            return;
-        }
-        if (self.burst) {
-            self.gone_pending = true;
-            const task = self.burst_task;
-            self.lock.unlock();
-            // The write under way is for nobody.
-            if (task) |t| placement.cancelTask(t);
-            return;
-        }
-        self.gone_sent = true;
+        const what = self.notice.peerGone();
+        const task = self.burst_task;
         self.lock.unlock();
-        self.owner.gone(self.owner.ctx);
+        switch (what) {
+            .none => {},
+            // The write under way is for nobody.
+            .deferred => if (task) |t| placement.cancelTask(t),
+            .tell => self.owner.gone(self.owner.ctx),
+        }
     }
 
     /// The core's runs: the first right after the handler returned, then
@@ -328,7 +470,7 @@ pub const H1Parked = struct {
             // thrown away.
             r.tossBuffered();
             self.lockFlags();
-            const over = self.over;
+            const over = self.notice == .over;
             self.lock.unlock();
             if (over) return .close;
             const input = b.waitInput() catch {

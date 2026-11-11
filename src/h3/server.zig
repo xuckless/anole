@@ -2718,8 +2718,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.unhold();
                     conn.lock();
                     // A burst of the response this handler parked may be
-                    // under way on another task, which owns `task` now.
-                    if (s.parked == null or !s.parked.?.bursting) s.task = null;
+                    // under way (or ending: `over` before its last
+                    // `finishBurst`) on another task, which owns `task`
+                    // now; after the end that task has cleared it.
+                    const burst_owns = if (s.parked) |p| p.notice.inBurst() or p.notice == .over else false;
+                    if (!burst_owns) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
                     if (!s.body_done and !s.reset) conn.lingerRead(s);
@@ -3244,11 +3247,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// (a `no_wait` route, the C ABI's requests): the detach's hold
             /// on the stream (`.handler`) is the park's to let go too.
             holds_handler: bool,
-            /// All under the connection's lock.
-            bursting: bool = false,
-            gone_pending: bool = false,
-            gone_sent: bool = false,
-            over: bool = false,
+            /// Under the connection's lock. The stream's own `reset`
+            /// is checked next to it.
+            notice: dusty.ParkedNotice = .idle,
 
             const vtable: dusty.Parked.VTable = .{
                 .begin = begin,
@@ -3268,8 +3269,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = self.s.conn;
                 conn.lock();
                 defer conn.unlock();
-                if (self.s.reset or self.over or self.gone_sent or self.gone_pending) return false;
-                self.bursting = true;
+                if (self.s.reset or !self.notice.begin()) return false;
                 // A reset cancels the burst's task (`cancelHandler`).
                 self.s.task = placement.currentTask(conn.ep.io);
                 return true;
@@ -3281,7 +3281,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                const over = self.over or self.s.reset;
+                const over = self.notice == .over or self.s.reset;
                 conn.unlock();
                 if (over) return error.Gone;
                 const sink_state = &self.ex.sink_state;
@@ -3300,13 +3300,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn finishBurst(self: *H3Parked) void {
                 const conn = self.s.conn;
                 conn.lock();
-                self.bursting = false;
                 self.s.task = null;
-                const deliver = self.gone_pending and !self.gone_sent and !self.over;
-                if (deliver) {
-                    self.gone_pending = false;
-                    self.gone_sent = true;
-                }
+                const deliver = self.notice.endBurst();
                 conn.unlock();
                 if (deliver) self.owner.gone(self.owner.ctx);
             }
@@ -3319,8 +3314,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                const already = self.over;
-                self.over = true;
+                const already = self.notice.finish();
                 const reset = self.s.reset;
                 conn.unlock();
                 // The middleware finishers, then FIN (`detachedEnd`).
@@ -3332,7 +3326,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                self.over = true;
+                _ = self.notice.finish();
                 conn.unlock();
                 self.s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
                 self.finishBurst();
@@ -3341,15 +3335,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The stream was reset or the connection is gone. Locked;
             /// never waits.
             fn peerGone(self: *H3Parked) void {
-                if (self.gone_sent or self.over) return;
                 // A burst running was canceled with the stream
                 // (`cancelHandler`): `endBurst` tells the owner.
-                if (self.bursting) {
-                    self.gone_pending = true;
-                    return;
-                }
-                self.gone_sent = true;
-                self.owner.gone(self.owner.ctx);
+                if (self.notice.peerGone() == .tell) self.owner.gone(self.owner.ctx);
             }
 
             fn release(p: *dusty.Parked) void {
