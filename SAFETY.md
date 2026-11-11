@@ -61,6 +61,8 @@ A pin (a handle's state word moved to a busy state, such as `polling`, while ano
 
 Anything else is re-fetched through its handle after the task resumes. This is Rust's "borrow across await" check done by hand, and every bug in the table above broke it.
 
+Executor buffers (K12, #48) come in two kinds under M3. A buffer taken from a per-executor pool (request buffer sets, write buffers, WebSocket `read_blocks`, TLS blocks) belongs to the one connection that took it until it gives it back, so that connection may hold it across a suspension: it is owned by the current task. A buffer that every task on an executor shares, with no owner per use (the per-thread encoders and their scratch, src/http/core/encoders.zig), is never referenced across a suspension: bytes still needed after a wait (unconsumed input, unsent output, a head or message a handler may still read) are first copied into memory the connection owns. Debug builds check the shared kind with a read section around the borrow (`safety.readSectionEntered`/`readSectionLeft`), so a task that suspends while borrowing one panics and the report names where the borrow began; release builds pay nothing.
+
 **M4. Arena memory never escapes its arena.** Nothing that outlives the request or batch keeps a slice of its arena. Copy it into memory owned by the longer-lived object.
 
 **M5. Teardown runs exactly once.** Objects with a teardown carry a state field (`alive → closing → dead`). `deinit` asserts `closing` and sets `dead`. A second teardown, or any use after `dead`, panics in debug builds. No `deinit` may be reachable from two paths without going through that state.
@@ -200,4 +202,5 @@ Each step:
 - maps its objects to M2's classes;
 - replaces its own counters and flags with the shared mechanisms;
 - adds the debug checks;
-- adds a regression test for each bug class it closes.
+- adds a regression test for each bug class it closes;
+- sorts each buffer it keeps per executor or per thread into M3's two kinds (pooled and owned while taken, or shared and never held across a suspension), and puts a read section around each borrow of a shared one.

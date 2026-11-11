@@ -65,6 +65,8 @@ pub const admission = @import("admission.zig");
 /// Read-mostly data behind an atomic pointer with quiescent-state
 /// reclamation (SAFETY.md L7).
 pub const qsbr = @import("qsbr.zig");
+/// Internal, for tests on the real runtime: the per-thread encoders.
+pub const _encoders = @import("encoders.zig");
 /// Counters kept per executor and summed when read (SAFETY.md L6/L7).
 pub const exec_counter = @import("exec_counter.zig");
 /// A sealable multi-producer, single-consumer push list (SAFETY.md L7's
