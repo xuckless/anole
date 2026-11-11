@@ -30,6 +30,13 @@ pub const Options = struct {
     /// Jobs that run at once; more wait for a free slot. Null: half the
     /// CPUs, at least 2.
     threads: ?usize = null,
+    /// Callers that may wait for a slot while every one is taken; one
+    /// more fails at once with `error.ServiceUnavailable` (a 503 from a
+    /// handler that `try`s it) rather than wait out its deadline behind
+    /// the queue (Envoy's `max_pending_requests`, a Java executor's bounded
+    /// queue). Null: no bound, every caller waits (a request's deadline
+    /// still ends its wait).
+    max_waiting: ?usize = null,
 };
 
 /// What a caller asks for besides the job (`runWith`).
@@ -52,12 +59,13 @@ pub const OnCancel = struct {
 };
 
 /// What `run(io, func, args)` returns: `func`'s result, with
-/// `error.Canceled` added.
+/// `error.Canceled` and `error.ServiceUnavailable` (`Options.max_waiting`)
+/// added.
 pub fn Result(comptime Func: type) type {
     const R = @typeInfo(Func).@"fn".return_type.?;
     return switch (@typeInfo(R)) {
-        .error_union => |eu| (eu.error_set || error{Canceled})!eu.payload,
-        else => error{Canceled}!R,
+        .error_union => |eu| (eu.error_set || error{ Canceled, ServiceUnavailable })!eu.payload,
+        else => error{ Canceled, ServiceUnavailable }!R,
     };
 }
 
@@ -67,6 +75,8 @@ pub fn Result(comptime Func: type) type {
 pub const Pool = struct {
     rt: *zio.Runtime,
     threads: usize,
+    /// `Options.max_waiting`.
+    max_waiting: ?usize = null,
     /// Guards the counts; a job holds a slot (`running`) while it runs.
     mutex: safety.Mutex(.leaf) = .init,
     changed: safety.Condition = .init,
@@ -81,7 +91,7 @@ pub const Pool = struct {
     pub fn init(self: *Pool, rt: *zio.Runtime, opts: Options) !void {
         const threads = opts.threads orelse @max(2, (std.Thread.getCpuCount() catch 4) / 2);
         if (threads == 0) return error.InvalidThreadCount;
-        self.* = .{ .rt = rt, .threads = threads };
+        self.* = .{ .rt = rt, .threads = threads, .max_waiting = opts.max_waiting };
         try register(self);
     }
 
@@ -99,9 +109,12 @@ pub const Pool = struct {
         while (self.running > 0 or self.waiting > 0) self.changed.waitUncancelable(io, &self.mutex);
     }
 
-    fn acquire(self: *Pool, io: std.Io) error{ Canceled, PoolClosed }!void {
+    fn acquire(self: *Pool, io: std.Io) error{ Canceled, PoolClosed, ServiceUnavailable }!void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
+        if (!self.closed and self.running >= self.threads) if (self.max_waiting) |max| {
+            if (self.waiting >= max) return error.ServiceUnavailable;
+        };
         self.waiting += 1;
         defer {
             self.waiting -= 1;
@@ -422,6 +435,48 @@ test "blocking.Pool: deinit waits for the running job, refuses the waiting one, 
             return 7;
         }
     }.seven, .{}));
+}
+
+test "blocking.Pool: past max_waiting a caller fails at once; the waiting one still runs" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var pool: Pool = undefined;
+    try pool.init(rt, .{ .threads = 1, .max_waiting = 1 });
+    defer pool.deinit();
+
+    const Jobs = struct {
+        fn work(_io: std.Io, go: *const std.atomic.Value(bool)) u32 {
+            spinUntilSet(_io, go);
+            return 1;
+        }
+        fn call(p: *Pool, _io: std.Io, go: *const std.atomic.Value(bool)) !u32 {
+            return p.run(_io, work, .{ _io, go });
+        }
+        fn oneRunsOneWaits(p: *Pool) bool {
+            const pio = p.rt.io();
+            p.mutex.lockUncancelable(pio);
+            defer p.mutex.unlock(pio);
+            return p.running == 1 and p.waiting == 1;
+        }
+    };
+    var go: std.atomic.Value(bool) = .init(false);
+    var first = try io.concurrent(Jobs.call, .{ &pool, io, &go });
+    var second = try io.concurrent(Jobs.call, .{ &pool, io, &go });
+    defer {
+        go.store(true, .release);
+        _ = first.cancel(io) catch 0;
+        _ = second.cancel(io) catch 0;
+    }
+    try test_wait.waitUntil(io, "one job runs and one waits for the slot", &pool, Jobs.oneRunsOneWaits);
+    // The third caller is past the bound: refused without waiting.
+    try std.testing.expectError(error.ServiceUnavailable, Jobs.call(&pool, io, &go));
+    go.store(true, .release);
+    try std.testing.expectEqual(@as(u32, 1), try first.await(io));
+    try std.testing.expectEqual(@as(u32, 1), try second.await(io));
+    // With the slot free again, a caller runs at once.
+    try std.testing.expectEqual(@as(u32, 1), try Jobs.call(&pool, io, &go));
 }
 
 test "blocking.runWith: on_cancel asks a running job to stop, and the caller gets error.Canceled" {
