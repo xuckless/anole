@@ -633,6 +633,9 @@ pub const Config = struct {
         /// Make every new client prove its address with a Retry first.
         validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
+        /// How long a new connection may take to complete its handshake
+        /// (0: no limit).
+        handshake_timeout_ms: u32 = 10_000,
         /// Advertise HTTP/3 with Alt-Svc on the TLS listener's responses.
         alt_svc: bool = true,
         /// Take 0-RTT from resuming clients (replayable: safe methods only
@@ -923,6 +926,9 @@ pub const Config = struct {
         read_ahead: u32 = 256 * 1024,
         max_connections: ?u32 = null,
         log_connections: bool = false,
+        /// No `anole.net.Tcp.Options` field: a Zig handler's opt-out is a
+        /// `drain` callback (`net.TcpTable.close_on_drain`).
+        close_on_drain: bool = true,
     };
 
     /// `Listener.udp`: `anole.net.Udp.Options` (no sessions: a binding keeps
@@ -2251,6 +2257,18 @@ test "config: http3.send_memory parses, defaults to null (auto) and is at least 
     const d = try parse(a, "{}", &why);
     try std.testing.expectEqual(@as(?usize, null), d.http3.send_memory);
     try std.testing.expectError(error.Config, parse(a, "{\"http3\": {\"send_memory\": 100}}", &why));
+}
+
+test "config: http3.handshake_timeout_ms parses and defaults to 10 s" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a, "{\"http3\": {\"handshake_timeout_ms\": 5000}}", &why);
+    try std.testing.expectEqual(@as(u32, 5000), c.http3.handshake_timeout_ms);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(@as(u32, 10_000), d.http3.handshake_timeout_ms);
 }
 
 test "config: log.format and log.service parse; the access log's format defaults to auto" {

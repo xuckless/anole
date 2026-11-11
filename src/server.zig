@@ -42,16 +42,17 @@ const lambda_serve = if (features.lambda) @import("lambda/serve.zig") else struc
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
-/// The text `/config` shows, rendered once at init: the resolved modes, the
+/// The text `/config` shows, rendered at init and again in `listenOn`, once
+/// the listeners are decided: the resolved modes, the
 /// options with secrets left out, the `.env` files read (names and counts
 /// only) and the features this build has.
-fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const modes.Resolved) ![]const u8 {
+fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const modes.Resolved, used_listen_tls: bool, rt: *zio.Runtime) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(a);
     const w = &aw.writer;
     try w.writeAll("# modes\n");
     var lines: [2048]u8 = undefined;
     var lw: std.Io.Writer = .fixed(&lines);
-    modes.writeLines(mode, .{ .used_listen_tls = false }, &lw) catch {};
+    modes.writeLines(mode, .{ .used_listen_tls = used_listen_tls }, &lw) catch {};
     var it = std.mem.splitScalar(u8, lw.buffered(), '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
@@ -68,6 +69,8 @@ fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const 
     inline for (.{ "tls", "http2", "http3", "grpc", "websocket", "auth", "compression", "brotli", "json", "redis", "postgres", "sqlite", "mongodb", "nats", "kafka", "openapi" }) |name| {
         try w.print("{s} = {any}\n", .{ name, @field(features, name) });
     }
+    try w.writeAll("\n# runtime\n");
+    try observe_runtime.writeConfigLines(w, rt);
     return aw.written();
 }
 
@@ -110,6 +113,7 @@ fn checkPattern(comptime method: []const u8, comptime path: []const u8) void {
 const ResponseCache = @import("cache/response.zig").ResponseCache;
 const client_mod = @import("client.zig");
 const observe = @import("observe/root.zig");
+const observe_runtime = @import("observe/runtime.zig");
 const websocket = if (features.websocket) @import("websocket/root.zig") else struct {
     pub const UpgradeOptions = struct {};
 };
@@ -577,6 +581,10 @@ pub const Options = struct {
         validate_address: bool = false,
         /// How long a connection may sit idle before it is closed.
         idle_timeout: std.Io.Duration = .fromSeconds(30),
+        /// How long a new connection may take to complete its handshake
+        /// before it is closed; requests held for a 0-RTT handshake end
+        /// with it. Zero: no limit (only `idle_timeout`).
+        handshake_timeout: std.Io.Duration = .fromSeconds(10),
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
         /// 0-RTT run at once, with `Early-Data: 1` among their headers
@@ -1251,7 +1259,6 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     return err;
                 };
             }
-            const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode) catch "" else "";
 
             // Under AWS Lambda at one invocation at a time, one executor:
             // one thread, the least memory, the fastest init.
@@ -1273,6 +1280,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 },
             });
             errdefer rt.deinit();
+            const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false, rt) catch "" else "";
             const rt_io = rt.io();
             server_on_thread = true;
             errdefer server_on_thread = false;
@@ -1597,6 +1605,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // What the options left null, from the modes.
             var opts = opts_in;
             try modes.fillListeners(a, &opts, self.mode);
+            // What this server binds (#96): `listen` and `listenTls` set
+            // http/https after init and the modes filled the rest just now.
+            // The console starts after this (`runInner`), so no reader yet;
+            // the init text stays in the arena.
+            if (comptime features.console) if (self.console_resolved.enabled) {
+                self.console_config_text = renderConsoleConfig(a, &opts, self.mode, self.used_listen_tls, self.rt) catch self.console_config_text;
+            };
             const specs = try listenerSpecs(a, opts, self.mode);
             {
                 var why_buf: [512]u8 = undefined;
@@ -1778,6 +1793,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .max_streams_bidi = q.max_streams_bidi,
                     .validate_address = q.validate_address,
                     .idle_timeout = q.idle_timeout,
+                    .handshake_timeout = q.handshake_timeout,
                     .hq_interop_root = q.hq_interop_root,
                     .prefer_v2 = q.prefer_v2,
                     .early_data = q.early_data,
@@ -3815,6 +3831,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     // adapter writes the deployment line once it is ready.
                     self.logModes();
                     logBuildMode(self.mode.debug_production);
+                    self.logIoEngine();
                     return lambda_serve.serve(Ctx, self);
                 }
             }
@@ -3823,6 +3840,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.logModes();
             self.sseNote();
             logBuildMode(self.mode.debug_production);
+            self.logIoEngine();
             self.addHelperRoutes();
             if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
                 errors.log.err("openapi: the document can't be built: {t}", .{err});
@@ -4061,6 +4079,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (line.len == 0) continue;
                 if (line[0] == '!') log.warn("{s}", .{line[1..]}) else log.info("{s}", .{line});
             }
+        }
+
+        /// The I/O engine, once at startup; when io_uring was expected but
+        /// epoll runs, the likely cause (zio drops the real error).
+        fn logIoEngine(self: *const Self) void {
+            const log = std.log.scoped(.anole);
+            if (observe_runtime.ioUringFallback(self.rt)) |cause|
+                log.info("I/O engine: epoll; io_uring is unavailable, {s}", .{observe_runtime.causeText(cause)})
+            else
+                log.info("I/O engine: {s}", .{observe_runtime.ioEngine(self.rt)});
         }
 
         /// Which build this is; a loud word for ReleaseFast, which has none

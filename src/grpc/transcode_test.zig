@@ -482,6 +482,23 @@ fn checkVerbs(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u16, 404), no_verb.status);
 }
 
+fn checkZeroSegments(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // `**` also matches no segment: the variable is empty.
+    const f = try send(ctx, arena, .{ .method = .get, .path = "/files/x" });
+    try std.testing.expectEqual(@as(u16, 200), f.status);
+    try std.testing.expectEqualStrings("{\"title\":\"file\"}", f.body);
+    const slash = try send(ctx, arena, .{ .method = .get, .path = "/files/x/" });
+    try std.testing.expectEqualStrings("{\"title\":\"file\"}", slash.body);
+    const i = try send(ctx, arena, .{ .method = .get, .path = "/info:stat" });
+    try std.testing.expectEqual(@as(u16, 200), i.status);
+    try std.testing.expectEqualStrings("{\"title\":\"info\"}", i.body);
+    const no_verb = try send(ctx, arena, .{ .method = .get, .path = "/info" });
+    try std.testing.expectEqual(@as(u16, 404), no_verb.status);
+    // One segment and more are as before.
+    const one = try send(ctx, arena, .{ .method = .get, .path = "/files/x/a" });
+    try std.testing.expectEqualStrings("{\"name\":\"a\",\"title\":\"file\"}", one.body);
+}
+
 fn checkCustomMethod(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
     // A custom HTTP method.
     const r = try send(ctx, arena, .{ .method = .search, .path = "/v1/books", .body = "{\"view\":\"S\"}" });
@@ -590,6 +607,10 @@ test "transcoding: DELETE" {
 
 test "transcoding: verbs after a variable, a literal and **" {
     try overBoth(checkVerbs);
+}
+
+test "transcoding: ** matches zero segments" {
+    try overBoth(checkZeroSegments);
 }
 
 test "transcoding: a custom HTTP method" {

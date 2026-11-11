@@ -1256,6 +1256,11 @@ test "gRPC client: a caller canceled while a send waits for flow control gets Ca
         fn body(env: *SleepEnv) anyerror!void {
             var st: CallerState = .{ .io = env.io, .channel = env.channel };
             var f = try env.io.concurrent(caller, .{&st});
+            // The server has the call first: a full outbox alone can come
+            // before the client's writer sent the request HEADERS, and a
+            // cancel then sends nothing (nghttp2 drops the queued HEADERS
+            // with the reset), so no handler would ever run or end.
+            wait.waitFlag(env.io, "the sleeping handler started", &Sleeper.started) catch |err| return joinAfter(env, &f, err);
             wait.waitUntil(env.io, "a send waiting for flow control", &st, CallerState.blockedInSend) catch |err| return joinAfter(env, &f, err);
             try std.testing.expectError(error.Canceled, f.cancel(env.io));
             try env.expectHandlerCanceled();

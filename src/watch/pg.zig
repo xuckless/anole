@@ -14,6 +14,7 @@ const resilience = @import("../resilience/root.zig");
 
 const Watch = root.Watch;
 const log = @import("../errors.zig").log;
+const builtin = @import("builtin");
 
 /// How often the hub asks the server whether the connection is alive.
 const keepalive_interval: std.Io.Duration = .fromSeconds(30);
@@ -268,6 +269,7 @@ pub const NotifyHub = struct {
         var seen: std.ArrayList(*Watch) = .empty;
         defer seen.deinit(self.gpa);
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var it = self.channels.valueIterator();
         while (it.next()) |ch| for (ch.*.watches.items) |w| {
             var dup = false;
@@ -277,8 +279,13 @@ pub const NotifyHub = struct {
             };
             if (!dup) seen.append(self.gpa, w) catch {};
         };
-        self.mutex.unlock(self.io);
-        for (seen.items) |w| w.gapped(detail);
+        // Still under the hub's lock, as `dispatch` and `statusAll`: a watch
+        // that `stop` took out (and `deinit` may have freed) is never reached
+        // (#165, #157).
+        for (seen.items) |w| {
+            testOnGap(self);
+            w.gapped(detail);
+        }
     }
 
     /// Every 30 s a ping; no answer in 10 s means a dead connection, which
@@ -327,4 +334,61 @@ pub fn register(w: *Watch) !void {
 pub fn unregister(w: *Watch) void {
     const hub = w.source.postgres.client.notify_hub orelse return;
     hub.remove(w, w.source.postgres.channels);
+}
+
+/// Tests: runs before each watch `gapAll` gives a gap, with the hub.
+/// Test builds only.
+pub var test_on_gap: if (builtin.is_test) std.atomic.Value(?*const fn (*NotifyHub) void) else void = if (builtin.is_test) .init(null) else {};
+
+fn testOnGap(hub: *NotifyHub) void {
+    if (comptime !builtin.is_test) return;
+    const hook = test_on_gap.load(.acquire) orelse return;
+    hook(hub);
+}
+
+const GapProbe = struct {
+    var calls: usize = 0;
+    var unlocked: usize = 0;
+    fn hook(hub: *NotifyHub) void {
+        calls += 1;
+        // `tryLock` succeeding means the hub's lock was free at the gap.
+        if (hub.mutex.tryLock()) {
+            hub.mutex.unlock(hub.io);
+            unlocked += 1;
+        }
+    }
+};
+
+test "watch postgres: gapAll reaches each watch under the hub's lock, once (#165)" {
+    const zio = @import("zio");
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const rio = rt.io();
+    // Nothing listens on port 1: the reader `add` starts is refused again
+    // and again, and never reaches `gapAll` (only a reconnect does).
+    const client = try pg_root.Client.init(gpa, rio, .{ .url = "postgres://u@127.0.0.1:1/db", .environ = .empty });
+    defer client.deinit();
+    const hub = try client._notifyHub();
+    const w1 = try Watch.init(gpa, rio, .{ .postgres = .{ .client = client, .channels = &.{ "a", "b" } } }, .{});
+    defer w1.deinit();
+    const w2 = try Watch.init(gpa, rio, .{ .postgres = .{ .client = client, .channels = &.{"a"} } }, .{});
+    defer w2.deinit();
+    try hub.add(w1, &.{ "a", "b" });
+    try hub.add(w2, &.{"a"});
+    defer {
+        hub.remove(w1, &.{ "a", "b" });
+        hub.remove(w2, &.{"a"});
+    }
+    GapProbe.calls = 0;
+    GapProbe.unlocked = 0;
+    test_on_gap.store(&GapProbe.hook, .release);
+    defer test_on_gap.store(null, .release);
+    hub.gapAll("test");
+    try std.testing.expectEqual(@as(usize, 2), GapProbe.calls);
+    try std.testing.expectEqual(@as(usize, 0), GapProbe.unlocked);
+    try std.testing.expectEqual(@as(u64, 1), w1.n_gaps.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), w2.n_gaps.load(.monotonic));
 }

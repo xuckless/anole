@@ -24,6 +24,8 @@ const unix_path_max = 108;
 /// anyway.
 const early_response_wait: std.Io.Duration = .fromMilliseconds(50);
 
+const request_mod = @import("request.zig");
+const allocRemainingHinted = request_mod.allocRemainingHinted;
 const config_mod = @import("config.zig");
 const Cert = config_mod.Cert;
 const Ca = config_mod.Ca;
@@ -1436,17 +1438,23 @@ pub const ClientResponse = struct {
     /// reader `reader` hands out carries one of these in `.err`.
     pub const ReadError = ResponseBodyReader.Error;
 
-    /// Read the entire response body into memory.
+    /// Read the entire response body into memory. The declared
+    /// Content-Length sizes the buffer up front (capped at 16 KiB).
     /// Result is cached for subsequent calls.
     pub fn body(self: *ClientResponse) !?[]const u8 {
         if (self._body_read) {
             return self._body;
         }
 
-        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        // Nothing to stage: the read streams straight into the arena.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
+        // The framed length sizes the buffer (at most 16 KiB up front). A
+        // bodyless response (HEAD, 1xx, 204, 304, length 0) is complete at
+        // the head whatever Content-Length said, and a decoder changes the
+        // length, so neither gets a hint.
+        const hint: ?usize = if (r.decode == null and !self.parser.isBodyComplete()) self.parsed.content_length else null;
+        const result = allocRemainingHinted(&r.interface, self.arena, self.max_response_size, hint) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             error.ReadFailed => return r.err orelse error.Unexpected,
             else => |e| return e,
@@ -3366,6 +3374,69 @@ test "ClientResponse.body: chunked trailers are not headers" {
 
     try std.testing.expectEqualStrings("hello", (try response.body()).?);
     try std.testing.expectEqual(null, response.headers().get("X-Trailer"));
+}
+
+/// Reads the body of `raw` (a whole response) through `ClientResponse.body`
+/// and returns what the read asked of the response's arena. `expected` is
+/// the body (null: none), or the error the read must fail with.
+fn bodyCounts(raw: []const u8, head_request: bool, max: usize, expected: anyerror!?[]const u8) !request_mod.BodyAllocCounter {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counter: request_mod.BodyAllocCounter = .{ .child = arena.allocator() };
+
+    var reader = try fixedMessageReader(arena.allocator(), raw);
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+    parser.head_request = head_request;
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = counter.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = max,
+    };
+    if (expected) |want| {
+        const got = try response.body();
+        if (want) |w| {
+            try std.testing.expectEqualSlices(u8, w, got.?);
+        } else {
+            try std.testing.expectEqual(null, got);
+        }
+    } else |err| {
+        try std.testing.expectError(err, response.body());
+    }
+    return counter;
+}
+
+test "ClientResponse.body: a declared length sizes the buffer" {
+    const payload = &@as([10240]u8, @splat('x'));
+    const counter = try bodyCounts("HTTP/1.1 200 OK\r\nContent-Length: 10240\r\n\r\n" ++ payload, false, 1 << 20, payload);
+    try std.testing.expectEqual(1, counter.allocs);
+    try std.testing.expect(counter.largest <= 10241);
+}
+
+test "ClientResponse.body: HEAD, 204 and 304 with a Content-Length reserve nothing" {
+    const cases = [_]struct { raw: []const u8, head: bool }{
+        .{ .raw = "HTTP/1.1 204 No Content\r\nContent-Length: 5000\r\n\r\n", .head = false },
+        .{ .raw = "HTTP/1.1 304 Not Modified\r\nContent-Length: 5000\r\n\r\n", .head = false },
+        .{ .raw = "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n", .head = true },
+    };
+    for (cases) |case| {
+        const counter = try bodyCounts(case.raw, case.head, 1 << 20, null);
+        try std.testing.expect(counter.largest < 5000);
+    }
+}
+
+test "ClientResponse.body: a peer declaring more than it sends gets no more than the reservation" {
+    const counter = try bodyCounts("HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\nx", false, 2 << 20, error.IncompleteBody);
+    try std.testing.expect(counter.largest <= 16 * 1024 + 1);
+}
+
+test "ClientResponse.body: a chunked body takes no hint" {
+    _ = try bodyCounts("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", false, 1024, "hello");
 }
 
 test "ClientResponse.body: a body cut short is IncompleteBody" {

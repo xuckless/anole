@@ -153,6 +153,11 @@ pub const TcpTable = struct {
     /// the net driver and in any order with one another, instead of on a
     /// task of their own one at a time.
     inline_events: bool = false,
+    /// Without `drain`: the drain ends each connection (#107). False
+    /// leaves them open until the handler closes them or
+    /// `timeouts.shutdown` (the C ABI's `tcp.close_on_drain`; a Zig
+    /// handler that wants that gives itself a `drain` callback).
+    close_on_drain: bool = true,
 };
 
 /// A TCP service for `Listener.tcp`: what `app.tcp` builds.
@@ -1707,7 +1712,19 @@ const TcpConn = struct {
         if (t.flags.load(.seq_cst) & Flag.drain_pending != 0) {
             const f = t.flags.fetchAnd(~Flag.drain_pending, .seq_cst);
             if (f & Flag.drain_pending != 0) {
-                if (t.spawn(drainTask, .spawn_drain) == .gone) return;
+                const table = t.service.table;
+                if (table.drain == null and table.inline_events) {
+                    // Nothing to wait for (no callback, no `callLock`): the
+                    // end is taken here. Its claim of the outbox, if it
+                    // makes one, is served below as this kick's.
+                    _ = t.drainEndKick();
+                } else switch (t.spawn(drainTask, .spawn_drain)) {
+                    .started => {},
+                    .gone => return,
+                    // No task (no suspension, `t` is there): the default
+                    // end rather than none, without the callback.
+                    .refused => _ = t.drainEndKick(),
+                }
             }
         }
         if (comptime native_os == .windows) if (t.flags.load(.seq_cst) & Flag.cancel_reader != 0) {
@@ -2104,13 +2121,15 @@ const TcpConn = struct {
 
     /// Runs under the drain's lock, on any task: must not wait. The driver
     /// starts the callback on the connection's executor, or without one
-    /// the default end (`drainTask`). The task form watches
-    /// `drainEvent`, and the C ABI's events are the consumer's: neither
-    /// gets the default.
+    /// the default end (`drainEndKick`). The task form watches `drainEvent`
+    /// and gets no default. The C ABI's table has no `drain` and gets it
+    /// (#166), taken by the driver itself: its consumer sees
+    /// ANOLE_EV_NET_CLOSE with reason DRAIN. A table without
+    /// `close_on_drain` gets nothing either.
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
         const table = t.service.table;
-        if (table.drain == null and (table.task != null or table.inline_events)) return;
+        if (table.drain == null and (table.task != null or !table.close_on_drain)) return;
         // `.seq_cst`: see `serviceKick`.
         _ = t.flags.fetchOr(Flag.drain_pending, .seq_cst);
         t.driver.kick(t.kick);
@@ -2128,10 +2147,21 @@ const TcpConn = struct {
         defer t.callUnlock();
         if (t.isClosed()) return;
         const f = t.service.table.drain orelse {
-            t.setReason(.drain);
-            return t.requestEnd(true);
+            if (t.drainEndKick()) |k| k.run();
+            return;
         };
         f(t.service.state, &t.conn) catch |err| t.callbackFailed("drain", err);
+    }
+
+    /// The drain's default end (#107): as `close`, with reason `.drain`;
+    /// nothing when the handler closed or reset the connection already
+    /// (its own reason stands). One whose write side alone ended (`end`,
+    /// a half-close) is still closed. Never waits; the kick to make, or
+    /// null.
+    fn drainEndKick(t: *TcpConn) ?Kick {
+        if (t.close_graceful.load(.acquire) or t.reset_requested.load(.acquire)) return null;
+        t.setReason(.drain);
+        return t.requestEndKick(true);
     }
 
     /// A callback task's error. Canceled: released (`release` reports the
