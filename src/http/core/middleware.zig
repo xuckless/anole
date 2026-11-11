@@ -153,10 +153,11 @@ pub fn Chain(comptime Ctx: type) type {
                     // By what it was answered with, which an `uncaughtError`
                     // or `error_handler` may have chosen: a 4xx is the
                     // request's fault, a 5xx the server's.
-                    // A WebSocket upgrade the admission gate refused (503):
-                    // load shed on purpose, counted in its metrics, and not
-                    // worth a line per refusal while overloaded.
-                    if (@backingInt(self.res.status) < 500 or self.req._ws_admission == .refused) {
+                    // A WebSocket upgrade the admission gate refused, or a
+                    // body over the buffer budget (503): load shed on
+                    // purpose, counted in its metrics, and not worth a
+                    // line per refusal while overloaded.
+                    if (@backingInt(self.res.status) < 500 or self.req._ws_admission == .refused or self.req._shed) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         if (!expect_log.swallow()) {

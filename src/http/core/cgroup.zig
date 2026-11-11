@@ -90,6 +90,74 @@ pub fn memoryLimit(io: std.Io) std.Io.Cancelable!?u64 {
     return parseMemoryMax(try readFile(io, path, &buf) orelse return null);
 }
 
+/// A quarter of the cgroup's limit or of RAM, whichever is lower, at
+/// least 64 MiB (as the JVM sizes its heap by default,
+/// MaxRAMPercentage=25); 1 GiB when neither can be read. HTTP/3's send
+/// memory and the server's buffer budget (`ServerConfig.buffer_budget`)
+/// each default to it.
+pub fn memoryQuarter(cgroup_max: ?u64, ram: ?u64) u64 {
+    const min_limit: u64 = 64 << 20;
+    const memory = if (cgroup_max) |cg| (if (ram) |r| @min(cg, r) else cg) else ram orelse return 1 << 30;
+    return @max(min_limit, memory / 4);
+}
+
+/// What the process's memory map allows, for `ServerConfig.max_tasks`:
+/// `vm.max_map_count` and the mappings in use now. Null off Linux, or when
+/// either can't be read.
+pub const MapCount = struct {
+    max: u64,
+    in_use: u64,
+};
+
+pub fn mapCount(io: std.Io) std.Io.Cancelable!?MapCount {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [32]u8 = undefined;
+    const max = parseCount(try readFile(io, "/proc/sys/vm/max_map_count", &buf) orelse return null) orelse return null;
+    // One line per mapping; read in pieces, as a process may have
+    // thousands.
+    const file = std.Io.Dir.cwd().openFile(io, "/proc/self/maps", .{}) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
+    defer file.close(io);
+    var maps_buf: [4096]u8 = undefined;
+    var r = file.readerStreaming(io, &maps_buf);
+    const in_use = countLines(&r.interface) catch |err| switch (err) {
+        error.ReadFailed => if (r.err) |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return null,
+        } else return null,
+    };
+    return .{ .max = max, .in_use = in_use };
+}
+
+/// Request tasks per executor that `vm.max_map_count` leaves room for:
+/// what the mappings in use and an eighth of headroom (malloc, TLS, the
+/// tasks nothing counts) leave, at two mappings per coroutine stack (zio
+/// maps a stack's guard and its committed part apart, slabs included),
+/// over the executors; at least 3 (`admission.State.min_task_cap`: an
+/// HTTP/2 connection and its first stream).
+pub fn taskCap(m: MapCount, executors: usize) u32 {
+    const free = m.max -| m.in_use -| m.max / 8;
+    const per = free / 2 / @max(executors, 1);
+    return @intCast(@max(3, @min(per, std.math.maxInt(u32) - 1)));
+}
+
+fn parseCount(content: []const u8) ?u64 {
+    return std.fmt.parseInt(u64, std.mem.trim(u8, content, " \n"), 10) catch null;
+}
+
+fn countLines(r: *std.Io.Reader) error{ReadFailed}!u64 {
+    var n: u64 = 0;
+    while (true) {
+        _ = r.discardDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return n,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        n += 1;
+    }
+}
+
 /// memory.max holds a byte count, or the literal "max" when there is no limit.
 fn parseMemoryMax(content: []const u8) ?u64 {
     const s = std.mem.trim(u8, content, " \n");
@@ -206,4 +274,50 @@ test "roundRatio: ceil with floor of 2" {
     // A quota far above the period does not fit a u32: no real limit.
     try std.testing.expectEqual(std.math.maxInt(u32), roundRatio(9.2e18));
     try std.testing.expectEqual(std.math.maxInt(u32), roundRatio(parseV2("9223372036854775807 1").?));
+}
+
+test "memoryQuarter: a quarter of the lower of the cgroup's and RAM, at least 64 MiB" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    // A quarter of RAM with no cgroup limit; of the cgroup's when lower.
+    try std.testing.expectEqual(8 * GiB, memoryQuarter(null, 32 * GiB));
+    try std.testing.expectEqual(512 * MiB, memoryQuarter(2 * GiB, 32 * GiB));
+    // A cgroup limit above RAM (or a huge one) leaves RAM's.
+    try std.testing.expectEqual(8 * GiB, memoryQuarter(1 << 62, 32 * GiB));
+    try std.testing.expectEqual(GiB, memoryQuarter(4 * GiB, null));
+    // At least 64 MiB; 1 GiB when neither is known.
+    try std.testing.expectEqual(64 * MiB, memoryQuarter(128 * MiB, 32 * GiB));
+    try std.testing.expectEqual(GiB, memoryQuarter(null, null));
+    // Split per executor, as the buffer budget is.
+    try std.testing.expectEqual(256 * MiB, memoryQuarter(null, 32 * GiB) / 32);
+}
+
+test "taskCap: the room vm.max_map_count leaves, two mappings a task, per executor" {
+    // 65530 - 1500 - 8191 = 55839 mappings; 27919 tasks; 6979 each of 4.
+    try std.testing.expectEqual(@as(u32, 6979), taskCap(.{ .max = 65530, .in_use = 1500 }, 4));
+    try std.testing.expectEqual(@as(u32, 27919), taskCap(.{ .max = 65530, .in_use = 1500 }, 0));
+    // Nothing left still lets an HTTP/2 connection and its first stream
+    // through.
+    try std.testing.expectEqual(@as(u32, 3), taskCap(.{ .max = 1000, .in_use = 5000 }, 4));
+    // A huge limit stays below "no cap".
+    try std.testing.expect(taskCap(.{ .max = 1 << 62, .in_use = 0 }, 1) < std.math.maxInt(u32));
+}
+
+test "mapCount parsing: the sysctl's number and one mapping per line" {
+    try std.testing.expectEqual(@as(?u64, 65530), parseCount("65530\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCount("lots\n"));
+    var r: std.Io.Reader = .fixed(
+        \\55d0c8a00000-55d0c8a01000 r--p 00000000 00:1f 123 /usr/bin/x
+        \\55d0c8a01000-55d0c8a02000 r-xp 00001000 00:1f 123 /usr/bin/x
+        \\7ffc1a000000-7ffc1a021000 rw-p 00000000 00:00 0 [stack]
+        \\
+    );
+    try std.testing.expectEqual(@as(u64, 3), try countLines(&r));
+    var empty: std.Io.Reader = .fixed("");
+    try std.testing.expectEqual(@as(u64, 0), try countLines(&empty));
+    // The running process has some, on Linux.
+    if (builtin.os.tag == .linux) {
+        const m = (try mapCount(std.testing.io)) orelse return;
+        try std.testing.expect(m.max > 0 and m.in_use > 0);
+    }
 }

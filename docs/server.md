@@ -243,6 +243,8 @@ pinned, every deadline is exact.
 | `max_requests_per_connection` | none | Requests per keep-alive connection. |
 | `ws_max_message` | 1 MiB | The largest WebSocket message, in or out; a route's `max_message_size` overrides it. |
 | `max_websockets` | none | Open WebSockets at most, over HTTP/1.1, HTTP/2 and HTTP/3; past it an upgrade gets 503 with `Retry-After`. See [Overload](#overload). |
+| `buffer_budget` | a quarter of memory over the executors | Bytes per executor that bodies collected whole and WebSocket messages being reassembled may hold; past it, 503 with `Retry-After` or close 1013. See [Buffer budget](#buffer-budget-and-task-cap). |
+| `max_tasks` | from `vm.max_map_count` (Linux) | Request tasks per executor, at least 3; a quarter below it accepts wait, at it streams are refused. See [Buffer budget](#buffer-budget-and-task-cap). |
 
 `proxy`: `trusted` (null), `trusted_hops` (0), `trust_forwarded_proto` (true) and
 `trust_forwarded_host` (false), as in [Behind a proxy](#behind-a-proxy).
@@ -449,9 +451,13 @@ fn report(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
 `anole.blocking.run(io, func, args)` calls `func(args...)` on a pool thread.
 The request's task waits without holding its executor, which goes on
-serving. The result is `func`'s, with `error.Canceled` added. The pool
-lets `threads` jobs run at once, by default half the CPUs and at least 2;
-more wait their turn. Without a pool, `run` calls `func` directly, so
+serving. The result is `func`'s, with `error.Canceled` and
+`error.ServiceUnavailable` added. The pool lets `threads` jobs run at once,
+by default half the CPUs and at least 2; more wait their turn.
+`max_waiting` (null: no bound) bounds how many may wait: one more fails at
+once with `error.ServiceUnavailable`, a 503 from a handler that `try`s it,
+instead of spending its deadline in the queue (`anole.auth.password.verify`
+returns it too). Without a pool, `run` calls `func` directly, so
 library code can use it whether or not the application set one up.
 `anole.auth.password` does.
 
@@ -790,6 +796,58 @@ gate's numbers are on `/metrics`: `anole_executor_utilization_permille`,
 and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`; the console's
 connections view shows each executor's utilization (a `!` while hot) and
 its WebSockets view the limit and the refusals.
+
+#### Buffer budget and task cap
+
+Two more limits are per executor and on by default
+([#131](https://github.com/xuckless/anole/issues/131),
+[#48](https://github.com/xuckless/anole/issues/48)). The server logs both
+at startup: `buffer budget 262144 KiB per executor (a quarter of RAM over
+the executors); at most 6979 request tasks per executor (from
+vm.max_map_count and the mappings in use)`.
+
+- **`limits.buffer_budget`**: the bytes a peer can make an executor hold
+  before a handler has them, shared by request bodies collected whole
+  (`req.body()`, `req.json()`, `req.bind()`, the form parsers, a unary gRPC
+  message) and WebSocket messages being reassembled. By default a quarter
+  of the lower of the cgroup's `memory.max` and RAM (at least 64 MiB),
+  divided by the executors. It counts what bodies are promised, not what
+  the allocator keeps.
+  - A body with a `Content-Length` takes its whole length before its
+    first byte is read, and before a `100 Continue`: past the budget it
+    gets **503 with `Retry-After`** (as above), and over HTTP/1.x the
+    connection closes. Once admitted it never fails for memory.
+  - A body of unknown length (chunked, HTTP/2 or HTTP/3 without
+    `content-length`, or compressed) takes its bytes as they arrive, so it
+    can get that 503 **partway**: what it sent is thrown away. 413 still
+    means "over `body_max`".
+  - A WebSocket message holds its bytes only while it is in pieces (or
+    a frame larger than the read buffer, from its header); one that would
+    pass the budget is closed with **1013** (Try Again Later). Upgrades are
+    never refused for memory, and frames that fit the read buffer hold
+    nothing. Over HTTP/2 and HTTP/3 a message's first 64 KiB hold nothing
+    either: the socket keeps that much between messages anyway.
+  - An executor that holds nothing else always lets one body or message
+    through, up to its own limit, whatever the budget.
+- **`limits.max_tasks`**: request tasks per executor (HTTP/1.x
+  connections being served, HTTP/2 and HTTP/3 streams). Every coroutine
+  stack is two memory mappings, and past `vm.max_map_count` every `mmap`
+  in the process fails, malloc and TLS included. On Linux the default is
+  what the sysctl leaves after the mappings in use and an eighth of
+  headroom, at two per task, divided by the executors; elsewhere there is
+  no cap. A quarter below the cap an HTTP/1.x accept waits (new
+  connections queue in the kernel's backlog, as at `max_connections`),
+  which keeps the rest for streams: an HTTP/2 connection holds two tasks
+  (its reader and its writer) even while idle, and connections alone
+  never fill the cap. At the cap an HTTP/2 stream gets REFUSED_STREAM and
+  an HTTP/3 one H3_REQUEST_REJECTED; both are safe for the client to
+  retry. A parked connection whose next request arrives is counted but
+  never refused: its request is already there. At least 3. Raising
+  `vm.max_map_count` (above) raises it.
+
+Refusals of both kinds are counted on `/metrics` as
+`anole_requests_shed_total{reason="memory"|"tasks"}`, beside
+`anole_buffer_budget_held_bytes`, and logged at debug only.
 
 ## HTTP/2
 

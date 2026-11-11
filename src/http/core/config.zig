@@ -293,6 +293,30 @@ pub const ServerConfig = struct {
     /// it an upgrade is answered 503 with `Retry-After`, before the
     /// handshake. Null: no cap (the load gate, `admission`, still applies).
     max_websockets: ?u32 = null,
+    /// Bytes per executor that request bodies collected whole
+    /// (`Request.body`, a unary gRPC message) and WebSocket messages being
+    /// reassembled may hold at once (#131). A body of known length takes
+    /// its whole size before its first byte, or gets 503 with
+    /// `Retry-After` (an HTTP/1.x connection then closes); one of unknown
+    /// length (chunked, compressed) grows as it comes and gets that 503
+    /// partway when the budget runs out; a WebSocket message being
+    /// reassembled is closed 1013. An executor holding nothing grants one
+    /// body or message up to its own limit whatever this is. Null: a
+    /// quarter of min(cgroup `memory.max`, RAM), at least 64 MiB, over the
+    /// executors.
+    buffer_budget: ?usize = null,
+    /// Request tasks per executor at once (#48): HTTP/1.x connections
+    /// being served, HTTP/2 and HTTP/3 streams. Each task's stack is two
+    /// memory mappings, and past `vm.max_map_count` every `mmap` in the
+    /// process fails. A quarter below the cap an HTTP/1.x accept waits
+    /// (the kernel's backlog holds the next connections), so connections
+    /// never take the room streams need; at the cap a stream is refused
+    /// (REFUSED_STREAM, H3_REQUEST_REJECTED). A parked connection whose
+    /// request arrived is counted, never refused. At least 3 (an HTTP/2
+    /// connection holds two tasks). Null: on Linux, what `vm.max_map_count`
+    /// leaves after the mappings in use and an eighth of headroom, over the
+    /// executors; elsewhere no cap.
+    max_tasks: ?u32 = null,
     /// The WebSocket admission gate: while an executor is overloaded, the
     /// number of open WebSockets is held where it was, and an upgrade past
     /// it gets 503 with `Retry-After` (see `admission.Config`).

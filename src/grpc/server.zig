@@ -695,6 +695,11 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
             call.status = .resource_exhausted;
             call.status_message = "message larger than the limit";
         },
+        // The buffer budget (#131): `readWhole`'s, or `Request.body`'s 503.
+        error.Overloaded, error.ServiceUnavailable => {
+            call.status = .unavailable;
+            call.status_message = "the server's buffers are full; retry";
+        },
         error.CallLimitExceeded => {
             call.status = .resource_exhausted;
             call.status_message = "request messages over the call's limit";
@@ -948,7 +953,7 @@ pub fn transcodedBody(call: *Call, has_body: bool, whole: ?[]const u8) ![]const 
         // Bounded by max_message_size below, not by limits.body_max.
         var reader = try call.req.readerLimited(&in_buf, null);
         const hint = if (reader.decode == null) call.req.content_length else null;
-        break :blk dusty.allocRemainingHinted(&reader.interface, call.arena, call.impl.max_message_size +| 1, hint) catch |err| switch (err) {
+        break :blk dusty.allocRemainingHinted(&reader.interface, call.arena, call.impl.max_message_size +| 1, hint, bodyBudget(call)) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,
         };
@@ -1128,21 +1133,32 @@ fn frameBuffered(reader: *std.Io.Reader) bool {
     return buffered.len - frame.header_size >= length;
 }
 
+/// The request's share of the server's buffer budget (#131), given back
+/// where the request's chain ends; null off a server.
+fn bodyBudget(call: *Call) ?dusty.admission.Budget {
+    const a = call.req._config._admission orelse return null;
+    return .{ .state = a, .held = &call.req._body_held, .io = call.io };
+}
+
 /// The rest of the body, of at most `limit - 1` bytes, in the call's
 /// arena, read within the call's `read_timeout`. Sized by the declared
 /// length while nothing decodes it (`dusty.allocRemainingHinted`).
 fn readWhole(call: *Call, body: *dusty.RequestBodyReader, limit: usize, streaming: bool) ![]u8 {
     const reader = &body.interface;
     const hint = if (body.decode == null) call.req.content_length else null;
+    // A unary request is collected whole, so it counts against the
+    // buffer budget like `Request.body`; a stream's messages don't (a
+    // long stream would hold a reservation per message).
+    const budget = if (streaming) null else bodyBudget(call);
     const read = struct {
-        fn all(r: *std.Io.Reader, arena: std.mem.Allocator, max: usize, declared: ?usize) ![]u8 {
-            return dusty.allocRemainingHinted(r, arena, max, declared) catch |err| switch (err) {
+        fn all(r: *std.Io.Reader, arena: std.mem.Allocator, max: usize, declared: ?usize, b: ?dusty.admission.Budget) ![]u8 {
+            return dusty.allocRemainingHinted(r, arena, max, declared, b) catch |err| switch (err) {
                 error.StreamTooLong => error.MessageTooLarge,
                 else => |e| e,
             };
         }
     }.all;
-    const timeout = call.impl.read_timeout orelse return read(reader, call.arena, limit, hint);
+    const timeout = call.impl.read_timeout orelse return read(reader, call.arena, limit, hint, budget);
     if (streaming) {
         _ = reader.peekByte() catch |err| switch (err) {
             error.EndOfStream => return &.{},
@@ -1150,7 +1166,7 @@ fn readWhole(call: *Call, body: *dusty.RequestBodyReader, limit: usize, streamin
         };
     }
     const bound: dusty.Deadline = .init(call.io, .{ .duration = .{ .raw = timeout, .clock = .awake } });
-    return bound.run(read, .{ reader, call.arena, limit, hint }) catch |err| switch (err) {
+    return bound.run(read, .{ reader, call.arena, limit, hint, budget }) catch |err| switch (err) {
         error.Timeout => error.ReadTimeout,
         else => |e| e,
     };

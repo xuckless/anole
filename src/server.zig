@@ -487,6 +487,16 @@ pub const Options = struct {
         /// Open WebSockets at most, over every protocol; past it an upgrade
         /// is answered 503 with `Retry-After`. Null: no cap.
         max_websockets: ?u32 = null,
+        /// Bytes per executor that bodies collected whole and WebSocket
+        /// messages being reassembled may hold; past it, 503 with
+        /// `Retry-After` (or close 1013). Null: a quarter of memory over
+        /// the executors. See `http.ServerConfig.buffer_budget`.
+        buffer_budget: ?usize = null,
+        /// Request tasks per executor (connections served, streams), at
+        /// least 3; near it accepts wait, past it streams are refused. Null: from
+        /// `vm.max_map_count` on Linux, no cap elsewhere. See
+        /// `http.ServerConfig.max_tasks`.
+        max_tasks: ?u32 = null,
     };
 
     /// `Options.proxy`.
@@ -765,6 +775,8 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
         else
             opts.limits.max_connections,
         .max_websockets = opts.limits.max_websockets,
+        .buffer_budget = opts.limits.buffer_budget,
+        .max_tasks = opts.limits.max_tasks,
         .admission = opts.admission,
         .errors = opts.errors,
         .error_handler = opts.error_handler,

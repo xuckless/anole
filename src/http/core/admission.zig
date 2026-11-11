@@ -37,9 +37,23 @@
 //! - Neither (perf denied, as under Docker's default seccomp profile or
 //!   `kernel.perf_event_paranoid` above 2; another backend; not zio): no
 //!   signal, so the gate never freezes. The exact cap still applies.
+//!
+//! The same state holds two per-executor budgets (#131):
+//! - Bytes a peer makes the server hold before a handler has them: request
+//!   bodies collected whole (`Request.body`) and WebSocket messages being
+//!   reassembled, counted per holder in a `Held` against
+//!   `buffer_budget`. A body of known length takes its whole size before
+//!   its first byte is read, so one admitted never fails later; one of
+//!   unknown length and a WebSocket message grow as their bytes come.
+//!   It counts bytes promised, not the arena behind them (goose-http's
+//!   gather budget, which #131 cites).
+//! - Request tasks (`reserveTask`): every coroutine stack is two memory
+//!   mappings, and past `vm.max_map_count` every `mmap` in the process
+//!   fails, not only the next spawn (#48).
 const std = @import("std");
 const builtin = @import("builtin");
 const safety = @import("anole_safety");
+const placement = @import("placement.zig");
 
 /// `ServerConfig.admission`.
 pub const Config = struct {
@@ -84,8 +98,8 @@ pub const Refusal = enum { load, cap };
 /// Where an executor's idle time comes from.
 pub const Source = enum(u8) { none, poll_wall, task_clock };
 
-/// One executor's last closed window, for `/metrics` and the console.
-/// Written by its probe only.
+/// One executor's last closed window, for `/metrics` and the console,
+/// written by its probe only; and its budgets, written by its tasks.
 pub const Row = struct {
     util_permille: std.atomic.Value(u32) align(64) = .init(0),
     lag_min_ns: std.atomic.Value(u64) = .init(0),
@@ -94,6 +108,64 @@ pub const Row = struct {
     source: std.atomic.Value(Source) = .init(.none),
     /// Windows closed so far.
     windows: std.atomic.Value(u32) = .init(0),
+    /// Bytes the executor's `Held`s hold. On a line of its own: written
+    /// per body, where the probe's fields are written once a window.
+    held_bytes: std.atomic.Value(usize) align(64) = .init(0),
+    /// Request tasks running on the executor (`State.reserveTask`).
+    tasks: std.atomic.Value(u32) = .init(0),
+};
+
+/// What a body or WebSocket message holds of its executor's
+/// `buffer_budget`: the row it took from (the executor it first grew on,
+/// so a release from anywhere goes back there) and how much.
+pub const Held = struct {
+    row: ?*Row = null,
+    bytes: usize = 0,
+
+    /// Grows the reservation to `total` bytes; false (counted in
+    /// `refused_memory`) when the row can't hold the growth. A row that
+    /// holds nothing but this always grants, so one body or message up to
+    /// its own limit always passes, whatever the budget. Before
+    /// `Server.prepareStatic` (no rows) everything is granted, unheld.
+    pub fn growTo(h: *Held, s: *State, io: std.Io, total: usize) bool {
+        if (total <= h.bytes) return true;
+        const r = h.row orelse blk: {
+            h.row = s.currentRow(io) orelse return true;
+            break :blk h.row.?;
+        };
+        const delta = total - h.bytes;
+        var held = r.held_bytes.load(.monotonic);
+        while (true) {
+            if (held != h.bytes and held +| delta > s.buffer_budget) {
+                _ = s.refused_memory.fetchAdd(1, .monotonic);
+                return false;
+            }
+            held = r.held_bytes.cmpxchgWeak(held, held + delta, .monotonic, .monotonic) orelse {
+                h.bytes = total;
+                return true;
+            };
+        }
+    }
+
+    /// Gives back all it holds; again, nothing.
+    pub fn release(h: *Held) void {
+        if (h.bytes == 0) return;
+        const before = h.row.?.held_bytes.fetchSub(h.bytes, .monotonic);
+        std.debug.assert(before >= h.bytes);
+        h.bytes = 0;
+    }
+};
+
+/// A `Held` with the state and `io` it grows with, for code that only
+/// collects bytes (`allocRemainingHinted`).
+pub const Budget = struct {
+    state: *State,
+    held: *Held,
+    io: std.Io,
+
+    pub fn growTo(b: Budget, total: usize) bool {
+        return b.held.growTo(b.state, b.io, total);
+    }
 };
 
 /// For tests: the probe acts as if perf_event_open were denied.
@@ -122,6 +194,20 @@ pub const State = struct {
     frozen: std.atomic.Value(u32) = .init(no_limit),
     refused_load: std.atomic.Value(u64) = .init(0),
     refused_cap: std.atomic.Value(u64) = .init(0),
+
+    /// Bytes per executor that bodies and WebSocket messages may hold
+    /// (`Held`; `ServerConfig.buffer_budget`, resolved when the server
+    /// starts to serve).
+    buffer_budget: usize = std.math.maxInt(usize),
+    /// Request tasks per executor (`reserveTask`; `ServerConfig.max_tasks`,
+    /// resolved when the server starts to serve).
+    task_cap: u32 = no_limit,
+    /// Bodies answered 503 and WebSocket messages closed 1013 for
+    /// `buffer_budget`.
+    refused_memory: std.atomic.Value(u64) = .init(0),
+    /// Tasks refused (or, for an HTTP/1.x accept, made to wait) at
+    /// `task_cap`.
+    refused_tasks: std.atomic.Value(u64) = .init(0),
 
     /// Taken only on a row's hot/cool transitions, at most twice a window
     /// per executor: a few stores, nothing allocated, no wait.
@@ -228,6 +314,95 @@ pub const State = struct {
     pub fn frozenLimit(s: *const State) ?u32 {
         const f = s.frozen.load(.monotonic);
         return if (f == no_limit) null else f;
+    }
+
+    /// The calling executor's row; null before the server prepared them.
+    pub fn currentRow(s: *State, io: std.Io) ?*Row {
+        if (s.rows.len == 0) return null;
+        const i = placement.currentExecutor(io) orelse 0;
+        return &s.rows[@min(i, s.rows.len - 1)];
+    }
+
+    /// The smallest `task_cap` (`ServerConfig.max_tasks`): an HTTP/2
+    /// connection holds two tasks (its reader and its writer), and one more
+    /// is its first stream's.
+    pub const min_task_cap = 3;
+
+    /// How a task takes its slot (`reserveTask`).
+    pub const TaskSlot = enum {
+        /// Refused at `task_cap`: a new HTTP/2 or HTTP/3 stream, which the
+        /// client may retry.
+        stream,
+        /// Counted, never refused: a task that has to run for work already
+        /// admitted (an HTTP/2 connection's writer, a parked connection
+        /// whose request has arrived). Bounded by the connections admitted.
+        forced,
+    };
+
+    /// Takes a task slot on `r`: false (counted) at `task_cap` for a
+    /// `.stream`; a `.forced` one is always granted.
+    pub fn reserveTask(s: *State, r: *Row, slot: TaskSlot) bool {
+        if (slot == .forced or s.task_cap == no_limit) {
+            _ = r.tasks.fetchAdd(1, .monotonic);
+            return true;
+        }
+        return s.tryTask(r, s.task_cap);
+    }
+
+    fn tryTask(s: *State, r: *Row, limit: u32) bool {
+        var n = r.tasks.load(.monotonic);
+        while (true) {
+            if (n >= limit) {
+                _ = s.refused_tasks.fetchAdd(1, .monotonic);
+                return false;
+            }
+            n = r.tasks.cmpxchgWeak(n, n + 1, .monotonic, .monotonic) orelse return true;
+        }
+    }
+
+    /// Where an HTTP/1.x accept starts to wait: a quarter of `task_cap`
+    /// below it, at least one slot, kept for the streams that can only be
+    /// refused. Connections alone (an idle HTTP/2 one holds two tasks)
+    /// never fill the cap, so a stream always has room once they stop.
+    pub fn acceptCap(s: *const State) u32 {
+        if (s.task_cap == no_limit) return no_limit;
+        return s.task_cap -| @max(1, s.task_cap / 4);
+    }
+
+    /// Takes a slot for an accepted connection, waiting for one at
+    /// `acceptCap` instead of failing: the accept loop holds its connection
+    /// the way the kernel's backlog holds the next ones (as at
+    /// `max_connections`). Counted once per wait.
+    pub fn waitTask(s: *State, io: std.Io, r: *Row) std.Io.Cancelable!void {
+        if (s.task_cap == no_limit) {
+            _ = r.tasks.fetchAdd(1, .monotonic);
+            return;
+        }
+        const limit = s.acceptCap();
+        if (s.tryTask(r, limit)) return;
+        while (true) {
+            const n = r.tasks.load(.acquire);
+            if (n < limit) {
+                if (r.tasks.cmpxchgWeak(n, n + 1, .monotonic, .monotonic) == null) return;
+                continue;
+            }
+            try io.futexWait(u32, &r.tasks.raw, n);
+        }
+    }
+
+    /// Gives back a slot of `r`; wakes the waiters only when the count
+    /// drops from `acceptCap`, so a release below it costs no syscall.
+    pub fn releaseTask(s: *State, io: std.Io, r: *Row) void {
+        const before = r.tasks.fetchSub(1, .release);
+        std.debug.assert(before > 0);
+        if (s.task_cap != no_limit and before >= s.acceptCap()) io.futexWake(u32, &r.tasks.raw, std.math.maxInt(u32));
+    }
+
+    /// Bytes held over every executor, for `/metrics`.
+    pub fn heldBytes(s: *const State) usize {
+        var sum: usize = 0;
+        for (s.rows) |*r| sum +|= r.held_bytes.load(.monotonic);
+        return sum;
     }
 
     /// A `Retry-After` in seconds, uniform in `cfg.retry_after_s`.
@@ -741,6 +916,101 @@ test "State: Retry-After stays in its range" {
     }
     s.cfg.retry_after_s = .{ 7, 7 };
     try testing.expectEqual(@as(u16, 7), s.retryAfter(testing.io));
+}
+
+fn twoRows() [2]Row {
+    return .{ .{}, .{} };
+}
+
+test "Held: grants within the budget, refuses past it, and counts" {
+    var rows = twoRows();
+    var s: State = .{ .rows = &rows, .buffer_budget = 100 };
+    var a: Held = .{};
+    var b: Held = .{};
+    try testing.expect(a.growTo(&s, testing.io, 60));
+    try testing.expect(b.growTo(&s, testing.io, 40));
+    try testing.expectEqual(@as(usize, 100), rows[0].held_bytes.load(.monotonic));
+    var c: Held = .{};
+    try testing.expect(!c.growTo(&s, testing.io, 1));
+    try testing.expect(!b.growTo(&s, testing.io, 41));
+    try testing.expectEqual(@as(u64, 2), s.refused_memory.load(.monotonic));
+    try testing.expectEqual(@as(usize, 40), b.bytes);
+    // Asking for what it holds, or less, is no growth.
+    try testing.expect(b.growTo(&s, testing.io, 10));
+    a.release();
+    try testing.expect(b.growTo(&s, testing.io, 90));
+    try testing.expectEqual(@as(usize, 90), rows[0].held_bytes.load(.monotonic));
+    b.release();
+    c.release();
+    try testing.expectEqual(@as(usize, 0), rows[0].held_bytes.load(.monotonic));
+}
+
+test "Held: a row holding nothing else grants past the budget" {
+    var rows = twoRows();
+    var s: State = .{ .rows = &rows, .buffer_budget = 1024 };
+    var a: Held = .{};
+    try testing.expect(a.growTo(&s, testing.io, 64 * 1024));
+    // Still alone on the row: it may keep growing.
+    try testing.expect(a.growTo(&s, testing.io, 128 * 1024));
+    var b: Held = .{};
+    try testing.expect(!b.growTo(&s, testing.io, 1));
+    a.release();
+    try testing.expect(b.growTo(&s, testing.io, 1));
+    b.release();
+    try testing.expectEqual(@as(u64, 1), s.refused_memory.load(.monotonic));
+}
+
+test "Held: release is idempotent and the row is kept across growths" {
+    var rows = twoRows();
+    var s: State = .{ .rows = &rows, .buffer_budget = 100 };
+    var a: Held = .{};
+    try testing.expect(a.growTo(&s, testing.io, 10));
+    const row = a.row.?;
+    try testing.expect(a.growTo(&s, testing.io, 20));
+    try testing.expectEqual(row, a.row.?);
+    a.release();
+    a.release();
+    try testing.expectEqual(@as(usize, 0), row.held_bytes.load(.monotonic));
+    // Without rows (a server not serving yet) everything passes, unheld.
+    var none: State = .{ .buffer_budget = 0 };
+    var b: Held = .{};
+    try testing.expect(b.growTo(&none, testing.io, 1 << 20));
+    try testing.expectEqual(@as(usize, 0), b.bytes);
+    b.release();
+}
+
+test "State: task slots up to the cap; forced ones past it; accepts stop a quarter below it; heldBytes sums rows" {
+    var rows = twoRows();
+    var s: State = .{ .rows = &rows, .task_cap = 3 };
+    const r = &rows[0];
+    // Accepts take the slots up to a quarter (at least one) below the cap.
+    try testing.expectEqual(@as(u32, 2), s.acceptCap());
+    try s.waitTask(testing.io, r);
+    try s.waitTask(testing.io, r);
+    // The last one is a stream's.
+    try testing.expect(s.reserveTask(r, .stream));
+    try testing.expect(!s.reserveTask(r, .stream));
+    try testing.expectEqual(@as(u64, 1), s.refused_tasks.load(.monotonic));
+    try testing.expect(s.reserveTask(r, .forced));
+    try testing.expectEqual(@as(u32, 4), r.tasks.load(.monotonic));
+    // A slot is free only once the count is below the cap again.
+    s.releaseTask(testing.io, r);
+    try testing.expect(!s.reserveTask(r, .stream));
+    s.releaseTask(testing.io, r);
+    try testing.expect(s.reserveTask(r, .stream));
+    s.releaseTask(testing.io, r);
+    s.releaseTask(testing.io, r);
+    try s.waitTask(testing.io, r);
+    try testing.expectEqual(@as(u32, 2), r.tasks.load(.monotonic));
+    s.releaseTask(testing.io, r);
+    s.releaseTask(testing.io, r);
+    try testing.expectEqual(@as(u32, 0), r.tasks.load(.monotonic));
+    // A large cap keeps a quarter for streams.
+    s.task_cap = 1000;
+    try testing.expectEqual(@as(u32, 750), s.acceptCap());
+    rows[0].held_bytes.store(5, .monotonic);
+    rows[1].held_bytes.store(7, .monotonic);
+    try testing.expectEqual(@as(usize, 12), s.heldBytes());
 }
 
 test "TaskClock: opens (or is denied), and grows across a busy loop" {

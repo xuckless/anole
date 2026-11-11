@@ -1498,8 +1498,18 @@ pub fn Server(comptime Ctx: type) type {
 
             fn wake(p: *park.Parked) anyerror!void {
                 const conn: *Conn = @fieldParentPtr("parked", p);
-                const group = conn.server.connections_group orelse return error.RuntimeShutdown;
-                try park.spawnLocal(group, resumeConnection, .{ conn.server, conn });
+                const server = conn.server;
+                const group = server.connections_group orelse return error.RuntimeShutdown;
+                // Counted against the task cap (`max_tasks`) but never
+                // refused for it: the connection was admitted, and its
+                // request is here already. Closing it would lose a request
+                // the client may not retry (RFC 9112 §9.3.1 covers only
+                // idempotent ones); accepts and streams are what wait or
+                // are refused.
+                const task_row = server.admission.currentRow(server.io);
+                if (task_row) |r| _ = server.admission.reserveTask(r, .forced);
+                errdefer if (task_row) |r| server.admission.releaseTask(server.io, r);
+                try park.spawnLocal(group, resumeConnection, .{ server, conn, task_row });
             }
 
             fn close(p: *park.Parked) void {
@@ -1633,17 +1643,59 @@ pub fn Server(comptime Ctx: type) type {
             self.static_prepared = true;
         }
 
-        /// Sizes the admission rows (one per executor, once) and points
+        /// Sizes the admission rows (one per executor, once), resolves the
+        /// per-executor budgets (`buffer_budget`, `max_tasks`) and points
         /// `config.request` at the state, which every request copies.
         fn prepareAdmission(self: *Self) !void {
             const a = &self.admission;
             a.cfg = self.config.admission;
             a.max_websockets = self.config.max_websockets;
+            const executors = placement.executorCount(self.io) orelse 1;
             if (a.rows.len == 0) {
-                a.rows = try self.allocator.alloc(admission.Row, placement.executorCount(self.io) orelse 1);
+                a.rows = try self.allocator.alloc(admission.Row, executors);
                 @memset(a.rows, .{});
             }
+            if (self.config.max_tasks) |n| if (n < admission.State.min_task_cap) {
+                self.logProtected(.err, "config.max_tasks is {d}, below {d}: an HTTP/2 connection holds two tasks, and its first stream needs a third", .{ n, admission.State.min_task_cap });
+                return error.NoTasksAllowed;
+            };
+            const budget = try resolveBudgets(self.io, self.config.buffer_budget, self.config.max_tasks, executors);
+            a.buffer_budget = budget.bytes;
+            a.task_cap = budget.tasks;
+            {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                if (budget.tasks == admission.no_limit) {
+                    log.info("buffer budget {d} KiB per executor ({s}); no task cap ({s})", .{ budget.bytes >> 10, budget.bytes_from, budget.tasks_from });
+                } else {
+                    log.info("buffer budget {d} KiB per executor ({s}); at most {d} request tasks per executor ({s})", .{ budget.bytes >> 10, budget.bytes_from, budget.tasks, budget.tasks_from });
+                }
+            }
             self.config.request._admission = a;
+        }
+
+        const Budgets = struct {
+            bytes: usize,
+            bytes_from: []const u8,
+            tasks: u32,
+            tasks_from: []const u8,
+        };
+
+        /// `buffer_budget` and `max_tasks`, or what memory and
+        /// `vm.max_map_count` make of them, per executor (#131, #48).
+        fn resolveBudgets(io: std.Io, bytes: ?usize, tasks: ?u32, executors: usize) std.Io.Cancelable!Budgets {
+            var b: Budgets = .{ .bytes = 0, .bytes_from = "set", .tasks = admission.no_limit, .tasks_from = "set" };
+            if (bytes) |n| b.bytes = n else {
+                const cgroup_max = try cgroup.memoryLimit(io);
+                const ram = std.process.totalSystemMemory() catch null;
+                b.bytes = @intCast(@min(cgroup.memoryQuarter(cgroup_max, ram) / @max(executors, 1), std.math.maxInt(usize)));
+                b.bytes_from = if (cgroup_max != null and (ram == null or cgroup_max.? <= ram.?)) "a quarter of the cgroup's memory.max over the executors" else if (ram != null) "a quarter of RAM over the executors" else "neither memory.max nor RAM could be read: 1 GiB over the executors";
+            }
+            if (tasks) |n| b.tasks = n else if (try cgroup.mapCount(io)) |m| {
+                b.tasks = cgroup.taskCap(m, executors);
+                b.tasks_from = "from vm.max_map_count and the mappings in use";
+            } else b.tasks_from = "vm.max_map_count does not apply here";
+            return b;
         }
 
         fn prepareStaticInner(self: *Self) !void {
@@ -2373,14 +2425,25 @@ pub fn Server(comptime Ctx: type) type {
                     stream.close(self.io);
                     return err;
                 };
+                // Near the task cap (`max_tasks`, a quarter below it) the
+                // loop waits for one to end, holding this connection as the
+                // backlog holds the next ones, as at the connection cap.
+                const task_row = self.admission.currentRow(self.io);
+                if (task_row) |r| self.admission.waitTask(self.io, r) catch |err| {
+                    self.releaseListenerSlot(l);
+                    self.releaseConnectionSlot();
+                    stream.close(self.io);
+                    return err;
+                };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 // On the executor that accepted it, for its whole life.
                 const spawned: std.Io.ConcurrentError!void = if (builtin.is_test and test_fail_spawn.once.swap(false, .acq_rel))
                     error.ConcurrencyUnavailable
                 else
-                    placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream });
+                    placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream, task_row });
                 spawned catch |err| {
                     self.logProtected(.err, "Failed to spawn connection handler: {}", .{err});
+                    if (task_row) |r| self.admission.releaseTask(self.io, r);
                     self.finishRequest();
                     self.releaseListenerSlot(l);
                     self.releaseConnectionSlot();
@@ -2653,7 +2716,8 @@ pub fn Server(comptime Ctx: type) type {
             return .arrived;
         }
 
-        fn handleConnectionWrapper(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+        fn handleConnectionWrapper(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, task_row: ?*admission.Row) std.Io.Cancelable!void {
+            defer if (task_row) |r| self.admission.releaseTask(self.io, r);
             if (comptime have_auto_cancel) return runConnection(self, l, stream, null);
 
             if (self.config.timeout.request == null and self.config.timeout.keepalive == null) {
@@ -3014,7 +3078,8 @@ pub fn Server(comptime Ctx: type) type {
         /// The task started for a parked connection whose socket became
         /// readable, on the executor it parked on: serves it until it
         /// closes or parks again.
-        fn resumeConnection(self: *Self, conn: *Conn) void {
+        fn resumeConnection(self: *Self, conn: *Conn, task_row: ?*admission.Row) void {
+            defer if (task_row) |r| self.admission.releaseTask(self.io, r);
             // Not counted while parked: `waitForRequest` counts it again
             // once a request arrives.
             var busy = false;
@@ -3201,6 +3266,12 @@ pub fn Server(comptime Ctx: type) type {
             };
             const t0 = hooks.begin(req.io);
             const result = executor.run();
+            // The body's share of the buffer budget, on every way out of
+            // the chain (an error, a cancel, a client gone); its bytes stay
+            // in the arena until the response is out, uncounted. A detached
+            // request's moved with it (`detachedRelocate`), and its engine
+            // gives it back when the exchange ends.
+            req._body_held.release();
             hooks.end(req, res, result, executor.answered, t0);
             return result;
         }
@@ -3618,6 +3689,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
+                request._body_held.release();
                 hooks.end(&request, &response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
                     error.ReadFailed => {
@@ -3652,6 +3724,10 @@ pub fn Server(comptime Ctx: type) type {
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
                         if (request._expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
+                        // Refused for the buffer budget (`Request.shedBody`):
+                        // the 503 goes out first, and the connection closes
+                        // rather than wait for a body there was no room for.
+                        if (request._shed) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.
@@ -3972,7 +4048,7 @@ fn feedConnection(io: std.Io, server: *Server(void), listener: *const @import("c
     try server.reserveConnectionSlot();
     // With the deadline watch the accept loop gives it, which also bounds
     // a lingering close rather than sleeping it out.
-    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream });
+    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream, null });
     var finished = false;
     defer if (!finished) future.cancel(io) catch {};
 

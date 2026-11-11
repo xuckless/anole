@@ -214,6 +214,14 @@ pub const Config = struct {
         /// Open WebSockets at most, over every protocol; past it an upgrade
         /// is answered 503 with Retry-After. Null: no cap.
         max_websockets: ?u32 = null,
+        /// Bytes per executor that bodies collected whole and WebSocket
+        /// messages being reassembled may hold; past it, 503 with
+        /// Retry-After (or close 1013). Null: a quarter of memory over the
+        /// executors.
+        buffer_budget: ?usize = null,
+        /// Request tasks per executor, at least 3; near it accepts wait,
+        /// past it streams are refused. Null: from vm.max_map_count on Linux.
+        max_tasks: ?u32 = null,
         /// Requests per keep-alive connection; null: no limit.
         max_requests_per_connection: ?u32 = null,
         /// The largest database answer, in bytes of its record: past it,
@@ -2257,6 +2265,23 @@ test "config: http3.send_memory parses, defaults to null (auto) and is at least 
     const d = try parse(a, "{}", &why);
     try std.testing.expectEqual(@as(?usize, null), d.http3.send_memory);
     try std.testing.expectError(error.Config, parse(a, "{\"http3\": {\"send_memory\": 100}}", &why));
+}
+
+test "config: limits.buffer_budget and limits.max_tasks parse, and default to null (automatic)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a, "{\"limits\": {\"buffer_budget\": 67108864, \"max_tasks\": 5000}}", &why);
+    try std.testing.expectEqual(@as(?usize, 64 << 20), c.limits.buffer_budget);
+    try std.testing.expectEqual(@as(?u32, 5000), c.limits.max_tasks);
+    const d = try parse(a, "{\"limits\": {\"buffer_budget\": null, \"max_tasks\": null}}", &why);
+    try std.testing.expectEqual(@as(?usize, null), d.limits.buffer_budget);
+    try std.testing.expectEqual(@as(?u32, null), d.limits.max_tasks);
+    const e = try parse(a, "{}", &why);
+    try std.testing.expectEqual(@as(?usize, null), e.limits.buffer_budget);
+    try std.testing.expectEqual(@as(?u32, null), e.limits.max_tasks);
 }
 
 test "config: http3.handshake_timeout_ms parses and defaults to 10 s" {
