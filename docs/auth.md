@@ -511,19 +511,32 @@ var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit =
 var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKeyOwner, .on_error = .deny });
 ```
 
+Each `Middleware.init` is a policy with buckets of its own, so the two
+above share a limiter but not their counts: a client that spends its login
+attempts still has its 1000 calls, and the other way round. One
+`Middleware` value used on several routes or groups is one policy, counted
+in one bucket per key.
+
 - `MemoryLimiter` is for one process. It holds at most `max_entries` keys
   and forgets a key idle for `idle` once its bucket is full again. When
   the table is full, a new key takes the place of a least recently used
   bucket that is full again, else of one that still has tokens; a throttled
   bucket is never pushed out, so a flood of new keys can't refill it. If
   every bucket near that end is throttled, new keys share one overflow
-  bucket until room frees up.
+  bucket until room frees up (one for the whole limiter, whatever the
+  policy).
 - `RedisLimiter` (`.{ .client = redis, .gpa = gpa }` with `redis` from
-  `app.redis(.{})`, keys `anole:rl:<key>`)
+  `app.redis(.{})`, keys `anole:rl:<scope>:<key>`)
   is shared by every node. One Lua script refills and takes atomically, on
-  the Redis server's clock.
+  the Redis server's clock. The scope tells the policies apart; `init`
+  numbers it in the order the middlewares are made in the process, so nodes
+  running the same app agree. Nodes that make their middlewares in a
+  different order (different apps, or routes registered conditionally) set
+  it themselves: `.{ .limit = 5, .scope = 1 }` for the login limit on every
+  node. Two middlewares given the same `.scope` share their buckets.
 - Your own limiter implements `anole.ratelimit.Limiter`: a vtable with
-  `take(ptr, key, cost, policy) !Result`.
+  `take(ptr, key, cost, policy) !Result`. Make `policy.scope` part of the
+  bucket's key, or every policy on it counts in one bucket.
 
 The key is the client's address by default (`ratelimit.clientAddress`): an
 IPv4 address on its own, an IPv6 address by its /64 network, since one

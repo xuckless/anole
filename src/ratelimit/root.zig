@@ -29,6 +29,11 @@ pub const Policy = struct {
     window: std.Io.Duration = .fromSeconds(60),
     /// Bucket size: how many may come at once. 0 means `limit`.
     burst: u32 = 0,
+    /// Whose buckets: takes with different scopes never share a bucket,
+    /// even for the same key. Each `Middleware.init` gets a scope of its
+    /// own, so two policies on one limiter count apart. A `Limiter` of your
+    /// own makes it part of the bucket's key.
+    scope: u32 = 0,
 
     fn windowMs(p: Policy) i64 {
         return @max(1, p.window.toMilliseconds());
@@ -115,7 +120,7 @@ pub const MemoryLimiter = struct {
     /// One process-wide lock over the buckets (a leaf), held for a lookup
     /// and its arithmetic.
     mutex: safety.Mutex(.leaf) = .init,
-    buckets: std.StringHashMapUnmanaged(*Bucket) = .empty,
+    buckets: std.HashMapUnmanaged(BucketKey, *Bucket, BucketKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// Most recently used first.
     lru: std.DoublyLinkedList = .{},
     max_entries: usize,
@@ -124,8 +129,24 @@ pub const MemoryLimiter = struct {
     /// go: a flood of fresh keys then shares one limit.
     overflow: struct { tokens: f64 = -1, last_ms: i64 = 0 } = .{},
 
+    /// A bucket is a policy's (`Policy.scope`) for one key.
+    const BucketKey = struct {
+        scope: u32,
+        key: []const u8,
+
+        const Context = struct {
+            pub fn hash(_: Context, k: BucketKey) u64 {
+                return std.hash.Wyhash.hash(k.scope, k.key);
+            }
+            pub fn eql(_: Context, a: BucketKey, b: BucketKey) bool {
+                return a.scope == b.scope and std.mem.eql(u8, a.key, b.key);
+            }
+        };
+    };
+
     const Bucket = struct {
         key: []u8,
+        scope: u32,
         tokens: f64,
         last_ms: i64,
         /// The policy's numbers at the last take, to tell when it is full.
@@ -186,7 +207,7 @@ pub const MemoryLimiter = struct {
 
     fn removeLocked(self: *MemoryLimiter, b: *Bucket) void {
         self.lru.remove(&b.node);
-        _ = self.buckets.remove(b.key);
+        _ = self.buckets.remove(.{ .scope = b.scope, .key = b.key });
         self.freeBucket(b);
     }
 
@@ -206,7 +227,7 @@ pub const MemoryLimiter = struct {
             if (now_ms - b.last_ms <= self.idle_ms or b.tokensAt(now_ms) < b.capacity) break;
             self.removeLocked(b);
         }
-        const bucket = self.buckets.get(key) orelse blk: {
+        const bucket = self.buckets.get(.{ .scope = policy.scope, .key = key }) orelse blk: {
             if (self.buckets.count() >= self.max_entries) {
                 const victim = self.victimLocked(now_ms) orelse {
                     // Every bucket in reach is still counting down.
@@ -217,14 +238,15 @@ pub const MemoryLimiter = struct {
             }
             const b = try self.gpa.create(Bucket);
             errdefer self.gpa.destroy(b);
-            b.* = .{ .key = try self.gpa.dupe(u8, key), .tokens = policy.capacity(), .last_ms = now_ms, .capacity = policy.capacity(), .rate = policy.ratePerMs() };
+            b.* = .{ .key = try self.gpa.dupe(u8, key), .scope = policy.scope, .tokens = policy.capacity(), .last_ms = now_ms, .capacity = policy.capacity(), .rate = policy.ratePerMs() };
             errdefer self.gpa.free(b.key);
-            try self.buckets.put(self.gpa, b.key, b);
+            try self.buckets.put(self.gpa, .{ .scope = b.scope, .key = b.key }, b);
             self.lru.prepend(&b.node);
             break :blk b;
         };
         self.lru.remove(&bucket.node);
         self.lru.prepend(&bucket.node);
+        // Middlewares given the same `.scope` on purpose may differ in policy.
         bucket.capacity = policy.capacity();
         bucket.rate = policy.ratePerMs();
         return step(&bucket.tokens, &bucket.last_ms, now_ms, cost, policy);
@@ -259,7 +281,7 @@ pub const RedisLimiter = if (features.redis) struct {
     client: *redis.Client,
     /// For the scratch memory of each take.
     gpa: std.mem.Allocator,
-    /// Prepended to each key to make the bucket's Redis key.
+    /// Starts each bucket's Redis key: `<prefix><scope>:<key>`.
     prefix: []const u8 = "anole:rl:",
 
     /// KEYS[1] the bucket; ARGV capacity, rate per ms, cost, window ms.
@@ -292,7 +314,7 @@ pub const RedisLimiter = if (features.redis) struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const k = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.prefix, key });
+        const k = try redisKey(arena, self.prefix, policy.scope, key);
         var c: db.Ctx = .{ .io = self.client.io, .arena = arena };
         const items = try self.client.all(i64, &c, .{ "EVAL", script, 1, k, policy.capacity(), policy.ratePerMs(), cost, policy.windowMs() });
         if (items.len != 3) return error.UnexpectedReply;
@@ -308,6 +330,11 @@ pub const RedisLimiter = if (features.redis) struct {
         };
     }
 } else struct {};
+
+/// A bucket's Redis key: `<prefix><scope>:<key>` ("anole:rl:3:192.0.2.7").
+fn redisKey(arena: std.mem.Allocator, prefix: []const u8, scope: u32, key: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}{d}:{s}", .{ prefix, scope, key });
+}
 
 /// The key a request is limited by, written into `buf` (128 bytes) or
 /// pointing into the request.
@@ -461,18 +488,34 @@ pub const Middleware = struct {
         /// When the limiter fails: `.allow` (the default) lets the request
         /// through, `.deny` answers 503. Either way a warning is logged.
         on_error: OnError = .allow,
+        /// Whose buckets (`Policy.scope`). Null (the default): `init` gives
+        /// the middleware a scope of its own, numbered in the order
+        /// middlewares are made in this process. Set it when processes that
+        /// share a `RedisLimiter` do not make their middlewares in the same
+        /// order; two middlewares given the same scope share their buckets
+        /// on purpose.
+        scope: ?u32 = null,
 
         /// The bucket policy these options describe.
         pub fn policy(o: Options) Policy {
-            return .{ .limit = o.limit, .window = o.window, .burst = o.burst };
+            return .{ .limit = o.limit, .window = o.window, .burst = o.burst, .scope = o.scope orelse 0 };
         }
     };
 
+    /// The next scope `init` hands out. From 1: scope 0 is for takes that
+    /// do not come through a `Middleware` (`Server.rateLimit`, the C ABI,
+    /// whose limiters are their own).
+    var next_scope: std.atomic.Value(u32) = .init(1);
+
     /// A middleware taking from `limiter` (which must outlive it) as
     /// `options` say: `.{ .limit = 5, .window = .fromSeconds(60) }` per client
-    /// address, `.key` to count by something else.
+    /// address, `.key` to count by something else. It counts in buckets of
+    /// its own (`Options.scope`), apart from other middlewares on the same
+    /// limiter.
     pub fn init(limiter: Limiter, options: Options) Middleware {
-        return .{ .limiter = limiter, .options = options };
+        var resolved = options;
+        resolved.scope = options.scope orelse next_scope.fetchAdd(1, .monotonic);
+        return .{ .limiter = limiter, .options = resolved };
     }
 
     /// Does nothing after `next()`: requests behind it can detach.
@@ -708,10 +751,10 @@ test "redis: live rate limiter (RedisLimiter)" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
-    _ = try client.del(&c, "anole:rl:t");
+    _ = try client.del(&c, "anole:rl:7:t");
     var rl: RedisLimiter = .{ .client = client, .gpa = gpa };
     const l = rl.limiter();
-    const policy: Policy = .{ .limit = 3, .window = .fromMilliseconds(60_000) };
+    const policy: Policy = .{ .limit = 3, .window = .fromMilliseconds(60_000), .scope = 7 };
     for (0..3) |_| try std.testing.expect((try l.take("t", 1, policy)).allowed);
     const denied = try l.take("t", 1, policy);
     try std.testing.expect(!denied.allowed);
@@ -785,4 +828,101 @@ test "ratelimit.Middleware.noWait follows its limiter" {
     var dummy: u8 = 0;
     const other: Limiter = .{ .ptr = &dummy, .vtable = &.{ .take = Dummy.take } };
     try std.testing.expect(!Middleware.init(other, .{}).noWait());
+}
+
+test "MemoryLimiter: two policies on one limiter keep separate buckets for one key" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    const strict: Policy = .{ .limit = 2, .window = .fromMilliseconds(60_000), .scope = 1 };
+    const loose: Policy = .{ .limit = 1000, .window = .fromMilliseconds(60_000), .scope = 2 };
+    try std.testing.expect((try l.takeAt("k", 1, strict, 0)).allowed);
+    try std.testing.expect((try l.takeAt("k", 1, strict, 0)).allowed);
+    for (0..10) |_| {
+        try std.testing.expect((try l.takeAt("k", 1, loose, 0)).allowed);
+        try std.testing.expect(!(try l.takeAt("k", 1, strict, 0)).allowed);
+    }
+    try std.testing.expectEqual(@as(usize, 2), l.count());
+    // 45 s later the strict bucket has refilled at its own rate (1.5
+    // tokens), the loose one at its own (full again).
+    const later = try l.takeAt("k", 1, strict, 45_000);
+    try std.testing.expect(later.allowed);
+    try std.testing.expectEqual(@as(u32, 0), later.remaining);
+    try std.testing.expectEqual(@as(u32, 999), (try l.takeAt("k", 1, loose, 45_000)).remaining);
+    // The same scope shares.
+    const strict_too: Policy = .{ .limit = 2, .window = .fromMilliseconds(60_000), .scope = 1 };
+    try std.testing.expect(!(try l.takeAt("k", 1, strict_too, 45_000)).allowed);
+}
+
+test "MemoryLimiter: eviction and idle removal find scoped buckets" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 2, .idle = .fromSeconds(300) });
+    defer l.deinit();
+    const a: Policy = .{ .limit = 2, .window = .fromMilliseconds(1000), .scope = 1 };
+    const b: Policy = .{ .limit = 2, .window = .fromMilliseconds(1000), .scope = 2 };
+    _ = try l.takeAt("k", 1, a, 0);
+    _ = try l.takeAt("k", 1, b, 1);
+    // Both full again: a new key replaces the least recently used, scope 1's.
+    _ = try l.takeAt("j", 1, a, 2000);
+    try std.testing.expectEqual(@as(usize, 2), l.count());
+    // Scope 1's "k" started over; scope 2's is the one that went next.
+    try std.testing.expectEqual(@as(u32, 1), (try l.takeAt("k", 1, a, 2001)).remaining);
+    try std.testing.expectEqual(@as(usize, 2), l.count());
+    // Everything idle for longer than `idle` goes.
+    _ = try l.takeAt("x", 1, b, 1_000_000);
+    try std.testing.expectEqual(@as(usize, 1), l.count());
+}
+
+test "ratelimit.Middleware.init: each middleware gets its own scope, .scope overrides it" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    const first = Middleware.init(l.limiter(), .{});
+    const second = Middleware.init(l.limiter(), .{});
+    try std.testing.expect(first.options.policy().scope != 0);
+    try std.testing.expect(first.options.policy().scope != second.options.policy().scope);
+    try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
+    try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
+}
+
+test "RedisLimiter: a bucket's key is the prefix, the scope and the key" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings("anole:rl:3:192.0.2.7", try redisKey(arena_state.allocator(), "anole:rl:", 3, "192.0.2.7"));
+    try std.testing.expectEqualStrings("anole:rl:0:", try redisKey(arena_state.allocator(), "anole:rl:", 0, ""));
+}
+
+test "ratelimit.Middleware: a login limit on the same limiter as an app-wide limit still bites" {
+    const zio = @import("zio");
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var limiter = MemoryLimiter.init(gpa, io, .{});
+    defer limiter.deinit();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &loopback_listeners }, {});
+    defer server.deinit();
+    var app_mw = Middleware.init(limiter.limiter(), .{ .limit = 100, .window = .fromMilliseconds(60_000) });
+    var login_mw = Middleware.init(limiter.limiter(), .{ .limit = 1, .window = .fromMilliseconds(60_000) });
+    const M = dusty.Middleware(void);
+    server.router.use(M.init(&app_mw));
+    server.router.get("/", KeyFixture.ok);
+    server.router.group("/login", &[_]M{.init(&login_mw)}).get("/", KeyFixture.ok);
+    var future = try io.concurrent(KeyFixture.serve, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var statuses: [3]u16 = undefined;
+    for (&statuses, [_][]const u8{ "/login/", "/", "/login/" }) |*st, path| {
+        const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var out: [1024]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        st.* = try std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
+    }
+    try std.testing.expectEqualSlices(u16, &.{ 200, 200, 429 }, &statuses);
 }
