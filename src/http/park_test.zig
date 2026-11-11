@@ -596,15 +596,12 @@ test "idle park: peers that hang up or reset are closed, parked or mid-request" 
 
 // Deadlines of connections that keep their task (K10): kept to the shelf's
 // sweep (`park.Lazy`) rather than to a timer each, on pinned zio, whether
-// connections park or not. The sweep runs every 20 ms here; assertions are
-// lower bounds (a deadline never fires early), plus the sweep's counter to
-// show it was the sweep that fired them.
+// connections park or not. The sweep runs every 20 ms here; the sweep's
+// counter shows it was the sweep that fired them, with no clock read
+// (that a deadline is not early is the unit tests', which sweep by hand
+// at chosen times).
 
 const ms = std.Io.Duration.fromMilliseconds;
-
-fn elapsedMs(io: std.Io, since: std.Io.Timestamp) i64 {
-    return since.untilNow(io, .awake).toMilliseconds();
-}
 
 test "deadline sweep: an idle keep-alive connection that keeps its task closes at its keep-alive deadline" {
     const gpa = std.testing.allocator;
@@ -620,10 +617,8 @@ test "deadline sweep: an idle keep-alive connection that keeps its task closes a
         var c: Client = undefined;
         try c.open(f.io, f.addr(), false);
         defer c.close(f.io);
-        const before = std.Io.Timestamp.now(f.io, .awake);
         try std.testing.expectEqual(200, try c.get("/"));
         try std.testing.expect(c.hungUp());
-        try std.testing.expect(elapsedMs(f.io, before) >= 300);
         try std.testing.expectEqual(0, f.server.parkedConnections());
         try std.testing.expect(f.lazyFired() >= 1);
         try f.waitClosed();
@@ -641,13 +636,11 @@ fn headDeadline(secure: bool) !void {
 
     // The first request's head counts from accept.
     {
-        const before = std.Io.Timestamp.now(f.io, .awake);
         var c: Client = undefined;
         try c.open(f.io, f.addr(), secure);
         defer c.close(f.io);
         try c.send("GET / HTTP/1.1\r\nHo");
         try std.testing.expect(c.hungUp());
-        try std.testing.expect(elapsedMs(f.io, before) >= 300);
     }
     // A later one's from its first byte.
     {
@@ -655,10 +648,8 @@ fn headDeadline(secure: bool) !void {
         try c.open(f.io, f.addr(), secure);
         defer c.close(f.io);
         try std.testing.expectEqual(200, try c.get("/"));
-        const before = std.Io.Timestamp.now(f.io, .awake);
         try c.send("GET / HTTP/1.1\r\nHo");
         try std.testing.expect(c.hungUp());
-        try std.testing.expect(elapsedMs(f.io, before) >= 300);
     }
     try std.testing.expect(f.lazyFired() >= 2);
     try f.waitClosed();
@@ -705,14 +696,12 @@ test "deadline sweep: a head trickled byte by byte is cut at read_header from it
             }
         }
     };
-    const before = std.Io.Timestamp.now(f.io, .awake);
     try c.send("GET / HTTP/1.1\r\n");
     var trickle: Trickle = .{};
     var future = try f.io.concurrent(Trickle.run, .{ &trickle, &f, &c });
     // After the await below this does nothing.
     defer future.await(f.io);
     try std.testing.expect(c.hungUp());
-    try std.testing.expect(elapsedMs(f.io, before) >= 300);
     future.await(f.io);
     try std.testing.expect(trickle.sent.load(.acquire) < rounds);
 }
@@ -726,14 +715,12 @@ test "deadline sweep: a stalled TLS handshake is cut at the request deadline" {
     try f.start(gpa, 1, true, .{ .idle_park = null, .request = ms(300) });
     defer f.stop(gpa);
 
-    const before = std.Io.Timestamp.now(f.io, .awake);
     const stream = try f.addr().connect(f.io, .{ .mode = .stream });
     defer stream.close(f.io);
     var buf: [64]u8 = undefined;
     var r = stream.reader(f.io, &buf);
     // No ClientHello: the server waits for one until the deadline.
     _ = r.interface.takeByte() catch {};
-    try std.testing.expect(elapsedMs(f.io, before) >= 300);
     try std.testing.expect(f.lazyFired() >= 1);
     try f.waitClosed();
 }
@@ -750,12 +737,10 @@ test "deadline sweep: a stream whose peer stops reading ends with WriteTimeout" 
     var c: Client = undefined;
     try c.open(f.io, f.addr(), false);
     defer c.close(f.io);
-    const before = std.Io.Timestamp.now(f.io, .awake);
     try c.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
     // The client reads none of it.
     _ = try wait.waitNonZero(f.io, "the stream's write failed", &big_failed);
     try std.testing.expectEqual(1, big_failed.load(.acquire));
-    try std.testing.expect(elapsedMs(f.io, before) >= 300);
     try std.testing.expect(f.lazyFired() >= 1);
     try f.waitClosed();
 }
@@ -775,12 +760,10 @@ test "deadline sweep: a handler claims the request deadline the sweep fired, and
     try c.open(f.io, f.addr(), false);
     defer c.close(f.io);
     for (0..2) |_| {
-        const before = std.Io.Timestamp.now(f.io, .awake);
         try c.send("GET /gated HTTP/1.1\r\nHost: x\r\n\r\n");
         const res = try c.response();
         try std.testing.expectEqual(504, res.status);
         try std.testing.expectEqualStrings("late", res.body);
-        try std.testing.expect(elapsedMs(f.io, before) >= 300);
         // No cancel left over for the next request's waits.
         try std.testing.expectEqual(200, try c.get("/"));
     }
@@ -851,6 +834,16 @@ fn after(io: std.Io, d: std.Io.Duration) std.Io.Clock.Timestamp {
     return dusty._park.now(io).addDuration(d).withClock(.awake);
 }
 
+/// A lazy deadline far enough off for the sweep (`park.sweepable`), which
+/// the tests below reach by sweeping at it rather than by waiting.
+fn due(io: std.Io) std.Io.Clock.Timestamp {
+    return after(io, .fromSeconds(2));
+}
+
+fn at(d: std.Io.Clock.Timestamp, offset_ns: i96) std.Io.Timestamp {
+    return .fromNanoseconds(d.raw.nanoseconds + offset_ns);
+}
+
 test "deadline sweep: a lazy deadline the sweep found past cancels the task once, and the timer claims it" {
     if (!dusty._park.supported) return error.SkipZigTest;
     try onTask(struct {
@@ -858,14 +851,15 @@ test "deadline sweep: a lazy deadline the sweep found past cancels the task once
             var timer: Timer = .init(null);
             timer.register(shelf);
             defer timer.unregister();
-            // Not past yet: nothing happens.
-            timer.setLazy(io, after(io, .fromSeconds(60)));
-            shelf.sweep(dusty._park.now(io));
+            const d = due(io);
+            timer.setLazy(io, d);
+            try std.testing.expect(!timer.armed);
+            // Not past yet, a nanosecond before it: nothing happens.
+            shelf.sweep(at(d, -1));
             try io.checkCancel();
             // Past: one cancel, which `fired` claims.
-            timer.setLazy(io, after(io, .zero));
-            shelf.sweep(dusty._park.now(io));
-            shelf.sweep(dusty._park.now(io));
+            shelf.sweep(at(d, 0));
+            shelf.sweep(at(d, 1));
             try std.testing.expectError(error.Canceled, io.checkCancel());
             try std.testing.expect(timer.fired());
             try io.checkCancel();
@@ -883,8 +877,9 @@ test "deadline sweep: a cancel no cancelation point saw is taken back by the nex
             timer.register(shelf);
             defer timer.unregister();
             for (0..3) |how| {
-                timer.setLazy(io, after(io, .zero));
-                shelf.sweep(dusty._park.now(io));
+                const d = due(io);
+                timer.setLazy(io, d);
+                shelf.sweep(at(d, 0));
                 // The step finished before any cancelation point.
                 switch (how) {
                     0 => timer.setLazy(io, after(io, .fromSeconds(60))),
@@ -896,11 +891,38 @@ test "deadline sweep: a cancel no cancelation point saw is taken back by the nex
                 timer.clear(io);
             }
             // An exact deadline replaces a lazy one: the sweep leaves it.
-            timer.setLazy(io, after(io, .zero));
+            const d = due(io);
+            timer.setLazy(io, d);
             timer.set(io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } });
-            shelf.sweep(dusty._park.now(io));
+            shelf.sweep(at(d, 0));
             try io.checkCancel();
             timer.clear(io);
         }
     }.body);
 }
+
+test "deadline sweep: a lazy deadline less than a sweep away gets an exact timer" {
+    if (!dusty._park.supported) return error.SkipZigTest;
+    try onTask(struct {
+        fn body(io: std.Io, shelf: *Shelf) !void {
+            var timer: Timer = .init(null);
+            timer.register(shelf);
+            defer timer.unregister();
+            // A 200 ms budget against the 1 s sweep: kept exact, not left
+            // to a sweep that could end it five times as late.
+            timer.setLazy(io, after(io, .fromMilliseconds(200)));
+            try std.testing.expect(timer.armed);
+            try std.testing.expectEqual(dusty._park.Lazy.never, timer.lazy.deadline);
+            shelf.sweep(at(after(io, .fromSeconds(60)), 0));
+            try std.testing.expectEqual(0, shelf.test_lazy_fired.load(.monotonic));
+            timer.clear(io);
+            try std.testing.expect(!timer.armed);
+            // A sweep or more away: on the sweep.
+            timer.setLazy(io, after(io, park_sweep));
+            try std.testing.expect(!timer.armed);
+            timer.clear(io);
+        }
+    }.body);
+}
+
+const park_sweep = dusty._park.sweep_interval;

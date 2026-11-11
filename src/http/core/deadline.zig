@@ -148,10 +148,12 @@ pub const Timer = if (have_auto_cancel) struct {
     }
 
     /// `deadline`, or none, up to about a second late: on the shelf's sweep
-    /// when registered, on the timer otherwise.
+    /// when registered, on the timer otherwise or when it is less than a
+    /// sweep away (`park.sweepable`), which keeps a short budget exact.
     pub fn setLazy(self: *@This(), io: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
         const d = deadline orelse return self.clear(io);
-        if (self.shelf == null or d.clock != .awake) return self.set(io, .{ .deadline = d });
+        if (self.shelf == null or d.clock != .awake or !park.sweepable(io, d.raw.nanoseconds))
+            return self.set(io, .{ .deadline = d });
         self.clearExact();
         self.lazy.set(d.raw.nanoseconds);
     }

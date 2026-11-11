@@ -3120,11 +3120,6 @@ pub fn Server(comptime Ctx: type) type {
             return if (x.compare(.lt, y)) x else y;
         }
 
-        /// Arms the timer for `deadline`, or clears it for none.
-        fn armDeadline(self: *Self, timer: *Timer, deadline: ?std.Io.Clock.Timestamp) void {
-            if (deadline) |d| timer.set(self.io, .{ .deadline = d }) else timer.clear(self.io);
-        }
-
         /// The awake clock as this executor last read it (`park.now`): what
         /// the deadlines a shelf's sweep enforces are taken from.
         fn tickNow(self: *const Self) std.Io.Clock.Timestamp {
@@ -3243,8 +3238,8 @@ pub fn Server(comptime Ctx: type) type {
             if (request_deadline) |d| if (now.compare(.gte, d)) return false;
             const budget = drainTimeout(&self.config);
             const deadline = earlier(request_deadline, now.addDuration(.{ .raw = budget, .clock = .awake }));
-            // A budget of a second or more can be a second late.
-            if (budget.nanoseconds >= park.sweep_interval.nanoseconds) timer.setLazy(self.io, deadline) else self.armDeadline(timer, deadline);
+            // Up to a second late, exact when sooner than that.
+            timer.setLazy(self.io, deadline);
             defer timer.clear(self.io);
             return discardBody(parser, connection, max) catch |err| switch (err) {
                 error.Canceled => if (timer.fired()) false else error.Canceled,
@@ -3363,8 +3358,8 @@ pub fn Server(comptime Ctx: type) type {
                     // as the connection waits: on this task, and parked.
                     const wait_deadline = if (wait_timeout != null) deadlineAfter(self.tickNow(), wait_timeout) else null;
                     timer.setLazy(self.io, wait_deadline);
-                    // Parking: the wait goes on for `idle_park` first (up to
-                    // half as long again, `park.Watch`), and a connection
+                    // Parking: the wait goes on for `idle_park` first (or up
+                    // to a quarter less, `park.Watch`), and a connection
                     // with nothing by then parks. One woken after a long
                     // park parks again as soon as it has answered what woke
                     // it, as if the delay had passed.

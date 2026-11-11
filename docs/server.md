@@ -216,7 +216,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 | `read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). Null: `request` alone. |
 | `write` | 30 s | One write the peer does not take for this long ends the response (HTTP/1.1: the connection; HTTP/2 and HTTP/3: the stream). Applies once a stream or file body has started, and to every HTTP/2 connection write. |
 | `keepalive` | 75 s | An idle connection between requests. Null: never. Keep it above the idle timeout of a balancer in front (nginx 60 s, AWS ALB 60 s) so the balancer never reuses a connection Anole just closed. |
-| `idle_park` | 1 s | An idle HTTP/1.1 connection gives up its coroutine after this (up to half as long again). Null: never. |
+| `idle_park` | 1 s | An idle HTTP/1.1 connection gives up its coroutine after this (or up to a quarter sooner). Null: never. |
 | `shutdown` | 10 s | The graceful drain. Null waits for every connection. |
 
 On HTTP/1.x, `request`, `read_header`, `write`, `keepalive` and the TLS
@@ -228,8 +228,9 @@ microseconds. A head's deadline runs from its first byte, and more bytes
 never move it later; a write's runs from the start of that write, and
 bytes the peer takes meanwhile never extend it. What stays exact: a
 handler's own deadline (`req.setTimeout`), database and blocking-pool
-calls, HTTP/2 and HTTP/3. Where executors are not pinned, every deadline
-is exact.
+calls, HTTP/2 and HTTP/3; and any of the above set under a second, or
+with less than a second left, which gets a timer. Where executors are not
+pinned, every deadline is exact.
 
 `limits`:
 

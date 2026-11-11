@@ -73,6 +73,13 @@ pub fn now(io: std.Io) std.Io.Timestamp {
     return placement.tickNow(io) orelse std.Io.Timestamp.now(io, .awake);
 }
 
+/// Whether a deadline at `deadline` (nanoseconds on `now`'s clock) is far
+/// enough off for the sweep: one sooner than a sweep from now could come
+/// many times its length late, so it goes on an exact timer instead.
+pub fn sweepable(io: std.Io, deadline: i96) bool {
+    return deadline - now(io).nanoseconds >= sweepInterval().nanoseconds;
+}
+
 /// What a parked connection keeps for its shelf, in the connection's own
 /// heap state.
 pub const Parked = struct {
@@ -119,9 +126,9 @@ pub const Parked = struct {
 /// callbacks), without a timer armed and cleared around every wait: the
 /// task marks its waits (`begin`, `end`) and is registered with its shelf
 /// for as long as it serves (`Shelf.watch`), and the shelf's driver, which
-/// looks at every registered task each half `Shelf.long_park`, ends a wait
-/// that has gone on for `long_park` (up to half as long again) the way a
-/// timer would, with an auto-cancel of the task's wait. A busy connection
+/// looks at every registered task each quarter `Shelf.long_park`, ends a
+/// wait that has gone on for `long_park` (or up to a quarter less) the way
+/// a timer would, with an auto-cancel of the task's wait. A busy connection
 /// then pays two stores per wait, where a timer took a clock read, a lock
 /// and two operations on the executor's timer heap, whose cost grows with
 /// the number of sockets waiting.
@@ -340,13 +347,16 @@ pub const Shelf = struct {
         self.lazies.remove(&l.node);
     }
 
-    /// How often the driver looks at the watches.
+    /// How often the driver looks at the watches: each quarter
+    /// `long_park`, so that a wait seen at four looks in a row
+    /// (`lookAtWatches`) has gone on for 3/4 to all of `long_park`, never
+    /// longer, as with a timer armed for it.
     fn watchInterval(self: *const Shelf) std.Io.Duration {
-        return .fromNanoseconds(@max(self.long_park.nanoseconds >> 1, std.time.ns_per_ms));
+        return .fromNanoseconds(@max(self.long_park.nanoseconds >> 2, std.time.ns_per_ms));
     }
 
     /// The driver's look at the watches: ends each wait seen going on at
-    /// the last two looks too.
+    /// the last three looks too.
     fn lookAtWatches(self: *Shelf) void {
         if (self.closed) return;
         var it = self.watches.first;
@@ -359,7 +369,7 @@ pub const Shelf = struct {
             }
             if (w.poked) continue;
             w.seen_count +|= 1;
-            if (w.seen_count >= 2) w.poke();
+            if (w.seen_count >= 3) w.poke();
         }
     }
 
