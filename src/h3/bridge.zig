@@ -401,13 +401,18 @@ pub const BlockPool = struct {
 
     /// When `trim` next may have something to give back: never while the
     /// free blocks are no more than it keeps at the least, `keep_min` or
-    /// the blocks live now (the peak of any window is at least that), so an
-    /// idle endpoint whose pooled streams hold more blocks than the floor
-    /// stops waking for it. By the owner.
+    /// the blocks live now (the peak of any window is at least that), and
+    /// the free list can't grow past that: `keep` is at the floor, or the
+    /// free list already holds `keep` and `give` frees the rest. So an idle
+    /// endpoint whose pooled streams hold more blocks than the floor stops
+    /// waking for it, while a past peak's `keep` still gets trimmed when
+    /// its blocks come back off the driver (a connection freed by its last
+    /// task). By the owner.
     pub fn trimAt(p: *BlockPool) u64 {
         if (!p.adaptive) return std.math.maxInt(u64);
         p.acquire();
-        const idle = p.free_count <= @max(p.keep_min, p.live);
+        const idle = p.keep <= @max(p.keep_min, p.free_count) and
+            p.free_count <= @max(p.keep_min, p.live);
         p.lock.unlock();
         return if (idle) std.math.maxInt(u64) else p.window_start + window_ns;
     }
@@ -985,6 +990,28 @@ test "adaptive block pool past its floor: keeps a 300-block peak for a window, t
     // to give back, so no further trim is due.
     pool.trim(t0 + 2 * BlockPool.window_ns);
     try std.testing.expectEqual(@as(u32, 40), pool.pooled());
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pool.trimAt());
+}
+
+test "adaptive block pool keeps waking while a past peak's blocks are live, then trims to its floor once they come back" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.initAdaptive(gpa, 32);
+    defer pool.deinit();
+    const t0: u64 = 1000 * BlockPool.window_ns;
+    pool.trim(t0);
+    var held: [300]*Block = undefined;
+    for (&held) |*b| b.* = try pool.get();
+    // No free blocks yet, but `keep` sits at 300: when they come back
+    // (off the driver, nothing waking it) a trim must still be due.
+    try std.testing.expectEqual(@as(u32, 0), pool.pooled());
+    try std.testing.expectEqual(t0 + BlockPool.window_ns, pool.trimAt());
+    for (held) |b| pool.put(b);
+    try std.testing.expectEqual(@as(u32, 300), pool.pooled());
+    try std.testing.expectEqual(t0 + BlockPool.window_ns, pool.trimAt());
+    pool.trim(t0 + BlockPool.window_ns);
+    try std.testing.expectEqual(t0 + 2 * BlockPool.window_ns, pool.trimAt());
+    pool.trim(t0 + 2 * BlockPool.window_ns);
+    try std.testing.expectEqual(@as(u32, 32), pool.pooled());
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pool.trimAt());
 }
 

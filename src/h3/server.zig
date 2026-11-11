@@ -720,11 +720,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Streams kept at most per endpoint.
         const pool_max = 64;
 
-        /// The free send and receive blocks an idle endpoint keeps (128 KiB):
-        /// under load the pool keeps the last window's peak instead, so a
-        /// floor only sizes the first burst after an idle spell. It was 256
-        /// (1 MiB), held by every endpoint (one per executor) once a burst
-        /// had filled it (#78).
+        /// The free send and receive blocks an idle endpoint keeps at the
+        /// least (128 KiB); it keeps as many as its pooled streams still
+        /// hold if that is more (up to `pool_max`), and under load the last
+        /// window's peak, so a floor only sizes the first burst after an
+        /// idle spell. It was 256 (1 MiB), held by every endpoint (one per
+        /// executor) once a burst had filled it (#78).
         const block_floor = 32;
 
         /// Copies the block pool's counts into `stats`.

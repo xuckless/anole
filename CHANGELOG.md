@@ -30,12 +30,14 @@ breaking changes are listed anyway.
 
 ### Changed
 
-- **HTTP/3 idle block pool** (#78): an idle HTTP/3 endpoint keeps 32
-  free 4 KiB blocks (128 KiB) instead of 256 (1 MiB); under load the
-  pool still keeps the last 2 s window's peak. There is one endpoint per
-  executor, so a 28-thread box held up to 28 MiB of free blocks after a
-  burst. An idle endpoint whose pooled streams hold more blocks than the
-  floor no longer wakes every 2 s to trim.
+- **HTTP/3 idle block pool** (#78): an idle HTTP/3 endpoint keeps at
+  least 32 free 4 KiB blocks, and as many as its pooled streams still
+  hold (up to 64, 256 KiB), instead of a floor of 256 (1 MiB); under
+  load the pool still keeps the last 2 s window's peak, and the rest goes
+  back to malloc. This lowers malloc in-use (about 0.5 MB per endpoint
+  after an `h2load --h3` burst), not settled RSS: glibc keeps the freed
+  chunks resident until a `malloc_trim`. An idle endpoint whose free
+  blocks are already down to that no longer wakes every 2 s to trim.
 - **C ABI raw TCP connections close at drain start** (#166): C ABI raw
   TCP listeners now close their connections at drain start, as callback
   handlers have since #107: what the consumer queued goes out, this side
