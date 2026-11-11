@@ -323,17 +323,36 @@ pub const State = struct {
         return &s.rows[@min(i, s.rows.len - 1)];
     }
 
-    /// Takes a task slot on `r`: false (counted) at `task_cap`, unless
-    /// `force`, for a task that has to run for the ones that can be
-    /// refused (an HTTP/2 connection's writer).
-    pub fn reserveTask(s: *State, r: *Row, force: bool) bool {
-        if (force or s.task_cap == no_limit) {
+    /// The smallest `task_cap` (`ServerConfig.max_tasks`): an HTTP/2
+    /// connection holds two tasks (its reader and its writer), and one more
+    /// is its first stream's.
+    pub const min_task_cap = 3;
+
+    /// How a task takes its slot (`reserveTask`).
+    pub const TaskSlot = enum {
+        /// Refused at `task_cap`: a new HTTP/2 or HTTP/3 stream, which the
+        /// client may retry.
+        stream,
+        /// Counted, never refused: a task that has to run for work already
+        /// admitted (an HTTP/2 connection's writer, a parked connection
+        /// whose request has arrived). Bounded by the connections admitted.
+        forced,
+    };
+
+    /// Takes a task slot on `r`: false (counted) at `task_cap` for a
+    /// `.stream`; a `.forced` one is always granted.
+    pub fn reserveTask(s: *State, r: *Row, slot: TaskSlot) bool {
+        if (slot == .forced or s.task_cap == no_limit) {
             _ = r.tasks.fetchAdd(1, .monotonic);
             return true;
         }
+        return s.tryTask(r, s.task_cap);
+    }
+
+    fn tryTask(s: *State, r: *Row, limit: u32) bool {
         var n = r.tasks.load(.monotonic);
         while (true) {
-            if (n >= s.task_cap) {
+            if (n >= limit) {
                 _ = s.refused_tasks.fetchAdd(1, .monotonic);
                 return false;
             }
@@ -341,15 +360,29 @@ pub const State = struct {
         }
     }
 
-    /// `reserveTask` that waits for a slot instead of failing: an accept
-    /// loop at the cap holds its connection the way the kernel's backlog
-    /// holds the next ones (as at `max_connections`). Counted once per
-    /// wait.
+    /// Where an HTTP/1.x accept starts to wait: a quarter of `task_cap`
+    /// below it, at least one slot, kept for the streams that can only be
+    /// refused. Connections alone (an idle HTTP/2 one holds two tasks)
+    /// never fill the cap, so a stream always has room once they stop.
+    pub fn acceptCap(s: *const State) u32 {
+        if (s.task_cap == no_limit) return no_limit;
+        return s.task_cap -| @max(1, s.task_cap / 4);
+    }
+
+    /// Takes a slot for an accepted connection, waiting for one at
+    /// `acceptCap` instead of failing: the accept loop holds its connection
+    /// the way the kernel's backlog holds the next ones (as at
+    /// `max_connections`). Counted once per wait.
     pub fn waitTask(s: *State, io: std.Io, r: *Row) std.Io.Cancelable!void {
-        if (s.reserveTask(r, false)) return;
+        if (s.task_cap == no_limit) {
+            _ = r.tasks.fetchAdd(1, .monotonic);
+            return;
+        }
+        const limit = s.acceptCap();
+        if (s.tryTask(r, limit)) return;
         while (true) {
             const n = r.tasks.load(.acquire);
-            if (n < s.task_cap) {
+            if (n < limit) {
                 if (r.tasks.cmpxchgWeak(n, n + 1, .monotonic, .monotonic) == null) return;
                 continue;
             }
@@ -358,11 +391,11 @@ pub const State = struct {
     }
 
     /// Gives back a slot of `r`; wakes the waiters only when the count
-    /// drops from the cap, so a release below it costs no syscall.
+    /// drops from `acceptCap`, so a release below it costs no syscall.
     pub fn releaseTask(s: *State, io: std.Io, r: *Row) void {
         const before = r.tasks.fetchSub(1, .release);
         std.debug.assert(before > 0);
-        if (before >= s.task_cap and s.task_cap != no_limit) io.futexWake(u32, &r.tasks.raw, std.math.maxInt(u32));
+        if (s.task_cap != no_limit and before >= s.acceptCap()) io.futexWake(u32, &r.tasks.raw, std.math.maxInt(u32));
     }
 
     /// Bytes held over every executor, for `/metrics`.
@@ -946,25 +979,35 @@ test "Held: release is idempotent and the row is kept across growths" {
     b.release();
 }
 
-test "State: task slots up to the cap; forced ones past it; heldBytes sums rows" {
+test "State: task slots up to the cap; forced ones past it; accepts stop a quarter below it; heldBytes sums rows" {
     var rows = twoRows();
-    var s: State = .{ .rows = &rows, .task_cap = 2 };
+    var s: State = .{ .rows = &rows, .task_cap = 3 };
     const r = &rows[0];
-    try testing.expect(s.reserveTask(r, false));
-    try testing.expect(s.reserveTask(r, false));
-    try testing.expect(!s.reserveTask(r, false));
+    // Accepts take the slots up to a quarter (at least one) below the cap.
+    try testing.expectEqual(@as(u32, 2), s.acceptCap());
+    try s.waitTask(testing.io, r);
+    try s.waitTask(testing.io, r);
+    // The last one is a stream's.
+    try testing.expect(s.reserveTask(r, .stream));
+    try testing.expect(!s.reserveTask(r, .stream));
     try testing.expectEqual(@as(u64, 1), s.refused_tasks.load(.monotonic));
-    try testing.expect(s.reserveTask(r, true));
-    try testing.expectEqual(@as(u32, 3), r.tasks.load(.monotonic));
+    try testing.expect(s.reserveTask(r, .forced));
+    try testing.expectEqual(@as(u32, 4), r.tasks.load(.monotonic));
     // A slot is free only once the count is below the cap again.
     s.releaseTask(testing.io, r);
-    try testing.expect(!s.reserveTask(r, false));
+    try testing.expect(!s.reserveTask(r, .stream));
+    s.releaseTask(testing.io, r);
+    try testing.expect(s.reserveTask(r, .stream));
+    s.releaseTask(testing.io, r);
     s.releaseTask(testing.io, r);
     try s.waitTask(testing.io, r);
     try testing.expectEqual(@as(u32, 2), r.tasks.load(.monotonic));
     s.releaseTask(testing.io, r);
     s.releaseTask(testing.io, r);
     try testing.expectEqual(@as(u32, 0), r.tasks.load(.monotonic));
+    // A large cap keeps a quarter for streams.
+    s.task_cap = 1000;
+    try testing.expectEqual(@as(u32, 750), s.acceptCap());
     rows[0].held_bytes.store(5, .monotonic);
     rows[1].held_bytes.store(7, .monotonic);
     try testing.expectEqual(@as(usize, 12), s.heldBytes());

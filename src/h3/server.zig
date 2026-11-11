@@ -2421,7 +2421,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // retry (RFC 9114 §4.1.1).
                 const adm = &conn.ep.http.admission;
                 stream.task_row = adm.currentRow(conn.ep.io);
-                const slot = if (stream.task_row) |r| adm.reserveTask(r, false) else true;
+                const slot = if (stream.task_row) |r| adm.reserveTask(r, .stream) else true;
                 const spawned = if (!slot) error.TaskCap else placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream});
                 if (spawned) |_| {
                     _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
@@ -3118,6 +3118,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const old = exchangeOf(d);
             const ex = try old.response.arena.create(Exchange);
             ex.* = old.*;
+            // The body's share of the buffer budget moves with the request:
+            // `Server.dispatch` then gives back nothing of the old one, and
+            // the end of the exchange gives back what the copy holds (a body
+            // read after the handler returned included).
+            old.request._body_held = .{};
             ex.request._response = &ex.response;
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
@@ -3141,6 +3146,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// owner's task, or the task `detachedAttach` was for.
         fn detachedEnd(d: *dusty.Detached, result: anyerror!void) void {
             const ex = exchangeOf(d);
+            ex.request._body_held.release();
             const s = ex.sink_state.stream;
             const conn = s.conn;
             if (s.parked != null) {
@@ -3207,6 +3213,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (d.state != .detached) return;
             s.detached = null;
             d.abort();
+            ex.request._body_held.release();
             ex.response.deinit();
             s.release(.handler);
         }
@@ -3342,6 +3349,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const s = self.s;
                 const conn = s.conn;
                 const holds_handler = self.holds_handler;
+                self.ex.request._body_held.release();
                 self.ex.response.deinit();
                 conn.lock();
                 defer conn.unlock();

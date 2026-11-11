@@ -1494,11 +1494,14 @@ pub fn Server(comptime Ctx: type) type {
                 const conn: *Conn = @fieldParentPtr("parked", p);
                 const server = conn.server;
                 const group = server.connections_group orelse return error.RuntimeShutdown;
-                // At the task cap (`max_tasks`) the shelf closes it, as when
-                // no task can be had: a client retries an idempotent request
-                // on a keep-alive connection that closed (RFC 9112 §9.3.1).
+                // Counted against the task cap (`max_tasks`) but never
+                // refused for it: the connection was admitted, and its
+                // request is here already. Closing it would lose a request
+                // the client may not retry (RFC 9112 §9.3.1 covers only
+                // idempotent ones); accepts and streams are what wait or
+                // are refused.
                 const task_row = server.admission.currentRow(server.io);
-                if (task_row) |r| if (!server.admission.reserveTask(r, false)) return error.TaskCap;
+                if (task_row) |r| _ = server.admission.reserveTask(r, .forced);
                 errdefer if (task_row) |r| server.admission.releaseTask(server.io, r);
                 try park.spawnLocal(group, resumeConnection, .{ server, conn, task_row });
             }
@@ -1646,8 +1649,8 @@ pub fn Server(comptime Ctx: type) type {
                 a.rows = try self.allocator.alloc(admission.Row, executors);
                 @memset(a.rows, .{});
             }
-            if (self.config.max_tasks) |n| if (n == 0) {
-                self.logProtected(.err, "config.max_tasks is 0, so no request could ever be served", .{});
+            if (self.config.max_tasks) |n| if (n < admission.State.min_task_cap) {
+                self.logProtected(.err, "config.max_tasks is {d}, below {d}: an HTTP/2 connection holds two tasks, and its first stream needs a third", .{ n, admission.State.min_task_cap });
                 return error.NoTasksAllowed;
             };
             const budget = try resolveBudgets(self.io, self.config.buffer_budget, self.config.max_tasks, executors);
@@ -2410,9 +2413,9 @@ pub fn Server(comptime Ctx: type) type {
                     stream.close(self.io);
                     return err;
                 };
-                // At the task cap (`max_tasks`) the loop waits for one to
-                // end, holding this connection as the backlog holds the
-                // next ones, as at the connection cap.
+                // Near the task cap (`max_tasks`, a quarter below it) the
+                // loop waits for one to end, holding this connection as the
+                // backlog holds the next ones, as at the connection cap.
                 const task_row = self.admission.currentRow(self.io);
                 if (task_row) |r| self.admission.waitTask(self.io, r) catch |err| {
                     self.releaseListenerSlot(l);
@@ -3250,7 +3253,9 @@ pub fn Server(comptime Ctx: type) type {
             const result = executor.run();
             // The body's share of the buffer budget, on every way out of
             // the chain (an error, a cancel, a client gone); its bytes stay
-            // in the arena until the response is out, uncounted.
+            // in the arena until the response is out, uncounted. A detached
+            // request's moved with it (`detachedRelocate`), and its engine
+            // gives it back when the exchange ends.
             req._body_held.release();
             hooks.end(req, res, result, executor.answered, t0);
             return result;
@@ -3703,6 +3708,10 @@ pub fn Server(comptime Ctx: type) type {
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
                         if (request._expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
+                        // Refused for the buffer budget (`Request.shedBody`):
+                        // the 503 goes out first, and the connection closes
+                        // rather than wait for a body there was no room for.
+                        if (request._shed) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.

@@ -231,7 +231,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 | `ws_max_message` | 1 MiB | The largest WebSocket message, in or out; a route's `max_message_size` overrides it. |
 | `max_websockets` | none | Open WebSockets at most, over HTTP/1.1, HTTP/2 and HTTP/3; past it an upgrade gets 503 with `Retry-After`. See [Overload](#overload). |
 | `buffer_budget` | a quarter of memory over the executors | Bytes per executor that bodies collected whole and WebSocket messages being reassembled may hold; past it, 503 with `Retry-After` or close 1013. See [Buffer budget](#buffer-budget-and-task-cap). |
-| `max_tasks` | from `vm.max_map_count` (Linux) | Request tasks per executor; past it, accepts wait and streams are refused. See [Buffer budget](#buffer-budget-and-task-cap). |
+| `max_tasks` | from `vm.max_map_count` (Linux) | Request tasks per executor, at least 3; a quarter below it accepts wait, at it streams are refused. See [Buffer budget](#buffer-budget-and-task-cap). |
 
 `proxy`: `trusted` (null), `trusted_hops` (0), `trust_forwarded_proto` (true) and
 `trust_forwarded_host` (false), as in [Behind a proxy](#behind-a-proxy).
@@ -811,7 +811,8 @@ vm.max_map_count and the mappings in use)`.
     a frame larger than the read buffer, from its header); one that would
     pass the budget is closed with **1013** (Try Again Later). Upgrades are
     never refused for memory, and frames that fit the read buffer hold
-    nothing.
+    nothing. Over HTTP/2 and HTTP/3 a message's first 64 KiB hold nothing
+    either: the socket keeps that much between messages anyway.
   - An executor that holds nothing else always lets one body or message
     through, up to its own limit, whatever the budget.
 - **`limits.max_tasks`**: request tasks per executor (HTTP/1.x
@@ -820,11 +821,14 @@ vm.max_map_count and the mappings in use)`.
   in the process fails, malloc and TLS included. On Linux the default is
   what the sysctl leaves after the mappings in use and an eighth of
   headroom, at two per task, divided by the executors; elsewhere there is
-  no cap. At the cap an HTTP/1.x accept waits (new connections queue in
-  the kernel's backlog, as at `max_connections`), a parked connection
-  that wakes is closed (clients retry an idempotent request on it), an
-  HTTP/2 stream gets REFUSED_STREAM and an HTTP/3 one
-  H3_REQUEST_REJECTED; both are safe for the client to retry. Raising
+  no cap. A quarter below the cap an HTTP/1.x accept waits (new
+  connections queue in the kernel's backlog, as at `max_connections`),
+  which keeps the rest for streams: an HTTP/2 connection holds two tasks
+  (its reader and its writer) even while idle, and connections alone
+  never fill the cap. At the cap an HTTP/2 stream gets REFUSED_STREAM and
+  an HTTP/3 one H3_REQUEST_REJECTED; both are safe for the client to
+  retry. A parked connection whose next request arrives is counted but
+  never refused: its request is already there. At least 3. Raising
   `vm.max_map_count` (above) raises it.
 
 Refusals of both kinds are counted on `/metrics` as

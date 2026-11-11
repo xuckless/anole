@@ -14,8 +14,8 @@ breaking changes are listed anyway.
   past it gets 503 with `Retry-After` before any of it is read (and before
   `100 Continue`); one of unknown length gets it partway; a WebSocket
   message is closed 1013. `limits.max_tasks` caps request tasks per
-  executor below `vm.max_map_count` (Linux): accepts wait, streams get
-  REFUSED_STREAM / H3_REQUEST_REJECTED. `blocking.max_waiting` (Zig,
+  executor below `vm.max_map_count` (Linux): accepts wait a quarter below
+  it, streams get REFUSED_STREAM / H3_REQUEST_REJECTED at it. `blocking.max_waiting` (Zig,
   opt-in) fails a caller past the bound at once with
   `error.ServiceUnavailable`. Both budgets are on the startup log and on
   `/metrics` (`anole_requests_shed_total`,

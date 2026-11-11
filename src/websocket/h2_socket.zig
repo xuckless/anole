@@ -34,8 +34,8 @@ pub const H2Socket = struct {
     /// goes back after it (`receiveMessage`).
     message: std.ArrayList(u8) = .empty,
     max_message_size: usize,
-    /// The server's buffer budget (#131): `message` holds its bytes of it
-    /// while it is incomplete (`held`).
+    /// The server's buffer budget (#131): `message` holds its bytes past
+    /// `retained_message_max` of it while it is incomplete (`held`).
     budget: ?*dusty.admission.State = null,
     held: dusty.admission.Held = .{},
     /// Sending is over: a close went out.
@@ -155,7 +155,12 @@ pub const H2Socket = struct {
                     self.fail(.too_large);
                     return error.MessageTooLarge;
                 }
-                if (self.budget) |a| if (!self.held.growTo(a, self.io, self.held.bytes + payload.len)) {
+                // The first `retained_message_max` bytes hold nothing: the
+                // socket keeps that much between messages anyway, as one
+                // over HTTP/1.1 keeps its read buffer, so a small message is
+                // never refused, however full the budget.
+                const total = self.message.items.len + payload.len;
+                if (total > retained_message_max) if (self.budget) |a| if (!self.held.growTo(a, self.io, total - retained_message_max)) {
                     self.fail(.try_again_later);
                     return error.TryAgainLater;
                 };

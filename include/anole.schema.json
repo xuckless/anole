@@ -1482,7 +1482,7 @@
           "anyOf": [
             {
               "type": "integer",
-              "minimum": 0,
+              "minimum": 3,
               "maximum": 4294967295
             },
             {
@@ -1490,7 +1490,7 @@
             }
           ],
           "default": null,
-          "description": "Request tasks per executor (connections being served, HTTP/2 and HTTP/3 streams); past it, accepts wait and streams are refused. Null: from vm.max_map_count on Linux, no cap elsewhere."
+          "description": "Request tasks per executor (connections being served, HTTP/2 and HTTP/3 streams), at least 3; accepts wait a quarter below it, streams are refused at it. Null: from vm.max_map_count on Linux, no cap elsewhere."
         },
         "max_requests_per_connection": {
           "anyOf": [

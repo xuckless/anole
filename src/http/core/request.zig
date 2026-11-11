@@ -388,13 +388,10 @@ pub const Request = struct {
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
         const hint = if (r.decode == null) self.content_length else null;
-        // A known length takes all it will hold now, before the first byte
-        // is read, so a body admitted never fails for memory later
-        // (goose-http's gather budget): the length and the byte of room
-        // `allocRemainingHinted` reads the end into.
-        if (budget) |b| if (hint) |n| {
-            if (n > 0 and !b.growTo(@min(n, self._config.max_body_size) +| 1)) return self.shedBody();
-        };
+        // Undecoded, the declared length is the body's (llhttp, nghttp2 and
+        // nghttp3 hold the peer to it): one past the limit is refused
+        // before any of it is read or held, and before a 100 Continue.
+        if (hint) |n| if (n > self._config.max_body_size) return error.BodyTooBig;
         const result = allocRemainingHinted(&r.interface, self.arena, self._config.max_body_size, hint, budget) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             error.Overloaded => return self.shedBody(),
@@ -832,15 +829,23 @@ const body_reserve_max = 16 * 1024;
 /// `r` yields: no hint when something between the wire and `r`
 /// changes their length (a decoder).
 ///
-/// With a `budget` (the server's, #131), every growth of the buffer is
-/// granted by it first, and one it refuses fails with
-/// `error.Overloaded`; a caller that granted the whole length up front
-/// (`Request.body`) never sees that. Null, nothing is counted.
+/// With a `budget` (the server's, #131), a hint within `limit` is granted
+/// whole (+ 1) before the first read, and a refusal fails with
+/// `error.Overloaded` before any byte is read; past the hint, or without
+/// one, each growth is granted as it comes and can fail partway. Null,
+/// nothing is counted.
 pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: usize, hint: ?usize, budget: ?admission.Budget) AllocHintedError![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const declared: usize = if (hint) |n| (if (n <= limit) n else 0) else 0;
-    if (declared > 0) try growBody(&aw, @min(declared, body_reserve_max) + 1, budget);
+    if (declared > 0) {
+        // A known length takes all it will hold of the budget now, before
+        // the first byte is read, so a body admitted never fails for memory
+        // later (goose-http's gather budget): the length and the byte of
+        // room the read that finds its end goes into.
+        if (budget) |b| if (!b.growTo(declared + 1)) return error.Overloaded;
+        try growBody(&aw, @min(declared, body_reserve_max) + 1, budget);
+    }
     // As `allocRemaining`: one byte past `limit` is how it is exceeded.
     var remaining: std.Io.Limit = .limited(limit +| 1);
     while (remaining != .nothing) {
@@ -2187,18 +2192,40 @@ test "Request.body: a declared length past the maximum reserves nothing for it" 
     const bytes = try bodyPattern(gpa, 4000);
     defer gpa.free(bytes);
     const grow = std.ArrayList(u8).growCapacity;
-    // Declared and sent past the maximum: 413 as before, and the buffer
-    // never went past what std's growth to the maximum takes (the 4000
-    // declared would have reserved 4001). `Allocating.drain` asks for one
-    // byte past what it writes, hence the + 1s.
+    // Declared past the maximum: 413 before any of it is read, with no
+    // buffer at all (undecoded, the declared length is the body's).
     const past = try sourceBodyCounts(bytes, 4000, 1000, error.BodyTooBig);
-    try std.testing.expect(past.largest <= grow(1000 + 1 + 1));
+    try std.testing.expectEqual(0, past.largest);
     // A source sending more than it declared, under the maximum: all of
     // it, the declared 1001 first and then std's growth past it.
     const more = try sourceBodyCounts(bytes, 1000, 1024 * 1024, bytes);
     try std.testing.expect(more.largest <= grow(bytes.len + 1));
     // And past the maximum: 413.
     _ = try sourceBodyCounts(bytes, 1000, 2000, error.BodyTooBig);
+}
+
+test "allocRemainingHinted: a budget grants a declared length whole before the first read, or refuses it before any" {
+    var rows = [_]admission.Row{.{}};
+    var s: admission.State = .{ .rows = &rows, .buffer_budget = 100 };
+    // Another holder has most of it.
+    var other: admission.Held = .{};
+    try std.testing.expect(other.growTo(&s, std.testing.io, 60));
+    var held: admission.Held = .{};
+    const b: admission.Budget = .{ .state = &s, .held = &held, .io = std.testing.io };
+    const fifty: [50]u8 = @splat('x');
+    var source: std.Io.Reader = .fixed(&fifty);
+    try std.testing.expectError(error.Overloaded, allocRemainingHinted(&source, std.testing.allocator, 1000, 50, b));
+    try std.testing.expectEqual(@as(usize, 0), source.seek);
+    try std.testing.expectEqual(@as(usize, 0), held.bytes);
+    // Once it fits, the length and the byte the end is read into, all at
+    // once: nothing is refused partway.
+    other.release();
+    const got = try allocRemainingHinted(&source, std.testing.allocator, 1000, 50, b);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqual(@as(usize, 50), got.len);
+    try std.testing.expectEqual(@as(usize, 51), held.bytes);
+    held.release();
+    try std.testing.expectEqual(@as(usize, 0), rows[0].held_bytes.load(.monotonic));
 }
 
 test "Request.body: Content-Length: 0 and no body are null" {

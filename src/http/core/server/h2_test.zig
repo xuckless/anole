@@ -1412,6 +1412,99 @@ test "HTTP/2: a body the buffer budget can't hold gets 503 on its stream, and th
     try std.testing.expectEqual(@as(usize, 0), row.held_bytes.load(.monotonic));
 }
 
+/// A no_wait handler that detaches, then reads the body from the moved
+/// request and finishes from inside the handler: the body is first
+/// collected by the copy, after the original's chain has nothing to give
+/// back.
+const DetachedBody = struct {
+    var ctx: u8 = 0;
+    fn abort(_: *anyopaque) void {}
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        const d = try res.detach(req, .{ .abort = abort, .ctx = &ctx });
+        const b = try d.request.body();
+        try d.response.print(.text, "{d}", .{if (b) |x| x.len else 0});
+        d.finish({});
+    }
+};
+
+test "HTTP/2: a body read from a detached request gives its share of the buffer budget back when the exchange ends" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.addRouteWith(.post, "/nw/detached-body", DetachedBody.handle, .{ .no_wait = true });
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const len = [_]c.nghttp2_nv{TestClient.nv("content-length", "9")};
+    const id = try client.requestHeaders("POST", "/nw/detached-body", &len, "123456789");
+    try client.run();
+    try std.testing.expectEqualStrings("9", client.get(id).body.items);
+    try std.testing.expectEqual(@as(usize, 0), fx.server.admission.rows[0].held_bytes.load(.monotonic));
+}
+
+fn tasksAre(server: *dusty.Server(void), n: u32) bool {
+    return server.admission.rows[0].tasks.load(.monotonic) == n;
+}
+
+fn waitTasks(io: std.Io, server: *dusty.Server(void), n: u32) !void {
+    const S = struct { s: *dusty.Server(void), n: u32 };
+    try wait.waitUntil(io, "the executor's request tasks", S{ .s = server, .n = n }, struct {
+        fn f(x: S) bool {
+            return tasksAre(x.s, x.n);
+        }
+    }.f);
+}
+
+test "HTTP/2: idle connections leave the task cap's last quarter to streams; past the cap a stream is refused, and served once a slot frees" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        // Accepts stop at 2: one HTTP/2 connection's reader and writer.
+        .max_tasks = 3,
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    server.router.get("/wait", Waiter.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const first = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(first).body.items);
+    try waitTasks(io, &server, 2);
+
+    // A second connection waits at the accept: it can't take the slot
+    // the first connection's streams need.
+    var idle: TestClient = undefined;
+    try idle.init(std.testing.allocator, io, server.address.ip);
+    defer idle.deinit();
+    try wait.waitAtLeast(io, "the accept waiting below the task cap", &server.admission.refused_tasks, 1);
+
+    // So a stream still gets a task...
+    const waiting = try client.request("GET", "/wait", null);
+    try Waiter.start(&client, io);
+    try std.testing.expect(tasksAre(&server, 3));
+    // ...and one past the cap is refused, safe to retry.
+    const refused = try client.request("GET", "/hello", null);
+    try client.runUntilDone(refused);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_REFUSED_STREAM), client.get(refused).error_code);
+    try std.testing.expectEqual(@as(u64, 2), server.admission.refused_tasks.load(.monotonic));
+
+    _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, waiting, c.NGHTTP2_CANCEL);
+    try client.runUntilDone(waiting);
+    try Waiter.expectLetGo(io);
+    try waitTasks(io, &server, 2);
+    const again = try client.request("GET", "/hello", null);
+    try client.runUntilDone(again);
+    try std.testing.expectEqualStrings("hello", client.get(again).body.items);
+}
+
 test "HTTP/2: a body that overflows its queue resets only its stream, with INTERNAL_ERROR" {
     const io = std.testing.io;
     var fx: Fixture = undefined;

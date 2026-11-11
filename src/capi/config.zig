@@ -219,8 +219,8 @@ pub const Config = struct {
         /// Retry-After (or close 1013). Null: a quarter of memory over the
         /// executors.
         buffer_budget: ?usize = null,
-        /// Request tasks per executor; past it, accepts wait and streams
-        /// are refused. Null: from vm.max_map_count on Linux.
+        /// Request tasks per executor, at least 3; near it accepts wait,
+        /// past it streams are refused. Null: from vm.max_map_count on Linux.
         max_tasks: ?u32 = null,
         /// Requests per keep-alive connection; null: no limit.
         max_requests_per_connection: ?u32 = null,

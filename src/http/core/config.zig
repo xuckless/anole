@@ -308,11 +308,13 @@ pub const ServerConfig = struct {
     /// Request tasks per executor at once (#48): HTTP/1.x connections
     /// being served, HTTP/2 and HTTP/3 streams. Each task's stack is two
     /// memory mappings, and past `vm.max_map_count` every `mmap` in the
-    /// process fails. At the cap an HTTP/1.x accept waits (the kernel's
-    /// backlog holds the next connections), a parked connection woken is
-    /// closed, and a stream is refused (REFUSED_STREAM,
-    /// H3_REQUEST_REJECTED). Null: on Linux, what `vm.max_map_count` leaves
-    /// after the mappings in use and an eighth of headroom, over the
+    /// process fails. A quarter below the cap an HTTP/1.x accept waits
+    /// (the kernel's backlog holds the next connections), so connections
+    /// never take the room streams need; at the cap a stream is refused
+    /// (REFUSED_STREAM, H3_REQUEST_REJECTED). A parked connection whose
+    /// request arrived is counted, never refused. At least 3 (an HTTP/2
+    /// connection holds two tasks). Null: on Linux, what `vm.max_map_count`
+    /// leaves after the mappings in use and an eighth of headroom, over the
     /// executors; elsewhere no cap.
     max_tasks: ?u32 = null,
     /// The WebSocket admission gate: while an executor is overloaded, the

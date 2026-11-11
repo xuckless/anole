@@ -244,27 +244,98 @@ test "budget: resolved per executor when the server starts, and set values kept"
     try std.testing.expectEqual(@as(u32, 7), server.admission.task_cap);
 }
 
-test "tasks: at the cap an HTTP/1.x accept waits for a task to end" {
+test "budget: a refused body sent without Expect gets its 503 before the rest of it" {
     const io = std.testing.io;
-    var server = Server.init(std.testing.allocator, io, .{ .listeners = loopback, .max_tasks = 1 }, {});
+    var server = Server.init(std.testing.allocator, io, .{ .listeners = loopback, .buffer_budget = 64 * 1024 }, {});
     defer server.deinit();
     var future = try startServer(&server, io);
     defer future.cancel(io) catch {};
 
-    // The one slot: a connection whose body never completes.
     const first = try startPost(io, &server, head_64k, 1000);
     defer first.close(io);
     try waitHeld(io, &server, 65537);
-    try std.testing.expectEqual(@as(u32, 1), server.admission.rows[0].tasks.load(.monotonic));
 
-    // A second connection is accepted by the kernel, then waits for the
+    // A browser's POST: no Expect, part of the body sent. The 503 comes
+    // without the server waiting for the rest (it is never sent here).
+    var buf: [2048]u8 = undefined;
+    const stream = try startPost(io, &server, "POST /len HTTP/1.1\r\nHost: x\r\nContent-Length: 65536\r\n\r\n", 1000);
+    defer stream.close(io);
+    const refused = try finish(io, stream, "", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 503"));
+    try std.testing.expect(headerValue(refused, "Retry-After") != null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(headerValue(refused, "Connection") orelse "", "close"));
+    try std.testing.expectEqual(@as(u64, 1), server.admission.refused_memory.load(.monotonic));
+
+    const done = try finish(io, first, &@as([64536]u8, @splat('x')), &buf);
+    try std.testing.expect(std.mem.startsWith(u8, done, "HTTP/1.1 200"));
+    try waitHeld(io, &server, 0);
+}
+
+test "budget: a declared length past max_body_size is 413 at once, holding nothing, however full the budget" {
+    const io = std.testing.io;
+    var server = Server.init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .buffer_budget = 64 * 1024,
+        .request = .{ .max_body_size = 128 * 1024 },
+    }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    const first = try startPost(io, &server, head_64k, 1000);
+    defer first.close(io);
+    try waitHeld(io, &server, 65537);
+
+    // Not a 503 to retry: it can never pass. No 100 Continue either.
+    var buf: [2048]u8 = undefined;
+    const too_big = try rawAll(io, &server, "POST /len HTTP/1.1\r\nHost: x\r\nContent-Length: 5000000\r\nExpect: 100-continue\r\n\r\n", 0, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, too_big, "HTTP/1.1 413"));
+    try std.testing.expect(std.mem.indexOf(u8, too_big, "100 Continue") == null);
+    try std.testing.expectEqual(@as(u64, 0), server.admission.refused_memory.load(.monotonic));
+    try std.testing.expect(heldIs(&server, 65537));
+
+    const done = try finish(io, first, &@as([64536]u8, @splat('x')), &buf);
+    try std.testing.expect(std.mem.startsWith(u8, done, "HTTP/1.1 200"));
+    try waitHeld(io, &server, 0);
+}
+
+test "tasks: a quarter below the cap an HTTP/1.x accept waits for a task to end" {
+    const io = std.testing.io;
+    // Accepts stop at 2 of 3: the third slot is kept for streams.
+    var server = Server.init(std.testing.allocator, io, .{ .listeners = loopback, .max_tasks = 3 }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    // The two slots accepts may take: connections whose bodies never
+    // complete.
+    var held: [2]std.Io.net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (held[0..opened]) |s| s.close(io);
+    for (&held) |*s| {
+        s.* = try startPost(io, &server, head_64k, 1000);
+        opened += 1;
+    }
+    try waitHeld(io, &server, 2 * 65537);
+    try std.testing.expectEqual(@as(u32, 2), server.admission.rows[0].tasks.load(.monotonic));
+
+    // A third connection is accepted by the kernel, then waits for a
     // slot; once the first ends it is served.
-    const second = try startPost(io, &server, head_64k, 65536);
-    defer second.close(io);
+    const third = try startPost(io, &server, head_64k, 65536);
+    defer third.close(io);
     try wait.waitAtLeast(io, "the accept waiting at the task cap", &server.admission.refused_tasks, 1);
     var buf: [2048]u8 = undefined;
-    const answer_first = try finish(io, first, &@as([64536]u8, @splat('x')), &buf);
+    const answer_first = try finish(io, held[0], &@as([64536]u8, @splat('x')), &buf);
     try std.testing.expect(std.mem.startsWith(u8, answer_first, "HTTP/1.1 200"));
-    const answer = try finish(io, second, "", &buf);
+    const answer = try finish(io, third, "", &buf);
     try std.testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200"));
+    const answer_second = try finish(io, held[1], &@as([64536]u8, @splat('x')), &buf);
+    try std.testing.expect(std.mem.startsWith(u8, answer_second, "HTTP/1.1 200"));
+}
+
+test "tasks: max_tasks below 3 is refused at startup" {
+    const io = std.testing.io;
+    var server = Server.init(std.testing.allocator, io, .{ .listeners = loopback, .max_tasks = 2 }, {});
+    defer server.deinit();
+    try std.testing.expectError(error.NoTasksAllowed, server.run());
 }

@@ -492,8 +492,8 @@ pub const Options = struct {
         /// `Retry-After` (or close 1013). Null: a quarter of memory over
         /// the executors. See `http.ServerConfig.buffer_budget`.
         buffer_budget: ?usize = null,
-        /// Request tasks per executor (connections served, streams); past
-        /// it, accepts wait and streams are refused. Null: from
+        /// Request tasks per executor (connections served, streams), at
+        /// least 3; near it accepts wait, past it streams are refused. Null: from
         /// `vm.max_map_count` on Linux, no cap elsewhere. See
         /// `http.ServerConfig.max_tasks`.
         max_tasks: ?u32 = null,

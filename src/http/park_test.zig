@@ -503,6 +503,40 @@ test "idle park: stopping the server with many parked connections closes them al
     }
 }
 
+test "idle park: at the task cap a parked connection whose request arrives is still served" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(30) });
+    defer f.stop(gpa);
+    // A cap of 3 (set before the first connection): accepts stop at 2.
+    f.server.admission.task_cap = 3;
+    slow_gate = .unset;
+    defer slow_gate.set(f.io);
+    const entered = slow_entered.load(.acquire);
+
+    // Two connections served once, then parked: no task.
+    var parked: [2]Client = undefined;
+    for (&parked) |*c| try c.open(f.io, f.addr(), false);
+    defer for (&parked) |*c| c.close(f.io);
+    for (&parked) |*c| try std.testing.expectEqual(200, try c.get("/"));
+    try f.waitParked(2);
+    // Two more take the slots accepts may, in a slow handler each.
+    var busy: [2]Client = undefined;
+    for (&busy) |*c| try c.open(f.io, f.addr(), false);
+    defer for (&busy) |*c| c.close(f.io);
+    for (&busy) |*c| try c.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+    try wait.waitAtLeast(f.io, "the slow requests in their handlers", &slow_entered, entered + 2);
+    // A parked one woken takes the last slot, the other goes past the
+    // cap: both are served, neither closed.
+    for (&parked) |*c| try c.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+    try wait.waitAtLeast(f.io, "the woken requests in their handlers", &slow_entered, entered + 4);
+    try std.testing.expectEqual(@as(u32, 4), f.server.admission.rows[0].tasks.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), f.server.admission.refused_tasks.load(.monotonic));
+    slow_gate.set(f.io);
+    for (&busy) |*c| try std.testing.expectEqualStrings("slow", (try c.response()).body);
+    for (&parked) |*c| try std.testing.expectEqualStrings("slow", (try c.response()).body);
+}
+
 test "idle park: off, a connection keeps its task" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;

@@ -135,11 +135,12 @@ pub fn mapCount(io: std.Io) std.Io.Cancelable!?MapCount {
 /// what the mappings in use and an eighth of headroom (malloc, TLS, the
 /// tasks nothing counts) leave, at two mappings per coroutine stack (zio
 /// maps a stack's guard and its committed part apart, slabs included),
-/// over the executors; at least 1.
+/// over the executors; at least 3 (`admission.State.min_task_cap`: an
+/// HTTP/2 connection and its first stream).
 pub fn taskCap(m: MapCount, executors: usize) u32 {
     const free = m.max -| m.in_use -| m.max / 8;
     const per = free / 2 / @max(executors, 1);
-    return @intCast(@max(1, @min(per, std.math.maxInt(u32) - 1)));
+    return @intCast(@max(3, @min(per, std.math.maxInt(u32) - 1)));
 }
 
 fn parseCount(content: []const u8) ?u64 {
@@ -295,8 +296,9 @@ test "taskCap: the room vm.max_map_count leaves, two mappings a task, per execut
     // 65530 - 1500 - 8191 = 55839 mappings; 27919 tasks; 6979 each of 4.
     try std.testing.expectEqual(@as(u32, 6979), taskCap(.{ .max = 65530, .in_use = 1500 }, 4));
     try std.testing.expectEqual(@as(u32, 27919), taskCap(.{ .max = 65530, .in_use = 1500 }, 0));
-    // Nothing left still lets one through.
-    try std.testing.expectEqual(@as(u32, 1), taskCap(.{ .max = 1000, .in_use = 5000 }, 4));
+    // Nothing left still lets an HTTP/2 connection and its first stream
+    // through.
+    try std.testing.expectEqual(@as(u32, 3), taskCap(.{ .max = 1000, .in_use = 5000 }, 4));
     // A huge limit stays below "no cap".
     try std.testing.expect(taskCap(.{ .max = 1 << 62, .in_use = 0 }, 1) < std.math.maxInt(u32));
 }
