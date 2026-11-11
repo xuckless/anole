@@ -1768,3 +1768,89 @@ test "net tcp: a connection paused while parked ends at its lifetime, not its id
         }
     }.run);
 }
+
+// -- The close state at the drain (#199, #200).
+
+/// Answers its first input with "bye" and ends its side (a half-close),
+/// then reads on: the peer stays silent.
+const HalfSilent = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var ends: std.atomic.Value(u32) = .init(0);
+    var reason: std.atomic.Value(u32) = .init(99);
+
+    fn reset() void {
+        conn.store(null, .monotonic);
+        closed.store(0, .monotonic);
+        ends.store(0, .monotonic);
+        reason.store(99, .monotonic);
+    }
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        _ = try c.send("bye");
+        c.end();
+        conn.store(c, .release);
+    }
+    pub fn end(_: *net.Conn) !void {
+        _ = ends.fetchAdd(1, .release);
+    }
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@backingInt(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a graceful close after end() ends a connection whose peer stays silent, after the linger (#199)" {
+    HalfSilent.reset();
+    tcp.test_linger = .fromMilliseconds(1);
+    defer tcp.test_linger = null;
+    // Nothing parks: the reading task stays in its wait for input.
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = null } });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", HalfSilent, .{ .half_open = true });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("x");
+            try s.writer().flush();
+            try expectRead(s, "bye");
+            try expectEnd(s);
+            const c = try waitConn(a.io(), "the handler ended its side", &HalfSilent.conn);
+            c.close();
+            try waitFor(a.io(), &HalfSilent.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.local), HalfSilent.reason.load(.acquire));
+            // The end came from this side's own shutdown, not the peer.
+            try std.testing.expectEqual(@as(u32, 0), HalfSilent.ends.load(.acquire));
+        }
+    }.run);
+}
+
+test "net tcp: the drain closes a half-closed connection whose peer stays silent (#199)" {
+    HalfSilent.reset();
+    tcp.test_linger = .fromMilliseconds(1);
+    defer tcp.test_linger = null;
+    // No shutdown deadline: only the drain's own close can end it.
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = null, .shutdown = null } });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", HalfSilent, .{ .half_open = true });
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("x");
+            try s.writer().flush();
+            try expectRead(s, "bye");
+            try expectEnd(s);
+            _ = try waitConn(a.io(), "the handler ended its side", &HalfSilent.conn);
+            a.stop();
+            try waitFor(a.io(), &HalfSilent.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.drain), HalfSilent.reason.load(.acquire));
+            try std.testing.expectEqual(@as(u32, 0), HalfSilent.ends.load(.acquire));
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.run();
+    try checking.await(app.io());
+}

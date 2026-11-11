@@ -883,6 +883,47 @@ test "capi net: close_on_drain false leaves a connection to the consumer through
     try expectNoMoreCloses(rig);
 }
 
+/// The graceful close's wait for the peer, cut short (`tcp.test_linger`).
+const tcp_mod = @import("../net/tcp.zig");
+
+/// `half_open`, no shutdown deadline and no parking: the reading task
+/// stays in its wait for input, and only the drain's own close can end a
+/// connection whose client stays silent.
+const tcp_half_unparked = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": null, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"half_open\": true}}]}";
+
+test "capi net: the drain closes a connection the consumer ended (NET_F_END) whose client stays silent (#199)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    tcp_mod.test_linger = .fromMilliseconds(1);
+    defer tcp_mod.test_linger = null;
+    const rig = try Rig.create(tcp_half_unparked);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    var r: ToEnd = .{ .s = s };
+    try r.start();
+    defer r.join();
+    _ = try engine.net.write(rig.e, open.handle, "bye", abi.NET_F_END);
+    try wait.waitFlag(std.testing.io, "the client read the server's FIN", &r.ended);
+    try std.testing.expectEqualStrings("bye", r.got);
+
+    // The client sends nothing more and keeps its side open.
+    try rig.e.drain();
+    const draining = try rig.take(.draining);
+    free(draining);
+    const close = try rig.take(.net_close);
+    defer free(close);
+    try std.testing.expectEqual(open.handle, close.handle);
+    const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
+    try std.testing.expectEqual(@as(u32, abi.NET_CLOSED_DRAIN), ce.reason);
+    try expectNoMoreCloses(rig);
+    // The end came from the server's own shutdown: no NET_END for it.
+    try std.testing.expectEqual(@as(usize, 0), rig.pending(.net_end));
+}
+
 test "capi net: config tcp and udp keys parse, and each refusal says why" {
     if (comptime !features.net) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(alloc);

@@ -1587,11 +1587,10 @@ connections stay open through the drain until the consumer closes them
 (after `ANOLE_EV_DRAINING`), or `timeouts.shutdown_ms` closes them with
 `ANOLE_NET_CLOSED_DRAIN`, as `node:net`'s `server.close()` leaves its
 sockets. Either way a connection that has parked (no input for
-`timeouts.idle_park_ms`) is closed at drain start. Known gap: a connection whose write side the consumer already
-ended (`ANOLE_NET_F_END`), whose peer then sends nothing, and that read input
-within `timeouts.idle_park_ms` before the drain is not closed by it; it stays
-until the peer sends or ends, `tcp.idle_timeout_ms` or `tcp.lifetime_ms`, or
-`timeouts.shutdown_ms`.
+`timeouts.idle_park_ms`) is closed at drain start. A connection whose write
+side the consumer already ended (`ANOLE_NET_F_END`) is closed by the drain
+too: its FIN went already, so the 2 s wait for the peer starts at once (as for
+`ANOLE_NET_CLOSE_GRACEFUL` after `ANOLE_NET_F_END`).
 
 **Read credit.** A connection posts at most `tcp.read_ahead` bytes the
 consumer has not polled yet; the rest waits in the kernel. One fast peer and a

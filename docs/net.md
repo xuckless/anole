@@ -202,10 +202,9 @@ still owed is lost; input read after it is dropped. The connection closes
 once the peer ends its side, or 2 s after this side ended (the queue written,
 bounded by `write_timeout`; TLS close_notify; FIN). One idle long enough to
 have parked (`timeouts.idle_park`) is closed by the server at once instead,
-without waiting for its queue. Known gap: a connection the handler already
-`end`ed (half-closed), whose peer then stays silent, and that read input
-within `timeouts.idle_park` before the drain stays until the peer sends or
-ends, `idle_timeout` or `lifetime`, or `timeouts.shutdown`.
+without waiting for its queue. A connection the handler already `end`ed
+(half-closed) is closed too: its FIN went already, so the 2 s wait for the
+peer starts at once (as for a `conn.close()` after `conn.end()`).
 
 The C ABI's raw TCP listeners get the same close at drain start: the consumer
 sees `ANOLE_EV_DRAINING` and an `ANOLE_EV_NET_CLOSE` with

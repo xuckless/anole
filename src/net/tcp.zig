@@ -1837,6 +1837,12 @@ const TcpConn = struct {
         return true;
     }
 
+    /// A close's linger is due: its FIN went and no flusher waits in it
+    /// yet (a close after an `end`'s FIN, #199).
+    fn lingerDue(t: *TcpConn) bool {
+        return t.closeState().local == .linger_due;
+    }
+
     /// The FIN is due: asked for, not sent, and nothing queued or reserved.
     fn endDue(t: *TcpConn) bool {
         const l = t.closeState().local;
@@ -1850,7 +1856,7 @@ const TcpConn = struct {
     /// driver, or the party sees its chunk.
     fn letGo(t: *TcpConn, mine: u8) bool {
         t.sched.store(Sched.none, .seq_cst);
-        const more = !t.inbox.isEmpty() or (!t.isDead() and (!t.out.isEmpty() or t.endDue()));
+        const more = !t.inbox.isEmpty() or (!t.isDead() and (!t.out.isEmpty() or t.endDue() or t.lingerDue()));
         if (!more) return false;
         return t.sched.cmpxchgStrong(Sched.none, mine, .seq_cst, .seq_cst) == null;
     }
@@ -1920,6 +1926,9 @@ const TcpConn = struct {
                         t.shutdownSocket(.send);
                         t.endFinished();
                     }
+                    // A close after the FIN (one raced this turn, or came
+                    // after an `end`): its linger waits, so a flusher's.
+                    if (t.lingerDue()) return t.handOver();
                     if (t.letGo(Sched.driver)) continue;
                     return;
                 }
@@ -2155,6 +2164,11 @@ const TcpConn = struct {
                         t.finishOutput();
                         continue;
                     }
+                    // A close after an `end` whose FIN went (#199).
+                    if (t.lingerDue()) {
+                        t.lingerAfterFin(false);
+                        continue;
+                    }
                     if (t.letGo(Sched.flusher)) continue;
                     return;
                 }
@@ -2239,6 +2253,9 @@ const TcpConn = struct {
         }
         if (t.over.load(.acquire) != 0) return;
         if (t.advance(.linger_end)) |c| if (c.becameOver()) {
+            // A close's (`finishGraceful` sets it too); the drain's, or one
+            // set before, stands.
+            t.setReason(.local);
             t.shutdownSocket(.both);
             t.setOver();
         };
@@ -2481,7 +2498,9 @@ const TcpConn = struct {
     /// A wait for input failed or the peer ended.
     fn readEnded(t: *TcpConn, burst: *dusty.Burst, err: anyerror) anyerror!dusty.Burst.End {
         switch (err) {
-            error.EndOfStream => return t.peerEnded(burst),
+            // Over already: the end is this side's own shutdown (a reset,
+            // a failure, a close's linger), not the peer's.
+            error.EndOfStream => return if (t.over.load(.acquire) != 0) .close else t.peerEnded(burst),
             error.Canceled => {
                 if (burst.timer.fired()) {
                     const now = std.Io.Clock.Timestamp.now(t.io, .awake);

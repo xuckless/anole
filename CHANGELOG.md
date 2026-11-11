@@ -97,6 +97,17 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- **net (raw TCP)**: a connection whose write side was already ended
+  (`conn.end()`, `ANOLE_NET_F_END`) and whose peer then stayed silent was
+  not closed by the drain or by a later graceful close until the peer
+  sent or ended, `idle_timeout`/`lifetime` or `timeouts.shutdown` (#199).
+  The close now waits at most the 2 s linger for the peer, as any graceful
+  close does. A graceful close that ends at its linger now reports reason
+  `local` (before, a connection whose reading task had parked fell back
+  to `drain`, `idle` or `lifetime`), and the end of input caused by the
+  server's own shutdown (a reset, a failure, the linger) is no longer
+  reported to a `half_open` handler as the peer's `end`
+  (`ANOLE_EV_NET_END`).
 - **watch (Redis Pub/Sub)**: a channel or pattern whose first watch
   started while the shared SUBSCRIBE connection was being opened was not
   subscribed until the connection was next lost (#216). The PostgreSQL
