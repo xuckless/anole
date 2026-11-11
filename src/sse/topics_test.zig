@@ -570,6 +570,39 @@ test "sse: a write error ends the subscriber (client_gone)" {
     try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
 }
 
+test "sse: close after a failed write does nothing: no sender claimed, the reason stays client_gone" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const f = try h.add(&.{"t"}, null);
+    try h.waitSettled(0);
+    const sub = h.subAt(0);
+    // Its sender runs here, by hand, as the fallback's own task runs it
+    // (S3): between the failed write and the end there is a window.
+    h.hub.mutex.lockUncancelable(io);
+    sub.fallback = true;
+    h.hub.mutex.unlock(io);
+    f.fail_with = error.Gone;
+    _ = try h.hub.publish("t", .{ .data = "x" });
+    try std.testing.expectEqual(Topics.SendOutcome.broken, try h.hub.sendQueued(sub));
+
+    sub.close();
+    h.hub.mutex.lockUncancelable(io);
+    // Before #211 this claimed a sender nothing would run (the fallback
+    // had stopped), so the end waited for it forever, and the reason
+    // became `closed`.
+    const running = sub.running;
+    const queued = sub.queue.items.len - sub.head;
+    const reason = sub.close_reason;
+    h.hub.mutex.unlock(io);
+    try std.testing.expect(!running);
+    try std.testing.expectEqual(@as(usize, 0), queued);
+    try std.testing.expectEqual(root.CloseReason.client_gone, reason);
+
+    Topics._gone(sub);
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+}
+
 test "sse: routes: templates are checked against the path" {
     try std.testing.expect(root.templatesMatch("/rooms/:room/events", .{ .topics = &.{ "news", "room:{room}" } }));
     try std.testing.expect(!root.templatesMatch("/rooms/:id/events", .{ .topics = &.{"room:{room}"} }));

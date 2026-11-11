@@ -97,6 +97,11 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- **SSE**: `Subscriber.close()` on a subscriber whose write had just
+  failed queued an end and claimed a sender for the dead stream (#211).
+  In the fallback (S3) nothing ran that sender, so ending the subscriber
+  waited for it forever; otherwise `on_close` could report `closed`
+  instead of `client_gone`. `close()` now does nothing once a write failed.
 - **watch**: `gapAll` could use a watch after free when a stop took it
   out concurrently; each watch now gets its gap under the hub's lock
   (#165).
