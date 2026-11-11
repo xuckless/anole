@@ -2069,3 +2069,163 @@ test "sqlite: migrate runs a migration below the latest applied when it is not r
     try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, &merged));
     try testing.expect(try tableExists(db, &s.ctx, "notes"));
 }
+
+test "sqlite: a write on the client inside the same task's open transaction fails at once instead of waiting for itself (#160)" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const level = quiet();
+    defer testing.log_level = level;
+    // A file with readers, and :memory:, where reads use the writer too.
+    for ([_][]const u8{ tmp.file("app.db"), ":memory:" }) |path| {
+        // No `timeout = .max`: a regression fails by GatewayTimeout, not a hang.
+        const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 1 });
+        defer db.deinit();
+        var s: Scratch = undefined;
+        s.init(io);
+        defer s.deinit();
+        const ctx = &s.ctx;
+        _ = try db.exec(ctx, schema, .{});
+
+        // An open transaction.
+        {
+            var tx = try db.begin(ctx, .{});
+            defer tx.deinit();
+            _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('in tx')", .{});
+            try testing.expectError(error.Database, db.exec(ctx, "INSERT INTO notes (title) VALUES ('on client')", .{}));
+            try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "already holds the writer") != null);
+            try testing.expectEqual(anole_db.Class.other, anole_db.lastError(ctx).?.class);
+            // A second transaction and an acquire are refused the same way.
+            try testing.expectError(error.Database, db.begin(ctx, .{}));
+            try testing.expectError(error.Database, db.acquire(ctx));
+            // The transaction is untouched.
+            _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('in tx 2')", .{});
+            try tx.commit(ctx);
+        }
+        try testing.expectEqual(@as(i64, 2), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+
+        // An acquired writer.
+        {
+            const conn = try db.acquire(ctx);
+            defer conn.release();
+            try testing.expectError(error.Database, db.exec(ctx, "INSERT INTO notes (title) VALUES ('x')", .{}));
+            try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "already holds the writer") != null);
+        }
+        // Rows open on the writer (a write's RETURNING goes there).
+        {
+            var rows = try db.iterate(i64, ctx, "INSERT INTO notes (title) VALUES ('r') RETURNING id", .{});
+            defer rows.deinit();
+            try testing.expectError(error.Database, db.exec(ctx, "INSERT INTO notes (title) VALUES ('y')", .{}));
+            try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "already holds the writer") != null);
+        }
+        // Everything given back: the client writes again.
+        try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('after')", .{}));
+    }
+}
+
+const ClientWriteTx = struct {
+    fn run(tx: *sqlite.Tx, db: *sqlite.Client, ctx: *anole_db.Ctx, calls: *u32) !void {
+        calls.* += 1;
+        _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('in tx')", .{});
+        _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('on client')", .{});
+    }
+};
+
+test "sqlite: transaction() whose function writes on the client fails once, not retried (#160)" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+    var calls: u32 = 0;
+    try testing.expectError(error.Database, db.transaction(ctx, .{ .retries = 3 }, ClientWriteTx.run, .{ db, ctx, &calls }));
+    try testing.expectEqual(@as(u32, 1), calls);
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "already holds the writer") != null);
+    // Rolled back.
+    try testing.expectEqual(@as(i64, 0), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+/// A client write from a task of its own: `err` is its failure.
+const OtherWrite = struct {
+    db: *sqlite.Client,
+    io: std.Io,
+    changes: u64 = 0,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *OtherWrite) void {
+        defer w.done.store(true, .release);
+        var sc: Scratch = undefined;
+        sc.init(w.io);
+        defer sc.deinit();
+        w.changes = w.db.exec(&sc.ctx, "INSERT INTO notes (title) VALUES ('other task')", .{}) catch |err| {
+            w.err = err;
+            return;
+        };
+    }
+};
+
+test "sqlite: a write from another task while a transaction is open waits for it, and runs after the commit (#160)" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('in tx')", .{});
+    var w: OtherWrite = .{ .db = db, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, OtherWrite.run, .{&w});
+    // It waits for the writer, not refused as the holder.
+    try wait.waitUntil(io, "the other task's write waits for the writer", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return consoleSays(d, "\"waiting\":1}");
+        }
+    }.f);
+    try testing.expect(!w.done.load(.acquire));
+    try tx.commit(ctx);
+    try wait.waitFlag(io, "the other task's write returned", &w.done);
+    if (w.err) |err| return err;
+    try testing.expectEqual(@as(u64, 1), w.changes);
+    try testing.expectEqual(@as(i64, 2), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: the writer's holder identity: a task has one, a blocking-pool thread and std.Io.Threaded have none (#160)" {
+    var r: Runtime = undefined;
+    try r.init(1, 1);
+    defer r.deinit();
+    const io = r.io();
+    // The test's thread runs executor 0's main task.
+    try testing.expect(dusty.placement.currentTask(io) != null);
+    const OnPool = struct {
+        fn run(io_: std.Io) bool {
+            return dusty.placement.currentTask(io_) == null;
+        }
+    };
+    try testing.expect(try r.pool.run(io, OnPool.run, .{io}));
+    try testing.expect(dusty.placement.currentTask(testing.io) == null);
+}

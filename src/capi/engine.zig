@@ -1583,6 +1583,7 @@ pub const Engine = struct {
                 .max_streams_bidi = cfg.http3.max_streams_bidi,
                 .validate_address = cfg.http3.validate_address,
                 .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
+                .handshake_timeout = .fromMilliseconds(cfg.http3.handshake_timeout_ms),
                 .alt_svc = cfg.http3.alt_svc,
                 .early_data = cfg.http3.early_data,
                 .prefer_v2 = cfg.http3.prefer_v2,

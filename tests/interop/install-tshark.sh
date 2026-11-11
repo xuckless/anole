@@ -34,7 +34,7 @@ mkdir -p "$debs"
 # connections fail after 20 s instead of its default 120.
 t_repo=45 t_update=75 t_install=120 budget=560
 attempt_max=$((t_repo + t_update + t_install))
-fallback_max=$((t_update + t_install))
+fallback_max=$((t_repo + t_update + t_install))
 
 # `bounded SECS CMD...` runs CMD as root for SECS seconds at most; timeout
 # runs as root too, so its signals reach CMD. sudo drops the environment,
@@ -61,8 +61,12 @@ from_ppa() {
   fi
 }
 
+# Bounded like every network step: `-r` asks Launchpad about the PPA too,
+# and a Launchpad that hangs instead of answering held this step to its 10
+# minutes. When it can't answer, the PPA's source file is removed by hand.
 drop_ppa() {
-  sudo add-apt-repository -r -y -n "$ppa" >/dev/null 2>&1 || true
+  bounded $t_repo add-apt-repository -r -y -n "$ppa" >/dev/null 2>&1 ||
+    sudo rm -f /etc/apt/sources.list.d/wireshark-dev-ubuntu-nightly-*
   apt $t_update update -qq || true
 }
 

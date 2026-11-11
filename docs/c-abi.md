@@ -259,7 +259,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_REQUEST` | `anole_request_event`, then header spans, parameter spans, bytes | `anole_req` | an answer: respond, respond_fd, stream_end, fail, abort or handle_release |
 | `ANOLE_EV_BODY` | `anole_event`: more request body (after `ANOLE_E_AGAIN`) | `anole_req` | none |
 | `ANOLE_EV_ABORT` | `anole_abort_event`: why (`reason`) and what the client was sent (`status`); nothing more is owed | `anole_req`, `anole_grpc_call` | ends it |
-| `ANOLE_EV_WRITABLE` | `anole_event`: a stream, call, WebSocket or WebTransport stream that took `ANOLE_BUSY` has room | `anole_req`, `anole_grpc_call`, `anole_ws`, `anole_wt_stream` | none |
+| `ANOLE_EV_WRITABLE` | `anole_event`: a stream, call, WebSocket, WebTransport stream, raw TCP connection, UDP socket, SSE subscriber or S3 transfer that took `ANOLE_BUSY` has room. Edge-triggered, one per wait; it may come spuriously, and for a WebTransport stream when its sending side is over (the next write answers `ANOLE_E_GONE`); for every other handle its own end event (`ANOLE_EV_ABORT`, `ANOLE_EV_NET_CLOSE`, `ANOLE_EV_WS_CLOSE`, `ANOLE_EV_SSE_CLOSE`, the transfer's `ANOLE_EV_S3_RESULT`) ends the wait, never a WRITABLE | `anole_req`, `anole_grpc_call`, `anole_ws`, `anole_wt_stream`, `anole_net_conn`, `anole_net_udp`, `anole_sse`, `anole_s3_transfer` | none |
 | `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | any (may be stale) | none |
 | `ANOLE_EV_WS_OPEN` | `anole_request_event` of the upgrade request | `anole_ws` | none |
 | `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` | none |
@@ -348,7 +348,10 @@ A request record (128 bytes, then variable parts) carries the route's
 `handler` id, the method (an enum and the name as sent), the HTTP version
 (11, 20, 30), the raw path and query, the headers (names lower-cased, order
 and duplicates kept; their spans start at `spans_off`, then the route
-parameters' spans: `anole_request_spans(r)`), the client's address (proxies
+parameters' spans: `anole_request_spans(r)`; pseudo-header fields never
+appear: HTTP/2 and HTTP/3 give `:authority` as a `host` header, so `host`
+is there on every protocol, absent only on an HTTP/1.0 request without one),
+the client's address (proxies
 applied), the listener's name, the request ID (the `request_id` middleware),
 a verified JWT's claims as JSON (the `jwt` middleware), the client's
 certificate as a span (`peer_cert`, mutual TLS), `timeout_us` (the time left
@@ -742,7 +745,7 @@ none.
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 4 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
-| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait`, `send_memory` | null, null, 256, false, 30000, true, false, true, null, true, true, null (auto) | `http3.*` |
+| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `handshake_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait`, `send_memory` | null, null, 256, false, 30000, 10000, true, false, true, null, true, true, null (auto) | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
@@ -789,7 +792,11 @@ thread. A body past `limits.body_max` ends the request with 413.
 - `anole_req_respond(r, status, headers, n, body, len, flags)`: the whole answer.
   The body is copied, or borrowed with `ANOLE_BODY_BORROW` (bindings borrow
   bodies above 64 KiB and copy small ones). Compression, the response cache
-  and the access log run on Anole's side afterwards.
+  and the access log run on Anole's side afterwards. Content-Length is
+  Anole's to write: leave it out and Anole sets it from the body as sent
+  (after compression). One the consumer sets is sent as given, turns
+  compression off for this response, and must equal `len` (a mismatch fails
+  the response).
 - `anole_req_respond_fd(r, status, headers, n, fd, offset, len)`: part of a
   regular file, sent by Anole (`sendfile` where it can).
 - `anole_req_stream_start`, `anole_req_stream_write` (or `anole_req_stream_write_wait`
@@ -1515,8 +1522,9 @@ listener's `framing`. See [net.md](net.md) for the same servers in Zig.
 `handler` is any number the consumer picks; it comes back as `handler_id`.
 `framing` is exactly one of `{"lines": {max, strip_cr, crlf}}`, `{"length":
 {bytes, endian, includes_header, max}}` and `{"varint": {max}}`; left out, bytes
-come as they arrive. Every other key is the Zig option of the same name (a
-duration as `<name>_ms`), listed with its default in the schema. A raw
+come as they arrive. Every other key but `close_on_drain` (see "The drain"
+below) is the Zig option of the same name (a duration as `<name>_ms`), listed
+with its default in the schema. A raw
 listener needs `port` (0 for a free one) or `unix`, and never takes `$PORT`.
 UDP takes no `tls`, `unix` or `proxy_protocol`.
 
@@ -1547,11 +1555,42 @@ framing around the bytes; `ANOLE_NET_F_END` ends this side after them (`len`
 may be 0), with TLS close_notify and a FIN. After this side ended, a write is
 `ANOLE_E_INVALID` ("Ended"). `anole_net_close(c, how)` closes gracefully
 (`ANOLE_NET_CLOSE_GRACEFUL`: what is queued goes out, input is dropped until
-the peer ends, at most 2 s) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
+the peer ends, or 2 s after this side ended) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
 `anole_handle_release` on a connection is the graceful close.
 `anole_net_pause` and `anole_net_resume` stop and restart reading (the input
 waits in the kernel, so TCP slows the peer); `anole_net_set_idle_timeout`
 replaces `tcp.idle_timeout_ms` for one connection.
+
+**The drain.** By default (`tcp.close_on_drain`, true) Anole closes each raw
+TCP connection at drain start as `ANOLE_NET_CLOSE_GRACEFUL` does, and
+`ANOLE_EV_NET_CLOSE` follows with `ANOLE_NET_CLOSED_DRAIN`. What the consumer
+wrote before it goes out. From then on a write answers `ANOLE_E_INVALID`
+("Ended") and is not sent, so a reply the consumer still owed is lost; a
+binding treats that `ANOLE_E_INVALID` as the connection going away, not as a
+programmer error. Input Anole reads after the close is dropped (records
+already posted still come). The connection closes once the peer ends its
+side, or 2 s after this side ended (the queue written, TLS close_notify,
+FIN); writing the queue is bounded by `tcp.write_timeout_ms`. A connection
+idle long enough to have parked (`timeouts.idle_park_ms`) is closed at once
+instead, without waiting for its queue. `ANOLE_EV_NET_CLOSE` is posted once
+the connection's reading side lets go: one waiting for read credit (a
+consumer that stopped polling) holds it until the consumer polls or
+`timeouts.shutdown_ms` passes. A connection the consumer closed or reset
+before the drain keeps its own reason. After `ANOLE_EV_NET_CLOSE` the handle
+is stale (`ANOLE_E_GONE`; a close or release is a no-op).
+`ANOLE_EV_DRAINING` comes on another ring: it may arrive before or after
+these closes, so a protocol that wants to say goodbye can't count on writing
+it after `ANOLE_EV_DRAINING`. To finish the exchanges in flight or say
+goodbye, set `"close_on_drain": false` on the listener's `tcp`: its
+connections stay open through the drain until the consumer closes them
+(after `ANOLE_EV_DRAINING`), or `timeouts.shutdown_ms` closes them with
+`ANOLE_NET_CLOSED_DRAIN`, as `node:net`'s `server.close()` leaves its
+sockets. Either way a connection that has parked (no input for
+`timeouts.idle_park_ms`) is closed at drain start. Known gap: a connection whose write side the consumer already
+ended (`ANOLE_NET_F_END`), whose peer then sends nothing, and that read input
+within `timeouts.idle_park_ms` before the drain is not closed by it; it stays
+until the peer sends or ends, `tcp.idle_timeout_ms` or `tcp.lifetime_ms`, or
+`timeouts.shutdown_ms`.
 
 **Read credit.** A connection posts at most `tcp.read_ahead` bytes the
 consumer has not polled yet; the rest waits in the kernel. One fast peer and a

@@ -1618,7 +1618,10 @@ pub fn Server(comptime Ctx: type) type {
         ///
         /// It also points requests at the server's WebSocket admission state
         /// (`admission`), for the same reason: before any protocol serves.
+        /// And it adds the routes that wait for all the others
+        /// (`Router.finish`).
         pub fn prepareStatic(self: *Self) !void {
+            self.router.finish();
             try self.prepareAdmission();
             try self.prepareStaticInner();
             self.static_prepared = true;

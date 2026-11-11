@@ -408,7 +408,7 @@ pub const Client = struct {
     }
 
     fn host(self: *Client) consumer_mod.Host {
-        return .{ .gpa = self.gpa, .io = self.io, .cluster = self.cluster, .producer = self.producer, .tel = if (self.telemetry != null) &self.telemetry.? else null };
+        return .{ .gpa = self.gpa, .io = self.io, .cluster = self.cluster, .producer = self.producer };
     }
 
     /// Stops the consumers (in-flight records finish, offsets are

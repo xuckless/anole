@@ -34,7 +34,10 @@ Python packages the protocol checks install are pinned with hashes in
 (the QUIC interop runner's, which follow its pinned commit): regenerate them
 with every file's SHA-256 from PyPI when either moves.
 
-The gRPC over HTTP/3 interop (`tests/grpc/h3/run.sh`) runs grpc-dotnet's
+The gRPC over HTTP/3 interop (`tests/grpc/h3/run.sh`) is not part of CI: it
+runs in the Release checks workflow, at every tag and on demand (`gh workflow
+run release-checks.yml`), because its image build depends on three outside
+services. Run it before merging a change to the gRPC or HTTP/3 code. It runs grpc-dotnet's
 interop programs (tag v2.84.0, cloned in `tests/grpc/h3/Dockerfile`) in a
 .NET SDK image with Microsoft's libmsquic. After the first green run, pin the
 base image by digest and libmsquic by version in the Dockerfile; bump the

@@ -30,7 +30,15 @@ esac
 
 tag="anole-grpc-dotnet-interop:v2.84.0-$(shasum "$here/Dockerfile" | cut -c1-12)"
 if ! docker image inspect "$tag" >/dev/null 2>&1; then
-  docker build -t "$tag" "$here"
+  # The image build is all network (apt, Microsoft's package feed, git):
+  # an outage there is retried, as tests/consumer/run.sh retries its
+  # fetches. No test runs in it, so a retry can't pass a bug.
+  for i in 1 2 3; do
+    docker build -t "$tag" "$here" && break
+    [ $i -lt 3 ] || { echo "the interop image could not be built (network): an infrastructure failure, not a test failure" >&2; exit 1; }
+    echo "retrying the image build ($i)" >&2
+    sleep $((i * 20))
+  done
 fi
 
 (cd "$root" && "${ZIG:-zig}" build grpc-interop-server grpc-interop-client capi-grpc \

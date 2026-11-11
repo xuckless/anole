@@ -298,6 +298,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].tls", .json = "listeners[].tls", .kind = .custom, .note = "cert: cert_file + key_file, cert_pem + key_pem or self_signed; client_auth: client_auth + one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system; alpn: alpn" },
     .{ .zig = "http3", .json = "http3", .kind = .same },
     .{ .zig = "http3.idle_timeout", .json = "http3.idle_timeout_ms", .kind = .ms },
+    .{ .zig = "http3.handshake_timeout", .json = "http3.handshake_timeout_ms", .kind = .ms },
     .{ .zig = "http3.hq_interop_root", .omitted = "QUIC interop runner only" },
     .{ .zig = "http3.webtransport", .omitted = "on when a route is `webtransport`" },
     .{ .zig = "timeouts.request", .json = "timeouts.request_ms", .kind = .ms, .note = "the consumer deadline (504); the core gets the longest plus 5 s" },
