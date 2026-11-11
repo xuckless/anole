@@ -52,7 +52,8 @@ breaking changes are listed anyway.
   deadlines stay exact: handler deadlines, `Deadline.run`, HTTP/2, HTTP/3).
   A request head's deadline counts from its first byte and never moves
   later; bytes a slow reader accepts never extend a write deadline. About
-  11% fewer instructions per request on HTTP/1.1 `/json`.
+  3% fewer instructions per request on HTTP/1.1 `/json` (about 10% on a
+  bare hello server), and 3% on a handler that waits.
 - **zio** is pinned at xuckless/zio 3c863fc: upstream lalinsky/zio main
   (299a618) merged in, with its fixes for task and group-task
   use-after-free races, a socket operation completing twice, and lost
