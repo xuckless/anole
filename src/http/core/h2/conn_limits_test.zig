@@ -342,6 +342,21 @@ test "h2 limits: PING flood" {
     }
 }
 
+test "h2 limits: control answers released as they are written" {
+    // A standing backlog: each ACK is written only after the next is
+    // queued, so the writer never passes the newest one. The count follows
+    // what is really unwritten (two answers), never the total (Go and
+    // nghttp2 release per frame).
+    const t = try ready(.{ .limits = .{ .control_frame_budget = 3 } });
+    defer t.destroy();
+    try t.feed(try t.ping(false, @splat(0)));
+    for (1..100) |i| {
+        try t.feed(try t.ping(false, @splat(@intCast(i))));
+        t.c.advance(frame.header_len + 8);
+    }
+    try expectFrames(try t.drain(), &.{.{ .type = .ping, .flags = F.ack }});
+}
+
 test "h2 limits: reset flood" {
     {
         const t = try ready(.{ .limits = .{ .control_frame_budget = 10 } });
@@ -436,6 +451,21 @@ test "h2 limits: refused-stream burst" {
     try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
 }
 
+test "h2 limits: header blocks after our GOAWAY" {
+    // Ignored, but decoded for the table: each is a glitch (nghttp2's
+    // IGN_HEADER_BLOCK, :5811), so a drain can't be fed blocks forever.
+    const t = try ready(.{ .limits = .{ .glitch_burst = 3, .glitch_rate = 1 } });
+    defer t.destroy();
+    try t.c.goaway(.no_error, "");
+    _ = try t.drain();
+    var id: u31 = 1;
+    while (id < 7) : (id += 2) try t.feed(try t.headers(id, &get, true));
+    try expectEqual(0, t.rec.count(.open));
+    try expectFrames(try t.drain(), &.{});
+    try expectError(error.ConnectionError, t.feed(try t.headers(7, &get, true)));
+    try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
+}
+
 const big_body: [4096]u8 = @splat('b');
 const big_parts = [_][]const u8{&big_body};
 
@@ -445,13 +475,22 @@ test "h2 limits: a peer that stops reading" {
     t.rec.answer = true;
     t.rec.body = &big_parts;
     try t.feed(try t.headers(1, &get, true));
-    // Framed, not written: the peer isn't reading.
+    // Framed, not yet written: the DATA is borrowed and the writer is mid
+    // write, which a reading peer must not pay for.
     var vecs: [8][]const u8 = undefined;
     _ = try t.c.pending(&vecs);
-    try expect(t.c.out.queuedBytes() > 4096);
+    try expect(t.c.out.queued_total - t.c.out.sent_total > 4096);
+    try expect(t.c.out.ownedUnsent() < 1024);
+    t.rec.answer = false;
+    try t.feed(try t.headers(3, &post, false));
+    try expectEqual(2, t.rec.count(.open));
+    // What grows while the peer doesn't read is owned: a 2000-byte head.
+    const v: [2000]u8 = @splat('~');
+    try t.c.submitHead(t.stream(3), 200, &.{.{ .name = "x-big", .value = &v }}, false);
+    try expect(t.c.out.ownedUnsent() > 1024);
     // New streams are refused...
-    try t.feed(try t.headers(3, &get, true));
-    try expectEqual(1, t.rec.count(.open));
+    try t.feed(try t.headers(5, &get, true));
+    try expectEqual(2, t.rec.count(.open));
     // ...while the rest is processed: credit, SETTINGS (ACKed), PING.
     const before = t.c.send_window;
     try t.feed(try t.windowUpdate(0, 1000));
@@ -461,13 +500,42 @@ test "h2 limits: a peer that stops reading" {
     try t.feed(try t.ping(false, @splat(9)));
     // The write timeout that would close this connection is M3's sweeper.
     const out = try t.drain();
-    try expectEqual(ErrorCode.refused_stream, find(out, .rst_stream, 3).?.code.?);
+    try expectEqual(ErrorCode.refused_stream, find(out, .rst_stream, 5).?.code.?);
     try expect(find(out, .data, 1) != null);
+    try expect(find(out, .headers, 3) != null);
     try expectEqual(1, count(out, .ping));
     try expectEqual(1, count(out, .settings));
     // Written: streams are admitted again.
-    try t.feed(try t.headers(5, &get, true));
-    try expectEqual(2, t.rec.count(.open));
+    try t.feed(try t.headers(7, &get, true));
+    try expectEqual(3, t.rec.count(.open));
+}
+
+test "h2 limits: one large DATA frame in flight refuses nothing" {
+    // A peer that reads at full speed with a 16 MiB frame size and big
+    // windows: one pending() frames a 2 MiB DATA frame, and a request
+    // arriving while it is written is admitted, uncharged.
+    const t = try ready(.{ .refused_stream_burst = 1, .refused_stream_rate = 1 });
+    defer t.destroy();
+    try t.feed(try t.settings(&.{
+        .{ .id = .max_frame_size, .value = frame.max_max_frame_size },
+        .{ .id = .initial_window_size, .value = 8 << 20 },
+    }));
+    try t.feed(try t.windowUpdate(0, 8 << 20));
+    _ = try t.drain();
+    const body = try t.arena().alloc(u8, 2 << 20);
+    @memset(body, 'd');
+    try t.feed(try t.headers(1, &get, true));
+    try t.c.submitHead(t.stream(1), 200, &.{}, false);
+    try t.c.submitData(t.stream(1), &.{body}, true);
+    var vecs: [8][]const u8 = undefined;
+    _ = try t.c.pending(&vecs);
+    try expect(t.c.out.queued_total - t.c.out.sent_total > 2 << 20);
+    var id: u31 = 3;
+    while (id < 9) : (id += 2) try t.feed(try t.headers(id, &post, false));
+    try expectEqual(4, t.rec.count(.open));
+    const out = try t.drain();
+    try expectEqual(0, count(out, .rst_stream));
+    try expectEqual(0, count(out, .goaway));
 }
 
 test "h2 limits: window update zero and overflow" {

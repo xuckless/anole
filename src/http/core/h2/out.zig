@@ -37,6 +37,8 @@ pub const Out = struct {
     sent_total: u64 = 0,
     /// Unsent borrowed segments.
     borrowed: usize = 0,
+    /// Owned bytes queued and not yet written.
+    owned_unsent: u64 = 0,
     /// IDs of streams with output to frame, oldest first (conn.zig's
     /// round robin). An ID may outlive its stream: the reader skips it.
     ready: std.ArrayList(u31) = .empty,
@@ -109,6 +111,7 @@ pub const Out = struct {
         const b = t.buf[t.used..][0..n];
         t.used += n;
         o.queued_total += n;
+        o.owned_unsent += n;
         // With unsent segments in the newest block, the last owned segment
         // is one of them.
         if (t.segs > 0) {
@@ -150,9 +153,11 @@ pub const Out = struct {
         return o.borrowed != 0;
     }
 
-    /// Bytes queued and not yet written (conn.zig's `out_high` check).
-    pub fn queuedBytes(o: *const Out) u64 {
-        return o.queued_total - o.sent_total;
+    /// Owned bytes queued and not yet written (conn.zig's `out_high`
+    /// check): what grows while the peer doesn't read. Borrowed DATA is
+    /// framed only at `Conn.pending`, a writev's worth at a time.
+    pub fn ownedUnsent(o: *const Out) u64 {
+        return o.owned_unsent;
     }
 
     /// `sent_total` reaches this once everything queued so far is written.
@@ -179,6 +184,7 @@ pub const Out = struct {
         while (left > 0) {
             const s = o.segs.items[o.head];
             const len = s.bytes().len - o.head_off;
+            if (s == .owned) o.owned_unsent -= @min(left, len);
             if (left < len) {
                 o.head_off += left;
                 break;

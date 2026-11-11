@@ -283,13 +283,21 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         refused_budget: limits.TokenBucket,
         empty_budget: limits.TokenBucket,
         glitch_budget: limits.TokenBucket,
-        /// Control answers queued (PING ACK, SETTINGS ACK, RST_STREAM) since
-        /// the writer last caught up, and `out`'s byte position just past the
-        /// last one: `advance` past it empties the count.
-        control_queued: u32 = 0,
-        control_mark: u64 = 0,
+        /// Control answers queued (PING ACK, SETTINGS ACK, RST_STREAM) and
+        /// not yet written, in two epochs, each with `out`'s byte position
+        /// just past its last answer: `sealed` was queued before the
+        /// writer's last `advance`, `open` since. `advance` past `sealed`'s
+        /// mark releases it and seals `open`, so the count follows the
+        /// writer to within one epoch under a standing backlog.
+        control_sealed: ControlEpoch = .{},
+        control_open: ControlEpoch = .{},
 
         const max_spare = 32;
+
+        const ControlEpoch = struct {
+            n: u32 = 0,
+            mark: u64 = 0,
+        };
 
         const DataIn = struct {
             stream_id: u31,
@@ -668,16 +676,24 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// only past one not yet acknowledged (:4014); INTENTIONAL.md,
         /// limits 7 and 8.
         fn admitStream(c: *Self, id: u31, hd: frame.Headers) RecvError!?Kind {
-            // After our GOAWAY: ignored.
-            if (c.goaway_sent != null) return .ignore;
+            // After our GOAWAY: ignored, and its block decoded only for the
+            // table (nghttp2 :5811).
+            if (c.goaway_sent != null) {
+                try c.chargeGlitch();
+                return .ignore;
+            }
             if (hd.priority) |p| if (p.dependency == id)
                 return c.terminate(.protocol_error, "request HEADERS: depend on itself");
-            // The slow reader (CVE-2019-9517): above out_high, new streams
-            // are refused while everything else is still processed (credit
-            // and ACKs can only shrink the queue; DATA on open streams goes
-            // on). The other half, closing a connection whose flushes stall,
-            // is M3's sweeper (`timeouts.write`, PLAN §3.3).
-            if (c.table.size >= c.opts.max_concurrent_streams or c.out.queuedBytes() > c.opts.limits.out_high) {
+            // The slow reader (CVE-2019-9517): above out_high owned bytes
+            // unwritten, new streams are refused while everything else is
+            // still processed (credit and ACKs can only shrink the queue;
+            // DATA on open streams goes on). Borrowed DATA isn't counted: it
+            // is framed only at `pending`, a writev's worth at a time, so its
+            // size follows the peer's frame size and the writer's iovecs,
+            // not a stalled reader. The other half, closing a connection
+            // whose flushes stall, is M3's sweeper (`timeouts.write`, PLAN
+            // §3.3).
+            if (c.table.size >= c.opts.max_concurrent_streams or c.out.ownedUnsent() > c.opts.limits.out_high) {
                 try c.refuse(id);
                 return .ignore;
             }
@@ -1054,8 +1070,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return c.charge(&c.refused_budget, "too many refused streams");
         }
 
-        /// An empty DATA/HEADERS/CONTINUATION without END_STREAM (or
-        /// END_HEADERS), or any unknown or extension frame
+        /// An empty DATA or HEADERS without END_STREAM, an empty
+        /// CONTINUATION without END_HEADERS, or any unknown or extension frame
         /// (CVE-2019-9518, D15 point 2). nghttp2 charges both to its glitch
         /// budget (:5721, :6930, :6025); INTENTIONAL.md, limits 3.
         fn chargeEmptyFrame(c: *Self) RecvError!void {
@@ -1074,14 +1090,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// obq_flood_counter_ against max_outbound_ack (nghttp2_session_add_ping
         /// :7343, nghttp2_submit_settings :7493), which counts only the ACKs
         /// and is released as each is packed (:2244); here the RST_STREAMs
-        /// recv queues count too, and the count is released once `advance`
-        /// passes the last one (Go's queuedControlFrames, released in
-        /// wroteFrame). INTENTIONAL.md, limits 4.
+        /// recv queues count too, and they are released an epoch at a time
+        /// as `advance` passes them (Go's queuedControlFrames, released per
+        /// frame in wroteFrame). INTENTIONAL.md, limits 4.
         fn chargeControl(c: *Self, len: usize) RecvError!void {
-            if (c.control_queued >= c.opts.limits.control_frame_budget)
+            if (c.control_sealed.n + c.control_open.n >= c.opts.limits.control_frame_budget)
                 return c.terminate(.enhance_your_calm, "too many control frames queued");
-            c.control_queued += 1;
-            c.control_mark = c.out.mark() + len;
+            c.control_open.n += 1;
+            c.control_open.mark = c.out.mark() + len;
         }
 
         /// A header block of `len` bytes so far, before decoding: past
@@ -1277,12 +1293,17 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return c.out.iovecs(vecs);
         }
 
-        /// `n` bytes of what `pending` returned were written. Past the last
-        /// control answer queued, the control budget is whole again
-        /// (`chargeControl`).
+        /// `n` bytes of what `pending` returned were written. The control
+        /// answers written give their budget back (`chargeControl`): past
+        /// the sealed epoch's last one, it goes, and the open one is sealed
+        /// (or goes too, if also written).
         pub fn advance(c: *Self, n: usize) void {
             c.out.advance(n);
-            if (c.out.sent_total >= c.control_mark) c.control_queued = 0;
+            const sent = c.out.sent_total;
+            if (sent >= c.control_sealed.mark) {
+                c.control_sealed = if (sent >= c.control_open.mark) .{} else c.control_open;
+                c.control_open = .{};
+            }
         }
 
         /// Borrowed DATA parts or trailers are still referenced, framed or

@@ -62,7 +62,7 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
 3. **Empty frames and unknown or extension frames have their own budget**
    (`Limits.empty_frame_rate`, 100 tokens refilled at 100/s; D15 point 2):
    DATA with an empty payload and no END_STREAM, HEADERS with an empty
-   fragment and neither END_STREAM nor END_HEADERS, an empty CONTINUATION
+   fragment and no END_STREAM (END_HEADERS or not), an empty CONTINUATION
    without END_HEADERS, and every frame of an unknown type. nghttp2 charges
    these to its one glitch budget (10000, 330/s: :5721, :6930, :6025), which
    conn.zig keeps for PRIORITY and blocks decoded only for the table until
@@ -74,8 +74,9 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    `max_outbound_ack` counts only the two ACKs (nghttp2.h's
    `nghttp2_option_set_max_outbound_ack`; :7343, :7493), releases each when
    it is packed (:2244, :2302), and returns NGHTTP2_ERR_FLOODED with no
-   GOAWAY. Here the count empties once `advance` passes the last answer
-   queued (Go's queuedControlFrames). Too many CONTINUATIONs
+   GOAWAY. Here the count is released an epoch at a time as `advance` passes
+   the answers (Go's queuedControlFrames releases per frame), so under a
+   standing backlog it stays within one epoch of what is really unwritten. Too many CONTINUATIONs
    (`max_continuations`) is likewise GOAWAY ENHANCE_YOUR_CALM where nghttp2
    returns NGHTTP2_ERR_TOO_MANY_CONTINUATIONS (:6831) with no GOAWAY.
 5. **A header block over `max_header_list_size` bytes on the wire is a
@@ -101,8 +102,11 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    nghttp2 makes it a connection PROTOCOL_ERROR past the acknowledged value
    (:3998) and refuses only past one not yet acknowledged (:4014). RFC 9113
    §5.1.2 allows either; a refused stream is safe for the client to retry.
-8. **New streams are refused while more than `Limits.out_high` bytes wait to
-   be written** (a peer that stops reading, CVE-2019-9517; h2o's
+8. **New streams are refused while more than `Limits.out_high` owned bytes
+   (HEADERS, control frames, DATA frame headers) wait to be written** (a peer that stops reading, CVE-2019-9517; h2o's
    OUTBUF_SOFT_MAX_SIZE), with the same refused budget. nghttp2 has no such
    rule. Credit, SETTINGS, PING, RST_STREAM and DATA on open streams are
    still processed; the write timeout that ends such a connection is M3's.
+   Borrowed DATA isn't counted: it is framed only at `pending`, so a peer
+   that reads normally while one large frame is being written (a 16 MiB
+   SETTINGS_MAX_FRAME_SIZE, or many iovecs) is never refused.
