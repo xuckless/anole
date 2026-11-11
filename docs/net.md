@@ -197,8 +197,9 @@ its side (FIN) and drops further input, and the connection closes, with reason
 `.drain`, as soon as the peer ends its side too, or after 2 s. A client that
 closes on FIN goes at once instead of holding the stop until
 `timeouts.shutdown`. Give the handler a `drain` callback to decide otherwise.
-The C ABI's raw TCP listeners keep their connections open until the consumer
-closes them or `timeouts.shutdown` passes.
+The C ABI's raw TCP listeners get the same close at drain start: the consumer
+sees `ANOLE_EV_DRAINING` and an `ANOLE_EV_NET_CLOSE` with
+`ANOLE_NET_CLOSED_DRAIN` for each connection, in no set order between the two.
 
 With `ServerOptions.process`, raw TCP listeners are inherited and handed over
 by name like HTTP ones: a systemd unit can use `ListenStream=` and

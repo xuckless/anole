@@ -2104,13 +2104,13 @@ const TcpConn = struct {
 
     /// Runs under the drain's lock, on any task: must not wait. The driver
     /// starts the callback on the connection's executor, or without one
-    /// the default end (`drainTask`). The task form watches
-    /// `drainEvent`, and the C ABI's events are the consumer's: neither
-    /// gets the default.
+    /// the default end (`drainTask`). The task form watches `drainEvent`
+    /// and gets no default. The C ABI's table has no `drain` and gets it
+    /// (#166): its consumer sees ANOLE_EV_NET_CLOSE with reason DRAIN.
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
         const table = t.service.table;
-        if (table.drain == null and (table.task != null or table.inline_events)) return;
+        if (table.drain == null and table.task != null) return;
         // `.seq_cst`: see `serviceKick`.
         _ = t.flags.fetchOr(Flag.drain_pending, .seq_cst);
         t.driver.kick(t.kick);

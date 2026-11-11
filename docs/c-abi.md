@@ -1560,6 +1560,15 @@ the peer ends, at most 2 s) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
 waits in the kernel, so TCP slows the peer); `anole_net_set_idle_timeout`
 replaces `tcp.idle_timeout_ms` for one connection.
 
+**The drain.** At drain start Anole closes each raw TCP connection as
+`ANOLE_NET_CLOSE_GRACEFUL` does: what was queued goes out, this side ends, and
+`ANOLE_EV_NET_CLOSE` follows with `ANOLE_NET_CLOSED_DRAIN` once the peer ends
+its side (at most 2 s). From then on a write is `ANOLE_E_INVALID` ("Ended"),
+and after `ANOLE_EV_NET_CLOSE` the handle is stale (`ANOLE_E_GONE`; a close or
+release is a no-op). `ANOLE_EV_DRAINING` comes on another ring: it may arrive
+before or after these closes. A protocol that wants to say goodbye can't count
+on writing it after `ANOLE_EV_DRAINING`.
+
 **Read credit.** A connection posts at most `tcp.read_ahead` bytes the
 consumer has not polled yet; the rest waits in the kernel. One fast peer and a
 slow consumer cannot fill a core's ring.
