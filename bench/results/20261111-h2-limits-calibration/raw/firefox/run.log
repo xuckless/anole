@@ -1,0 +1,8 @@
+[06:12:19] scenario firefox-load
+[06:12:31] scenario firefox-reload
+[06:12:44] scenario firefox-abort
+[06:12:56] scenario firefox-sse
+[06:13:07] scenario firefox-upload
+[06:13:21] scenario firefox-download
+[06:13:44] scenario firefox-nav
+[06:13:56] report: /tmp/claude-1000/h2w/r-firefox/h2count.json

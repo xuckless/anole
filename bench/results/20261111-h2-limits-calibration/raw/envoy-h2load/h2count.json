@@ -1,0 +1,4450 @@
+{
+ "tool": "h2count",
+ "generated": "2026-11-11T11:14:24.352857009Z",
+ "scenarios": [
+  {
+   "name": "start",
+   "connections": 1,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 92,
+    "frames/100ms": 10,
+    "frames/conn_total": 11,
+    "frames/s": 11,
+    "header_block_bytes": 92,
+    "headers/100ms": 7,
+    "headers/conn_total": 8,
+    "headers/s": 8,
+    "peak_streams": 6,
+    "requests/100ms": 7,
+    "requests/conn_total": 8,
+    "requests/s": 8,
+    "s2c_data/100ms": 1778,
+    "s2c_data/conn_total": 4104,
+    "s2c_data/s": 4104,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 5,
+    "settings_entries/conn_total": 5,
+    "settings_entries/s": 5,
+    "settings_entries_per_frame": 5,
+    "window_update/100ms": 1,
+    "window_update/conn_total": 1,
+    "window_update/s": 1
+   },
+   "rollup_total": {
+    "frames": 11,
+    "headers": 8,
+    "requests": 8,
+    "s2c_data": 4104,
+    "s2c_settings": 1,
+    "settings": 1,
+    "settings_ack": 1,
+    "settings_entries": 5,
+    "window_update": 1
+   },
+   "conns": [
+    {
+     "id": 1,
+     "scenario": "start",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52108",
+     "start": "2026-11-11T06:13:57.554951305-05:00",
+     "duration_s": 12.534033548,
+     "bytes_c2s": 550,
+     "bytes_s2c": 67147068,
+     "rates": {
+      "frames": {
+       "total": 11,
+       "peak_1s": 11,
+       "peak_100ms": 10
+      },
+      "headers": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 7
+      },
+      "requests": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 7
+      },
+      "s2c_data": {
+       "total": 4104,
+       "peak_1s": 4104,
+       "peak_100ms": 1778
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 92,
+      "header_block_bytes": 92,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "envoy-default",
+   "connections": 24,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 97,
+    "frames/100ms": 11,
+    "frames/conn_total": 14,
+    "frames/s": 14,
+    "header_block_bytes": 97,
+    "headers/100ms": 8,
+    "headers/conn_total": 10,
+    "headers/s": 10,
+    "peak_streams": 8,
+    "requests/100ms": 8,
+    "requests/conn_total": 10,
+    "requests/s": 10,
+    "rst/100ms": 1,
+    "rst/conn_total": 1,
+    "rst/s": 1,
+    "rst_unanswered/100ms": 1,
+    "rst_unanswered/conn_total": 1,
+    "rst_unanswered/s": 1,
+    "s2c_data/100ms": 3480,
+    "s2c_data/conn_total": 8202,
+    "s2c_data/s": 8202,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 5,
+    "settings_entries/conn_total": 5,
+    "settings_entries/s": 5,
+    "settings_entries_per_frame": 5,
+    "window_update/100ms": 1,
+    "window_update/conn_total": 2,
+    "window_update/s": 2
+   },
+   "rollup_total": {
+    "frames": 179,
+    "headers": 104,
+    "requests": 104,
+    "rst": 1,
+    "rst_unanswered": 1,
+    "s2c_data": 37087,
+    "s2c_settings": 24,
+    "settings": 24,
+    "settings_ack": 24,
+    "settings_entries": 120,
+    "window_update": 26
+   },
+   "conns": [
+    {
+     "id": 2,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52118",
+     "start": "2026-11-11T06:13:57.568761034-05:00",
+     "duration_s": 12.52028503,
+     "bytes_c2s": 447,
+     "bytes_s2c": 1149,
+     "rates": {
+      "frames": {
+       "total": 9,
+       "peak_1s": 9,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "requests": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 3,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52136",
+     "start": "2026-11-11T06:13:57.585528935-05:00",
+     "duration_s": 12.503591793,
+     "bytes_c2s": 349,
+     "bytes_s2c": 67146371,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 4100,
+       "peak_1s": 4100,
+       "peak_100ms": 1670
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 4,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52160",
+     "start": "2026-11-11T06:13:57.585550898-05:00",
+     "duration_s": 12.503335116,
+     "bytes_c2s": 503,
+     "bytes_s2c": 67146899,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 10,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "requests": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 4103,
+       "peak_1s": 4103,
+       "peak_100ms": 2368
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 5,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52156",
+     "start": "2026-11-11T06:13:57.585602436-05:00",
+     "duration_s": 12.503552806,
+     "bytes_c2s": 242,
+     "bytes_s2c": 447,
+     "rates": {
+      "frames": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 6,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52290",
+     "start": "2026-11-11T06:13:57.585632131-05:00",
+     "duration_s": 12.503380661,
+     "bytes_c2s": 346,
+     "bytes_s2c": 799,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 7,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52128",
+     "start": "2026-11-11T06:13:57.585791161-05:00",
+     "duration_s": 12.503391611,
+     "bytes_c2s": 294,
+     "bytes_s2c": 623,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 8,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52236",
+     "start": "2026-11-11T06:13:57.585825216-05:00",
+     "duration_s": 12.503190833,
+     "bytes_c2s": 294,
+     "bytes_s2c": 623,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 9,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52298",
+     "start": "2026-11-11T06:13:57.585836481-05:00",
+     "duration_s": 12.502920631,
+     "bytes_c2s": 348,
+     "bytes_s2c": 67146371,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 4100,
+       "peak_1s": 4100,
+       "peak_100ms": 1672
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 10,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52188",
+     "start": "2026-11-11T06:13:57.585855187-05:00",
+     "duration_s": 12.503030168,
+     "bytes_c2s": 242,
+     "bytes_s2c": 447,
+     "rates": {
+      "frames": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 11,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52154",
+     "start": "2026-11-11T06:13:57.585858057-05:00",
+     "duration_s": 12.50293205,
+     "bytes_c2s": 355,
+     "bytes_s2c": 5009,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "rst": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "rst_unanswered": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 123,
+       "peak_1s": 10,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 12,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52162",
+     "start": "2026-11-11T06:13:57.585897757-05:00",
+     "duration_s": 12.502963767,
+     "bytes_c2s": 345,
+     "bytes_s2c": 799,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 13,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52214",
+     "start": "2026-11-11T06:13:57.585899056-05:00",
+     "duration_s": 12.503123297,
+     "bytes_c2s": 346,
+     "bytes_s2c": 799,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 14,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52184",
+     "start": "2026-11-11T06:13:57.585971875-05:00",
+     "duration_s": 12.503066692,
+     "bytes_c2s": 675,
+     "bytes_s2c": 134292998,
+     "rates": {
+      "frames": {
+       "total": 14,
+       "peak_1s": 14,
+       "peak_100ms": 11
+      },
+      "headers": {
+       "total": 10,
+       "peak_1s": 10,
+       "peak_100ms": 8
+      },
+      "requests": {
+       "total": 10,
+       "peak_1s": 10,
+       "peak_100ms": 8
+      },
+      "s2c_data": {
+       "total": 8202,
+       "peak_1s": 8202,
+       "peak_100ms": 3480
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 8,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 15,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52190",
+     "start": "2026-11-11T06:13:57.586006383-05:00",
+     "duration_s": 12.503171165,
+     "bytes_c2s": 399,
+     "bytes_s2c": 975,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 97,
+      "header_block_bytes": 97,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 16,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52248",
+     "start": "2026-11-11T06:13:57.586009585-05:00",
+     "duration_s": 12.502877308,
+     "bytes_c2s": 517,
+     "bytes_s2c": 134292470,
+     "rates": {
+      "frames": {
+       "total": 11,
+       "peak_1s": 11,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "requests": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 8199,
+       "peak_1s": 8199,
+       "peak_100ms": 3085
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 17,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52238",
+     "start": "2026-11-11T06:13:57.586076741-05:00",
+     "duration_s": 12.503124163,
+     "bytes_c2s": 294,
+     "bytes_s2c": 623,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 18,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52182",
+     "start": "2026-11-11T06:13:57.586092463-05:00",
+     "duration_s": 12.502699154,
+     "bytes_c2s": 344,
+     "bytes_s2c": 799,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 19,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52286",
+     "start": "2026-11-11T06:13:57.586117627-05:00",
+     "duration_s": 12.502664305,
+     "bytes_c2s": 399,
+     "bytes_s2c": 975,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 20,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52274",
+     "start": "2026-11-11T06:13:57.586193879-05:00",
+     "duration_s": 12.502700979,
+     "bytes_c2s": 398,
+     "bytes_s2c": 975,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 21,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52250",
+     "start": "2026-11-11T06:13:57.586227037-05:00",
+     "duration_s": 12.50292693,
+     "bytes_c2s": 348,
+     "bytes_s2c": 67146371,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 4100,
+       "peak_1s": 4100,
+       "peak_100ms": 1724
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 22,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52218",
+     "start": "2026-11-11T06:13:57.58623768-05:00",
+     "duration_s": 12.502551423,
+     "bytes_c2s": 242,
+     "bytes_s2c": 446,
+     "rates": {
+      "frames": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 23,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52152",
+     "start": "2026-11-11T06:13:57.586269253-05:00",
+     "duration_s": 12.502907735,
+     "bytes_c2s": 399,
+     "bytes_s2c": 67146547,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4101,
+       "peak_1s": 4101,
+       "peak_100ms": 1742
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 24,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52226",
+     "start": "2026-11-11T06:13:57.586304956-05:00",
+     "duration_s": 12.502753274,
+     "bytes_c2s": 346,
+     "bytes_s2c": 799,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 25,
+     "scenario": "envoy-default",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:52216",
+     "start": "2026-11-11T06:13:57.586326077-05:00",
+     "duration_s": 12.502472228,
+     "bytes_c2s": 292,
+     "bytes_s2c": 621,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "envoy-keepalive",
+   "connections": 28,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 97,
+    "frames/100ms": 14,
+    "frames/conn_total": 20,
+    "frames/s": 18,
+    "header_block_bytes": 97,
+    "headers/100ms": 12,
+    "headers/conn_total": 14,
+    "headers/s": 14,
+    "peak_streams": 12,
+    "ping/100ms": 1,
+    "ping/conn_total": 2,
+    "ping/s": 1,
+    "requests/100ms": 12,
+    "requests/conn_total": 14,
+    "requests/s": 14,
+    "rst/100ms": 1,
+    "rst/conn_total": 1,
+    "rst/s": 1,
+    "rst_unanswered/100ms": 1,
+    "rst_unanswered/conn_total": 1,
+    "rst_unanswered/s": 1,
+    "s2c_data/100ms": 4159,
+    "s2c_data/conn_total": 8206,
+    "s2c_data/s": 8206,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 5,
+    "settings_entries/conn_total": 5,
+    "settings_entries/s": 5,
+    "settings_entries_per_frame": 5,
+    "window_update/100ms": 1,
+    "window_update/conn_total": 2,
+    "window_update/s": 2
+   },
+   "rollup_total": {
+    "frames": 254,
+    "headers": 112,
+    "ping": 56,
+    "requests": 112,
+    "rst": 1,
+    "rst_unanswered": 1,
+    "s2c_data": 41191,
+    "s2c_settings": 28,
+    "settings": 28,
+    "settings_ack": 28,
+    "settings_entries": 140,
+    "window_update": 29
+   },
+   "conns": [
+    {
+     "id": 26,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23390",
+     "start": "2026-11-11T06:14:10.917930378-05:00",
+     "duration_s": 12.553092976,
+     "bytes_c2s": 429,
+     "bytes_s2c": 67146599,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 8,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4101,
+       "peak_1s": 4101,
+       "peak_100ms": 2000
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 92,
+      "header_block_bytes": 92,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 27,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23398",
+     "start": "2026-11-11T06:14:10.930753814-05:00",
+     "duration_s": 12.540295874,
+     "bytes_c2s": 377,
+     "bytes_s2c": 830,
+     "rates": {
+      "frames": {
+       "total": 9,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 28,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23412",
+     "start": "2026-11-11T06:14:10.940490531-05:00",
+     "duration_s": 12.530947718,
+     "bytes_c2s": 484,
+     "bytes_s2c": 1185,
+     "rates": {
+      "frames": {
+       "total": 11,
+       "peak_1s": 9,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 29,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23482",
+     "start": "2026-11-11T06:14:10.940553657-05:00",
+     "duration_s": 12.530872933,
+     "bytes_c2s": 431,
+     "bytes_s2c": 1009,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 30,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23442",
+     "start": "2026-11-11T06:14:10.940647983-05:00",
+     "duration_s": 12.530829892,
+     "bytes_c2s": 914,
+     "bytes_s2c": 134293758,
+     "rates": {
+      "frames": {
+       "total": 20,
+       "peak_1s": 18,
+       "peak_100ms": 14
+      },
+      "headers": {
+       "total": 14,
+       "peak_1s": 14,
+       "peak_100ms": 12
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 14,
+       "peak_1s": 14,
+       "peak_100ms": 12
+      },
+      "s2c_data": {
+       "total": 8206,
+       "peak_1s": 8206,
+       "peak_100ms": 4159
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 12,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 31,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23428",
+     "start": "2026-11-11T06:14:10.940678725-05:00",
+     "duration_s": 12.530788144,
+     "bytes_c2s": 224,
+     "bytes_s2c": 305,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "headers": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 32,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23520",
+     "start": "2026-11-11T06:14:10.940693982-05:00",
+     "duration_s": 12.530388532,
+     "bytes_c2s": 330,
+     "bytes_s2c": 67146252,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 6,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 4099,
+       "peak_1s": 4099,
+       "peak_100ms": 2102
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 33,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23646",
+     "start": "2026-11-11T06:14:10.940697196-05:00",
+     "duration_s": 12.530304038,
+     "bytes_c2s": 277,
+     "bytes_s2c": 481,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 34,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23468",
+     "start": "2026-11-11T06:14:10.940703626-05:00",
+     "duration_s": 12.530733763,
+     "bytes_c2s": 432,
+     "bytes_s2c": 1009,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 35,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23490",
+     "start": "2026-11-11T06:14:10.940722821-05:00",
+     "duration_s": 12.530286664,
+     "bytes_c2s": 224,
+     "bytes_s2c": 305,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "headers": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 36,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23432",
+     "start": "2026-11-11T06:14:10.940725058-05:00",
+     "duration_s": 12.530724744,
+     "bytes_c2s": 331,
+     "bytes_s2c": 67146252,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 6,
+       "peak_100ms": 4
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 4099,
+       "peak_1s": 4099,
+       "peak_100ms": 1583
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 37,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23430",
+     "start": "2026-11-11T06:14:10.940727624-05:00",
+     "duration_s": 12.530320886,
+     "bytes_c2s": 222,
+     "bytes_s2c": 304,
+     "rates": {
+      "frames": {
+       "total": 6,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "headers": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 94,
+      "header_block_bytes": 94,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 38,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23426",
+     "start": "2026-11-11T06:14:10.940729436-05:00",
+     "duration_s": 12.530738587,
+     "bytes_c2s": 278,
+     "bytes_s2c": 67146076,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 5,
+       "peak_100ms": 3
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 4098,
+       "peak_1s": 4098,
+       "peak_100ms": 1584
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 39,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23532",
+     "start": "2026-11-11T06:14:10.940788081-05:00",
+     "duration_s": 12.530592752,
+     "bytes_c2s": 329,
+     "bytes_s2c": 67146251,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 6,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 4099,
+       "peak_1s": 4099,
+       "peak_100ms": 2186
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 40,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23570",
+     "start": "2026-11-11T06:14:10.940790579-05:00",
+     "duration_s": 12.530629849,
+     "bytes_c2s": 485,
+     "bytes_s2c": 1185,
+     "rates": {
+      "frames": {
+       "total": 11,
+       "peak_1s": 9,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 97,
+      "header_block_bytes": 97,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 41,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23546",
+     "start": "2026-11-11T06:14:10.940834817-05:00",
+     "duration_s": 12.530150815,
+     "bytes_c2s": 380,
+     "bytes_s2c": 833,
+     "rates": {
+      "frames": {
+       "total": 9,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 42,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23648",
+     "start": "2026-11-11T06:14:10.940848803-05:00",
+     "duration_s": 12.530562866,
+     "bytes_c2s": 389,
+     "bytes_s2c": 5043,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 3
+      },
+      "rst": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "rst_unanswered": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 123,
+       "peak_1s": 10,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 43,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23582",
+     "start": "2026-11-11T06:14:10.941687195-05:00",
+     "duration_s": 12.52934834,
+     "bytes_c2s": 434,
+     "bytes_s2c": 1009,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_data": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 97,
+      "header_block_bytes": 97,
+      "peak_streams": 5,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 44,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23488",
+     "start": "2026-11-11T06:14:10.941694497-05:00",
+     "duration_s": 12.52949334,
+     "bytes_c2s": 379,
+     "bytes_s2c": 832,
+     "rates": {
+      "frames": {
+       "total": 9,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 45,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23602",
+     "start": "2026-11-11T06:14:10.941710063-05:00",
+     "duration_s": 12.529483797,
+     "bytes_c2s": 328,
+     "bytes_s2c": 657,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 46,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23592",
+     "start": "2026-11-11T06:14:10.941718825-05:00",
+     "duration_s": 12.529271615,
+     "bytes_c2s": 276,
+     "bytes_s2c": 481,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 47,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23558",
+     "start": "2026-11-11T06:14:10.941769756-05:00",
+     "duration_s": 12.529325229,
+     "bytes_c2s": 379,
+     "bytes_s2c": 832,
+     "rates": {
+      "frames": {
+       "total": 9,
+       "peak_1s": 7,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 95,
+      "header_block_bytes": 95,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 48,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23664",
+     "start": "2026-11-11T06:14:10.94183487-05:00",
+     "duration_s": 12.529148621000001,
+     "bytes_c2s": 278,
+     "bytes_s2c": 67146076,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 1
+      },
+      "s2c_data": {
+       "total": 4098,
+       "peak_1s": 4098,
+       "peak_100ms": 1958
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 49,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23660",
+     "start": "2026-11-11T06:14:10.941843603-05:00",
+     "duration_s": 12.529193692,
+     "bytes_c2s": 328,
+     "bytes_s2c": 657,
+     "rates": {
+      "frames": {
+       "total": 8,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "headers": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 3,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 50,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23548",
+     "start": "2026-11-11T06:14:10.941894549-05:00",
+     "duration_s": 12.529122143,
+     "bytes_c2s": 276,
+     "bytes_s2c": 481,
+     "rates": {
+      "frames": {
+       "total": 7,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "headers": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 2,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 51,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23626",
+     "start": "2026-11-11T06:14:10.941896892-05:00",
+     "duration_s": 12.529242186,
+     "bytes_c2s": 538,
+     "bytes_s2c": 67146956,
+     "rates": {
+      "frames": {
+       "total": 12,
+       "peak_1s": 10,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 7,
+       "peak_1s": 7,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 4103,
+       "peak_1s": 4103,
+       "peak_100ms": 1508
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 52,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23642",
+     "start": "2026-11-11T06:14:10.941905278-05:00",
+     "duration_s": 12.529357905,
+     "bytes_c2s": 486,
+     "bytes_s2c": 1185,
+     "rates": {
+      "frames": {
+       "total": 11,
+       "peak_1s": 9,
+       "peak_100ms": 9
+      },
+      "headers": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_data": {
+       "total": 6,
+       "peak_1s": 6,
+       "peak_100ms": 6
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 6,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    },
+    {
+     "id": 53,
+     "scenario": "envoy-keepalive",
+     "listener": "h2c@127.0.0.1:19080",
+     "client_addr": "127.0.0.1:23612",
+     "start": "2026-11-11T06:14:10.941947259-05:00",
+     "duration_s": 12.529245054,
+     "bytes_c2s": 434,
+     "bytes_s2c": 67146604,
+     "rates": {
+      "frames": {
+       "total": 10,
+       "peak_1s": 8,
+       "peak_100ms": 7
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "ping": {
+       "total": 2,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "s2c_data": {
+       "total": 4101,
+       "peak_1s": 4101,
+       "peak_100ms": 1828
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 5
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 96,
+      "header_block_bytes": 96,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 5
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0003": 1,
+      "0x0004": 1,
+      "0x0008": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "h2load-synthetic",
+   "connections": 4,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 37,
+    "frames/100ms": 335,
+    "frames/conn_total": 504,
+    "frames/s": 504,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 37,
+    "headers/100ms": 334,
+    "headers/conn_total": 500,
+    "headers/s": 500,
+    "peak_streams": 100,
+    "requests/100ms": 334,
+    "requests/conn_total": 500,
+    "requests/s": 500,
+    "s2c_data/100ms": 434,
+    "s2c_data/conn_total": 500,
+    "s2c_data/s": 500,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 2,
+    "settings_entries/conn_total": 2,
+    "settings_entries/s": 2,
+    "settings_entries_per_frame": 2,
+    "window_update/100ms": 1,
+    "window_update/conn_total": 1,
+    "window_update/s": 1
+   },
+   "rollup_total": {
+    "frames": 2016,
+    "goaway": 4,
+    "headers": 2000,
+    "requests": 2000,
+    "s2c_data": 2000,
+    "s2c_settings": 4,
+    "settings": 4,
+    "settings_ack": 4,
+    "settings_entries": 8,
+    "window_update": 4
+   },
+   "conns": [
+    {
+     "id": 54,
+     "scenario": "h2load-synthetic",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:38070",
+     "start": "2026-11-11T06:14:23.732703167-05:00",
+     "duration_s": 0.047719041,
+     "bytes_c2s": 9112,
+     "bytes_s2c": 85592,
+     "rates": {
+      "frames": {
+       "total": 504,
+       "peak_1s": 504,
+       "peak_100ms": 335
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "headers": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 334
+      },
+      "requests": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 334
+      },
+      "s2c_data": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 434
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 37,
+      "header_block_bytes": 37,
+      "peak_streams": 100,
+      "settings_entries_per_frame": 2
+     },
+     "settings_ids": {
+      "0x0002": 1,
+      "0x0004": 1
+     }
+    },
+    {
+     "id": 55,
+     "scenario": "h2load-synthetic",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:38062",
+     "start": "2026-11-11T06:14:23.733148908-05:00",
+     "duration_s": 0.049531649,
+     "bytes_c2s": 9112,
+     "bytes_s2c": 85592,
+     "rates": {
+      "frames": {
+       "total": 504,
+       "peak_1s": 504,
+       "peak_100ms": 329
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "headers": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 328
+      },
+      "requests": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 328
+      },
+      "s2c_data": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 428
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 37,
+      "header_block_bytes": 37,
+      "peak_streams": 100,
+      "settings_entries_per_frame": 2
+     },
+     "settings_ids": {
+      "0x0002": 1,
+      "0x0004": 1
+     }
+    },
+    {
+     "id": 56,
+     "scenario": "h2load-synthetic",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:38050",
+     "start": "2026-11-11T06:14:23.733580085-05:00",
+     "duration_s": 0.047827345,
+     "bytes_c2s": 9112,
+     "bytes_s2c": 85592,
+     "rates": {
+      "frames": {
+       "total": 504,
+       "peak_1s": 504,
+       "peak_100ms": 329
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "headers": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 328
+      },
+      "requests": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 328
+      },
+      "s2c_data": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 428
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 37,
+      "header_block_bytes": 37,
+      "peak_streams": 100,
+      "settings_entries_per_frame": 2
+     },
+     "settings_ids": {
+      "0x0002": 1,
+      "0x0004": 1
+     }
+    },
+    {
+     "id": 57,
+     "scenario": "h2load-synthetic",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:38056",
+     "start": "2026-11-11T06:14:23.733985802-05:00",
+     "duration_s": 0.046333405,
+     "bytes_c2s": 9112,
+     "bytes_s2c": 85592,
+     "rates": {
+      "frames": {
+       "total": 504,
+       "peak_1s": 504,
+       "peak_100ms": 335
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "headers": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 334
+      },
+      "requests": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 334
+      },
+      "s2c_data": {
+       "total": 500,
+       "peak_1s": 500,
+       "peak_100ms": 434
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 2,
+       "peak_1s": 2,
+       "peak_100ms": 2
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 37,
+      "header_block_bytes": 37,
+      "peak_streams": 100,
+      "settings_entries_per_frame": 2
+     },
+     "settings_ids": {
+      "0x0002": 1,
+      "0x0004": 1
+     }
+    }
+   ]
+  }
+ ],
+ "caveat": "client-to-server frames seen by a TLS-terminating TCP proxy; peaks are over 0.9-1.0 s windows; unanswered RSTs are judged from END_STREAM on the wire"
+}
