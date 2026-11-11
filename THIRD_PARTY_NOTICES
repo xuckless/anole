@@ -263,12 +263,16 @@ src/http/core/h2/ (the HTTP/2 codecs and protocol core; so far the HPACK
 Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
 from nghttp2's lib/nghttp2_hd_huffman_data.c, and the HPACK codec from
 lib/nghttp2_hd.c; testdata/hpack_blocks.bin holds header blocks that
-tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus)
+tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus; streams.zig's
+stream table from lib/nghttp2_map.c, its window and content-length checks from
+lib/nghttp2_stream.c and lib/nghttp2_http.c, and its closed-stream memory from
+the fork patch in lib/nghttp2_session.c)
   Translated from nghttp2's lib/. Every translated Zig file carries an
   attribution header; nghttp2's licence is kept as
   src/http/core/h2/LICENSE.nghttp2.
   Licence:  MIT. Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa;
-            Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
+            Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors;
+            lib/nghttp2_map.c also Copyright (c) 2017 ngtcp2 contributors
   Source:   https://github.com/nghttp2/nghttp2, tag v1.70.0, through
             https://github.com/xuckless/nghttp2, commit
             0f8bc1c4271f4380409071eade31830e6e436bd6 (branch anole)
