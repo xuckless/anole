@@ -1701,6 +1701,13 @@
           "maximum": 4294967295,
           "default": 30000
         },
+        "handshake_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long a new connection may take to complete its handshake (0: no limit)."
+        },
         "alt_svc": {
           "type": "boolean",
           "default": true,

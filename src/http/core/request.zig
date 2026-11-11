@@ -1932,7 +1932,7 @@ test "Request.body: a gzip body from a body source is decoded" {
 /// largest one and the bytes in all. It refuses to grow anything in place,
 /// so every growth is a fresh allocation and a copy, and the counts do not
 /// depend on where the allocator below happens to have room.
-const BodyAllocCounter = struct {
+pub const BodyAllocCounter = struct {
     child: std.mem.Allocator,
     allocs: usize = 0,
     largest: usize = 0,
@@ -1941,7 +1941,7 @@ const BodyAllocCounter = struct {
     watch_len: usize = 0,
     watched: usize = 0,
 
-    fn allocator(self: *BodyAllocCounter) std.mem.Allocator {
+    pub fn allocator(self: *BodyAllocCounter) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 

@@ -581,6 +581,10 @@ pub const Options = struct {
         validate_address: bool = false,
         /// How long a connection may sit idle before it is closed.
         idle_timeout: std.Io.Duration = .fromSeconds(30),
+        /// How long a new connection may take to complete its handshake
+        /// before it is closed; requests held for a 0-RTT handshake end
+        /// with it. Zero: no limit (only `idle_timeout`).
+        handshake_timeout: std.Io.Duration = .fromSeconds(10),
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
         /// 0-RTT run at once, with `Early-Data: 1` among their headers
@@ -1789,6 +1793,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .max_streams_bidi = q.max_streams_bidi,
                     .validate_address = q.validate_address,
                     .idle_timeout = q.idle_timeout,
+                    .handshake_timeout = q.handshake_timeout,
                     .hq_interop_root = q.hq_interop_root,
                     .prefer_v2 = q.prefer_v2,
                     .early_data = q.early_data,
