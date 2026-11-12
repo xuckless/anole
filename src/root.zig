@@ -471,6 +471,7 @@ test {
     _ = observe;
     _ = console;
     _ = capi;
+    _ = config;
 }
 
 test "feature constraints hold" {
