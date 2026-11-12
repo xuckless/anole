@@ -2901,29 +2901,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // The PROXY protocol header comes first, ahead of TLS.
             var proxied: proxy_protocol.Header = .{};
-            if (l.config.proxy_protocol) {
-                const from = if (l.config.proxy_protocol_from.len > 0) l.config.proxy_protocol_from else self.config.trusted_proxies orelse &.{};
-                if (l.config.address == .ip and !proxy_protocol.trustedPeer(from, stream.socket.address)) {
-                    if (!(self.config.warn_untrusted_peer and warnUntrustedPeerProxy(stream.socket.address)))
-                        log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
-                    return .close;
-                }
-                defer timer.clear(self.io);
-                if (l.config.raw != null)
-                    timer.setLazy(self.io, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
-                else
-                    timer.setLazy(self.io, earlier(
-                        deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
-                        deadlineAfter(conn.accepted_at, self.config.timeout.request),
-                    ));
-                proxied = proxy_protocol.read(self.io, stream) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => {
-                        log.info("PROXY protocol header refused: {}", .{err});
-                        return .close;
-                    },
-                };
-            }
+            if (l.config.proxy_protocol) proxied = (try self.readProxyHeader(conn, timer)) orelse return .close;
 
             // What this connection handshakes with, held until it closes,
             // whatever `reloadTls` swaps in meanwhile.
@@ -2942,41 +2920,7 @@ pub fn Server(comptime Ctx: type) type {
                     // task and the connection's whole buffer reservation
                     // for as long as it likes -- cheaper for it than a
                     // slow request, which is bounded.
-                    {
-                        defer timer.clear(self.io);
-                        timer.setLazy(self.io, deadlineAfter(self.tickNow(), if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request));
-
-                        connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
-                            // tls.zig only saw the ciphertext reader or
-                            // writer fail generically, so the cause is a
-                            // layer down -- and when the handshake ran out
-                            // of time, that cause is the cancel.
-                            const cause = switch (err) {
-                                error.ReadFailed => connection.getReadError() orelse err,
-                                error.WriteFailed => connection.getWriteError() orelse err,
-                                else => err,
-                            };
-                            if (cause == error.Canceled) {
-                                log.debug("TLS handshake canceled", .{});
-                                return error.Canceled;
-                            }
-                            if (Connection.isPeerGone(cause)) {
-                                log.debug("TLS handshake abandoned by peer: {}", .{cause});
-                            } else if (cause == error.OutOfMemory) {
-                                log.err("TLS handshake failed: {}", .{cause});
-                            } else {
-                                // Anyone who can reach the port can fail a
-                                // handshake at will (a scanner, a client that
-                                // rejects the certificate or sends none), so
-                                // this is not the server's error and must not
-                                // flood the error log (nginx logs these at
-                                // info too).
-                                log.info("TLS handshake failed: {}", .{cause});
-                                try self.lingerAfterRefusal(stream, timer);
-                            }
-                            return .close;
-                        };
-                    }
+                    if (!try self.handshakeTls(conn, m, timer)) return .close;
 
                     connection.proxied_peer = proxied.source;
                     connection.proxied_secure = proxied.ssl;
@@ -3009,6 +2953,79 @@ pub fn Server(comptime Ctx: type) type {
             if (l.config.raw) |raw| return self.startRaw(conn, raw, timer, busy);
             connection.write_pool = &self.request_buffers;
             return self.serveRequests(conn, timer, busy);
+        }
+
+        /// The PROXY protocol header of `conn` (`Listener.proxy_protocol`),
+        /// or null when the connection closes instead. Out of line, as is
+        /// `handshakeTls`: inlined, they add 608 bytes to the frame of
+        /// `handleConnectionWrapper`, which stays on a connection's stack
+        /// while it serves requests (in a ReleaseFast build). Under K10's
+        /// deadlines that took the keep-alive path into a third 4 KiB stack
+        /// page, 16 MB more RSS at 4,096 connections.
+        noinline fn readProxyHeader(self: *Self, conn: *Conn, timer: *Timer) std.Io.Cancelable!?proxy_protocol.Header {
+            const l = conn.listener;
+            const stream = conn.connection.stream;
+            const from = if (l.config.proxy_protocol_from.len > 0) l.config.proxy_protocol_from else self.config.trusted_proxies orelse &.{};
+            if (l.config.address == .ip and !proxy_protocol.trustedPeer(from, stream.socket.address)) {
+                if (!(self.config.warn_untrusted_peer and warnUntrustedPeerProxy(stream.socket.address)))
+                    log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
+                return null;
+            }
+            defer timer.clear(self.io);
+            if (l.config.raw != null)
+                timer.setLazy(self.io, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
+            else
+                timer.setLazy(self.io, earlier(
+                    deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
+                    deadlineAfter(conn.accepted_at, self.config.timeout.request),
+                ));
+            return proxy_protocol.read(self.io, stream) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    log.info("PROXY protocol header refused: {}", .{err});
+                    return null;
+                },
+            };
+        }
+
+        /// The TLS handshake of `conn` with `m`, under the handshake
+        /// deadline: false when the connection closes instead.
+        noinline fn handshakeTls(self: *Self, conn: *Conn, m: *TlsMaterial, timer: *Timer) std.Io.Cancelable!bool {
+            const l = conn.listener;
+            const stream = conn.connection.stream;
+            const connection = &conn.connection;
+            defer timer.clear(self.io);
+            timer.setLazy(self.io, deadlineAfter(self.tickNow(), if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request));
+
+            connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
+                // tls.zig only saw the ciphertext reader or writer fail
+                // generically, so the cause is a layer down -- and when the
+                // handshake ran out of time, that cause is the cancel.
+                const cause = switch (err) {
+                    error.ReadFailed => connection.getReadError() orelse err,
+                    error.WriteFailed => connection.getWriteError() orelse err,
+                    else => err,
+                };
+                if (cause == error.Canceled) {
+                    log.debug("TLS handshake canceled", .{});
+                    return error.Canceled;
+                }
+                if (Connection.isPeerGone(cause)) {
+                    log.debug("TLS handshake abandoned by peer: {}", .{cause});
+                } else if (cause == error.OutOfMemory) {
+                    log.err("TLS handshake failed: {}", .{cause});
+                } else {
+                    // Anyone who can reach the port can fail a handshake at
+                    // will (a scanner, a client that rejects the certificate
+                    // or sends none), so this is not the server's error and
+                    // must not flood the error log (nginx logs these at info
+                    // too).
+                    log.info("TLS handshake failed: {}", .{cause});
+                    try self.lingerAfterRefusal(stream, timer);
+                }
+                return false;
+            };
+            return true;
         }
 
         /// Hands a ready connection of a raw listener (`Listener.raw`) to
