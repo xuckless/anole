@@ -3,7 +3,25 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.5.4 (2026-11-12)
+
+S2 tier 3 without the HTTP/2 engine: zio's upstream merged, HTTP/1.x deadlines on a once-a-second sweep, per-executor byte budgets and a task cap, direct UDP batches on io_uring; two batches of bug fixes; and the HTTP/2 takeover's protocol core (M1 and M2, added but not used yet).
+
+### Performance
+
+On my box (i7-14700F), against main before tier 3 (0.5.3 plus the first fix batch), one interleaved pass:
+
+| Cell | Before | 0.5.4 |
+|---|---|---|
+| HTTP/1.1 `/json`, 1 executor: instructions per request | 8,025 | 7,750 (−3.4%) |
+| Async handler (`/delay/10`, 1k connections): instructions per request | 9,370 | 9,083 (−3.1%) |
+| json, 4096 connections: CPU per request | 12.44 µs | 12.17 µs (−2.1%) |
+| json-tls: CPU per request | 15.81 µs | 15.42 µs (−2.4%) |
+| json-h3: p99 | 77.9 ms | 62.3 ms (+1.5% req/s) |
+| json-h2c: RSS | 989 MB | 948 MB (+1.5% req/s) |
+| UDP echo on io_uring: syscalls per batch of 32 | 4.0 | 2.1 (−6% instructions per datagram) |
+
+json-comp, WebSocket echo and TCP echo are within ±1%; HTTP/1.1 RSS is unchanged (45 MB at 4096 connections), and 16,384 connections waiting 10 s in a handler are all answered.
 
 ### Added
 

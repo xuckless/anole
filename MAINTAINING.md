@@ -241,7 +241,8 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   only, a77def3, 806b5e4): past a spent tick, the no-park yield point
   yields only after `no_park_grace` (16) more operations without a park,
   charged to the task that overran (`yieldIfOverrun`). Pinned at 806b5e4
-  on `anole-diag` (0.5.3); the merge of upstream 299a618 on top is d799693.
+  on `anole-diag` (0.5.3); the merge of upstream 299a618 on top is d799693,
+  and 0.5.4 pins 3c863fc (#106 on top of it).
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is
