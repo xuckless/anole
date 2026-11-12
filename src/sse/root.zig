@@ -677,8 +677,14 @@ pub const Topics = struct {
         return sub;
     }
 
-    /// For a subscriber made by tests or the C ABI over an `Out` of their
-    /// own: registers it with `opts.topics` and arms it.
+    /// For a subscriber made by tests over an `Out` of their own: registers
+    /// it with `opts.topics` and arms it. The pointer is valid only until
+    /// its end task runs, which frees it after `opts.on_close`: a caller
+    /// uses it only while it knows the subscriber cannot have ended (no
+    /// `_gone`, no `close`, no failed write, no drain, and `on_close` not
+    /// called). It may be freed already when this returns, if the
+    /// subscriber's end was asked for while it was opened (`on_open`
+    /// closing it, a failed first write, `_gone` from another task).
     pub fn _attach(self: *Topics, io: std.Io, out: Out, opts: ServeOptions, last_header: ?[]const u8) !*Subscriber {
         _ = self.bind(io);
         for (opts.topics) |t| if (!validTopic(t)) return error.InvalidTopic;
@@ -1262,8 +1268,11 @@ pub const Topics = struct {
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
                 const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
-                if (sub.gone.load(.acquire) and sub.end.load(.acquire) == .none) {
-                    if (ne < ends.len) {
+                // An end that is wanted but not started (its start
+                // failed): claimed here, under the mutex, while `sub` is
+                // linked and so not freed; started below.
+                if (sub.end.load(.acquire) == .none and sub.wantsEnd()) {
+                    if (ne < ends.len and sub.end.cmpxchgStrong(.none, .started, .acq_rel, .acquire) == null) {
                         ends[ne] = sub;
                         ne += 1;
                     }
@@ -1302,7 +1311,7 @@ pub const Topics = struct {
         if (self.metrics != null) self.syncMetrics(self.topics.count(), self.store.bytes);
         self.mutex.unlock(io);
         for (stack[0..n]) |sub| self.startSender(io, sub);
-        for (ends[0..ne]) |sub| self.spawnEnd(sub);
+        for (ends[0..ne]) |sub| self.startEnd(sub);
         return more;
     }
 
@@ -1489,6 +1498,18 @@ pub const Subscriber = struct {
             .ending => |e| e == .abort,
             .left => |e| e == .abort,
             else => false,
+        };
+    }
+
+    /// Its end task is wanted: the peer is gone, or (served by the hub's
+    /// sender, not the handler's own task) a write failed or the end went
+    /// out. Under the hub's mutex.
+    fn wantsEnd(sub: *const Subscriber) bool {
+        if (sub.gone.load(.acquire)) return true;
+        if (sub.fallback) return false;
+        return switch (sub.phase) {
+            .broken, .over => true,
+            .open, .ending, .left => false,
         };
     }
 
