@@ -1129,6 +1129,15 @@ pub const Engine = struct {
     signals: bool,
     /// `anole_console_close` is closing the console: no event 132.
     console_quiet: std.atomic.Value(bool) = .init(false),
+    /// On the server's drain hooks while it serves: posts
+    /// `ANOLE_EV_DRAINING` when the drain starts, whatever started it
+    /// (`anole_server_drain`, the console's drain, a listener failing).
+    drain_hook: dusty.DrainHooks.Hook = .{ .callback = onServerDrain },
+    /// `ANOLE_EV_DRAINING` went out: swapped by `onServerDrain` and by
+    /// `drain` before it stops the engine's areas, so whichever comes first
+    /// posts it, and an explicit drain has it in the queue before its area
+    /// drains post anything and before `anole_server_drain` returns.
+    draining_posted: std.atomic.Value(bool) = .init(false),
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
     thread: ?std.Thread = null,
@@ -1450,6 +1459,8 @@ pub const Engine = struct {
             };
             // Control calls may reach the server from here until `run` returns.
             _ = e.ctl.fetchAnd(~ctl_closed, .release);
+            // Lives in `e`, past the server's hook list (freed with `app`).
+            app.server.drain_hooks.add(app.io(), &e.drain_hook);
             e.phase.store(.running, .release);
             // The watches start with serving (`anole_server_start`).
             result = if (watch.start(e, &app)) |_| app.run() else |err| err;
@@ -1956,8 +1967,9 @@ pub const Engine = struct {
         // on its own.
         const app = e.enter() orelse return;
         defer e.leave();
-        // The first drain call tells every consumer (once each), before the
-        // server starts closing sockets and cutting requests.
+        // The first drain call tells the consumers (unless the server's hook
+        // did already) and stops the engine's own areas; a drain started
+        // elsewhere reaches the consumers through `onServerDrain` alone.
         if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
             e.notifyDraining();
             kafka.draining(e);
@@ -1970,13 +1982,36 @@ pub const Engine = struct {
         app.stop();
     }
 
-    /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once: long-poll,
-    /// SSE and similar consumers finish up before the drain's deadline.
+    /// A drain hook: `ANOLE_EV_DRAINING` for a drain started anywhere (if
+    /// `drain` has not posted it already). Runs once per drain, on the task
+    /// that started it, before the server closes sockets or cuts requests
+    /// (and before the hooks registered later, the connections'). Never
+    /// waits.
+    fn onServerDrain(hook: *dusty.DrainHooks.Hook) void {
+        // SAFETY: the only hook registered with this callback is `Engine.drain_hook`.
+        const e: *Engine = @alignCast(@fieldParentPtr("drain_hook", hook));
+        e.notifyDraining();
+    }
+
+    /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once
+    /// (`draining_posted`): long-poll, SSE and similar consumers finish up
+    /// before the drain's deadline. Never waits: the post goes to the
+    /// overflow list or the ring without blocking.
     fn notifyDraining(e: *Engine) void {
+        if (e.draining_posted.swap(true, .acq_rel)) return;
         for (e.consumers.items) |c| {
             if (c.execs.items.len == 0) continue;
             c.execs.items[0].postEvent(.draining, 0);
         }
+    }
+
+    /// Tests only: stops the server as the console's drain and a signal do
+    /// (`App.stop`), not through `drain`.
+    pub fn testStopServer(e: *Engine) void {
+        if (comptime !builtin.is_test) @compileError("tests only");
+        const app = e.enter() orelse return;
+        defer e.leave();
+        app.stop();
     }
 
     /// Waits for the stop; false when `timeout_ms` passed first.

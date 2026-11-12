@@ -660,10 +660,6 @@ pub const Service = struct {
         self.restart_state.store(if (ok) 2 else 3, .release);
     }
 
-    pub fn restartRequested(self: *const Service) bool {
-        return self.restart_state.load(.acquire) == 1;
-    }
-
     fn handleFullRestart(c: *Client, a: std.mem.Allocator, r: protocol.Request) !void {
         const self = c.service;
         if (self.opts.read_only) return fail(c, r.id, protocol.code_refused, "the console is read-only (console.read_only)");

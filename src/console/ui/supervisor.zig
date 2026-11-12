@@ -59,10 +59,6 @@ fn serviceName(text: []const u8) []const u8 {
     return best;
 }
 
-pub fn kindName(k: Supervisor) []const u8 {
-    return @tagName(k);
-}
-
 const Fake = struct {
     vars: []const [2][]const u8 = &.{},
     files: []const [2][]const u8 = &.{},

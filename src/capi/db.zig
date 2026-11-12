@@ -11,6 +11,7 @@ const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const engine = @import("engine.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 const abi = @import("abi.zig");
 const config_mod = @import("config.zig");
 const jobs = @import("jobs.zig");
@@ -73,7 +74,7 @@ pub const ExecState = struct {
 
     /// The stop: open transactions are rolled back and answer nothing.
     pub fn cancel(st: *ExecState, io: std.Io) void {
-        st.txs.markStopped();
+        st.txs.forEach(markTxStopped);
         st.work.cancel(io);
     }
 
@@ -83,7 +84,7 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.txs.deinit();
+        st.txs.deinit(null);
     }
 };
 
@@ -220,7 +221,7 @@ fn callBound(d: *Db) ?std.Io.Duration {
 }
 
 /// `anole.db.Tls` from a connector's TLS keys.
-fn tlsOf(c: anytype) db.Tls {
+pub fn tlsOf(c: anytype) db.Tls {
     return .{
         .ca = if (c.ca_file) |f| .{ .file = f } else if (c.ca_pem) |pem| .{ .pem = pem } else null,
         .client_certificate = if (c.client_cert_file) |f|
@@ -866,12 +867,6 @@ fn packTx(gen: u32, state: TxState) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
-const tx_chunk_len = 64;
-const tx_max_chunks = 1024;
-comptime {
-    std.debug.assert(tx_chunk_len * tx_max_chunks <= engine.max_slots);
-}
-
 pub const TxWhat = enum {
     query,
     exec,
@@ -978,64 +973,16 @@ fn cutTx(tied: *Tied) void {
     t.wake();
 }
 
-const TxChunk = [tx_chunk_len]TxSlot;
+fn txFreeWord(gen: u32) u64 {
+    return packTx(gen, .free);
+}
 
-pub const TxTable = struct {
-    chunks: [tx_max_chunks]std.atomic.Value(?*TxChunk) = @splat(.init(null)),
-    nchunks: std.atomic.Value(u32) = .init(0),
-    free_head: u32 = engine.no_slot,
+pub const TxTable = SlotTable(TxSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransactions }, txFreeWord);
 
-    fn slot(t: *TxTable, i: u32) ?*TxSlot {
-        // `i` may come from a made-up handle.
-        if (i / tx_chunk_len >= tx_max_chunks) return null;
-        const c = t.chunks[i / tx_chunk_len].load(.acquire) orelse return null;
-        return &c[i % tx_chunk_len];
-    }
-
-    fn alloc(t: *TxTable, x: *Exec) !*TxSlot {
-        if (t.free_head == engine.no_slot) {
-            const n = t.nchunks.load(.monotonic);
-            if (n == tx_max_chunks) return error.TooManyTransactions;
-            const c = try gpa.create(TxChunk);
-            const base = n * tx_chunk_len;
-            for (c, 0..) |*s, j| s.* = .{
-                .word = .init(packTx(x.engine.first_gen, .free)),
-                .exec = x,
-                .index = @intCast(base + j),
-                .next_free = if (j + 1 < tx_chunk_len) @intCast(base + j + 1) else engine.no_slot,
-            };
-            t.chunks[n].store(c, .release);
-            t.nchunks.store(n + 1, .release);
-            t.free_head = base;
-        }
-        const s = t.slot(t.free_head).?;
-        t.free_head = s.next_free;
-        return s;
-    }
-
-    /// Any thread, at the stop: every open transaction ends without
-    /// answering.
-    fn markStopped(t: *TxTable) void {
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| {
-            for (cv.load(.acquire).?) |*s| {
-                if (@as(TxState, @fromBackingInt(@intCast(s.word.load(.acquire) & 0xFFFFFFFF))) != .free) s.setEnd(.stopped);
-            }
-        }
-    }
-
-    fn maxGen(t: *const TxTable) u32 {
-        var max: u32 = 0;
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| {
-            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-        }
-        return max;
-    }
-
-    fn deinit(t: *TxTable) void {
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| gpa.destroy(cv.load(.acquire).?);
-        t.nchunks.store(0, .release);
-    }
-};
+/// Any thread, at the stop: every open transaction ends without answering.
+fn markTxStopped(s: *TxSlot) void {
+    if (@as(TxState, @fromBackingInt(@intCast(s.word.load(.acquire) & 0xFFFFFFFF))) != .free) s.setEnd(.stopped);
+}
 
 /// The two SQL connectors' transactions behind one type.
 pub const AnyTx = union(enum) {
@@ -1166,8 +1113,7 @@ fn postAnswerNoWait(x: *Exec, a: *const Answer) void {
 fn freeTx(x: *Exec, t: *TxSlot, g: u32) void {
     t.task = null;
     t.word.store(packTx(engine.nextGen(g), .free), .release);
-    t.next_free = x.db.txs.free_head;
-    x.db.txs.free_head = t.index;
+    x.db.txs.free(t);
 }
 
 fn nowNs(io: std.Io) i96 {

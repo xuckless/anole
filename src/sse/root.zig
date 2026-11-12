@@ -428,7 +428,7 @@ pub const Topics = struct {
             } else |_| null;
             var n: usize = 0;
             for (members) |sub| {
-                if (sub.ending or sub.broken or sub.left) {
+                if (!sub.accepts()) {
                     self.checkStuck(sub, now);
                     continue;
                 }
@@ -439,8 +439,7 @@ pub const Topics = struct {
                     }
                     self.beginClose(sub, .slow, true);
                     self.checkStuck(sub, now);
-                    if (!sub.running and sub.armed) {
-                        sub.running = true;
+                    if (sub.claimSender()) {
                         if (buf) |b| {
                             b[n] = sub;
                             n += 1;
@@ -452,8 +451,7 @@ pub const Topics = struct {
                 p.retain();
                 sub.queued_bytes += p.cost();
                 reached += 1;
-                if (sub.running or !sub.armed) continue;
-                sub.running = true;
+                if (!sub.claimSender()) continue;
                 if (buf) |b| {
                     b[n] = sub;
                     n += 1;
@@ -496,12 +494,11 @@ pub const Topics = struct {
             const body = self.gapBody(gap_name, self.seq, &.{t.name}) catch continue;
             _ = self.n_gaps.fetchAdd(1, .monotonic);
             for (t.members.items) |sub| {
-                if (sub.ending or sub.broken or sub.left) continue;
+                if (!sub.accepts()) continue;
                 sub.queue.append(self.gpa, body) catch continue;
                 body.retain();
                 sub.queued_bytes += body.cost();
-                if (!sub.running and sub.armed) {
-                    sub.running = true;
+                if (sub.claimSender()) {
                     started.append(self.gpa, sub) catch {
                         sub.running = false;
                     };
@@ -642,15 +639,19 @@ pub const Topics = struct {
         sub.has_out = true;
         sub.fallback = true;
         self.arm(io, sub, opts);
+        // Canceled (the peer reset the stream, the server stopped) is the
+        // peer going away; otherwise the hub ended the stream.
+        var outcome: SendOutcome = .broken;
         while (true) {
             sub.wake.wait(io) catch break;
             sub.wake.reset();
-            self.sendQueued(sub) catch break;
-            if (sub.over or sub.broken) break;
+            const o = self.sendQueued(sub) catch break;
+            if (o != .idle) {
+                outcome = o;
+                break;
+            }
         }
-        // Canceled (the peer reset the stream, the server stopped) is the
-        // peer going away; otherwise the hub ended the stream.
-        const reason: CloseReason = if (sub.over) sub.close_reason else .client_gone;
+        const reason: CloseReason = if (outcome == .over) sub.close_reason else .client_gone;
         self.finishSubscriber(sub, reason);
         if (fb.aborted) return error.ResponseAborted;
     }
@@ -676,8 +677,14 @@ pub const Topics = struct {
         return sub;
     }
 
-    /// For a subscriber made by tests or the C ABI over an `Out` of their
-    /// own: registers it with `opts.topics` and arms it.
+    /// For a subscriber made by tests over an `Out` of their own: registers
+    /// it with `opts.topics` and arms it. The pointer is valid only until
+    /// its end task runs, which frees it after `opts.on_close`: a caller
+    /// uses it only while it knows the subscriber cannot have ended (no
+    /// `_gone`, no `close`, no failed write, no drain, and `on_close` not
+    /// called). It may be freed already when this returns, if the
+    /// subscriber's end was asked for while it was opened (`on_open`
+    /// closing it, a failed first write, `_gone` from another task).
     pub fn _attach(self: *Topics, io: std.Io, out: Out, opts: ServeOptions, last_header: ?[]const u8) !*Subscriber {
         _ = self.bind(io);
         for (opts.topics) |t| if (!validTopic(t)) return error.InvalidTopic;
@@ -735,6 +742,9 @@ pub const Topics = struct {
     }
 
     /// Everything after the head is out: `on_open`, the first sender.
+    /// Its last touch of `sub` ends the opening: an end asked for since
+    /// the subscriber was made (the peer gone while `on_open` ran or the
+    /// head went out, a failed first write) starts only then (`opened`).
     fn arm(self: *Topics, io: std.Io, sub: *Subscriber, opts: ServeOptions) void {
         if (opts.on_open) |f| f(sub);
         var launch = false;
@@ -742,23 +752,21 @@ pub const Topics = struct {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             sub.armed = true;
-            if (!sub.running and sub.head < sub.queue.items.len) {
-                sub.running = true;
-                launch = true;
-            }
+            launch = sub.head < sub.queue.items.len and sub.claimSender();
         }
         if (launch) self.startSender(io, sub);
         self.ensureTickers(io, sub);
+        self.opened(sub);
     }
 
     fn joinLocked(self: *Topics, sub: *Subscriber, name: []const u8) error{ OutOfMemory, TooManyTopics, InvalidTopic }!void {
         if (!validTopic(name)) return error.InvalidTopic;
-        for (sub.memberships.items) |t| if (std.mem.eql(u8, t.name, name)) return;
+        for (sub.memberships.items) |m| if (std.mem.eql(u8, m.topic.name, name)) return;
         if (sub.memberships.items.len >= self.options.max_topics_per_subscriber) return error.TooManyTopics;
         const t = try self.topicLocked(name);
         try t.members.append(self.gpa, sub);
         errdefer _ = t.members.pop();
-        try sub.memberships.append(self.gpa, t);
+        try sub.memberships.append(self.gpa, .{ .topic = t, .index = @intCast(t.members.items.len - 1) });
         t.empty_since_ms = null;
     }
 
@@ -773,15 +781,27 @@ pub const Topics = struct {
         return t;
     }
 
+    /// `sub` out of `t.members`, where it is at `index`; the member moved
+    /// into its place learns its new position (from its own memberships,
+    /// at most `max_topics_per_subscriber`). Under the mutex.
+    fn removeMember(t: *Topic, sub: *Subscriber, index: u32) void {
+        std.debug.assert(t.members.items[index] == sub);
+        _ = t.members.swapRemove(index);
+        if (index == t.members.items.len) return;
+        const moved = t.members.items[index];
+        for (moved.memberships.items) |*m| if (m.topic == t) {
+            m.index = index;
+            return;
+        };
+        unreachable;
+    }
+
     /// Takes `sub` out of every topic and its executor's list.
     fn unlinkLocked(self: *Topics, sub: *Subscriber) void {
         const now = if (self.io_set.load(.acquire)) self.nowMs() else 0;
-        for (sub.memberships.items) |t| {
-            for (t.members.items, 0..) |m, i| if (m == sub) {
-                _ = t.members.swapRemove(i);
-                break;
-            };
-            if (t.members.items.len == 0) t.empty_since_ms = now;
+        for (sub.memberships.items) |m| {
+            removeMember(m.topic, sub, m.index);
+            if (m.topic.members.items.len == 0) m.topic.empty_since_ms = now;
         }
         sub.memberships.clearRetainingCapacity();
         if (sub.linked) {
@@ -818,7 +838,7 @@ pub const Topics = struct {
         self.end_payload.retain();
         errdefer self.end_payload.release(self.gpa);
         try self.enqueueLocked(sub, self.end_payload);
-        sub.ending = true;
+        sub.phase = .{ .ending = .graceful };
         sub.close_reason = .drain;
     }
 
@@ -848,7 +868,8 @@ pub const Topics = struct {
             var all_gap = parsed == null or parsed.?.epoch != self.epoch;
             if (!all_gap) {
                 const last = parsed.?.seq;
-                for (joined) |t| {
+                for (joined) |m| {
+                    const t = m.topic;
                     if (last < t.ring.complete_after) {
                         try gap_topics.append(self.gpa, t.name);
                         continue;
@@ -872,11 +893,12 @@ pub const Topics = struct {
             if (all_gap) {
                 entries.clearRetainingCapacity();
                 gap_topics.clearRetainingCapacity();
-                for (joined) |t| try gap_topics.append(self.gpa, t.name);
+                for (joined) |m| try gap_topics.append(self.gpa, m.topic.name);
             }
             _ = self.n_resumed.fetchAdd(1, .monotonic);
         } else if (last_n > 0) {
-            for (joined) |t| {
+            for (joined) |m| {
+                const t = m.topic;
                 var node = t.ring.list.last;
                 var taken: u16 = 0;
                 var first: ?*std.DoublyLinkedList.Node = null;
@@ -914,15 +936,15 @@ pub const Topics = struct {
     /// A subscriber that takes no more events: after what is queued, its
     /// stream ends. Under the mutex.
     fn beginClose(self: *Topics, sub: *Subscriber, reason: CloseReason, count_slow: bool) void {
-        if (sub.ending) return;
-        sub.ending = true;
+        if (!sub.accepts()) return;
+        sub.phase = .{ .ending = .graceful };
         sub.close_reason = reason;
         if (count_slow) _ = self.n_closed_slow.fetchAdd(1, .monotonic);
         self.end_payload.retain();
         sub.queue.append(self.gpa, self.end_payload) catch {
             self.end_payload.release(self.gpa);
             // No room even for that: it is stuck, and aborted below.
-            sub.abort_requested = true;
+            sub.phase = .{ .ending = .abort };
             return;
         };
         sub.queued_bytes += self.end_payload.cost();
@@ -931,10 +953,10 @@ pub const Topics = struct {
     /// A sender stuck on an ending subscriber past `close_after` is
     /// canceled, which aborts the stream. Under the mutex.
     fn checkStuck(self: *Topics, sub: *Subscriber, now: i64) void {
-        if (!sub.ending or !sub.running) return;
+        if (sub.phase != .ending or !sub.running) return;
         const since = sub.sending_since_ms orelse return;
         if (now - since < self.options.close_after.toMilliseconds()) return;
-        sub.abort_requested = true;
+        sub.phase = .{ .ending = .abort };
         if (sub.task) |t| placement.cancelTask(t);
     }
 
@@ -952,20 +974,31 @@ pub const Topics = struct {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             sub.running = false;
-            if (sub.left) self.idle.broadcast(io);
+            if (sub.phase == .left) self.idle.broadcast(io);
         };
     }
 
     fn senderTask(self: *Topics, sub: *Subscriber) std.Io.Cancelable!void {
-        return self.sendQueued(sub);
+        _ = try self.sendQueued(sub);
     }
+
+    /// How a sender's run ended.
+    pub const SendOutcome = enum {
+        /// The queue is empty and the stream still open.
+        idle,
+        /// The end was written, or the stream aborted.
+        over,
+        /// A write failed.
+        broken,
+    };
 
     /// A subscriber's sender: writes what is queued for it, in order, until
     /// the queue is empty or the subscriber is done. Everything queued, up
     /// to a round's worth, goes out in one write.
-    pub fn sendQueued(self: *Topics, sub: *Subscriber) error{Canceled}!void {
+    pub fn sendQueued(self: *Topics, sub: *Subscriber) error{Canceled}!SendOutcome {
         const io = self.io;
         var canceled = false;
+        var failed = false;
         var in_burst = false;
         var ended = false;
         var aborted = false;
@@ -975,7 +1008,7 @@ pub const Topics = struct {
         // queued while the burst ended (unlocked) found `running` set and
         // started no sender: a further pass takes them.
         pass: while (true) {
-            while (!sub.left and !sub.broken) {
+            while (sub.writable()) {
                 var round: [send_round]*Payload = undefined;
                 var n: usize = 0;
                 while (n < round.len) {
@@ -1028,9 +1061,11 @@ pub const Topics = struct {
                 sub.sending_since_ms = null;
                 sub.last_write_ms = self.nowMs();
                 if (!ok) {
-                    sub.broken = true;
+                    failed = true;
+                    if (canceled and sub.abortRequested()) aborted = true;
+                    // Once left, it stays left.
+                    if (sub.phase != .left) sub.phase = .broken;
                     sub.dropQueue(self.gpa);
-                    if (canceled and sub.ending and sub.abort_requested) aborted = true;
                     break;
                 }
                 if (has_end) {
@@ -1050,44 +1085,76 @@ pub const Topics = struct {
                 }
             }
             self.mutex.lockUncancelable(io);
-            if (!ended and !aborted and !canceled and !sub.left and !sub.broken and sub.head < sub.queue.items.len) {
+            if (!ended and !aborted and !canceled and sub.writable() and sub.head < sub.queue.items.len) {
                 in_burst = false;
                 continue :pass;
             }
             break :pass;
         }
-        if (ended or aborted) sub.over = true;
+        if ((ended or aborted) and sub.phase != .left) sub.phase = .over;
         sub.running = false;
         sub.task = null;
-        const spawn_end = (ended or aborted or sub.broken) and !sub.fallback;
-        if (sub.broken and !ended and !aborted) sub.close_reason = .client_gone;
-        if (sub.left) self.idle.broadcast(io);
+        const spawn_end = (ended or aborted or failed) and !sub.fallback;
+        if (failed and !ended and !aborted) sub.close_reason = .client_gone;
+        if (sub.phase == .left) self.idle.broadcast(io);
         self.mutex.unlock(io);
         if (spawn_end) self.spawnEnd(sub);
         if (canceled and !aborted) return error.Canceled;
+        return if (ended or aborted) .over else if (failed) .broken else .idle;
     }
 
-    /// Starts the task that ends `sub`, once.
+    /// Starts the task that ends `sub`, once; while it is being opened,
+    /// only notes that it is to start (`opened` starts it). Must not wait.
     fn spawnEnd(self: *Topics, sub: *Subscriber) void {
-        if (sub.end_started.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        var cur = sub.end.load(.acquire);
+        while (true) {
+            const next: Subscriber.EndTask = switch (cur) {
+                .none => .started,
+                .opening => .asked,
+                .asked, .started => return,
+            };
+            cur = sub.end.cmpxchgWeak(cur, next, .acq_rel, .acquire) orelse {
+                if (next == .started) self.startEnd(sub);
+                return;
+            };
+        }
+    }
+
+    /// The opening is done (the end of `arm`, the caller's last touch of
+    /// `sub`): an end asked for meanwhile starts now.
+    fn opened(self: *Topics, sub: *Subscriber) void {
+        // Only `spawnEnd` moves it on from `opening`, to `asked`.
+        if (sub.end.cmpxchgStrong(.opening, .none, .acq_rel, .acquire)) |cur| {
+            std.debug.assert(cur == .asked);
+            sub.end.store(.started, .release);
+            self.startEnd(sub);
+        }
+    }
+
+    fn startEnd(self: *Topics, sub: *Subscriber) void {
         const io = self.io;
         const where: placement.Where = if (sub.executor) |i| .{ .executor = i } else .local;
         placement.concurrent(&self.ends, io, where, endTask, .{ self, sub }) catch {
             // A tick tries again.
-            sub.end_started.store(false, .release);
+            sub.end.store(.none, .release);
         };
     }
 
     fn endTask(self: *Topics, sub: *Subscriber) std.Io.Cancelable!void {
-        self.finishSubscriber(sub, sub.close_reason);
+        self.finishSubscriber(sub, null);
     }
 
     /// Leaves every topic, waits for the sender, releases the stream, tells
-    /// `on_close` and frees the subscriber.
-    fn finishSubscriber(self: *Topics, sub: *Subscriber, reason: CloseReason) void {
+    /// `on_close` and frees the subscriber. `reason` null: the one the hub
+    /// recorded (`close_reason`, read under the mutex).
+    fn finishSubscriber(self: *Topics, sub: *Subscriber, reason_arg: ?CloseReason) void {
         const io = self.io;
         self.mutex.lockUncancelable(io);
-        sub.left = true;
+        const reason = reason_arg orelse sub.close_reason;
+        sub.phase = .{ .left = switch (sub.phase) {
+            .ending => |e| e,
+            else => null,
+        } };
         self.unlinkLocked(sub);
         sub.dropQueue(self.gpa);
         const canceled = self.awaitSender(io, sub);
@@ -1134,11 +1201,12 @@ pub const Topics = struct {
     // -- the peer going away ---------------------------------------------
 
     /// `Parked.Owner.gone`: must not wait. Marks the subscriber and starts
-    /// its end task.
+    /// its end task (or, while it is being opened, has `arm` start it).
+    /// The reason needs no write: an open subscriber's `close_reason` is
+    /// `client_gone` already, and an ending one keeps its own.
     fn onGone(ctx: *anyopaque) void {
         const sub: *Subscriber = @ptrCast(@alignCast(ctx));
         sub.gone.store(true, .release);
-        if (!sub.ending) sub.close_reason = .client_gone;
         sub.hub.spawnEnd(sub);
     }
 
@@ -1200,8 +1268,11 @@ pub const Topics = struct {
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
                 const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
-                if (sub.gone.load(.acquire) and !sub.end_started.load(.acquire)) {
-                    if (ne < ends.len) {
+                // An end that is wanted but not started (its start
+                // failed): claimed here, under the mutex, while `sub` is
+                // linked and so not freed; started below.
+                if (sub.end.load(.acquire) == .none and sub.wantsEnd()) {
+                    if (ne < ends.len and sub.end.cmpxchgStrong(.none, .started, .acq_rel, .acquire) == null) {
                         ends[ne] = sub;
                         ne += 1;
                     }
@@ -1209,13 +1280,12 @@ pub const Topics = struct {
                 }
                 self.checkStuck(sub, now_ms);
                 if (hb_ms) |hb| {
-                    if (!sub.ending and !sub.broken and !sub.left and sub.armed and now_ms - sub.last_write_ms >= hb) {
+                    if (sub.accepts() and sub.armed and now_ms - sub.last_write_ms >= hb) {
                         self.heartbeat_payload.retain();
                         if (sub.queue.append(self.gpa, self.heartbeat_payload)) |_| {
                             sub.queued_bytes += self.heartbeat_payload.cost();
                             sub.last_write_ms = now_ms;
-                            if (!sub.running and n < stack.len) {
-                                sub.running = true;
+                            if (n < stack.len and sub.claimSender()) {
                                 stack[n] = sub;
                                 n += 1;
                             }
@@ -1241,7 +1311,7 @@ pub const Topics = struct {
         if (self.metrics != null) self.syncMetrics(self.topics.count(), self.store.bytes);
         self.mutex.unlock(io);
         for (stack[0..n]) |sub| self.startSender(io, sub);
-        for (ends[0..ne]) |sub| self.spawnEnd(sub);
+        for (ends[0..ne]) |sub| self.startEnd(sub);
         return more;
     }
 
@@ -1298,10 +1368,9 @@ pub const Topics = struct {
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
                 const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
-                if (sub.ending or sub.left or sub.broken) continue;
+                if (!sub.accepts()) continue;
                 self.queueDrainEnd(sub) catch continue;
-                if (!sub.running and sub.armed) {
-                    sub.running = true;
+                if (sub.claimSender()) {
                     started.append(self.gpa, sub) catch {
                         sub.running = false;
                     };
@@ -1347,32 +1416,120 @@ pub const Subscriber = struct {
     queue: std.ArrayList(*Payload) = .empty,
     head: usize = 0,
     queued_bytes: usize = 0,
-    /// A sender is started or running; it alone takes from the queue.
+    /// A sender is started or running; it alone takes from the queue. Not
+    /// part of `phase`: a sender may exist in every phase but `over`.
+    /// Set only through `claimSender`. Under the hub's mutex.
     running: bool = false,
-    /// The head is out and the first sender may start.
+    /// The head is out and the first sender may start. Not part of
+    /// `phase` either: a subscriber can be ending before it is armed (a
+    /// subscribe during the drain, `close` from `on_open`, a publish past
+    /// the cap between `register` and `arm`). Under the hub's mutex.
     armed: bool = false,
-    /// The end is queued (slow, drain, `close`): it takes no more events.
-    ending: bool = false,
-    broken: bool = false,
-    left: bool = false,
-    over: bool = false,
+    phase: Phase = .open,
     linked: bool = false,
     fallback: bool = false,
     draining_at_start: bool = false,
-    abort_requested: bool = false,
     /// The peer is gone (set from the engine's callback).
     gone: std.atomic.Value(bool) = .init(false),
-    end_started: std.atomic.Value(bool) = .init(false),
+    /// Its end task (`spawnEnd`), started once.
+    end: std.atomic.Value(EndTask) = .init(.opening),
     close_reason: CloseReason = .client_gone,
     sending_since_ms: ?i64 = null,
     last_write_ms: i64,
-    memberships: std.ArrayList(*Topics.Topic) = .empty,
+    /// The topics it is in, each with its position in the topic's
+    /// `members`. Under the hub's mutex.
+    memberships: std.ArrayList(Membership) = .empty,
     exec_node: std.DoublyLinkedList.Node = .{},
     sender: std.Io.Group = .init,
     task: ?placement.Task = null,
     wake: std.Io.Event = .unset,
 
     pub const JoinOptions = struct { last: u16 = 0 };
+
+    /// Where its end task is. A subscriber is `opening` from its making
+    /// until `arm` has touched it for the last time: the owner's `gone`
+    /// can come as soon as `Response._park` has the owner (the peer
+    /// leaving while the head goes out or `on_open` runs), and an end
+    /// started then would free the subscriber under `arm`.
+    pub const EndTask = enum(u8) {
+        /// Being opened (`serve`, `_attach`): an end asked for waits.
+        opening,
+        /// Asked for while opening: `opened` starts it.
+        asked,
+        /// Not asked for (or its start failed: a tick tries again).
+        none,
+        started,
+    };
+
+    pub const Membership = struct { topic: *Topics.Topic, index: u32 };
+
+    /// Where the subscriber is in its life, under the hub's mutex:
+    ///
+    ///   open --close/slow/drain--> ending --end written--> over
+    ///   open, ending --write failed--> broken (ending + abort --canceled--> over)
+    ///   any --finishSubscriber--> left (final; a later write failure or
+    ///   end of the sender leaves it `left`)
+    ///
+    /// `ending` carries whether its sender is to be aborted (no room for
+    /// the end, or stuck past `close_after`), and `left` keeps that when it
+    /// left while ending: a sender still writing then aborts the stream as
+    /// before. Once `broken` or `over`, it no longer matters whether the
+    /// end was queued: `close_reason` holds the reason, and a failed write
+    /// turns it into `client_gone` anyway.
+    pub const Phase = union(enum) {
+        /// Takes events.
+        open,
+        /// The end is queued (slow, drain, `close`): it takes no more events.
+        ending: End,
+        /// The end was written, or the stream aborted.
+        over,
+        /// A write failed.
+        broken,
+        /// Out of the hub (finishSubscriber); the end it had queued, if
+        /// it was ending.
+        left: ?End,
+
+        pub const End = enum { graceful, abort };
+    };
+
+    /// Its queued end is to be aborted. Under the hub's mutex.
+    fn abortRequested(sub: *const Subscriber) bool {
+        return switch (sub.phase) {
+            .ending => |e| e == .abort,
+            .left => |e| e == .abort,
+            else => false,
+        };
+    }
+
+    /// Its end task is wanted: the peer is gone, or (served by the hub's
+    /// sender, not the handler's own task) a write failed or the end went
+    /// out. Under the hub's mutex.
+    fn wantsEnd(sub: *const Subscriber) bool {
+        if (sub.gone.load(.acquire)) return true;
+        if (sub.fallback) return false;
+        return switch (sub.phase) {
+            .broken, .over => true,
+            .open, .ending, .left => false,
+        };
+    }
+
+    /// Whether it still takes events (and a `close`). Under the hub's mutex.
+    fn accepts(sub: *const Subscriber) bool {
+        return sub.phase == .open;
+    }
+
+    /// Neither failed nor left: its sender may write. Under the hub's mutex.
+    fn writable(sub: *const Subscriber) bool {
+        return sub.phase != .broken and sub.phase != .left;
+    }
+
+    /// Marks a sender as started when none runs and the head is out; the
+    /// caller then starts it (`startSender`). Under the hub's mutex.
+    fn claimSender(sub: *Subscriber) bool {
+        if (sub.running or !sub.armed) return false;
+        sub.running = true;
+        return true;
+    }
 
     fn execIndex(sub: *const Subscriber, hub: *const Topics) usize {
         const e = sub.executor orelse return 0;
@@ -1412,14 +1569,11 @@ pub const Subscriber = struct {
         {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
-            if (sub.left or sub.ending or sub.broken) return error.Closed;
+            if (!sub.accepts()) return error.Closed;
             hub.joinLocked(sub, topic) catch |err| return err;
             if (opts.last > 0) {
                 hub.queueReplayLocked(sub, null, opts.last) catch return error.OutOfMemory;
-                if (!sub.running and sub.armed and sub.head < sub.queue.items.len) {
-                    sub.running = true;
-                    start = true;
-                }
+                start = sub.head < sub.queue.items.len and sub.claimSender();
             }
         }
         if (start) hub.startSender(io, sub);
@@ -1434,13 +1588,11 @@ pub const Subscriber = struct {
         defer hub.mutex.unlock(io);
         var i: usize = 0;
         while (i < sub.memberships.items.len) : (i += 1) {
-            const t = sub.memberships.items[i];
+            const m = sub.memberships.items[i];
+            const t = m.topic;
             if (!std.mem.eql(u8, t.name, topic)) continue;
             _ = sub.memberships.swapRemove(i);
-            for (t.members.items, 0..) |m, j| if (m == sub) {
-                _ = t.members.swapRemove(j);
-                break;
-            };
+            Topics.removeMember(t, sub, m.index);
             if (t.members.items.len == 0) t.empty_since_ms = hub.nowMs();
             break;
         }
@@ -1478,28 +1630,19 @@ pub const Subscriber = struct {
         {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
-            if (sub.left or sub.ending or sub.broken or sub.gone.load(.acquire)) return error.Closed;
+            if (!sub.accepts() or sub.gone.load(.acquire)) return error.Closed;
             if (admission == .capped and sub.queued_bytes > 0 and sub.queued_bytes + p.cost() > hub.options.max_queued_bytes) return error.Full;
             sub.queue.append(hub.gpa, p) catch return error.OutOfMemory;
             p.retain();
             sub.queued_bytes += p.cost();
-            if (!sub.running and sub.armed) {
-                sub.running = true;
-                launch = true;
-            }
+            launch = sub.claimSender();
         }
         if (launch) hub.startSender(io, sub);
     }
 
-    /// Bytes queued for this subscriber (the C ABI's accounting).
-    pub fn queuedBytes(sub: *Subscriber) usize {
-        const hub = sub.hub;
-        hub.mutex.lockUncancelable(hub.io);
-        defer hub.mutex.unlock(hub.io);
-        return sub.queued_bytes;
-    }
-
     /// Ends the stream after what is queued (`on_close` reason `.closed`).
+    /// Nothing once it ends anyway: after the end is queued, after a
+    /// failed write (`client_gone` follows) and after it left.
     pub fn close(sub: *Subscriber) void {
         const hub = sub.hub;
         const io = hub.io;
@@ -1507,12 +1650,9 @@ pub const Subscriber = struct {
         {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
-            if (sub.ending or sub.left) return;
+            if (!sub.accepts()) return;
             hub.beginClose(sub, .closed, false);
-            if (!sub.running and sub.armed) {
-                sub.running = true;
-                start = true;
-            }
+            start = sub.claimSender();
         }
         if (start) hub.startSender(io, sub);
     }

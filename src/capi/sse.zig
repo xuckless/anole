@@ -20,6 +20,7 @@ const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 const placement = dusty.placement;
 const Engine = engine.Engine;
 const Exec = engine.Exec;
@@ -31,12 +32,6 @@ const gpa = engine.gpa;
 const sse = anole.sse;
 
 const log = @import("../errors.zig").log;
-
-const chunk_len = 256;
-const max_chunks = 4096;
-comptime {
-    std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-}
 
 const SlotState = enum(u32) { free, open, reserved };
 
@@ -89,7 +84,11 @@ pub const SseSlot = struct {
     }
 };
 
-const Chunk = [chunk_len]SseSlot;
+fn freeWord(gen: u32) u64 {
+    return pack(gen, .free);
+}
+
+const Slots = SlotTable(SseSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManySubscribers }, freeWord);
 
 /// Engine-wide state (`Engine.sse_state`).
 pub const State = struct {
@@ -123,45 +122,17 @@ pub const State = struct {
 
 /// Per executor (`Exec.sse`): the slot table and the publish lane.
 pub const ExecState = struct {
-    chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-    nchunks: u32 = 0,
-    free_head: u32 = engine.no_slot,
+    slots: Slots = .{},
     /// The publish lane's task.
     work: std.Io.Group = .init,
     lane_head: ?*PublishCmd = null,
     lane_tail: ?*PublishCmd = null,
     lane_running: bool = false,
 
-    fn slot(st: *ExecState, i: u32) ?*SseSlot {
-        if (i / chunk_len >= max_chunks) return null;
-        const c = st.chunks[i / chunk_len].load(.acquire) orelse return null;
-        return &c[i % chunk_len];
-    }
-
-    fn alloc(st: *ExecState, x: *Exec) !*SseSlot {
-        if (st.free_head == engine.no_slot) {
-            if (st.nchunks == max_chunks) return error.TooManySubscribers;
-            const c = try gpa.create(Chunk);
-            const base = st.nchunks * chunk_len;
-            for (c, 0..) |*s, j| s.* = .{
-                .word = .init(pack(x.engine.first_gen, .free)),
-                .exec = x,
-                .index = @intCast(base + j),
-                .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-            };
-            st.chunks[st.nchunks].store(c, .release);
-            st.nchunks += 1;
-            st.free_head = base;
-        }
-        const s = st.slot(st.free_head).?;
-        st.free_head = s.next_free;
-        return s;
-    }
-
     /// A slot for a subscription the consumer is deciding: not open, its
     /// handle not handed out.
     fn reserve(st: *ExecState, x: *Exec, route: *const Route) !*SseSlot {
-        const s = try st.alloc(x);
+        const s = try st.slots.alloc(x);
         const g = s.gen();
         s.pending_bytes.store(0, .monotonic);
         s.want_event.store(false, .monotonic);
@@ -177,29 +148,21 @@ pub const ExecState = struct {
     fn unreserve(st: *ExecState, s: *SseSlot) void {
         const g = s.gen();
         s.word.store(pack(engine.nextGen(g), .free), .release);
-        s.next_free = st.free_head;
-        st.free_head = s.index;
+        st.slots.free(s);
     }
 
     pub fn maxGen(st: *const ExecState) u32 {
-        var max: u32 = 0;
-        for (st.chunks[0..st.nchunks]) |*cv| {
-            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-        }
-        return max;
+        return st.slots.maxGen();
     }
 
     pub fn deinit(st: *ExecState) void {
         st.dropLane();
-        for (st.chunks[0..st.nchunks]) |*cv| {
-            const c = cv.load(.acquire).?;
-            for (c) |*s| {
-                for (s.pending.items) |cmd| freeCmd(cmd);
-                s.pending.deinit(gpa);
-            }
-            gpa.destroy(c);
-        }
-        st.nchunks = 0;
+        st.slots.deinit(freeSlotPending);
+    }
+
+    fn freeSlotPending(s: *SseSlot) void {
+        for (s.pending.items) |cmd| freeCmd(cmd);
+        s.pending.deinit(gpa);
     }
 
     fn dropLane(st: *ExecState) void {
@@ -220,7 +183,7 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *SseSlot, u32 } {
     const h = Handle.decode(hv);
     if (hv == 0 or h.gen == 0 or h.kind != .sse) return error.WrongKind;
     if (h.exec >= e.execs.len) return error.Over;
-    const s = e.execs[h.exec].sse.slot(h.slot) orelse return error.Over;
+    const s = e.execs[h.exec].sse.slots.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 
@@ -228,7 +191,7 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *SseSlot, u32 } {
 /// subscriber of the subscription the consumer accepted; its handle. Any
 /// thread.
 pub fn openReserved(x: *Exec, i: u32) u64 {
-    const s = x.sse.slot(i).?;
+    const s = x.sse.slots.slot(i).?;
     const g = s.gen();
     s.word.store(pack(g, .open), .release);
     return s.handle(g);
@@ -375,8 +338,7 @@ fn retire(x: *Exec, s: *SseSlot, g: u32, reason: u32) void {
         ev.reason = reason;
         x.postRemote(rec);
     } else |_| {}
-    s.next_free = x.sse.free_head;
-    x.sse.free_head = s.index;
+    x.sse.slots.free(s);
 }
 
 /// A sender wrote `bytes` of the subscriber's own events: room again?

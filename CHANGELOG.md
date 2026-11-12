@@ -90,9 +90,83 @@ breaking changes are listed anyway.
   GOAWAY or the connection's close overtakes ends as "unprocessed", so
   a gRPC call may retry it elsewhere.
 - **`-Dtest-filter`** (#167) also filters the HTTP core's tests.
+- **SSE topics and WebSocket rooms** (#219): leaving a topic or room no
+  longer searches its member list (each membership keeps its position),
+  so many subscribers leaving at once no longer hold the hub's lock for
+  a time that grows with the square of their number.
+- **Docs, net (raw TCP)**: docs/net.md and docs/c-abi.md said a raw TCP
+  connection that had parked (`timeouts.idle_park`) was closed at drain
+  start whatever the listener asked, its queue dropped (#200). It is not:
+  raw connections count for the drain while parked, the park shelf stops
+  only after the drain's wait, and a parked connection gets the
+  listener's drain handling (`drain`, `close_on_drain: false`, or the
+  default close after its queue) like any other. Tests now cover it.
+- **Docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
+  that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
+  and that WRITABLE ends a wait on a finished WebTransport stream only
+  (#189).
 
 ### Fixed
 
+- **C ABI**: `ANOLE_EV_DRAINING` was posted only when the drain came
+  from `anole_server_drain`; a drain the console started, a signal (with
+  `ANOLE_SERVER_SIGNALS`), a restart's hand-off or a failing listener
+  posted none (#201). It is now posted when the server's drain starts,
+  whatever started it, once per consumer; after `anole_server_drain` it
+  is in the queue when the call returns, before anything the drain of
+  jobs, Kafka or webhooks posts.
+- **HTTP/3**: a request whose `host` field named another authority
+  than its `:authority` was served, with the `host` value as the host
+  (#202). It is now refused with 400, as over HTTP/2 (RFC 9114 §4.3.1);
+  the comparison ignores case, and a `host` alone is still the host.
+- **net (raw TCP)**: a connection whose write side was already ended
+  (`conn.end()`, `ANOLE_NET_F_END`) and whose peer then stayed silent was
+  not closed by the drain or by a later graceful close until the peer
+  sent or ended, `idle_timeout`/`lifetime` or `timeouts.shutdown` (#199).
+  The close now waits at most the 2 s linger for the peer, as any graceful
+  close does. A graceful close that ends at its linger now reports reason
+  `local` (before, a connection whose reading task had parked fell back
+  to `drain`, `idle` or `lifetime`), and the end of input caused by the
+  server's own shutdown (a reset, a failure, the linger) is no longer
+  reported to a `half_open` handler as the peer's `end`
+  (`ANOLE_EV_NET_END`).
+- **watch (Redis Pub/Sub)**: a channel or pattern whose first watch
+  started while the shared SUBSCRIBE connection was being opened was not
+  subscribed until the connection was next lost (#216). The PostgreSQL
+  and Redis Pub/Sub watches now share one hub, which subscribes such
+  names (and unsubscribes names whose last watch left meanwhile) once
+  the connection is open. The PostgreSQL hub, like the Redis one, now
+  stops reconnecting once no watch is left, and starts again with the
+  next.
+- **watch (PostgreSQL, Redis Pub/Sub)**: a LISTEN/SUBSCRIBE or
+  UNLISTEN/UNSUBSCRIBE sent as a watch started or stopped, or the
+  PostgreSQL keep-alive's ping, could write to the shared connection
+  after the hub's reader had freed it on a reconnect (#198). The reader
+  now waits for the send in flight and the keep-alive before it frees
+  the connection.
+- **watch (PostgreSQL, Redis Pub/Sub)**: when a name's last watch left
+  and a new watch of it started at about the same time, the
+  UNLISTEN/UNSUBSCRIBE could be written after the new LISTEN/SUBSCRIBE,
+  leaving the name unsubscribed while watched until the next reconnect.
+  The verbs for a name are now written in the order they were decided.
+  A Redis hub that opens its connection after the names changed sends
+  every SUBSCRIBE and PSUBSCRIBE before any UNSUBSCRIBE: an UNSUBSCRIBE
+  that left it subscribed to nothing for a moment ended the connection,
+  and the watches saw a reconnect and a gap.
+- **SSE**: a subscriber whose end task could not be started after a
+  failed write or after its end went out (HTTP/1.1, where the peer's
+  leaving is not reported then) was never ended: it and its connection
+  stayed until the server stopped. The hub's periodic tick now starts any end
+  that is due and not running.
+- **SSE**: `Subscriber.close()` on a subscriber whose write had just
+  failed queued an end and claimed a sender for the dead stream (#211).
+  In the fallback (S3) nothing ran that sender, so ending the subscriber
+  waited for it forever; otherwise `on_close` could report `closed`
+  instead of `client_gone`. `close()` now does nothing once a write failed.
+- **SSE**: a subscriber whose peer leaves while it is being opened (the
+  head going out over HTTP/2 or HTTP/3, or `on_open` waiting) is no
+  longer written after its end: its end now starts only once the open
+  is done. `on_close`'s reason is read under the hub's lock.
 - **watch**: `gapAll` could use a watch after free when a stop took it
   out concurrently; each watch now gets its gap under the hub's lock
   (#165).
@@ -116,10 +190,9 @@ breaking changes are listed anyway.
   route there (#45).
 - **console**: `/config` shows the listeners that `listen` and
   `listenTls` set, not the ones at init (#96).
-- **docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
-  that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
-  and that WRITABLE ends a wait on a finished WebTransport stream only
-  (#189).
+- **gRPC client, NATS URLs**: a `%` followed by a sign and a hex digit
+  (`%+f`) was decoded as a byte instead of staying text; both now share
+  the core's percent-decoder, which accepts hex digits only (#217).
 
 ## 0.5.3 (2026-11-05)
 

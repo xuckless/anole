@@ -342,16 +342,8 @@ pub const UdpSocket = struct {
         return s.group.name;
     }
 
-    pub fn index_(s: *const UdpSocket) u8 {
-        return s.index;
-    }
-
     pub fn address(s: *const UdpSocket) std.Io.net.IpAddress {
         return s.udp.socket.address;
-    }
-
-    pub fn handlerState(s: *const UdpSocket) ?*anyopaque {
-        return s.group.service.state;
     }
 
     /// `ip` as the socket sends to it: an IPv4 peer of a dual-stack socket

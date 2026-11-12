@@ -26,6 +26,7 @@
 //! The method table is the generated service type the server side uses;
 //! its handlers are not called here, only its names and message types.
 const std = @import("std");
+const dusty = @import("dusty");
 const builtin = @import("builtin");
 const h2 = @import("anole_h2_client");
 const frame = @import("frame.zig");
@@ -667,7 +668,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             const code_text = if (which == .headers) self.stream.header("grpc-status") else self.stream.trailer("grpc-status");
             const message_text = if (which == .headers) self.stream.header("grpc-message") else self.stream.trailer("grpc-message");
             const code: ?Code = if (code_text) |t| Code.fromInt(std.fmt.parseInt(u32, t, 10) catch 2) else null;
-            const message = if (message_text) |t| try self.arena.dupe(u8, try percentDecode(self.arena, t)) else "";
+            const message = if (message_text) |t| try self.arena.dupe(u8, try dusty.percentDecodeLenient(self.arena, t)) else "";
             return .init(code orelse .internal, if (code == null) "missing grpc-status" else message);
         }
 
@@ -914,23 +915,6 @@ fn openOn(comptime Req: type, comptime Resp: type, channel: *Channel, method_pat
 /// How much request data a call may have unacknowledged over HTTP/3.
 const call_send_buffer = 1 << 20;
 
-fn percentDecode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, text, '%') == null) return text;
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] == '%' and i + 2 < text.len) {
-            if (std.fmt.parseInt(u8, text[i + 1 .. i + 3], 16)) |b| {
-                try out.append(arena, b);
-                i += 2;
-                continue;
-            } else |_| {}
-        }
-        try out.append(arena, text[i]);
-    }
-    return out.items;
-}
-
 /// What a server's reset of a call's stream means (PROTOCOL-HTTP2.md for
 /// HTTP/2, gRFC G2 for HTTP/3; the two code ranges do not overlap).
 /// `arena` formats the message of an unlisted code.
@@ -960,11 +944,11 @@ fn httpStatusCode(http: u16) Code {
     };
 }
 
-test "percentDecode undoes grpc-message encoding" {
+test "percentDecodeLenient undoes grpc-message encoding" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("a%b\né", try percentDecode(arena.allocator(), "a%25b%0A%C3%A9"));
-    try std.testing.expectEqualStrings("plain", try percentDecode(arena.allocator(), "plain"));
+    try std.testing.expectEqualStrings("a%b\né", try dusty.percentDecodeLenient(arena.allocator(), "a%25b%0A%C3%A9"));
+    try std.testing.expectEqualStrings("plain", try dusty.percentDecodeLenient(arena.allocator(), "plain"));
 }
 pub const ChannelOptions = Channel.Options;
 

@@ -475,7 +475,7 @@ test "capi net: pause holds input until resume" {
 fn slotUnpolled(e: *engine.Engine, hv: u64) u32 {
     const h = engine.Handle.decode(hv);
     const x = &e.execs[h.exec];
-    const chunk = x.net.chunks[h.slot / 256].load(.acquire).?;
+    const chunk = x.net.slots.chunks[h.slot / 256].load(.acquire).?;
     return chunk[h.slot % 256].unpolled.load(.acquire);
 }
 
@@ -792,8 +792,8 @@ test "capi net: a drain closes the connections the consumer leaves open at its s
     try expectNoMoreCloses(rig);
 }
 
-/// As `tcp_no_deadline`, and no connection parks: a parked one is closed
-/// by the core's own sweep at drain start, with the fallback reason DRAIN.
+/// As `tcp_no_deadline`, and no connection parks: the reading task is the
+/// one that gives the reason (LOCAL or PEER) below.
 const tcp_no_deadline_unparked = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": null, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7}}]}";
 
 test "capi net: a connection the consumer closed just before a drain closes once, with the consumer's reason (#166)" {
@@ -835,7 +835,7 @@ test "capi net: a connection the consumer closed just before a drain closes once
 }
 
 /// `close_on_drain: false`, a bounded shutdown far past the test, and no
-/// connection parks (a parked one is closed at drain start either way).
+/// connection parks (`tcp_kept_parked` is the parked case).
 const tcp_kept = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 60000, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"close_on_drain\": false}}]}";
 
 test "capi net: close_on_drain false leaves a connection to the consumer through the drain, closed by its own close (#166)" {
@@ -880,6 +880,95 @@ test "capi net: close_on_drain false leaves a connection to the consumer through
     const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
     try std.testing.expect(ce.reason != abi.NET_CLOSED_DRAIN);
     try std.testing.expect(ce.reason == abi.NET_CLOSED_PEER or ce.reason == abi.NET_CLOSED_LOCAL);
+    try expectNoMoreCloses(rig);
+}
+
+/// The graceful close's wait for the peer, cut short (`tcp.test_linger`).
+const tcp_mod = @import("../net/tcp.zig");
+
+/// `half_open`, no shutdown deadline and no parking: the reading task
+/// stays in its wait for input, and only the drain's own close can end a
+/// connection whose client stays silent.
+const tcp_half_unparked = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": null, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"half_open\": true}}]}";
+
+test "capi net: the drain closes a connection the consumer ended (NET_F_END) whose client stays silent (#199)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    tcp_mod.test_linger = .fromMilliseconds(1);
+    defer tcp_mod.test_linger = null;
+    const rig = try Rig.create(tcp_half_unparked);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    var r: ToEnd = .{ .s = s };
+    try r.start();
+    defer r.join();
+    _ = try engine.net.write(rig.e, open.handle, "bye", abi.NET_F_END);
+    try wait.waitFlag(std.testing.io, "the client read the server's FIN", &r.ended);
+    try std.testing.expectEqualStrings("bye", r.got);
+
+    // The client sends nothing more and keeps its side open.
+    try rig.e.drain();
+    const draining = try rig.take(.draining);
+    free(draining);
+    const close = try rig.take(.net_close);
+    defer free(close);
+    try std.testing.expectEqual(open.handle, close.handle);
+    const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
+    try std.testing.expectEqual(@as(u32, abi.NET_CLOSED_DRAIN), ce.reason);
+    try expectNoMoreCloses(rig);
+    // The end came from the server's own shutdown: no NET_END for it.
+    try std.testing.expectEqual(@as(usize, 0), rig.pending(.net_end));
+}
+
+/// `tcp_kept` with parking on: an idle connection parks before the drain.
+const tcp_kept_parked = "{\"executors\": 1, \"timeouts\": {\"shutdown_ms\": 60000, \"idle_park_ms\": 5}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"close_on_drain\": false}}]}";
+
+test "capi net: close_on_drain false leaves a parked connection open through the drain (#200)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_kept_parked);
+    defer rig.destroy();
+    const app = rig.e.app.?;
+    if (!app.server.parksIdle()) return error.SkipZigTest;
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    const first = try rig.take(.net_data);
+    free(first);
+    try wait.waitUntil(std.testing.io, "the connection parked", app, struct {
+        fn one(ap: *anole.App) bool {
+            return ap.server.parkedConnections() >= 1;
+        }
+    }.one);
+
+    try rig.e.drain();
+    const draining = try rig.take(.draining);
+    free(draining);
+    // Still open after DRAINING: input wakes it, is delivered, and the
+    // consumer's answer goes out.
+    try s.writer().writeAll("ping");
+    try s.writer().flush();
+    const ping = try rig.take(.net_data);
+    defer free(ping);
+    try std.testing.expectEqual(open.handle, ping.handle);
+    var r: ToEnd = .{ .s = s };
+    try r.start();
+    defer r.join();
+    _ = try engine.net.write(rig.e, open.handle, "pong", 0);
+    try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_GRACEFUL);
+    try wait.waitFlag(std.testing.io, "the client read the server's FIN", &r.ended);
+    try std.testing.expectEqualStrings("pong", r.got);
+    s.socket.shutdown(s.io, .send) catch {};
+    const close = try rig.take(.net_close);
+    defer free(close);
+    const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
+    try std.testing.expect(ce.reason != abi.NET_CLOSED_DRAIN);
     try expectNoMoreCloses(rig);
 }
 

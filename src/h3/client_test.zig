@@ -252,6 +252,11 @@ fn hugeHead(_: *dusty.Request, res: *dusty.Response) !void {
 }
 
 /// GET /fields: the request's cookie, then every `x-multi` value.
+/// The request's host (`req.host()`), or "-" when it has none.
+fn hostOf(req: *dusty.Request, res: *dusty.Response) !void {
+    res.body = req.host() orelse "-";
+}
+
 fn fields(req: *dusty.Request, res: *dusty.Response) !void {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(res.arena, req.headers.get("cookie") orelse "");
@@ -391,6 +396,7 @@ const Fixture = struct {
         http.router.get("/ahead", ahead);
         http.router.get("/huge-head", hugeHead);
         http.router.get("/fields", fields);
+        http.router.get("/host", hostOf);
         http.router.get("/hold", holdHandler);
         http.router.get("/wait", waitHandler);
         http.router.post("/gated", gated);
@@ -1161,6 +1167,53 @@ test "h3 server: cookie crumbs are joined with \"; \", other repeated fields all
     const body = try s.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("a=1; b=2; c=3|one|two", body);
+}
+
+test "h3 server: a host field naming another authority than :authority gets 400; the same one (in any case) or a host alone is the host (#202)" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const Case = struct { authority: ?[]const u8, host: ?[]const u8, status: u16, body: []const u8 };
+    const cases = [_]Case{
+        .{ .authority = "localhost", .host = "other.example", .status = 400, .body = "" },
+        .{ .authority = "localhost:4433", .host = "localhost", .status = 400, .body = "" },
+        .{ .authority = "localhost", .host = "localhost", .status = 200, .body = "localhost" },
+        .{ .authority = "localhost", .host = "LocalHost", .status = 200, .body = "LocalHost" },
+        .{ .authority = null, .host = "a.example", .status = 200, .body = "a.example" },
+        .{ .authority = "b.example", .host = null, .status = 200, .body = "b.example" },
+    };
+    for (cases) |cs| {
+        var hs: [5]client.Header = undefined;
+        var n: usize = 0;
+        for ([_]client.Header{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":path", .value = "/host" },
+            .{ .name = ":scheme", .value = "https" },
+        }) |x| {
+            hs[n] = x;
+            n += 1;
+        }
+        if (cs.authority) |a| {
+            hs[n] = .{ .name = ":authority", .value = a };
+            n += 1;
+        }
+        if (cs.host) |x| {
+            hs[n] = .{ .name = "host", .value = x };
+            n += 1;
+        }
+        const s = try conn.request(hs[0..n], .{});
+        defer s.release();
+        try s.waitHead();
+        const body = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(body);
+        try std.testing.expectEqual(cs.status, s.status);
+        if (cs.status == 200) try std.testing.expectEqualStrings(cs.body, body);
+    }
 }
 
 test "h3 server: hq_interop_root is refused outside the interop runner's program" {

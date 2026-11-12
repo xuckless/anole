@@ -1133,21 +1133,8 @@ pub fn listenIp(io: std.Io, address: std.Io.net.IpAddress, options: ListenIpOpti
     return .{ .socket = .{ .handle = fd, .address = bound }, .options = {} };
 }
 
-/// `address` as a client on the other end knows it: an IPv4-mapped IPv6
-/// address (`::ffff:127.0.0.1`, how a dual-stack socket sees an IPv4
-/// peer) becomes the IPv4 address itself, with the same port. Any other
-/// address is returned as it is. Requests' `remote_address` goes through
-/// it, so logs, rate limits and `X-Forwarded-For` see one client one way
-/// whichever socket it came in on.
-pub fn unmapIpv4(address: std.Io.net.IpAddress) std.Io.net.IpAddress {
-    const a = switch (address) {
-        .ip4 => return address,
-        .ip6 => |a| a,
-    };
-    const prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-    if (!std.mem.eql(u8, a.bytes[0..12], &prefix)) return address;
-    return .{ .ip4 = .{ .bytes = a.bytes[12..16].*, .port = a.port } };
-}
+/// See `proxy_protocol.unmapIpv4`: requests' `remote_address` goes through it.
+pub const unmapIpv4 = proxy_protocol.unmapIpv4;
 
 /// Where a listener is and what it speaks, for the line logged when it
 /// starts: "https://127.0.0.1:8443 (HTTP/2, HTTP/1.1, HTTP/3)".

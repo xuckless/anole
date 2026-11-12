@@ -25,10 +25,6 @@ pub const Alg = enum {
     ES256,
     ES384,
     EdDSA,
-
-    fn isHmac(a: Alg) bool {
-        return a == .HS256 or a == .HS384 or a == .HS512;
-    }
 };
 
 /// A verification key pinned to one algorithm. Build one by hand

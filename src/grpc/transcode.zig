@@ -475,7 +475,8 @@ pub fn jsonName(comptime name: []const u8) []const u8 {
     }
 }
 
-fn jsonNameAlloc(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+/// The JSON name of a proto field name (`foo_bar` is `fooBar`), in `arena`.
+pub fn jsonNameAlloc(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, name, '_') == null) return name;
     var out: std.ArrayList(u8) = try .initCapacity(arena, name.len);
     var upper = false;

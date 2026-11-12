@@ -451,10 +451,6 @@ fn writeQueryTo(hw: *HashWriter, query: []const Pair) !void {
     try hw.writeAll(w.buffered());
 }
 
-pub fn encodedKeyLen(key: []const u8) usize {
-    return encodedLen(key, true);
-}
-
 // ---------------------------------------------------------------------------
 // Tests. The examples are the worked ones on AWS's S3 API reference pages:
 // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html

@@ -5,321 +5,66 @@
 //! backoff and every channel listened to once more (§4.2).
 
 const std = @import("std");
-const dusty = @import("dusty");
-const placement = dusty.placement;
 const pg_root = @import("../pg/root.zig");
 const driver = pg_root.driver;
 const root = @import("root.zig");
-const resilience = @import("../resilience/root.zig");
+const hubs = @import("hub.zig");
 
 const Watch = root.Watch;
-const log = @import("../errors.zig").log;
-const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
 
-/// How often the hub asks the server whether the connection is alive.
-const keepalive_interval: std.Io.Duration = .fromSeconds(30);
-/// How long the answer may take.
-const keepalive_wait: std.Io.Duration = .fromSeconds(10);
+/// LISTEN and UNLISTEN on a `driver.Listener`, with a ping every 30 s.
+const Transport = struct {
+    pub const Client = pg_root.Client;
+    pub const Conn = driver.Listener;
+    pub const Kind = enum { channel };
+    pub const log_name = "postgres watch";
+    pub const verb = "LISTEN";
+    pub const ready_text = "listening";
+    pub const keepalive: ?hubs.Keepalive = .{ .interval = .fromSeconds(30), .wait = .fromSeconds(10) };
 
-const Channel = struct {
-    name: []u8,
-    watches: std.ArrayList(*Watch) = .empty,
-};
-
-pub const NotifyHub = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    client: *pg_root.Client,
-    /// Over `channels`, `connected`, the listener pointer and the watch lists.
-    mutex: std.Io.Mutex = .init,
-    channels: std.StringHashMapUnmanaged(*Channel) = .empty,
-    listener: ?*driver.Listener = null,
-    connected: bool = false,
-    /// Serializes the writes (LISTEN, UNLISTEN, ping) on the connection.
-    write_mutex: std.Io.Mutex = .init,
-    group: std.Io.Group = .init,
-    running: bool = false,
-    stopping: std.atomic.Value(bool) = .init(false),
-    /// Awake-clock milliseconds of the last ReadyForQuery, and of the last
-    /// ping sent.
-    last_ready_ms: std.atomic.Value(i64) = .init(0),
-    backoff: resilience.Backoff,
-    reader_task: ?placement.Task = null,
-
-    pub fn create(client: *pg_root.Client) !*NotifyHub {
-        const h = try client.gpa.create(NotifyHub);
-        h.* = .{ .gpa = client.gpa, .io = client.io, .client = client, .backoff = .{ .base = .fromMilliseconds(100), .max = .fromSeconds(5) } };
-        return h;
-    }
-
-    /// Stops the tasks and frees the hub (the client's `deinit`).
-    pub fn destroy(self: *NotifyHub) void {
-        self.stopping.store(true, .release);
-        self.mutex.lockUncancelable(self.io);
-        if (self.listener) |l| l.stop() catch {};
-        if (self.reader_task) |t| placement.cancelTask(t);
-        self.mutex.unlock(self.io);
-        self.group.cancel(self.io);
-        if (self.listener) |l| {
-            l.deinit();
-            self.gpa.destroy(l);
-        }
-        var it = self.channels.iterator();
-        while (it.next()) |e| {
-            e.value_ptr.*.watches.deinit(self.gpa);
-            self.gpa.free(e.value_ptr.*.name);
-            self.gpa.destroy(e.value_ptr.*);
-        }
-        self.channels.deinit(self.gpa);
-        self.gpa.destroy(self);
-    }
-
-    fn nowMs(self: *NotifyHub) i64 {
-        return std.Io.Clock.awake.now(self.io).toMilliseconds();
-    }
-
-    /// Adds `w` to each of its channels, LISTENing to the new ones.
-    pub fn add(self: *NotifyHub, w: *Watch, names: []const []const u8) !void {
-        for (names) |name| {
-            var send = false;
-            {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                const entry = try self.channels.getOrPut(self.gpa, name);
-                if (!entry.found_existing) {
-                    const ch = self.gpa.create(Channel) catch |err| {
-                        self.channels.removeByPtr(entry.key_ptr);
-                        return err;
-                    };
-                    ch.* = .{ .name = self.gpa.dupe(u8, name) catch |err| {
-                        self.gpa.destroy(ch);
-                        self.channels.removeByPtr(entry.key_ptr);
-                        return err;
-                    } };
-                    entry.key_ptr.* = ch.name;
-                    entry.value_ptr.* = ch;
-                    send = self.connected;
-                }
-                try entry.value_ptr.*.watches.append(self.gpa, w);
-            }
-            if (send) self.sendVerb(true, name);
-        }
-        try self.ensureRunning();
-    }
-
-    /// Takes `w` out of each channel, UNLISTENing to those left with none.
-    pub fn remove(self: *NotifyHub, w: *Watch, names: []const []const u8) void {
-        for (names) |name| {
-            var send = false;
-            {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                const ch = self.channels.get(name) orelse continue;
-                for (ch.watches.items, 0..) |x, i| if (x == w) {
-                    _ = ch.watches.swapRemove(i);
-                    break;
-                };
-                if (ch.watches.items.len == 0) {
-                    _ = self.channels.remove(name);
-                    ch.watches.deinit(self.gpa);
-                    self.gpa.free(ch.name);
-                    self.gpa.destroy(ch);
-                    send = self.connected;
-                }
-            }
-            if (send) self.sendVerb(false, name);
-        }
-    }
-
-    fn sendVerb(self: *NotifyHub, listen: bool, name: []const u8) void {
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-        const l = self.listener orelse return;
-        (if (listen) l.sendListen(name) else l.sendUnlisten(name)) catch |err| {
-            log.debug("postgres watch: {s} {s} failed: {t}", .{ if (listen) "LISTEN" else "UNLISTEN", name, err });
-            // The reader sees the broken connection and reconnects.
-            l.stop() catch {};
-        };
-    }
-
-    fn ensureRunning(self: *NotifyHub) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.running) return;
-        placement.concurrent(&self.group, self.io, .local, readerTask, .{self}) catch return error.ServiceUnavailable;
-        self.running = true;
-    }
-
-    /// The connection's task: connects, listens, reads, and again after a
-    /// failure.
-    fn readerTask(self: *NotifyHub) std.Io.Cancelable!void {
-        self.mutex.lockUncancelable(self.io);
-        self.reader_task = placement.currentTask(self.io);
-        self.mutex.unlock(self.io);
-        var attempt: u32 = 0;
-        var first = true;
-        while (!self.stopping.load(.acquire)) {
-            const l = self.connect() catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-                attempt += 1;
-                if (attempt == 1) {
-                    log.warn("postgres watch: cannot open the LISTEN connection ({t}); trying again", .{err});
-                } else log.debug("postgres watch: LISTEN connection attempt {d} failed: {t}", .{ attempt, err });
-                self.statusAll(.reconnecting);
-                try self.pause(attempt);
-                continue;
-            };
-            attempt = 0;
-            const lost = !first;
-            first = false;
-            // The channels listened to, and connected for the watches.
-            {
-                self.mutex.lockUncancelable(self.io);
-                self.listener = l;
-                self.connected = true;
-                var names: std.ArrayList([]u8) = .empty;
-                var it = self.channels.keyIterator();
-                while (it.next()) |k| {
-                    const copy = self.gpa.dupe(u8, k.*) catch continue;
-                    names.append(self.gpa, copy) catch self.gpa.free(copy);
-                }
-                self.mutex.unlock(self.io);
-                for (names.items) |n| {
-                    self.sendVerb(true, n);
-                    self.gpa.free(n);
-                }
-                names.deinit(self.gpa);
-            }
-            self.last_ready_ms.store(self.nowMs(), .release);
-            self.statusAll(.connected);
-            if (lost) self.gapAll("the LISTEN connection was lost and opened again");
-            log.info("postgres watch: listening", .{});
-            placement.concurrent(&self.group, self.io, .local, keepaliveTask, .{ self, l }) catch {};
-            self.readLoop(l);
-            // Gone: close it, tell the watches, try again.
-            self.mutex.lockUncancelable(self.io);
-            self.connected = false;
-            self.listener = null;
-            self.mutex.unlock(self.io);
-            l.stop() catch {};
-            l.deinit();
-            self.gpa.destroy(l);
-            if (self.stopping.load(.acquire)) return;
-            log.warn("postgres watch: the LISTEN connection was lost; opening it again", .{});
-            self.statusAll(.reconnecting);
-            attempt += 1;
-            try self.pause(attempt);
-        }
-    }
-
-    fn pause(self: *NotifyHub, attempt: u32) std.Io.Cancelable!void {
-        var rnd: [8]u8 = undefined;
-        self.io.random(&rnd);
-        const d = self.backoff.delay(attempt, std.mem.readInt(u64, &rnd, .little));
-        try self.io.sleep(d, .awake);
-    }
-
-    fn connect(self: *NotifyHub) !*driver.Listener {
-        const l = try self.gpa.create(driver.Listener);
-        errdefer self.gpa.destroy(l);
-        l.* = try self.client.listener();
+    pub fn dial(client: *Client, _: Allocator, names: hubs.Names(Kind)) !*Conn {
+        const l = try client.gpa.create(Conn);
+        errdefer client.gpa.destroy(l);
+        l.* = try client.listener();
+        errdefer l.deinit();
+        // Answered through `next` (`.ready`).
+        for (names.get(.channel)) |n| try l.sendListen(n);
         return l;
     }
 
-    fn readLoop(self: *NotifyHub, l: *driver.Listener) void {
-        while (true) {
-            const ev = l.nextEvent() catch |err| {
-                if (!self.stopping.load(.acquire)) log.debug("postgres watch: read failed: {t}", .{err});
-                return;
-            };
-            switch (ev) {
-                .ready => self.last_ready_ms.store(self.nowMs(), .release),
-                .notification => |n| self.dispatch(n.channel, n.payload, n.process_id),
-            }
-        }
+    pub fn send(l: *Conn, _: Allocator, _: std.Io, on: bool, _: Kind, name: []const u8) !void {
+        return if (on) l.sendListen(name) else l.sendUnlisten(name);
     }
 
-    /// Hands a notification to the watches of its channel, in arrival order
-    /// (which is commit order). Holds the hub's lock: a watch's `onHubEvent`
-    /// never waits.
-    fn dispatch(self: *NotifyHub, channel: []const u8, payload: []const u8, pid: u32) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const ch = self.channels.get(channel) orelse return;
-        for (ch.watches.items) |w| {
-            w.onHubEvent(.{
+    pub fn ping(l: *Conn) !void {
+        return l.sendPing();
+    }
+
+    pub fn next(l: *Conn, _: Allocator) !?hubs.Message(Kind) {
+        return switch (try l.nextEvent()) {
+            .ready => .ready,
+            .notification => |n| .{ .message = .{ .kind = .channel, .name = n.channel, .raw = .{
                 .op = .message,
                 .op_name = "message",
-                .channel = channel,
-                .data = payload,
-                .pg_pid = @bitCast(pid),
-            });
-        }
-    }
-
-    fn statusAll(self: *NotifyHub, s: root.Status) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var it = self.channels.valueIterator();
-        while (it.next()) |ch| for (ch.*.watches.items) |w| w.setStatus(s);
-    }
-
-    fn gapAll(self: *NotifyHub, detail: []const u8) void {
-        // Each watch once, even when it listens on several channels.
-        var seen: std.ArrayList(*Watch) = .empty;
-        defer seen.deinit(self.gpa);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var it = self.channels.valueIterator();
-        while (it.next()) |ch| for (ch.*.watches.items) |w| {
-            var dup = false;
-            for (seen.items) |s| if (s == w) {
-                dup = true;
-                break;
-            };
-            if (!dup) seen.append(self.gpa, w) catch {};
+                .channel = n.channel,
+                .data = n.payload,
+                .pg_pid = @bitCast(n.process_id),
+            } } },
         };
-        // Still under the hub's lock, as `dispatch` and `statusAll`: a watch
-        // that `stop` took out (and `deinit` may have freed) is never reached
-        // (#165, #157).
-        for (seen.items) |w| {
-            testOnGap(self);
-            w.gapped(detail);
-        }
     }
 
-    /// Every 30 s a ping; no answer in 10 s means a dead connection, which
-    /// `stop` turns into a read error for the reader.
-    fn keepaliveTask(self: *NotifyHub, l: *driver.Listener) std.Io.Cancelable!void {
-        while (true) {
-            try self.io.sleep(keepalive_interval, .awake);
-            if (self.stopping.load(.acquire)) return;
-            self.mutex.lockUncancelable(self.io);
-            const current = self.listener;
-            self.mutex.unlock(self.io);
-            if (current != l) return;
-            const before = self.last_ready_ms.load(.acquire);
-            {
-                self.write_mutex.lockUncancelable(self.io);
-                defer self.write_mutex.unlock(self.io);
-                l.sendPing() catch {
-                    l.stop() catch {};
-                    return;
-                };
-            }
-            try self.io.sleep(keepalive_wait, .awake);
-            self.mutex.lockUncancelable(self.io);
-            const still = self.listener == l;
-            self.mutex.unlock(self.io);
-            if (!still) return;
-            if (self.last_ready_ms.load(.acquire) == before) {
-                log.warn("postgres watch: the server did not answer a ping; closing the LISTEN connection", .{});
-                l.stop() catch {};
-                return;
-            }
-        }
+    pub fn stop(l: *Conn) void {
+        l.stop() catch {};
+    }
+
+    pub fn close(l: *Conn, gpa: Allocator) void {
+        l.deinit();
+        gpa.destroy(l);
     }
 };
+
+pub const NotifyHub = hubs.Hub(Transport);
 
 /// The hub of `w`'s client, made on first use.
 fn hubOf(w: *Watch) !*NotifyHub {
@@ -327,24 +72,18 @@ fn hubOf(w: *Watch) !*NotifyHub {
 }
 
 pub fn register(w: *Watch) !void {
-    const hub = try hubOf(w);
-    try hub.add(w, w.source.postgres.channels);
+    const h = try hubOf(w);
+    try h.add(w, w.source.postgres.channels, .channel);
+    try h.ensureRunning();
 }
 
 pub fn unregister(w: *Watch) void {
-    const hub = w.source.postgres.client.notify_hub orelse return;
-    hub.remove(w, w.source.postgres.channels);
+    const h = w.source.postgres.client.notify_hub orelse return;
+    h.remove(w, w.source.postgres.channels, .channel);
 }
 
-/// Tests: runs before each watch `gapAll` gives a gap, with the hub.
-/// Test builds only.
-pub var test_on_gap: if (builtin.is_test) std.atomic.Value(?*const fn (*NotifyHub) void) else void = if (builtin.is_test) .init(null) else {};
-
-fn testOnGap(hub: *NotifyHub) void {
-    if (comptime !builtin.is_test) return;
-    const hook = test_on_gap.load(.acquire) orelse return;
-    hook(hub);
-}
+/// Tests: the hub's hook (`hub.Hub.test_on_gap`).
+pub const test_on_gap = &NotifyHub.test_on_gap;
 
 const GapProbe = struct {
     var calls: usize = 0;
@@ -367,8 +106,8 @@ test "watch postgres: gapAll reaches each watch under the hub's lock, once (#165
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const rio = rt.io();
-    // Nothing listens on port 1: the reader `add` starts is refused again
-    // and again, and never reaches `gapAll` (only a reconnect does).
+    // Nothing listens on port 1, and the reader is never started: the hub
+    // only holds the two watches.
     const client = try pg_root.Client.init(gpa, rio, .{ .url = "postgres://u@127.0.0.1:1/db", .environ = .empty });
     defer client.deinit();
     const hub = try client._notifyHub();
@@ -376,11 +115,11 @@ test "watch postgres: gapAll reaches each watch under the hub's lock, once (#165
     defer w1.deinit();
     const w2 = try Watch.init(gpa, rio, .{ .postgres = .{ .client = client, .channels = &.{"a"} } }, .{});
     defer w2.deinit();
-    try hub.add(w1, &.{ "a", "b" });
-    try hub.add(w2, &.{"a"});
+    try hub.add(w1, &.{ "a", "b" }, .channel);
+    try hub.add(w2, &.{"a"}, .channel);
     defer {
-        hub.remove(w1, &.{ "a", "b" });
-        hub.remove(w2, &.{"a"});
+        hub.remove(w1, &.{ "a", "b" }, .channel);
+        hub.remove(w2, &.{"a"}, .channel);
     }
     GapProbe.calls = 0;
     GapProbe.unlocked = 0;

@@ -322,16 +322,6 @@ pub const Cluster = struct {
         return Conn.open(self.gpa, self.io, self.settings, host_buf[0..host_len], port, id);
     }
 
-    /// A broker's address as a copy in `buf`, for logs and coordinator lookups.
-    pub fn brokerAddress(self: *Cluster, id: i32, buf: *[256]u8) ?HostPort {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const info = self.brokers.get(id) orelse return null;
-        if (info.host.len > buf.len) return null;
-        @memcpy(buf[0..info.host.len], info.host);
-        return .{ .host = buf[0..info.host.len], .port = info.port };
-    }
-
     /// Any broker: the known ones first, then the bootstrap list.
     pub fn connectAny(self: *Cluster) ConnError!*Conn {
         var ids: [64]i32 = undefined;

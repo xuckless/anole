@@ -7,8 +7,8 @@
 //! connection comes back as the I/O error that broke it, for the caller to
 //! map (`Session.broken` is set).
 const std = @import("std");
-const dusty = @import("dusty");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const net = @import("../net/root.zig");
 const auth = @import("core/auth.zig");
 const reply_mod = @import("core/reply.zig");
@@ -20,29 +20,7 @@ const Duration = std.Io.Duration;
 const Reply = reply_mod.Reply;
 
 /// The calling context, without its type: what a failure is recorded on.
-pub const Ctx = struct {
-    io: std.Io,
-    arena: std.mem.Allocator,
-    any: *anyopaque,
-    record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
-    request: ?*const dusty.Request,
-    last: *const fn (any: *anyopaque) ?db.ErrorDetail,
-
-    /// The last error recorded on the context it stands for.
-    pub fn lastDetail(self: *const Ctx) ?db.ErrorDetail {
-        return self.last(self.any);
-    }
-
-    /// `internal.fail` on the context it stands for.
-    pub fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-        return self.record(self.any, map, detail);
-    }
-
-    pub fn failf(self: *const Ctx, map: db.ErrorMap, class: db.Class, code: []const u8, comptime fmt: []const u8, args: anytype) db.Error {
-        const message = std.fmt.allocPrint(self.arena, fmt, args) catch "(message lost: out of memory)";
-        return self.fail(map, .{ .system = .smtp, .class = class, .code = code, .message = message });
-    }
-};
+pub const Ctx = internal.ErasedCtx(.smtp);
 
 /// Where to connect and how to talk.
 pub const Settings = struct {
@@ -159,20 +137,20 @@ pub const Session = struct {
 
         const greeting = try self.read(ctx, map);
         if (greeting.code != 220)
-            return ctx.failf(map, .unavailable, "greeting_refused", "{s}:{d} refused the connection: {d} {s}", .{ s.host, s.port, greeting.code, greeting.first() });
+            return ctx.failCode(map, .unavailable, "greeting_refused", "{s}:{d} refused the connection: {d} {s}", .{ s.host, s.port, greeting.code, greeting.first() });
         try self.hello(ctx, map, s);
         if (s.tls_mode == .starttls_required or s.tls_mode == .starttls_optional) {
             if (self.caps.starttls) {
                 try self.command(ctx, "STARTTLS");
                 const r = try self.read(ctx, map);
                 if (r.code != 220)
-                    return ctx.failf(map, .unavailable, "starttls_failed", "{s}:{d} refused STARTTLS: {d} {s}", .{ s.host, s.port, r.code, r.first() });
+                    return ctx.failCode(map, .unavailable, "starttls_failed", "{s}:{d} refused STARTTLS: {d} {s}", .{ s.host, s.port, r.code, r.first() });
                 try self.stream.startTls(s.tls);
                 // What the server said before TLS means nothing now.
                 self.caps = .{};
                 try self.hello(ctx, map, s);
             } else if (s.tls_mode == .starttls_required) {
-                return ctx.failf(map, .unavailable, "starttls_unavailable", "{s}:{d} does not offer STARTTLS; mail and credentials would cross the network in clear text (use smtps://, or ?tls=none on a trusted network)", .{ s.host, s.port });
+                return ctx.failCode(map, .unavailable, "starttls_unavailable", "{s}:{d} does not offer STARTTLS; mail and credentials would cross the network in clear text (use smtps://, or ?tls=none on a trusted network)", .{ s.host, s.port });
             }
         }
         if (s.username) |user| try self.login(ctx, map, s, user, s.password orelse "");
@@ -201,9 +179,9 @@ pub const Session = struct {
 
     fn login(self: *Session, ctx: *const Ctx, map: db.ErrorMap, s: *const Settings, user: []const u8, password: []const u8) anyerror!void {
         if (!self.stream.isTls() and !s.loopback)
-            return ctx.failf(map, .other, "insecure_auth", "{s}:{d}: refusing to send the password without TLS", .{ s.host, s.port });
+            return ctx.failCode(map, .other, "insecure_auth", "{s}:{d}: refusing to send the password without TLS", .{ s.host, s.port });
         const mech = self.caps.mechanism orelse
-            return ctx.failf(map, .other, "auth_unsupported", "{s}:{d} offers no AUTH PLAIN or LOGIN{s}", .{ s.host, s.port, if (self.caps.auth_offered) " (only mechanisms Anole does not speak)" else " (no AUTH at all: remove the credentials from the URL?)" });
+            return ctx.failCode(map, .other, "auth_unsupported", "{s}:{d} offers no AUTH PLAIN or LOGIN{s}", .{ s.host, s.port, if (self.caps.auth_offered) " (only mechanisms Anole does not speak)" else " (no AUTH at all: remove the credentials from the URL?)" });
         const w = self.stream.writer();
         switch (mech) {
             .plain => {
@@ -247,7 +225,7 @@ pub const Session = struct {
         return reply_mod.read(self.stream.reader(), ctx.arena) catch |err| switch (err) {
             error.MalformedReply => {
                 self.broken = true;
-                return ctx.failf(map, .unavailable, "protocol_error", "the server sent something that is not an SMTP reply", .{});
+                return ctx.failCode(map, .unavailable, "protocol_error", "the server sent something that is not an SMTP reply", .{});
             },
             else => |e| return e,
         };
@@ -276,7 +254,7 @@ pub const Session = struct {
             },
             else => {},
         }
-        return ctx.failf(map, class, code, "{d} {s}", .{ r.code, text });
+        return ctx.failCode(map, class, code, "{d} {s}", .{ r.code, text });
     }
 
     // -- a transaction ---------------------------------------------------------
@@ -297,11 +275,11 @@ pub const Session = struct {
         self.after_dot = false;
         self.mail_accepted = false;
         if (c.utf8 and !self.caps.smtputf8)
-            return ctx.failf(map, .invalid, "smtputf8_unsupported", "an address is not ASCII and the server does not offer SMTPUTF8", .{});
+            return ctx.failCode(map, .invalid, "smtputf8_unsupported", "an address is not ASCII and the server does not offer SMTPUTF8", .{});
         if (self.caps.size > 0 and c.size > self.caps.size)
-            return ctx.failf(map, .invalid, "message_too_large", "the message is {d} bytes; the server accepts {d} (its SIZE)", .{ c.size, self.caps.size });
+            return ctx.failCode(map, .invalid, "message_too_large", "the message is {d} bytes; the server accepts {d} (its SIZE)", .{ c.size, self.caps.size });
         if (c.size > max_bytes)
-            return ctx.failf(map, .invalid, "message_too_large", "the message is {d} bytes; the limit is {d} (Options.max_message_bytes)", .{ c.size, max_bytes });
+            return ctx.failCode(map, .invalid, "message_too_large", "the message is {d} bytes; the limit is {d} (Options.max_message_bytes)", .{ c.size, max_bytes });
 
         const w = self.stream.writer();
         const pipelined = self.caps.pipelining;

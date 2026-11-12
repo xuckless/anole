@@ -299,25 +299,10 @@ pub fn jsonField(arena: std.mem.Allocator, msg_type: *const anyopaque, json: []c
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{ .parse_numbers = false }) catch return error.DecodeFailed;
     if (value != .object) return error.DecodeFailed;
     const proto_name = std.mem.span(f.name);
-    const json_name = try jsonNameAlloc(arena, proto_name);
+    const json_name = try transcode.jsonNameAlloc(arena, proto_name);
     const field = value.object.get(json_name) orelse value.object.get(proto_name) orelse
         return if (f.kind == c.ANOLE_UPB_MESSAGE or f.kind == c.ANOLE_UPB_MAP) "{}" else "null";
     return std.json.Stringify.valueAlloc(arena, field, .{});
-}
-
-fn jsonNameAlloc(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '_') == null) return name;
-    var out: std.ArrayList(u8) = try .initCapacity(arena, name.len);
-    var upper = false;
-    for (name) |ch| {
-        if (ch == '_') {
-            upper = true;
-        } else {
-            out.appendAssumeCapacity(if (upper) std.ascii.toUpper(ch) else ch);
-            upper = false;
-        }
-    }
-    return out.items;
 }
 
 // ---------------------------------------------------------------------------

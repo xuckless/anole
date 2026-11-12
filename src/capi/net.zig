@@ -22,6 +22,7 @@ const dusty = @import("dusty");
 const safety = @import("anole_safety");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 const config_mod = @import("config.zig");
 const net = anole.net;
 const placement = dusty.placement;
@@ -33,12 +34,6 @@ const gpa = engine.gpa;
 /// The writes' chunks come from it: in Debug and test builds an allocation
 /// or a free under a slot's spin lock panics (L5); elsewhere it is `gpa`.
 var chunk_checked: safety.SpinCheckedAllocator = .init(engine.gpa);
-
-const chunk_len = 256;
-const max_chunks = 4096;
-comptime {
-    std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-}
 
 /// The most a DATA record holds of one connection's bytes: bigger bursts
 /// come as several records (a frame larger than this in one of its own).
@@ -90,40 +85,15 @@ pub const NetSlot = struct {
     }
 };
 
-const Chunk = [chunk_len]NetSlot;
+fn freeWord(gen: u32) u64 {
+    return pack(gen, .free);
+}
+
+const Slots = SlotTable(NetSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyConnections }, freeWord);
 
 /// Per executor (`Exec.net`).
 pub const ExecState = struct {
-    chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-    nchunks: u32 = 0,
-    free_head: u32 = engine.no_slot,
-
-    fn slot(st: *ExecState, i: u32) ?*NetSlot {
-        // `i` may come from a made-up handle: past the table is no connection.
-        if (i / chunk_len >= max_chunks) return null;
-        const c = st.chunks[i / chunk_len].load(.acquire) orelse return null;
-        return &c[i % chunk_len];
-    }
-
-    fn alloc(st: *ExecState, x: *Exec) !*NetSlot {
-        if (st.free_head == engine.no_slot) {
-            if (st.nchunks == max_chunks) return error.TooManyConnections;
-            const c = try gpa.create(Chunk);
-            const base = st.nchunks * chunk_len;
-            for (c, 0..) |*s, j| s.* = .{
-                .word = .init(pack(x.engine.first_gen, .free)),
-                .exec = x,
-                .index = @intCast(base + j),
-                .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-            };
-            st.chunks[st.nchunks].store(c, .release);
-            st.nchunks += 1;
-            st.free_head = base;
-        }
-        const s = st.slot(st.free_head).?;
-        st.free_head = s.next_free;
-        return s;
-    }
+    slots: Slots = .{},
 
     /// The tasks it runs (the net drivers) belong to the server's group and
     /// end with it.
@@ -134,16 +104,11 @@ pub const ExecState = struct {
 
     /// The highest generation handed out (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
-        var max: u32 = 0;
-        for (st.chunks[0..st.nchunks]) |*cv| {
-            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-        }
-        return max;
+        return st.slots.maxGen();
     }
 
     pub fn deinit(st: *ExecState) void {
-        for (st.chunks[0..st.nchunks]) |*cv| gpa.destroy(cv.load(.acquire).?);
-        st.nchunks = 0;
+        st.slots.deinit(null);
     }
 };
 
@@ -366,7 +331,7 @@ fn onOpen(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     const st: *TcpState = @ptrCast(@alignCast(state.?));
     const e = st.engine;
     const x = execOf(e) orelse return error.Unexpected;
-    const slot = try x.net.alloc(x);
+    const slot = try x.net.slots.alloc(x);
     const g = slot.gen();
     slot.acquire();
     slot.conn = conn;
@@ -550,8 +515,7 @@ fn onClose(state: ?*anyopaque, conn: *net.Conn, reason: net.CloseReason) void {
     slot.credit_wait.store(0, .seq_cst);
     slot.exec.wakeFutex(&slot.credit_wait);
     slot.unpolled.store(0, .monotonic);
-    slot.next_free = x.net.free_head;
-    x.net.free_head = slot.index;
+    x.net.slots.free(slot);
     _ = e.net_state.conns.fetchSub(1, .monotonic);
     _ = e.net_state.bytes_in.fetchAdd(totals.bytes_in, .monotonic);
     _ = e.net_state.bytes_out.fetchAdd(totals.bytes_out, .monotonic);
@@ -593,7 +557,7 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *NetSlot, u32 } {
     const h = Handle.decode(hv);
     if (hv == 0 or h.gen == 0 or h.kind != .net_conn) return error.WrongKind;
     if (h.exec >= e.execs.len) return error.Over;
-    const s = e.execs[h.exec].net.slot(h.slot) orelse return error.Over;
+    const s = e.execs[h.exec].net.slots.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 

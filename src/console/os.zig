@@ -129,11 +129,6 @@ pub fn peerAllowed(peer_uid: u32, euid: u32) bool {
     return peer_uid == euid or peer_uid == 0;
 }
 
-pub fn shutdownWrite(fd: sys.fd_t) void {
-    if (comptime !supported) return;
-    _ = posix.shutdown(fd, 1);
-}
-
 pub fn dup(fd: sys.fd_t) sys.fd_t {
     if (comptime !supported) return -1;
     return posix.dup(fd);

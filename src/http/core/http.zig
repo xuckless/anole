@@ -911,6 +911,25 @@ pub fn percentDecode(arena: std.mem.Allocator, text: []const u8, plus_is_space: 
     return out;
 }
 
+/// Like `percentDecode` with `plus_is_space` off, but a '%' that is not
+/// followed by two hex digits stays as text (gRPC's `grpc-message`, credentials
+/// in a URL). Returns `text` itself when there is no '%'.
+pub fn percentDecodeLenient(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '%') == null) return text;
+    var out: std.ArrayList(u8) = try .initCapacity(arena, text.len);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '%' and i + 2 < text.len and std.ascii.isHex(text[i + 1]) and std.ascii.isHex(text[i + 2])) {
+            out.appendAssumeCapacity((hexValue(text[i + 1]) << 4) | hexValue(text[i + 2]));
+            i += 3;
+        } else {
+            out.appendAssumeCapacity(text[i]);
+            i += 1;
+        }
+    }
+    return out.items;
+}
+
 fn hexValue(digit: u8) u8 {
     return switch (digit) {
         '0'...'9' => digit - '0',
@@ -1464,4 +1483,18 @@ test "Params: JSON object of string values, {} when empty" {
 
     const empty: Params = .{};
     try expectJson("{}", empty);
+}
+
+test "percentDecodeLenient keeps a bad escape as text" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("A", try percentDecodeLenient(arena, "%41"));
+    try std.testing.expectEqualStrings("a%b\n\xc3\xa9", try percentDecodeLenient(arena, "a%25b%0A%C3%A9"));
+    // parseInt would take the sign and read %+f as 0x0f.
+    try std.testing.expectEqualStrings("%+f", try percentDecodeLenient(arena, "%+f"));
+    try std.testing.expectEqualStrings("%-1x", try percentDecodeLenient(arena, "%-1x"));
+    try std.testing.expectEqualStrings("100%", try percentDecodeLenient(arena, "100%"));
+    try std.testing.expectEqualStrings("%4", try percentDecodeLenient(arena, "%4"));
+    try std.testing.expectEqualStrings("plain+text", try percentDecodeLenient(arena, "plain+text"));
 }

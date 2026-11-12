@@ -130,10 +130,6 @@ pub const Reply = struct {
     /// kept for the tests' fake server, which reads what clients send.
     sequences: []const u8 = &.{},
 
-    pub fn moreToCome(r: Reply) bool {
-        return r.flags & flag_more_to_come != 0;
-    }
-
     /// The documents of the kind-1 section `identifier`.
     pub fn sequence(r: Reply, identifier: []const u8) SequenceIterator {
         var rest = r.sequences;

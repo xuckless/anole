@@ -298,13 +298,6 @@ pub fn encodePath(arena: std.mem.Allocator, path: []const u8) Error![]const u8 {
     return out.written();
 }
 
-/// Percent-encodes a query name or value (space is %20).
-pub fn encodeQuery(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    writeEncoded(&out.writer, s, query_unreserved) catch return error.OutOfMemory;
-    return out.written();
-}
-
 /// "/Prod/my/path" with stage "Prod" gives "/my/path"; `$default` and
 /// look-alikes ("/Production/x") are left alone. An empty rest is "/".
 fn stripStage(path: []const u8, stage: []const u8) []const u8 {

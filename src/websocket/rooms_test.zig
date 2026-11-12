@@ -719,3 +719,50 @@ test "Rooms: a member that left and one that joined between broadcasts of a big 
     try joiner.entered.wait(io);
     try std.testing.expectEqual(written, leaver.written.load(.monotonic));
 }
+
+/// Every member of `room` stores its own position in the room's list.
+fn expectIndexed(r: *websocket.Rooms, room: []const u8) !void {
+    const members = (r.rooms.get(room) orelse return).items;
+    for (members, 0..) |m, i| try std.testing.expectEqual(@as(u32, @intCast(i)), m.index);
+}
+
+test "Rooms: leaving from the front, middle and end keeps every member's index" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var r: websocket.Rooms = .init(gpa, .{});
+    defer r.deinit();
+
+    var s: [6]Stalled = undefined;
+    for (&s) |*a| {
+        a.init(gpa, io);
+        a.release.set(io);
+        try r.join("room", &a.socket);
+    }
+    defer for (&s) |*a| a.ws.deinit();
+    // The first three are in a second room too.
+    for (s[0..3]) |*a| try r.join("other", &a.socket);
+    try expectIndexed(&r, "room");
+    try expectIndexed(&r, "other");
+
+    // Front, middle, end, then down to the last one.
+    for ([_]usize{ 0, 3, 5, 1, 2, 4 }, 0..) |k, done| {
+        r.leave("room", &s[k].socket);
+        try std.testing.expectEqual(@as(usize, 5 - done), r.count("room"));
+        try expectIndexed(&r, "room");
+        try expectIndexed(&r, "other");
+    }
+    try std.testing.expect(r.rooms.get("room") == null);
+    try std.testing.expectEqual(@as(usize, 3), r.count("other"));
+    // The other room still reaches its members, and they leave from it.
+    try std.testing.expectEqual(@as(usize, 3), r.broadcast("other", .text, "hi", null));
+    r.leave("other", &s[1].socket);
+    try expectIndexed(&r, "other");
+    try std.testing.expectEqual(@as(usize, 2), r.count("other"));
+    // Leave waits for the senders that broadcast started.
+    r.leave("other", &s[2].socket);
+    try expectIndexed(&r, "other");
+    r.leave("other", &s[0].socket);
+    try std.testing.expectEqual(@as(usize, 0), r.count("other"));
+}

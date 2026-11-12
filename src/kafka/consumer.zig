@@ -287,6 +287,19 @@ const Member = struct {
     coord: ?*Conn = null,
 };
 
+/// Why a session ended, by severity: a later one wins when two race.
+const End = enum(u8) {
+    none,
+    /// Join again (a rebalance, a generation that is gone, a failed fetch).
+    rebalance,
+    /// The broker does not know the member id: join with a new one.
+    new_member,
+    /// The coordinator moved or failed: find it again.
+    new_coordinator,
+    /// Another member took this instance id: the consumer stops.
+    fenced,
+};
+
 const Session = struct {
     consumer: *Consumer,
     member: *Member,
@@ -295,10 +308,9 @@ const Session = struct {
     parts: []*PartState = &.{},
     leaders: []LeaderGroup = &.{},
     stop: std.atomic.Value(bool) = .init(false),
-    rejoin: std.atomic.Value(bool) = .init(false),
-    reset_member: std.atomic.Value(bool) = .init(false),
-    stale_coord: std.atomic.Value(bool) = .init(false),
-    fatal: std.atomic.Value(bool) = .init(false),
+    /// Why the session is over (`endWith`); `stop` is the other way round:
+    /// the session is over, its tasks should end.
+    end: std.atomic.Value(End) = .init(.none),
     group: std.Io.Group = .init,
     deliveries: std.Io.Group = .init,
     /// Over `running`: the delivery tasks (one per partition, each on its
@@ -307,10 +319,19 @@ const Session = struct {
     cond: safety.Condition = .init,
     running: usize = 0,
 
-    /// Ends the session at the member's next look.
-    fn rebalance(s: *Session) void {
-        s.rejoin.store(true, .release);
+    /// Ends the session at the member's next look, for `why`. When two
+    /// causes race the more severe one stays (the order of `End`).
+    fn endWith(s: *Session, why: End) void {
+        var cur = s.end.load(.acquire);
+        while (@backingInt(cur) < @backingInt(why)) {
+            cur = s.end.cmpxchgWeak(cur, why, .release, .acquire) orelse break;
+        }
         s.member.wake.set(s.consumer.host.io);
+    }
+
+    /// Ends the session so that the member joins again.
+    fn rebalance(s: *Session) void {
+        s.endWith(.rebalance);
     }
 };
 
@@ -470,7 +491,7 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
     var ibuf: [128]u8 = undefined;
     const instance = c.instanceFor(m, &ibuf);
 
-    if (m.coord == null or sess.stale_coord.load(.acquire)) {
+    if (m.coord == null) {
         if (m.coord) |k| k.close();
         m.coord = null;
         m.coord = try findCoordinator(c, arena);
@@ -588,16 +609,19 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
             return err;
         };
         m.wake.reset();
-        if (c.stopping.load(.acquire) or sess.rejoin.load(.acquire) or sess.fatal.load(.acquire)) break;
+        if (c.stopping.load(.acquire) or sess.end.load(.acquire) != .none) break;
     }
     sess.stop.store(true, .release);
     endSession(&sess);
-    if (sess.reset_member.load(.acquire)) m.member_id.clearRetainingCapacity();
-    if (sess.stale_coord.load(.acquire)) {
-        if (m.coord) |k| k.close();
-        m.coord = null;
+    switch (sess.end.load(.acquire)) {
+        .none, .rebalance => {},
+        .new_member => m.member_id.clearRetainingCapacity(),
+        .new_coordinator => {
+            if (m.coord) |k| k.close();
+            m.coord = null;
+        },
+        .fenced => return error.Fenced,
     }
-    if (sess.fatal.load(.acquire)) return error.Fenced;
 }
 
 fn msOf(d: Duration) i32 {
@@ -911,8 +935,7 @@ fn heartbeatLoop(sess: *Session) std.Io.Cancelable!void {
         const body = coord.call(arena, .heartbeat, e.bytesWritten(), c.host.cluster.settings.request_timeout) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             log.debug("kafka group {s}: heartbeat failed: {t}", .{ c.opts.group, err });
-            sess.stale_coord.store(true, .release);
-            sess.rebalance();
+            sess.endWith(.new_coordinator);
             return;
         };
         const ec = protocol.decodeSimpleError(body) catch 0;
@@ -923,18 +946,15 @@ fn heartbeatLoop(sess: *Session) std.Io.Cancelable!void {
                 return;
             },
             protocol.unknown_member_id => {
-                sess.reset_member.store(true, .release);
-                sess.rebalance();
+                sess.endWith(.new_member);
                 return;
             },
             protocol.not_coordinator, protocol.coordinator_not_available, protocol.coordinator_load_in_progress => {
-                sess.stale_coord.store(true, .release);
-                sess.rebalance();
+                sess.endWith(.new_coordinator);
                 return;
             },
             protocol.fenced_instance_id => {
-                sess.fatal.store(true, .release);
-                sess.rebalance();
+                sess.endWith(.fenced);
                 return;
             },
             else => log.warn("kafka group {s}: Heartbeat: {s}", .{ c.opts.group, protocol.errorName(ec) }),

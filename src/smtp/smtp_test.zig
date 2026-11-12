@@ -2,6 +2,7 @@
 //! process. No timing assertions: the fake answers when asked, and what
 //! the tests count is commands, connections and messages.
 const std = @import("std");
+const repeat = @import("testutil.zig").repeat;
 const zio = @import("zio");
 const features = @import("build_options");
 const db = @import("../db/root.zig");
@@ -12,18 +13,6 @@ const mime = @import("mime.zig");
 const FakeServer = smtp.testing.FakeServer;
 const testing = std.testing;
 
-/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    const Storage = struct {
-        const data: [s.len * n]u8 = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [s.len * n]u8 = undefined;
-            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
-            break :blk out;
-        };
-    };
-    return &Storage.data;
-}
 const gpa = testing.allocator;
 const has_tls = features.tls == .boringssl;
 

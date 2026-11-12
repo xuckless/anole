@@ -14,6 +14,7 @@ const redis = @import("../redis/root.zig");
 const db = @import("../db/root.zig");
 const root = @import("root.zig");
 const resilience = @import("../resilience/root.zig");
+const hubs = @import("hub.zig");
 
 const Watch = root.Watch;
 const Raw = root.Raw;
@@ -25,312 +26,77 @@ const S = []const []const u8;
 // ---------------------------------------------------------------------------
 // Pub/sub
 
-const Entry = struct {
-    name: []u8,
-    watches: std.ArrayList(*Watch) = .empty,
-};
+/// (P)SUBSCRIBE and (P)UNSUBSCRIBE on a `redis.Subscriber`.
+const Transport = struct {
+    pub const Client = redis.Client;
+    pub const Conn = redis.Subscriber;
+    pub const Kind = enum { channel, pattern };
+    pub const log_name = "redis watch";
+    pub const verb = "SUBSCRIBE";
+    pub const ready_text = "subscribed";
+    pub const keepalive: ?hubs.Keepalive = null;
 
-pub const PubSubHub = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    client: *redis.Client,
-    mutex: std.Io.Mutex = .init,
-    channels: std.StringHashMapUnmanaged(*Entry) = .empty,
-    patterns: std.StringHashMapUnmanaged(*Entry) = .empty,
-    sub: ?*redis.Subscriber = null,
-    connected: bool = false,
-    write_mutex: std.Io.Mutex = .init,
-    group: std.Io.Group = .init,
-    running: bool = false,
-    stopping: std.atomic.Value(bool) = .init(false),
-    reader_task: ?placement.Task = null,
-    backoff: resilience.Backoff = .{ .base = .fromMilliseconds(100), .max = .fromSeconds(5) },
-
-    pub fn create(client: *redis.Client) !*PubSubHub {
-        const h = try client.gpa.create(PubSubHub);
-        h.* = .{ .gpa = client.gpa, .io = client.io, .client = client };
-        return h;
+    pub fn dial(client: *Client, arena: std.mem.Allocator, names: hubs.Names(Kind)) !*Conn {
+        var ctx: db.Ctx = .{ .io = client.io, .arena = arena };
+        const chans = names.get(.channel);
+        const pats = names.get(.pattern);
+        if (chans.len == 0) return client.psubscribe(&ctx, pats);
+        const s = try client.subscribe(&ctx, chans);
+        errdefer s.close();
+        if (pats.len > 0) try s.psubscribe(&ctx, pats);
+        return s;
     }
 
-    pub fn destroy(self: *PubSubHub) void {
-        self.stopping.store(true, .release);
-        self.mutex.lockUncancelable(self.io);
-        if (self.sub) |s| s.stop();
-        if (self.reader_task) |t| placement.cancelTask(t);
-        self.mutex.unlock(self.io);
-        self.group.cancel(self.io);
-        inline for (.{ &self.channels, &self.patterns }) |map| {
-            var it = map.iterator();
-            while (it.next()) |e| {
-                e.value_ptr.*.watches.deinit(self.gpa);
-                self.gpa.free(e.value_ptr.*.name);
-                self.gpa.destroy(e.value_ptr.*);
-            }
-            map.deinit(self.gpa);
-        }
-        self.gpa.destroy(self);
-    }
-
-    fn add(self: *PubSubHub, w: *Watch, names: []const []const u8, comptime patterns: bool) !void {
-        for (names) |name| {
-            var send = false;
-            {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                const map = if (patterns) &self.patterns else &self.channels;
-                const entry = try map.getOrPut(self.gpa, name);
-                if (!entry.found_existing) {
-                    const e = self.gpa.create(Entry) catch |err| {
-                        map.removeByPtr(entry.key_ptr);
-                        return err;
-                    };
-                    e.* = .{ .name = self.gpa.dupe(u8, name) catch |err| {
-                        self.gpa.destroy(e);
-                        map.removeByPtr(entry.key_ptr);
-                        return err;
-                    } };
-                    entry.key_ptr.* = e.name;
-                    entry.value_ptr.* = e;
-                    send = self.connected;
-                }
-                try entry.value_ptr.*.watches.append(self.gpa, w);
-            }
-            if (send) self.sendVerb(true, patterns, name);
-        }
-    }
-
-    fn remove(self: *PubSubHub, w: *Watch, names: []const []const u8, comptime patterns: bool) void {
-        for (names) |name| {
-            var send = false;
-            {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                const map = if (patterns) &self.patterns else &self.channels;
-                const e = map.get(name) orelse continue;
-                for (e.watches.items, 0..) |x, i| if (x == w) {
-                    _ = e.watches.swapRemove(i);
-                    break;
-                };
-                if (e.watches.items.len == 0) {
-                    _ = map.remove(name);
-                    e.watches.deinit(self.gpa);
-                    self.gpa.free(e.name);
-                    self.gpa.destroy(e);
-                    send = self.connected;
-                }
-            }
-            if (send) self.sendVerb(false, patterns, name);
-        }
-    }
-
-    fn sendVerb(self: *PubSubHub, subscribe: bool, pattern: bool, name: []const u8) void {
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-        const s = self.sub orelse return;
-        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    pub fn send(s: *Conn, gpa: std.mem.Allocator, io: std.Io, on: bool, kind: Kind, name: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
-        var ctx: db.Ctx = .{ .io = self.io, .arena = arena_state.allocator() };
+        var ctx: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
         const one = [_][]const u8{name};
-        const result = if (subscribe)
-            (if (pattern) s.psubscribe(&ctx, one[0..]) else s.subscribe(&ctx, one[0..]))
-        else
-            (if (pattern) s.punsubscribe(&ctx, one[0..]) else s.unsubscribe(&ctx, one[0..]));
-        result catch |err| {
-            log.debug("redis watch: {s} {s} failed: {t}", .{ if (subscribe) "SUBSCRIBE" else "UNSUBSCRIBE", name, err });
-            s.stop();
+        return switch (kind) {
+            .channel => if (on) s.subscribe(&ctx, one[0..]) else s.unsubscribe(&ctx, one[0..]),
+            .pattern => if (on) s.psubscribe(&ctx, one[0..]) else s.punsubscribe(&ctx, one[0..]),
         };
     }
 
-    fn ensureRunning(self: *PubSubHub) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.running) return;
-        placement.concurrent(&self.group, self.io, .local, readerTask, .{self}) catch return error.ServiceUnavailable;
-        self.running = true;
+    /// Null once stopped or subscribed to nothing.
+    pub fn next(s: *Conn, arena: std.mem.Allocator) !?hubs.Message(Kind) {
+        var ctx: db.Ctx = .{ .io = s.io, .arena = arena };
+        const msg = (try s.next(&ctx)) orelse return null;
+        return .{ .message = .{
+            .kind = if (msg.pattern != null) .pattern else .channel,
+            .name = msg.pattern orelse msg.channel,
+            .raw = .{ .op = .message, .op_name = "message", .channel = msg.channel, .pattern = msg.pattern, .data = msg.payload },
+        } };
     }
 
-    fn readerTask(self: *PubSubHub) std.Io.Cancelable!void {
-        self.mutex.lockUncancelable(self.io);
-        self.reader_task = placement.currentTask(self.io);
-        self.mutex.unlock(self.io);
-        var attempt: u32 = 0;
-        var first = true;
-        while (!self.stopping.load(.acquire)) {
-            const sub = self.connect() catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-                // Nothing to subscribe to (every watch left): idle.
-                if (err == error.Nothing) {
-                    self.mutex.lockUncancelable(self.io);
-                    self.running = false;
-                    self.mutex.unlock(self.io);
-                    return;
-                }
-                attempt += 1;
-                if (attempt == 1) {
-                    log.warn("redis watch: cannot open the SUBSCRIBE connection ({t}); trying again", .{err});
-                } else log.debug("redis watch: SUBSCRIBE connection attempt {d} failed: {t}", .{ attempt, err });
-                self.statusAll(.reconnecting);
-                try self.pause(attempt);
-                continue;
-            };
-            attempt = 0;
-            const lost = !first;
-            first = false;
-            self.mutex.lockUncancelable(self.io);
-            self.sub = sub;
-            self.connected = true;
-            self.mutex.unlock(self.io);
-            self.statusAll(.connected);
-            if (lost) self.gapAll("the SUBSCRIBE connection was lost and opened again");
-            log.info("redis watch: subscribed", .{});
-            self.readLoop(sub);
-            self.mutex.lockUncancelable(self.io);
-            self.connected = false;
-            self.sub = null;
-            const idle = self.channels.count() == 0 and self.patterns.count() == 0;
-            if (idle) self.running = false;
-            self.mutex.unlock(self.io);
-            sub.stop();
-            sub.close();
-            if (self.stopping.load(.acquire) or idle) return;
-            log.warn("redis watch: the SUBSCRIBE connection was lost; opening it again", .{});
-            self.statusAll(.reconnecting);
-            attempt += 1;
-            try self.pause(attempt);
-        }
+    pub fn stop(s: *Conn) void {
+        s.stop();
     }
 
-    fn pause(self: *PubSubHub, attempt: u32) std.Io.Cancelable!void {
-        var rnd: [8]u8 = undefined;
-        self.io.random(&rnd);
-        try self.io.sleep(self.backoff.delay(attempt, std.mem.readInt(u64, &rnd, .little)), .awake);
-    }
-
-    /// A subscriber with every channel and pattern registered so far.
-    fn connect(self: *PubSubHub) !*redis.Subscriber {
-        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena_state.deinit();
-        const a = arena_state.allocator();
-        var chans: std.ArrayList([]const u8) = .empty;
-        var pats: std.ArrayList([]const u8) = .empty;
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            var it = self.channels.keyIterator();
-            while (it.next()) |k| try chans.append(a, try a.dupe(u8, k.*));
-            var pit = self.patterns.keyIterator();
-            while (pit.next()) |k| try pats.append(a, try a.dupe(u8, k.*));
-        }
-        if (chans.items.len == 0 and pats.items.len == 0) return error.Nothing;
-        var ctx: db.Ctx = .{ .io = self.io, .arena = a };
-        const sub = if (chans.items.len > 0) blk: {
-            const s = try self.client.subscribe(&ctx, chans.items);
-            errdefer s.close();
-            if (pats.items.len > 0) try s.psubscribe(&ctx, pats.items);
-            break :blk s;
-        } else try self.client.psubscribe(&ctx, pats.items);
-        return sub;
-    }
-
-    fn readLoop(self: *PubSubHub, sub: *redis.Subscriber) void {
-        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena_state.deinit();
-        var ctx: db.Ctx = .{ .io = self.io, .arena = arena_state.allocator() };
-        while (true) {
-            _ = arena_state.reset(.retain_capacity);
-            const msg = sub.next(&ctx) catch |err| {
-                if (!self.stopping.load(.acquire)) log.debug("redis watch: read failed: {t}", .{err});
-                return;
-            } orelse return;
-            self.dispatch(msg);
-        }
-    }
-
-    fn dispatch(self: *PubSubHub, msg: redis.Message) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const e = (if (msg.pattern) |p| self.patterns.get(p) else self.channels.get(msg.channel)) orelse return;
-        for (e.watches.items) |w| {
-            w.onHubEvent(.{
-                .op = .message,
-                .op_name = "message",
-                .channel = msg.channel,
-                .pattern = msg.pattern,
-                .data = msg.payload,
-            });
-        }
-    }
-
-    fn statusAll(self: *PubSubHub, s: root.Status) void {
-        testBeforeStatus();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        inline for (.{ &self.channels, &self.patterns }) |map| {
-            var it = map.valueIterator();
-            while (it.next()) |e| for (e.*.watches.items) |w| w.setStatus(s);
-        }
-    }
-
-    fn gapAll(self: *PubSubHub, detail: []const u8) void {
-        var seen: std.ArrayList(*Watch) = .empty;
-        defer seen.deinit(self.gpa);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        inline for (.{ &self.channels, &self.patterns }) |map| {
-            var it = map.valueIterator();
-            while (it.next()) |e| for (e.*.watches.items) |w| {
-                var dup = false;
-                for (seen.items) |s| if (s == w) {
-                    dup = true;
-                    break;
-                };
-                if (!dup) seen.append(self.gpa, w) catch {};
-            };
-        }
-        // Still under the hub's lock, as `dispatch` and `statusAll`: a watch
-        // that `stop` took out (and `deinit` may have freed) is never reached
-        // (#165, #157).
-        for (seen.items) |w| {
-            testOnGap(self);
-            w.gapped(detail);
-        }
+    pub fn close(s: *Conn, _: std.mem.Allocator) void {
+        s.close();
     }
 };
 
-/// Tests: runs before each watch `gapAll` gives a gap, with the hub.
-/// Test builds only.
-pub var test_on_gap: if (builtin.is_test) std.atomic.Value(?*const fn (*PubSubHub) void) else void = if (builtin.is_test) .init(null) else {};
+pub const PubSubHub = hubs.Hub(Transport);
 
-fn testOnGap(hub: *PubSubHub) void {
-    if (comptime !builtin.is_test) return;
-    const hook = test_on_gap.load(.acquire) orelse return;
-    hook(hub);
-}
-
-/// Tests: runs once, on the hub's reader task, as `statusAll` begins (before
-/// it takes the hub's lock), where a watch's owner may end and free it.
-/// Test builds only.
-pub var test_before_status: if (builtin.is_test) std.atomic.Value(?*const fn () void) else void = if (builtin.is_test) .init(null) else {};
-
-fn testBeforeStatus() void {
-    if (comptime !builtin.is_test) return;
-    const hook = test_before_status.swap(null, .acq_rel) orelse return;
-    hook();
-}
+/// Tests: the hub's hooks (`hub.Hub.test_on_gap`, `test_before_status`).
+pub const test_on_gap = &PubSubHub.test_on_gap;
+pub const test_before_status = &PubSubHub.test_before_status;
 
 pub fn register(w: *Watch) !void {
     const r = w.source.redis;
-    const hub = try r.client._pubsubHub();
-    try hub.add(w, r.channels, false);
-    try hub.add(w, r.patterns, true);
-    try hub.ensureRunning();
+    const h = try r.client._pubsubHub();
+    try h.add(w, r.channels, .channel);
+    try h.add(w, r.patterns, .pattern);
+    try h.ensureRunning();
 }
 
 pub fn unregister(w: *Watch) void {
     const r = w.source.redis;
-    const hub = r.client.pubsub_hub orelse return;
-    hub.remove(w, r.channels, false);
-    hub.remove(w, r.patterns, true);
+    const h = r.client.pubsub_hub orelse return;
+    h.remove(w, r.channels, .channel);
+    h.remove(w, r.patterns, .pattern);
 }
 
 // ---------------------------------------------------------------------------
@@ -868,11 +634,11 @@ test "watch redis: gapAll reaches each watch under the hub's lock, once (#165)" 
     defer w1.deinit();
     const w2 = try Watch.init(gpa, rio, .{ .redis = .{ .client = client, .channels = &.{"a"} } }, .{});
     defer w2.deinit();
-    try hub.add(w1, &.{ "a", "b" }, false);
-    try hub.add(w2, &.{"a"}, false);
+    try hub.add(w1, &.{ "a", "b" }, .channel);
+    try hub.add(w2, &.{"a"}, .channel);
     defer {
-        hub.remove(w1, &.{ "a", "b" }, false);
-        hub.remove(w2, &.{"a"}, false);
+        hub.remove(w1, &.{ "a", "b" }, .channel);
+        hub.remove(w2, &.{"a"}, .channel);
     }
     GapProbe.calls = 0;
     GapProbe.unlocked = 0;

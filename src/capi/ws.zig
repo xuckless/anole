@@ -15,6 +15,7 @@ const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 const placement = dusty.placement;
 const websocket = anole.websocket;
 const origin = @import("../origin.zig");
@@ -25,12 +26,6 @@ const Route = engine.Route;
 const Command = engine.Command;
 const Handle = engine.Handle;
 const gpa = engine.gpa;
-
-const chunk_len = 256;
-const max_chunks = 4096;
-comptime {
-    std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-}
 
 const State = enum(u32) { free, open, reserved };
 
@@ -99,12 +94,14 @@ pub const WsSlot = struct {
     }
 };
 
-const Chunk = [chunk_len]WsSlot;
+fn freeWord(gen: u32) u64 {
+    return pack(gen, .free);
+}
+
+const Slots = SlotTable(WsSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyWebSockets }, freeWord);
 
 pub const ExecState = struct {
-    chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-    nchunks: u32 = 0,
-    free_head: u32 = engine.no_slot,
+    slots: Slots = .{},
     /// Unsubscribes and the publish lane.
     work: std.Io.Group = .init,
     /// The publish lane: publishes to topics that hash to this executor,
@@ -113,38 +110,11 @@ pub const ExecState = struct {
     lane_tail: ?*PublishCmd = null,
     lane_running: bool = false,
 
-    fn slot(st: *ExecState, i: u32) ?*WsSlot {
-        // `i` may come from a made-up handle: past the table is no socket.
-        if (i / chunk_len >= max_chunks) return null;
-        const c = st.chunks[i / chunk_len].load(.acquire) orelse return null;
-        return &c[i % chunk_len];
-    }
-
-    fn alloc(st: *ExecState, x: *Exec) !*WsSlot {
-        if (st.free_head == engine.no_slot) {
-            if (st.nchunks == max_chunks) return error.TooManyWebSockets;
-            const c = try gpa.create(Chunk);
-            const base = st.nchunks * chunk_len;
-            for (c, 0..) |*s, j| s.* = .{
-                .word = .init(pack(x.engine.first_gen, .free)),
-                .exec = x,
-                .index = @intCast(base + j),
-                .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-            };
-            st.chunks[st.nchunks].store(c, .release);
-            st.nchunks += 1;
-            st.free_head = base;
-        }
-        const s = st.slot(st.free_head).?;
-        st.free_head = s.next_free;
-        return s;
-    }
-
     /// A slot for a socket whose handshake the consumer is deciding
     /// (executor-local): not open yet, its handle not handed out. The
     /// outbox is clean and the socket unset.
     fn reserve(st: *ExecState, x: *Exec, route: *const Route) !*WsSlot {
-        const s = try st.alloc(x);
+        const s = try st.slots.alloc(x);
         const g = s.gen();
         s.acquire();
         s.bytes = 0;
@@ -169,36 +139,28 @@ pub const ExecState = struct {
     fn unreserve(st: *ExecState, s: *WsSlot) void {
         const g = s.gen();
         s.word.store(pack(engine.nextGen(g), .free), .release);
-        s.next_free = st.free_head;
-        st.free_head = s.index;
+        st.slots.free(s);
     }
 
     /// The highest generation of any slot (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
-        var max: u32 = 0;
-        for (st.chunks[0..st.nchunks]) |*cv| {
-            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-        }
-        return max;
+        return st.slots.maxGen();
     }
 
     pub fn deinit(st: *ExecState) void {
         st.dropLane();
-        for (st.chunks[0..st.nchunks]) |*cv| {
-            const c = cv.load(.acquire).?;
-            for (c) |*s| {
-                for (s.msgs.items) |m| {
-                    if (m.sent) |r| engine.freeRecord(r.ptr);
-                }
-                s.msgs.deinit(gpa);
-                s.buf.deinit(gpa);
-                gpa.free(s.close_reason);
-                for (s.topics.items) |t| gpa.free(t);
-                s.topics.deinit(gpa);
-            }
-            gpa.destroy(c);
+        st.slots.deinit(freeSlotBuffers);
+    }
+
+    fn freeSlotBuffers(s: *WsSlot) void {
+        for (s.msgs.items) |m| {
+            if (m.sent) |r| engine.freeRecord(r.ptr);
         }
-        st.nchunks = 0;
+        s.msgs.deinit(gpa);
+        s.buf.deinit(gpa);
+        gpa.free(s.close_reason);
+        for (s.topics.items) |t| gpa.free(t);
+        s.topics.deinit(gpa);
     }
 
     /// Frees the publishes left in the lane.
@@ -220,14 +182,14 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *WsSlot, u32 } {
     const h = Handle.decode(hv);
     if (hv == 0 or h.gen == 0 or h.kind != .websocket) return error.WrongKind;
     if (h.exec >= e.execs.len) return error.Over;
-    const s = e.execs[h.exec].ws.slot(h.slot) orelse return error.Over;
+    const s = e.execs[h.exec].ws.slots.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 
 /// `anole_ws_accept`: the reserved slot `i` of `x` becomes the open socket
 /// of the handshake the consumer accepted; its handle. Any thread.
 pub fn openReserved(x: *Exec, i: u32) u64 {
-    const s = x.ws.slot(i).?;
+    const s = x.ws.slots.slot(i).?;
     const g = s.gen();
     s.word.store(pack(g, .open), .release);
     _ = x.engine.websockets.fetchAdd(1, .monotonic);
@@ -347,7 +309,7 @@ fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void 
     const route: *const Route = @ptrCast(@alignCast(state.?));
     const e = route.engine;
     const x = &e.execs[placement.currentExecutor(req.io).?];
-    const s = try x.ws.alloc(x);
+    const s = try x.ws.slots.alloc(x);
     const g = s.gen();
     s.socket = sock;
     s.route = route;
@@ -443,8 +405,7 @@ fn retire(x: *Exec, s: *WsSlot, g: u32, sock: ?*Socket, code: u16) void {
         x.postRecord(rec, true);
     } else |_| {}
     _ = e.websockets.fetchSub(1, .monotonic);
-    s.next_free = x.ws.free_head;
-    x.ws.free_head = s.index;
+    x.ws.slots.free(s);
 }
 
 fn newRecord(size: usize, typ: abi.EventType, h: u64) ![]align(8) u8 {

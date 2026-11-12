@@ -1833,7 +1833,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     session.onCapsuleBytes(buf[0..n]);
                     if (!s.reset) conn.consume(id, n);
                 }
-                if (s.body_done) session.onChannelEnd(.peer) else if (s.reset) session.onChannelEnd(.connection);
+                if (s.recv == .done) session.onChannelEnd(.peer) else if (s.reset) session.onChannelEnd(.connection);
             }
 
             /// Ends the CONNECT stream's response (its FIN) without
@@ -1841,10 +1841,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// out. Locked.
             fn endConnect(conn: *Conn, id: i64) bool {
                 const s = conn.streams.get(id) orelse return true;
-                if (s.ended) return true;
-                if (!s.submitted) return false;
+                if (s.send.hasEnded()) return true;
+                if (!s.send.isSubmitted()) return false;
                 s.trailer_nv = &.{};
-                s.ended = true;
+                s.send = .ended;
                 s.resume_();
                 s.unhold();
                 conn.kick();
@@ -2297,10 +2297,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// a peer still sending when STOP_SENDING arrives can fail the
             /// whole call though its response came complete (.NET's HTTP/3
             /// client did, in the gRPC interop's early-status cases). Past
-            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Locked.
+            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Only while the body
+            /// is open (callers check `done` and `reset`). Locked.
             fn lingerRead(conn: *Conn, s: *Stream) void {
-                if (s.lingering) return;
-                s.lingering = true;
+                if (s.recv != .open) return;
+                s.recv = .lingering;
                 // What the handler left unread: dropped, its credit given
                 // back so the peer can send the rest and end the stream.
                 const left = s.body.len;
@@ -2312,8 +2313,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `n` more bytes of an unwanted body were dropped. Locked.
             fn lingered(conn: *Conn, s: *Stream, n: u64) void {
                 s.lingered += n;
-                if (s.lingered <= linger_max or s.read_stopped) return;
-                s.read_stopped = true;
+                if (s.lingered <= linger_max or s.recv == .stopped) return;
+                s.recv = .stopped;
                 _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
             }
 
@@ -2526,13 +2527,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// A WebTransport session on this CONNECT stream with its
             /// capsules parsed as they arrive (`Session.Options.inline_capsules`).
             wt_session: ?*webtransport.Session = null,
-            body_done: bool = false,
-            /// The answer is done before the body: what is left is read and
-            /// dropped (`lingerRead`), `lingered` bytes so far.
-            lingering: bool = false,
+            /// The request body's receive side (`Recv`). Locked.
+            recv: Recv = .open,
+            /// Bytes of an unwanted body dropped so far (`lingerRead`).
             lingered: u64 = 0,
-            /// STOP_SENDING went out: the peer is to send no more.
-            read_stopped: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
             /// The task running the handler, published for `cancelHandler`;
@@ -2595,8 +2593,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
             trailer_nv: []h.nghttp3_nv = &.{},
-            submitted: bool = false,
-            ended: bool = false,
+            /// The response's send side (`Send`). Locked.
+            send: Send = .none,
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
             /// A writer found no room under the cap: the next bytes nghttp3
@@ -2616,6 +2614,81 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// grew it past `arena_keep` into a node too big for malloc's
             /// slabs, an mmap and munmap per request.
             sink_buf: []u8 = &.{},
+
+            /// The request body's receive side:
+            ///
+            ///   open -> done                    the body's end (FIN) came
+            ///   open -> lingering               the answer is done first: the
+            ///                                   rest is read and dropped
+            ///                                   (`lingerRead`)
+            ///   lingering -> stopped            past `linger_max`: STOP_SENDING
+            ///                                   went out (`lingered`)
+            ///   lingering | stopped -> done     the FIN came anyway (it may be
+            ///                                   in the same read as the bytes
+            ///                                   past `linger_max`)
+            ///
+            /// `done` is final: nothing after it asks whether the body
+            /// lingered, and no data follows a FIN. Lingering starts only
+            /// from `open` (its callers check `done` and `reset`). Whether
+            /// the peer reset the stream is `reset`, which covers the
+            /// response too. The values make `dropping` one compare.
+            const Recv = enum(u8) {
+                open = 0,
+                done = 1,
+                lingering = 2,
+                stopped = 3,
+
+                /// What arrives is read and dropped (lingering, or past it).
+                fn dropping(r: Recv) bool {
+                    return @backingInt(r) >= @backingInt(Recv.lingering);
+                }
+            };
+
+            /// The response's send side:
+            ///
+            ///   none -> submitted               the head went to nghttp3
+            ///                                   (`StreamSink.submit`)
+            ///   submitted -> ended              the body's end is queued
+            ///                                   (`StreamSink.end`, `endConnect`)
+            ///   none -> ended_unsubmitted       `end` with no head out yet:
+            ///                                   ended, then the head is
+            ///                                   submitted, or it never is
+            ///                                   (the stream was reset, the
+            ///                                   connection gone, nghttp3
+            ///                                   refused it)
+            ///   ended_unsubmitted -> ended      that submit went through
+            ///
+            /// All four are real, so this is the old pair of flags named:
+            /// bit 0 is "ended", bit 1 "submitted", and each test is one
+            /// instruction, as a flag's was.
+            const Send = enum(u8) {
+                none = 0,
+                ended_unsubmitted = 1,
+                submitted = 2,
+                ended = 3,
+
+                /// The head went to nghttp3.
+                fn isSubmitted(t: Send) bool {
+                    return @backingInt(t) >= @backingInt(Send.submitted);
+                }
+
+                /// The response ended (`end`), its head out or not.
+                fn hasEnded(t: Send) bool {
+                    return @backingInt(t) & 1 != 0;
+                }
+
+                /// After the head's submit: none -> submitted,
+                /// ended_unsubmitted -> ended (bit 1 set, an `or`).
+                fn submit(t: Send) Send {
+                    return @fromBackingInt(@intCast(@backingInt(t) | @backingInt(Send.submitted)));
+                }
+
+                /// At `end`: none -> ended_unsubmitted, submitted -> ended
+                /// (bit 0 set).
+                fn end(t: Send) Send {
+                    return @fromBackingInt(@intCast(@backingInt(t) | @backingInt(Send.ended_unsubmitted)));
+                }
+            };
 
             /// The most a stream's arena keeps when it goes back to the pool:
             /// a typical request's head and response, so the reset at close
@@ -2699,7 +2772,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// ended: cancel the handler, so a wait it is in returns
             /// `error.Canceled`. Locked.
             fn cancelHandler(s: *Stream) void {
-                if (s.ended) return;
+                if (s.send.hasEnded()) return;
                 if (s.task) |t| placement.cancelTask(t);
             }
 
@@ -2718,11 +2791,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.unhold();
                     conn.lock();
                     // A burst of the response this handler parked may be
-                    // under way on another task, which owns `task` now.
-                    if (s.parked == null or !s.parked.?.bursting) s.task = null;
+                    // under way (or ending: `over` before its last
+                    // `finishBurst`) on another task, which owns `task`
+                    // now; after the end that task has cleared it.
+                    const burst_owns = if (s.parked) |p| p.notice.inBurst() or p.notice == .over else false;
+                    if (!burst_owns) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
-                    if (!s.body_done and !s.reset) conn.lingerRead(s);
+                    if (s.recv != .done and !s.reset) conn.lingerRead(s);
                     s.release(.handler);
                     conn.unlock();
                     conn.kick();
@@ -2944,8 +3020,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                     },
                     error.OutOfMemory => return error.OutOfMemory,
                 };
-                if (!too_many and request.headers.get("Host") == null and s.authority.len > 0) {
-                    request.headers.put("Host", s.authority) catch {
+                // One host, from `:authority` when it is there (RFC 9114
+                // §4.3.1), as over HTTP/2: a `host` field naming another
+                // makes the request malformed. nghttp3 has already refused
+                // a second or empty `host`, an empty `:authority`, and a
+                // request with neither; a `host` alone is the authority.
+                if (!too_many and s.authority.len > 0) {
+                    if (request.headers.get("Host")) |host| {
+                        if (!std.ascii.eqlIgnoreCase(host, s.authority)) {
+                            response.status = .bad_request;
+                            {
+                                try response.write();
+                                return .done;
+                            }
+                        }
+                    } else request.headers.add("Host", s.authority) catch {
                         too_many = true;
                     };
                 }
@@ -2987,7 +3076,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                         conn.lock();
-                        request._expects_continue = !s.body_done;
+                        request._expects_continue = s.recv != .done;
                         conn.unlock();
                     } else {
                         response.status = .expectation_failed;
@@ -3187,7 +3276,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return;
             }
             s.detached = null;
-            if (!s.body_done and !s.reset) conn.lingerRead(s);
+            if (s.recv != .done and !s.reset) conn.lingerRead(s);
             if (!s.in_handler) s.release(.handler);
             conn.unlock();
             conn.kick();
@@ -3244,11 +3333,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// (a `no_wait` route, the C ABI's requests): the detach's hold
             /// on the stream (`.handler`) is the park's to let go too.
             holds_handler: bool,
-            /// All under the connection's lock.
-            bursting: bool = false,
-            gone_pending: bool = false,
-            gone_sent: bool = false,
-            over: bool = false,
+            /// Under the connection's lock. The stream's own `reset`
+            /// is checked next to it.
+            notice: dusty.ParkedNotice = .idle,
 
             const vtable: dusty.Parked.VTable = .{
                 .begin = begin,
@@ -3268,8 +3355,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = self.s.conn;
                 conn.lock();
                 defer conn.unlock();
-                if (self.s.reset or self.over or self.gone_sent or self.gone_pending) return false;
-                self.bursting = true;
+                if (self.s.reset or !self.notice.begin()) return false;
                 // A reset cancels the burst's task (`cancelHandler`).
                 self.s.task = placement.currentTask(conn.ep.io);
                 return true;
@@ -3281,7 +3367,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                const over = self.over or self.s.reset;
+                const over = self.notice == .over or self.s.reset;
                 conn.unlock();
                 if (over) return error.Gone;
                 const sink_state = &self.ex.sink_state;
@@ -3300,13 +3386,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn finishBurst(self: *H3Parked) void {
                 const conn = self.s.conn;
                 conn.lock();
-                self.bursting = false;
                 self.s.task = null;
-                const deliver = self.gone_pending and !self.gone_sent and !self.over;
-                if (deliver) {
-                    self.gone_pending = false;
-                    self.gone_sent = true;
-                }
+                const deliver = self.notice.endBurst();
                 conn.unlock();
                 if (deliver) self.owner.gone(self.owner.ctx);
             }
@@ -3319,8 +3400,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                const already = self.over;
-                self.over = true;
+                const already = self.notice.finish();
                 const reset = self.s.reset;
                 conn.unlock();
                 // The middleware finishers, then FIN (`detachedEnd`).
@@ -3332,7 +3412,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const conn = self.s.conn;
                 conn.lock();
-                self.over = true;
+                _ = self.notice.finish();
                 conn.unlock();
                 self.s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
                 self.finishBurst();
@@ -3341,15 +3421,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The stream was reset or the connection is gone. Locked;
             /// never waits.
             fn peerGone(self: *H3Parked) void {
-                if (self.gone_sent or self.over) return;
                 // A burst running was canceled with the stream
                 // (`cancelHandler`): `endBurst` tells the owner.
-                if (self.bursting) {
-                    self.gone_pending = true;
-                    return;
-                }
-                self.gone_sent = true;
-                self.owner.gone(self.owner.ctx);
+                if (self.notice.peerGone() == .tell) self.owner.gone(self.owner.ctx);
             }
 
             fn release(p: *dusty.Parked) void {
@@ -3363,11 +3437,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer conn.unlock();
                 // Let go before it ended (the owner gave up on a stream the
                 // peer still has open): reset it, so QUIC closes it.
-                if (!s.ended and s.refs.quic) {
+                if (!s.send.hasEnded() and s.refs.quic) {
                     s.reset = true;
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
-                } else if (!s.body_done and !s.reset and s.refs.quic) {
+                } else if (s.recv != .done and !s.reset and s.refs.quic) {
                     conn.lingerRead(s);
                 }
                 s.parked = null;
@@ -3463,7 +3537,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         w.advance(n);
                         return n;
                     }
-                    const done = s.body_done;
+                    const done = s.recv == .done;
                     const reset = s.reset;
                     conn.unlock();
                     if (done) return error.EndOfStream;
@@ -3592,7 +3666,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn submit(self: *StreamSink) std.Io.Writer.Error!void {
                 const s = self.stream;
                 const conn = s.conn;
-                if (s.submitted) return;
+                if (s.send.isSubmitted()) return;
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
                 const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
                 const reader: h.nghttp3_data_reader = .{ .read_data = readData };
@@ -3601,7 +3675,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     log.debug("nghttp3_conn_submit_response: {s}", .{h.nghttp3_strerror(rv)});
                     return self.fail(error.ConnectionResetByPeer);
                 }
-                s.submitted = true;
+                s.send = s.send.submit();
                 conn.kick();
             }
 
@@ -3755,7 +3829,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 s.trailer_nv = trailer_nv.items;
-                s.ended = true;
+                s.send = s.send.end();
                 try self.submit();
                 s.resume_();
                 s.unhold();
@@ -3972,7 +4046,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.allSent() and s.body_done)) {
+                    if (!(s.send.hasEnded() and s.allSent() and s.recv == .done)) {
                         s.reset = true;
                         s.cancelHandler();
                     }
@@ -4130,7 +4204,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return 0;
             }
             // Nobody wants the rest of this body: dropped, its credit back.
-            if (s.lingering) {
+            if (s.recv.dropping()) {
                 conn.consume(stream_id, len);
                 conn.lingered(s, len);
                 // The window update (or the STOP_SENDING) goes out.
@@ -4203,13 +4277,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
             if (s.started) return 0;
-            if (fin != 0) s.body_done = true;
+            if (fin != 0) s.recv = .done;
             // On a server, 1-RTT data is only read once the handshake has
             // completed, so a head that ends before came in 0-RTT.
             s.early = !conn.handshakeDone();
             if (!conn.noWaitRoute(s)) {
                 conn.startStream(s);
-            } else if (s.body_done) {
+            } else if (s.recv == .done) {
                 conn.queueInline(s);
             } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
                 s.started = true;
@@ -4222,7 +4296,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3EndStream(_: ?*h.nghttp3_conn, _: i64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
-            s.body_done = true;
+            s.recv = .done;
             s.rx.notify(conn.ep.io);
             if (s.wt_session) |session| session.onChannelEnd(.peer);
             if (s.await_body) {
@@ -4251,7 +4325,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn readData(_: ?*h.nghttp3_conn, stream_id: i64, vec: [*c]h.nghttp3_vec, veccnt: usize, pflags: [*c]u32, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) h.nghttp3_ssize {
             const s = streamOfUser(sud) orelse return h.NGHTTP3_ERR_CALLBACK_FAILURE;
             if (s.out.allSent()) {
-                if (!s.ended or !s.allSent()) {
+                if (!s.send.hasEnded() or !s.allSent()) {
                     s.deferred = true;
                     return h.NGHTTP3_ERR_WOULDBLOCK;
                 }
@@ -4271,7 +4345,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.wants_room = false;
                 s.tx.notify(s.conn.ep.io);
             }
-            if (s.ended and s.allSent()) {
+            if (s.send.hasEnded() and s.allSent()) {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;

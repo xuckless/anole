@@ -570,6 +570,39 @@ test "sse: a write error ends the subscriber (client_gone)" {
     try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
 }
 
+test "sse: close after a failed write does nothing: no sender claimed, the reason stays client_gone" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const f = try h.add(&.{"t"}, null);
+    try h.waitSettled(0);
+    const sub = h.subAt(0);
+    // Its sender runs here, by hand, as the fallback's own task runs it
+    // (S3): between the failed write and the end there is a window.
+    h.hub.mutex.lockUncancelable(io);
+    sub.fallback = true;
+    h.hub.mutex.unlock(io);
+    f.fail_with = error.Gone;
+    _ = try h.hub.publish("t", .{ .data = "x" });
+    try std.testing.expectEqual(Topics.SendOutcome.broken, try h.hub.sendQueued(sub));
+
+    sub.close();
+    h.hub.mutex.lockUncancelable(io);
+    // Before #211 this claimed a sender nothing would run (the fallback
+    // had stopped), so the end waited for it forever, and the reason
+    // became `closed`.
+    const running = sub.running;
+    const queued = sub.queue.items.len - sub.head;
+    const reason = sub.close_reason;
+    h.hub.mutex.unlock(io);
+    try std.testing.expect(!running);
+    try std.testing.expectEqual(@as(usize, 0), queued);
+    try std.testing.expectEqual(root.CloseReason.client_gone, reason);
+
+    Topics._gone(sub);
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+}
+
 test "sse: routes: templates are checked against the path" {
     try std.testing.expect(root.templatesMatch("/rooms/:room/events", .{ .topics = &.{ "news", "room:{room}" } }));
     try std.testing.expect(!root.templatesMatch("/rooms/:id/events", .{ .topics = &.{"room:{room}"} }));
@@ -661,4 +694,97 @@ test "sse: leave while a write is under way: nothing is written after the end re
     try std.testing.expectEqual(@as(u32, 0), c.f.writes_done.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), c.f.bytes.items.len);
     try std.testing.expectEqual(@as(usize, 0), c.hub.count("t"));
+}
+
+/// Every member of every topic stores its own position in the topic's
+/// list, and every membership points back at its subscriber.
+fn expectIndexed(h: *Harness) !void {
+    h.hub.mutex.lockUncancelable(io);
+    defer h.hub.mutex.unlock(io);
+    var it = h.hub.topics.valueIterator();
+    while (it.next()) |tp| {
+        const t = tp.*;
+        for (t.members.items, 0..) |sub, i| {
+            const m = for (sub.memberships.items) |m| {
+                if (m.topic == t) break m;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u32, @intCast(i)), m.index);
+        }
+    }
+    for (h.recs.items) |rec| {
+        if (rec.done.load(.acquire)) continue;
+        for (rec.sub.memberships.items) |m| try std.testing.expectEqual(rec.sub, m.topic.members.items[m.index]);
+    }
+}
+
+/// The subscriber at `pos` of topic `name` (`null`: the last one).
+fn memberAt(h: *Harness, name: []const u8, pos: ?usize) *Subscriber {
+    h.hub.mutex.lockUncancelable(io);
+    defer h.hub.mutex.unlock(io);
+    const members = h.hub.topics.get(name).?.members.items;
+    return members[pos orelse members.len - 1];
+}
+
+test "sse: leaving from the front, middle and end keeps every member's index" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    // The first three are in "u" too.
+    for (0..3) |_| _ = try h.add(&.{ "t", "u" }, null);
+    for (0..3) |_| _ = try h.add(&.{"t"}, null);
+    try expectIndexed(h);
+
+    // Leave (one topic) and an end (every topic), from the front, the
+    // middle and the end, down to the last member.
+    var closed: u32 = 0;
+    const Op = struct { pos: ?usize, end: bool };
+    for ([_]Op{
+        .{ .pos = 0, .end = false },
+        .{ .pos = 2, .end = true },
+        .{ .pos = null, .end = false },
+        .{ .pos = null, .end = true },
+        .{ .pos = 0, .end = true },
+        .{ .pos = 0, .end = false },
+    }, 0..) |op, done| {
+        const sub = memberAt(h, "t", op.pos);
+        if (op.end) {
+            Topics._gone(sub);
+            closed += 1;
+            try h.waitClosed(closed);
+        } else sub.leave("t");
+        try std.testing.expectEqual(@as(usize, 5 - done), h.hub.count("t"));
+        try expectIndexed(h);
+    }
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    // "u" kept its members that did not end, and they still leave it.
+    while (h.hub.count("u") > 0) {
+        memberAt(h, "u", 0).leave("u");
+        try expectIndexed(h);
+    }
+}
+
+test "sse: the peer leaving while on_open runs: the end waits for the open, then frees the subscriber" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const f = try gpa.create(Fake);
+    f.* = .init(gpa, io);
+    try h.fakes.append(gpa, f);
+    const rec = try gpa.create(Rec);
+    rec.* = .{ .h = h };
+    try h.recs.append(gpa, rec);
+    const Open = struct {
+        // The engine's `gone` while the subscriber is being opened (the
+        // owner is reachable from `Response._park` on), then every end
+        // task that started has run: before the fix that freed the
+        // subscriber, and the rest of the open wrote to freed memory.
+        fn onOpen(sub: *Subscriber) void {
+            Topics._gone(sub);
+            sub.hub.ends.await(io) catch unreachable;
+        }
+    };
+    rec.sub = try h.hub._attach(io, f.out(), .{ .topics = &.{"t"}, .context = rec, .on_open = Open.onOpen, .on_close = Harness.onClose }, null);
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.stats().subscribers);
+    try std.testing.expect(f.released);
 }

@@ -20,6 +20,9 @@ const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
+const slot_table = @import("slot_table.zig");
+const SlotTable = slot_table.SlotTable;
+const spin = slot_table.spin;
 const placement = dusty.placement;
 const webtransport = anole.webtransport;
 const Session = webtransport.Session;
@@ -46,80 +49,14 @@ fn pack(gen: u32, state: State) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
-fn spin(l: *std.atomic.Mutex) void {
-    while (!l.tryLock()) std.atomic.spinLoopHint();
+fn freeWord(gen: u32) u64 {
+    return pack(gen, .free);
 }
 
-/// Slots of one kind on one executor: grown a chunk at a time, never
-/// moved or freed until the engine goes.
+/// Slots of one kind on one executor; also taken from consumer threads, so
+/// the free list is under a lock.
 fn Table(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        const chunk_len = 256;
-        const max_chunks = 4096;
-        const Chunk = [chunk_len]T;
-        comptime {
-            std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-        }
-
-        chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-        nchunks: u32 = 0,
-        free_head: u32 = engine.no_slot,
-        lock: std.atomic.Mutex = .unlocked,
-
-        fn slot(t: *Self, i: u32) ?*T {
-            // `i` may come from a made-up handle: past the table is nothing.
-            if (i / chunk_len >= max_chunks) return null;
-            const c = t.chunks[i / chunk_len].load(.acquire) orelse return null;
-            return &c[i % chunk_len];
-        }
-
-        fn alloc(t: *Self, x: *Exec) !*T {
-            spin(&t.lock);
-            defer t.lock.unlock();
-            if (t.free_head == engine.no_slot) {
-                if (t.nchunks == max_chunks) return error.OutOfMemory;
-                const c = try gpa.create(Chunk);
-                const base = t.nchunks * chunk_len;
-                for (c, 0..) |*s, j| s.* = .{
-                    .word = .init(pack(x.engine.first_gen, .free)),
-                    .exec = x,
-                    .index = @intCast(base + j),
-                    .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-                };
-                t.chunks[t.nchunks].store(c, .release);
-                t.nchunks += 1;
-                t.free_head = base;
-            }
-            const s = t.slot(t.free_head).?;
-            t.free_head = s.next_free;
-            return s;
-        }
-
-        fn free(t: *Self, s: *T) void {
-            spin(&t.lock);
-            defer t.lock.unlock();
-            s.next_free = t.free_head;
-            t.free_head = s.index;
-        }
-
-        fn maxGen(t: *const Self) u32 {
-            var max: u32 = 0;
-            for (t.chunks[0..t.nchunks]) |*cv| {
-                for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-            }
-            return max;
-        }
-
-        fn deinit(t: *Self) void {
-            for (t.chunks[0..t.nchunks]) |*cv| {
-                const c = cv.load(.acquire).?;
-                for (c) |*s| s.clear();
-                gpa.destroy(c);
-            }
-            t.nchunks = 0;
-        }
-    };
+    return SlotTable(T, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.OutOfMemory, .locked = true }, freeWord);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,8 +218,18 @@ pub const StreamSlot = struct {
     sending: std.ArrayList(u8) = .empty,
     sent_off: usize = 0,
     recv_done: bool = false,
-    send_done: bool = false,
-    fin_done: bool = false,
+    send: Send = .open,
+
+    /// The executor's view of the sending half.
+    const Send = enum {
+        /// Bytes (and the end, if asked for) may still go into the stream.
+        open,
+        /// The end went out after every byte.
+        finished,
+        /// Over without the end: reset by us, stopped by the peer, the
+        /// session gone, or no sending half at all (`uni_in`).
+        over,
+    };
 
     fn gen(s: *const StreamSlot) u32 {
         return @intCast(s.word.load(.acquire) >> 32);
@@ -340,8 +287,7 @@ pub const StreamSlot = struct {
         s.stream = null;
         s.sent_off = 0;
         s.recv_done = dir == .uni_out;
-        s.send_done = dir == .uni_in;
-        s.fin_done = false;
+        s.send = if (dir == .uni_in) .over else .open;
     }
 };
 
@@ -355,8 +301,8 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.sessions.deinit();
-        st.streams.deinit();
+        st.sessions.deinit(SessionSlot.clear);
+        st.streams.deinit(StreamSlot.clear);
     }
 };
 
@@ -587,16 +533,20 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
 
     // Released with its end asked for: what was written still goes out
     // first, then the stream is let go.
-    if (released and (st.send_done or !fin)) {
+    const let_go = switch (st.send) {
+        .open => released and !fin,
+        .finished, .over => released,
+    };
+    if (let_go) {
         stream.release();
         st.stream = null;
         st.free();
         progress.* = true;
         return false;
     }
-    if (reset_code) |code| if (!st.send_done) {
+    if (reset_code) |code| if (st.send == .open) {
         stream.reset(code);
-        st.send_done = true;
+        st.send = .over;
         dropOutput(st, if (released) 0 else h);
         progress.* = true;
     };
@@ -607,7 +557,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
     };
 
     // Out.
-    if (!st.send_done) {
+    if (st.send == .open) {
         var wrote: usize = 0;
         var failed = false;
         while (st.sent_off < st.sending.items.len) {
@@ -630,16 +580,15 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         const all_out = st.bytes == 0;
         st.lock.unlock();
         if (writable and !released) postSmall(x, .writable, h);
-        if (!failed and fin and all_out and !st.fin_done) {
+        if (!failed and fin and all_out) {
             stream.closeSend() catch {};
-            st.fin_done = true;
-            st.send_done = true;
+            st.send = .finished;
             progress.* = true;
         }
         const send_err = Stream.Driver.sendError(stream);
-        if (!st.fin_done and (failed or send_err != null)) {
+        if (st.send == .open and (failed or send_err != null)) {
             // Stopped by the peer, or the session went.
-            st.send_done = true;
+            st.send = .over;
             dropOutput(st, if (released) 0 else h);
             if (!released and send_err != null and send_err.? == error.StreamStopped) {
                 postCode(x, .wt_stream_stop, h, stream.stopCode() orelse 0);
@@ -648,17 +597,17 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         }
     }
 
-    if (released) {
-        if (st.send_done) {
+    if (released) switch (st.send) {
+        .finished, .over => {
             stream.release();
             st.stream = null;
             st.free();
             progress.* = true;
             return false;
-        }
+        },
         // Nobody reads it any more.
-        return true;
-    }
+        .open => return true,
+    };
 
     // In: a chunk per round, so one stream does not hold up the others.
     if (!st.recv_done) {

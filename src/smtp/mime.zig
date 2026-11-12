@@ -4,6 +4,7 @@
 //! Every name, value, address and file name is checked for CR, LF and NUL
 //! first, so nothing a caller passes can add a header or an SMTP command.
 const std = @import("std");
+const repeat = @import("testutil.zig").repeat;
 const address = @import("address.zig");
 const encode = @import("core/encode.zig");
 const date = @import("core/date.zig");
@@ -604,19 +605,6 @@ pub fn writeData(c: *const Composed, io: std.Io, w: *Writer) WriteError!void {
 }
 
 const testing = std.testing;
-
-/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    const Storage = struct {
-        const data: [s.len * n]u8 = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [s.len * n]u8 = undefined;
-            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
-            break :blk out;
-        };
-    };
-    return &Storage.data;
-}
 
 fn composeTest(arena: Allocator, msg: Message, defaults: Defaults) !Composed {
     var prng = std.Random.DefaultPrng.init(42);

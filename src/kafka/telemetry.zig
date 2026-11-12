@@ -34,10 +34,6 @@ pub const Telemetry = struct {
             .dead_lettered = try registry.counter("anole_kafka_dead_lettered_total", "Records sent to a dead letter topic.", &.{ "client", "group", "topic" }),
         };
     }
-
-    pub fn deliveredOne(t: *const Telemetry, topic: []const u8) void {
-        t.produced.with(&.{ t.client, topic }).inc();
-    }
     pub fn failedOne(t: *const Telemetry, code: []const u8) void {
         t.produce_errors.with(&.{ t.client, code }).inc();
     }

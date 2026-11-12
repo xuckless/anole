@@ -319,7 +319,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | (127-131) | reserved for storage and mail | | |
 | `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
 | (133-135) | reserved for the console | | |
-| `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
+| `ANOLE_EV_DRAINING` (41) | `anole_event`: the drain started, whatever started it (`anole_server_drain`, the console, a signal under `ANOLE_SERVER_SIGNALS`, a restart's hand-off); once per consumer (queued already when `anole_server_drain` returns), before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
 20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;
@@ -1572,8 +1572,8 @@ programmer error. Input Anole reads after the close is dropped (records
 already posted still come). The connection closes once the peer ends its
 side, or 2 s after this side ended (the queue written, TLS close_notify,
 FIN); writing the queue is bounded by `tcp.write_timeout_ms`. A connection
-idle long enough to have parked (`timeouts.idle_park_ms`) is closed at once
-instead, without waiting for its queue. `ANOLE_EV_NET_CLOSE` is posted once
+idle long enough to have parked (`timeouts.idle_park_ms`) is closed the same
+way, after its queue. `ANOLE_EV_NET_CLOSE` is posted once
 the connection's reading side lets go: one waiting for read credit (a
 consumer that stopped polling) holds it until the consumer polls or
 `timeouts.shutdown_ms` passes. A connection the consumer closed or reset
@@ -1586,12 +1586,11 @@ goodbye, set `"close_on_drain": false` on the listener's `tcp`: its
 connections stay open through the drain until the consumer closes them
 (after `ANOLE_EV_DRAINING`), or `timeouts.shutdown_ms` closes them with
 `ANOLE_NET_CLOSED_DRAIN`, as `node:net`'s `server.close()` leaves its
-sockets. Either way a connection that has parked (no input for
-`timeouts.idle_park_ms`) is closed at drain start. Known gap: a connection whose write side the consumer already
-ended (`ANOLE_NET_F_END`), whose peer then sends nothing, and that read input
-within `timeouts.idle_park_ms` before the drain is not closed by it; it stays
-until the peer sends or ends, `tcp.idle_timeout_ms` or `tcp.lifetime_ms`, or
-`timeouts.shutdown_ms`.
+sockets. Parked connections (no input for `timeouts.idle_park_ms`) are no
+exception either way. A connection whose write
+side the consumer already ended (`ANOLE_NET_F_END`) is closed by the drain
+too: its FIN went already, so the 2 s wait for the peer starts at once (as for
+`ANOLE_NET_CLOSE_GRACEFUL` after `ANOLE_NET_F_END`).
 
 **Read credit.** A connection posts at most `tcp.read_ahead` bytes the
 consumer has not polled yet; the rest waits in the kernel. One fast peer and a

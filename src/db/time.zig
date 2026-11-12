@@ -1,6 +1,7 @@
 //! `anole.db.Time`: a timestamp as every connector hands it over, in JSON
 //! as RFC 3339.
 const std = @import("std");
+const civil = @import("../civil.zig");
 
 /// An instant, in microseconds since 1970-01-01T00:00:00Z: PostgreSQL's
 /// resolution (`timestamptz`, `timestamp` read as UTC), MongoDB's dates
@@ -84,7 +85,7 @@ pub const Time = struct {
         try p.expect('-');
         const day = try p.int(2);
         if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, @intCast(month))) return error.InvalidTime;
-        var secs: i64 = daysFromCivil(year, @intCast(month), @intCast(day)) * std.time.s_per_day;
+        var secs: i64 = civil.daysFromCivil(year, month, day) * std.time.s_per_day;
         var frac: i64 = 0;
         if (p.i < p.s.len) {
             switch (p.s[p.i]) {
@@ -138,7 +139,7 @@ pub const Time = struct {
         const frac: u64 = @intCast(@mod(self.us, std.time.us_per_s));
         const days = @divFloor(secs, std.time.s_per_day);
         const in_day: u64 = @intCast(@mod(secs, std.time.s_per_day));
-        const date = civilFromDays(days);
+        const date = civil.civilFromDays(days);
         if (date.year >= 0 and date.year <= 9999)
             try w.print("{d:0>4}", .{@as(u64, @intCast(date.year))})
         else
@@ -214,33 +215,6 @@ fn daysInMonth(year: i64, month: u8) i64 {
         4, 6, 9, 11 => 30,
         else => 31,
     };
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
-/// `days_from_civil`).
-fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
-    const y = if (month <= 2) year - 1 else year;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const m: i64 = month;
-    const doy = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
-
-const Date = struct { year: i64, month: u8, day: u8 };
-
-/// The inverse (`civil_from_days`).
-fn civilFromDays(days: i64) Date {
-    const z = days + 719468;
-    const era = @divFloor(z, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const day: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const month: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .year = yoe + era * 400 + @intFromBool(month <= 2), .month = month, .day = day };
 }
 
 const testing = std.testing;
