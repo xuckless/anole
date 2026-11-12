@@ -1133,6 +1133,11 @@ pub const Engine = struct {
     /// `ANOLE_EV_DRAINING` when the drain starts, whatever started it
     /// (`anole_server_drain`, the console's drain, a listener failing).
     drain_hook: dusty.DrainHooks.Hook = .{ .callback = onServerDrain },
+    /// `ANOLE_EV_DRAINING` went out: swapped by `onServerDrain` and by
+    /// `drain` before it stops the engine's areas, so whichever comes first
+    /// posts it, and an explicit drain has it in the queue before its area
+    /// drains post anything and before `anole_server_drain` returns.
+    draining_posted: std.atomic.Value(bool) = .init(false),
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
     thread: ?std.Thread = null,
@@ -1962,9 +1967,11 @@ pub const Engine = struct {
         // on its own.
         const app = e.enter() orelse return;
         defer e.leave();
-        // The first drain call stops the engine's own areas; the consumers
-        // hear of the drain from `onServerDrain`, as for any other start.
+        // The first drain call tells the consumers (unless the server's hook
+        // did already) and stops the engine's own areas; a drain started
+        // elsewhere reaches the consumers through `onServerDrain` alone.
         if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
+            e.notifyDraining();
             kafka.draining(e);
             jobs.draining(e);
             webhooks.draining(e);
@@ -1975,15 +1982,23 @@ pub const Engine = struct {
         app.stop();
     }
 
-    /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once: long-poll,
-    /// SSE and similar consumers finish up before the drain's deadline.
-    /// A drain hook: runs once per drain, on the task that started it,
-    /// before the server closes sockets or cuts requests (and before the
-    /// hooks registered later, the connections'). Never waits: the post
-    /// goes to the overflow list or the ring without blocking.
+    /// A drain hook: `ANOLE_EV_DRAINING` for a drain started anywhere (if
+    /// `drain` has not posted it already). Runs once per drain, on the task
+    /// that started it, before the server closes sockets or cuts requests
+    /// (and before the hooks registered later, the connections'). Never
+    /// waits.
     fn onServerDrain(hook: *dusty.DrainHooks.Hook) void {
         // SAFETY: the only hook registered with this callback is `Engine.drain_hook`.
         const e: *Engine = @alignCast(@fieldParentPtr("drain_hook", hook));
+        e.notifyDraining();
+    }
+
+    /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once
+    /// (`draining_posted`): long-poll, SSE and similar consumers finish up
+    /// before the drain's deadline. Never waits: the post goes to the
+    /// overflow list or the ring without blocking.
+    fn notifyDraining(e: *Engine) void {
+        if (e.draining_posted.swap(true, .acq_rel)) return;
         for (e.consumers.items) |c| {
             if (c.execs.items.len == 0) continue;
             c.execs.items[0].postEvent(.draining, 0);

@@ -2576,6 +2576,32 @@ test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain 
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
+test "capi engine: anole_server_drain has posted ANOLE_EV_DRAINING when it returns (#201)" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    try e.drain();
+    // No wait: it is in the queue already, the first record.
+    var buf: [4096]u8 align(8) = undefined;
+    var need: u32 = 0;
+    const n = try engine.poll(c, &buf, false, &need);
+    try std.testing.expect(n >= @sizeOf(abi.Event));
+    // SAFETY: `poll` writes whole records into `buf` (8-aligned), the first at 0.
+    const ev: *const abi.Event = @ptrCast(@alignCast(&buf[0]));
+    try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.draining)), ev.type);
+    var counts: [64]u32 = @splat(0);
+    var off: usize = 0;
+    while (off < n) {
+        // SAFETY: as above, every record starts 8-aligned at `off`.
+        const r: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+        if (r.type < counts.len) counts[r.type] += 1;
+        off += r.len;
+    }
+    if (counts[@backingInt(abi.EventType.stopped)] == 0) try drainCounts(c, &counts, 1);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
 test "capi engine: a drain the console or a signal starts (App.stop, not anole_server_drain) posts ANOLE_EV_DRAINING once (#201)" {
     const e, const c = try ringEngine(8);
     defer e.destroy();
