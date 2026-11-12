@@ -101,6 +101,10 @@ breaking changes are listed anyway.
   only after the drain's wait, and a parked connection gets the
   listener's drain handling (`drain`, `close_on_drain: false`, or the
   default close after its queue) like any other. Tests now cover it.
+- **Docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
+  that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
+  and that WRITABLE ends a wait on a finished WebTransport stream only
+  (#189).
 
 ### Fixed
 
@@ -108,7 +112,9 @@ breaking changes are listed anyway.
   from `anole_server_drain`; a drain the console started, a signal (with
   `ANOLE_SERVER_SIGNALS`), a restart's hand-off or a failing listener
   posted none (#201). It is now posted when the server's drain starts,
-  whatever started it, once per consumer.
+  whatever started it, once per consumer; after `anole_server_drain` it
+  is in the queue when the call returns, before anything the drain of
+  jobs, Kafka or webhooks posts.
 - **HTTP/3**: a request whose `host` field named another authority
   than its `:authority` was served, with the `host` value as the host
   (#202). It is now refused with 400, as over HTTP/2 (RFC 9114 §4.3.1);
@@ -138,6 +144,20 @@ breaking changes are listed anyway.
   after the hub's reader had freed it on a reconnect (#198). The reader
   now waits for the send in flight and the keep-alive before it frees
   the connection.
+- **watch (PostgreSQL, Redis Pub/Sub)**: when a name's last watch left
+  and a new watch of it started at about the same time, the
+  UNLISTEN/UNSUBSCRIBE could be written after the new LISTEN/SUBSCRIBE,
+  leaving the name unsubscribed while watched until the next reconnect.
+  The verbs for a name are now written in the order they were decided.
+  A Redis hub that opens its connection after the names changed sends
+  every SUBSCRIBE and PSUBSCRIBE before any UNSUBSCRIBE: an UNSUBSCRIBE
+  that left it subscribed to nothing for a moment ended the connection,
+  and the watches saw a reconnect and a gap.
+- **SSE**: a subscriber whose end task could not be started after a
+  failed write or after its end went out (HTTP/1.1, where the peer's
+  leaving is not reported then) was never ended: it and its connection
+  stayed until the server stopped. The hub's periodic tick now starts any end
+  that is due and not running.
 - **SSE**: `Subscriber.close()` on a subscriber whose write had just
   failed queued an end and claimed a sender for the dead stream (#211).
   In the fallback (S3) nothing ran that sender, so ending the subscriber
@@ -173,10 +193,6 @@ breaking changes are listed anyway.
 - **gRPC client, NATS URLs**: a `%` followed by a sign and a hex digit
   (`%+f`) was decoded as a byte instead of staying text; both now share
   the core's percent-decoder, which accepts hex digits only (#217).
-- **docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
-  that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
-  and that WRITABLE ends a wait on a finished WebTransport stream only
-  (#189).
 
 ## 0.5.3 (2026-11-05)
 
