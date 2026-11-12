@@ -116,7 +116,12 @@ pub fn Hub(comptime T: type) type {
         /// Adds `w` to each name, subscribing to the new ones.
         pub fn add(self: *Self, w: *Watch, names: []const []const u8, kind: Kind) !void {
             for (names) |name| {
-                var send = false;
+                // Held from the decision to the write: verbs for one name go
+                // out in the order they were decided (an UNLISTEN decided
+                // first is never written after a LISTEN decided second).
+                self.write_mutex.lockUncancelable(self.io);
+                defer self.write_mutex.unlock(self.io);
+                var conn: ?*T.Conn = null;
                 {
                     self.mutex.lockUncancelable(self.io);
                     defer self.mutex.unlock(self.io);
@@ -134,11 +139,14 @@ pub fn Hub(comptime T: type) type {
                         } };
                         entry.key_ptr.* = e.name;
                         entry.value_ptr.* = e;
-                        send = self.state == .ready;
+                        conn = self.readyConn();
                     }
                     try entry.value_ptr.*.watches.append(self.gpa, w);
                 }
-                if (send) self.sendVerb(true, kind, name);
+                if (conn) |c| {
+                    testAfterDecide(self);
+                    self.sendVerbLocked(c, true, kind, name);
+                }
             }
         }
 
@@ -146,7 +154,10 @@ pub fn Hub(comptime T: type) type {
         /// none.
         pub fn remove(self: *Self, w: *Watch, names: []const []const u8, kind: Kind) void {
             for (names) |name| {
-                var send = false;
+                // As in `add`: decided and written under `write_mutex`.
+                self.write_mutex.lockUncancelable(self.io);
+                defer self.write_mutex.unlock(self.io);
+                var conn: ?*T.Conn = null;
                 {
                     self.mutex.lockUncancelable(self.io);
                     defer self.mutex.unlock(self.io);
@@ -161,17 +172,28 @@ pub fn Hub(comptime T: type) type {
                         e.watches.deinit(self.gpa);
                         self.gpa.free(e.name);
                         self.gpa.destroy(e);
-                        send = self.state == .ready;
+                        conn = self.readyConn();
                     }
                 }
-                if (send) self.sendVerb(false, kind, name);
+                if (conn) |c| {
+                    testAfterDecide(self);
+                    self.sendVerbLocked(c, false, kind, name);
+                }
             }
         }
 
-        fn sendVerb(self: *Self, on: bool, kind: Kind, name: []const u8) void {
-            self.write_mutex.lockUncancelable(self.io);
-            defer self.write_mutex.unlock(self.io);
-            const conn = self.current() orelse return;
+        /// Under `mutex`: the published connection, if any. Read with
+        /// `write_mutex` held too, it stays alive until that is unlocked
+        /// (`retire` takes `write_mutex` before it unpublishes one).
+        fn readyConn(self: *Self) ?*T.Conn {
+            return switch (self.state) {
+                .ready => |c| c,
+                else => null,
+            };
+        }
+
+        /// Under `write_mutex`, with `conn` read under it (`readyConn`).
+        fn sendVerbLocked(self: *Self, conn: *T.Conn, on: bool, kind: Kind, name: []const u8) void {
             testBeforeSend(self);
             T.send(conn, self.gpa, self.io, on, kind, name) catch |err| {
                 log.debug(T.log_name ++ ": {s} {s} failed: {t}", .{ if (on) T.verb else "UN" ++ T.verb, name, err });
@@ -257,27 +279,37 @@ pub fn Hub(comptime T: type) type {
             for (&names.values, &dialed.values) |*n, *set| n.* = set.keys();
             const conn = try T.dial(self.client, arena, names);
             // Names added or removed while it dialed are subscribed or
-            // unsubscribed now; the rest already are.
+            // unsubscribed now; the rest already are. `write_mutex` is held
+            // from publishing the connection until they are written, so an
+            // `add` or `remove` deciding after the publish writes after them.
+            // Every subscribe goes before any unsubscribe, across the kinds:
+            // Redis ends a Pub/Sub connection whose UNSUBSCRIBE leaves it
+            // subscribed to nothing, even with a PSUBSCRIBE about to follow.
             const Change = struct { on: bool, kind: Kind, name: []const u8 };
             var changes: std.ArrayList(Change) = .empty;
+            self.write_mutex.lockUncancelable(self.io);
+            defer self.write_mutex.unlock(self.io);
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
                 self.state = .{ .ready = conn };
                 for (std.enums.values(Kind)) |kind| {
-                    const map = self.entries.getPtr(kind);
                     const set = dialed.getPtr(kind);
-                    var it = map.keyIterator();
+                    var it = self.entries.getPtr(kind).keyIterator();
                     while (it.next()) |k| if (!set.contains(k.*)) {
                         const name = arena.dupe(u8, k.*) catch continue;
                         changes.append(arena, .{ .on = true, .kind = kind, .name = name }) catch {};
                     };
-                    for (set.keys()) |k| if (!map.contains(k)) {
+                }
+                for (std.enums.values(Kind)) |kind| {
+                    const map = self.entries.getPtr(kind);
+                    for (dialed.getPtr(kind).keys()) |k| if (!map.contains(k)) {
                         changes.append(arena, .{ .on = false, .kind = kind, .name = k }) catch {};
                     };
                 }
             }
-            for (changes.items) |c| self.sendVerb(c.on, c.kind, c.name);
+            if (changes.items.len > 0) testAfterDecide(self);
+            for (changes.items) |c| self.sendVerbLocked(conn, c.on, c.kind, c.name);
             return conn;
         }
 
@@ -306,17 +338,6 @@ pub fn Hub(comptime T: type) type {
             return idle;
         }
 
-        /// The published connection; under `write_mutex`, it stays alive
-        /// until that is unlocked.
-        fn current(self: *Self) ?*T.Conn {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            return switch (self.state) {
-                .ready => |c| c,
-                else => null,
-            };
-        }
-
         fn nowMs(self: *Self) i64 {
             return std.Io.Clock.awake.now(self.io).toMilliseconds();
         }
@@ -333,6 +354,10 @@ pub fn Hub(comptime T: type) type {
             while (true) {
                 _ = arena_state.reset(.retain_capacity);
                 const msg = T.next(conn, arena_state.allocator()) catch |err| {
+                    // The reader's cancel (`destroy`) stays pending for the
+                    // waits after this (`retire`, `pause`).
+                    const e: anyerror = err;
+                    if (e == error.Canceled) self.io.recancel();
                     if (!self.stopping.load(.acquire)) log.debug(T.log_name ++ ": read failed: {t}", .{err});
                     return;
                 } orelse return;
@@ -433,6 +458,17 @@ pub fn Hub(comptime T: type) type {
         fn testBeforeSend(hub: *Self) void {
             if (comptime !builtin.is_test) return;
             const hook = test_before_send.swap(null, .acq_rel) orelse return;
+            hook(hub);
+        }
+
+        /// Tests: runs once, after a subscribe or unsubscribe verb was
+        /// decided (in `add`, `remove`, or `open`'s change list) and before
+        /// it is written. Test builds only.
+        pub var test_after_decide: if (builtin.is_test) std.atomic.Value(?*const fn (*Self) void) else void = if (builtin.is_test) .init(null) else {};
+
+        fn testAfterDecide(hub: *Self) void {
+            if (comptime !builtin.is_test) return;
+            const hook = test_after_decide.swap(null, .acq_rel) orelse return;
             hook(hub);
         }
 
@@ -593,7 +629,9 @@ test "watch hub: names added or removed while the connection opens are subscribe
     defer tw.deinit();
     try h.add(tw.w, &.{"a"}, .channel);
     defer h.remove(tw.w, &.{"b"}, .pattern);
-    // While the reader dials with "a": "a" goes, the pattern "b" comes.
+    // While the reader dials with "a": "a" goes, the pattern "b" comes. The
+    // subscribe goes first, across the kinds (Redis ends a connection an
+    // UNSUBSCRIBE leaves with nothing).
     const Dial = struct {
         var hub: *H = undefined;
         var w: *Watch = undefined;
@@ -608,7 +646,7 @@ test "watch hub: names added or removed while the connection opens are subscribe
     F.on_dial = &Dial.hook;
     try h.ensureRunning();
     client.reading[0].waitUncancelable(io);
-    try std.testing.expectEqualStrings("-a +p:b ", client.sent.items);
+    try std.testing.expectEqualStrings("+p:b -a ", client.sent.items);
 }
 
 test "watch hub: the reader ends once no watch is left, and the next watch starts it again (#216)" {
@@ -645,6 +683,78 @@ test "watch hub: the reader ends once no watch is left, and the next watch start
     try h.ensureRunning();
     client.reading[0].waitUncancelable(io);
     try std.testing.expect(h.state == .ready);
+}
+
+/// A LISTEN of "x" decided on another task while an UNLISTEN of "x" was
+/// decided but not yet written: the verbs go out in the order they were
+/// decided, so "x", watched again, ends subscribed.
+fn raceVerbs(comptime in_dial: bool) !void {
+    const zio = @import("zio");
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const F = Fake(null);
+    const H = Hub(F);
+    F.reset();
+    defer F.reset();
+    var client: F.Client = .{ .gpa = gpa, .io = io };
+    defer client.sent.deinit(gpa);
+    const h = try H.create(&client);
+    defer h.destroy();
+    const tw = try TestWatch.init(gpa, io);
+    defer tw.deinit();
+    const Race = struct {
+        var w: ?*Watch = null;
+        var hub_ptr: ?*H = null;
+        var group: std.Io.Group = .init;
+        var entered: std.Io.Event = .unset;
+        fn adder(hub: *H) std.Io.Cancelable!void {
+            entered.set(hub.io);
+            hub.add(w.?, &.{"x"}, .channel) catch unreachable;
+        }
+        /// After the UNLISTEN of "x" was decided: another task adds "x"
+        /// again, and this one goes on once that task began.
+        fn afterDecide(hub: *H) void {
+            placement.concurrent(&group, hub.io, .local, adder, .{hub}) catch unreachable;
+            entered.waitUncancelable(hub.io);
+        }
+        fn onDial() void {
+            F.on_dial = null;
+            hub_ptr.?.remove(w.?, &.{"x"}, .channel);
+        }
+    };
+    Race.w = tw.w;
+    Race.hub_ptr = h;
+    Race.group = .init;
+    Race.entered = .unset;
+    try h.add(tw.w, &.{"x"}, .channel);
+    defer h.remove(tw.w, &.{"x"}, .channel);
+    H.test_after_decide.store(&Race.afterDecide, .release);
+    defer H.test_after_decide.store(null, .release);
+    if (in_dial) {
+        // "x" goes while the reader dials with it: `open` queues its
+        // UNLISTEN.
+        F.on_dial = &Race.onDial;
+        try h.ensureRunning();
+        client.reading[0].waitUncancelable(io);
+    } else {
+        try h.ensureRunning();
+        client.reading[0].waitUncancelable(io);
+        h.remove(tw.w, &.{"x"}, .channel);
+    }
+    try Race.group.await(io);
+    try std.testing.expectEqualStrings("-x +x ", client.sent.items);
+}
+
+test "watch hub: an UNLISTEN decided before a LISTEN of the same name is written before it" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    try raceVerbs(false);
+}
+
+test "watch hub: an UNLISTEN queued while the connection opened is written before a LISTEN decided after it opened" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    try raceVerbs(true);
 }
 
 /// The #198 race: a send (or ping) has read the connection, then it is lost
