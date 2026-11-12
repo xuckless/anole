@@ -1841,10 +1841,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// out. Locked.
             fn endConnect(conn: *Conn, id: i64) bool {
                 const s = conn.streams.get(id) orelse return true;
-                if (s.ended) return true;
-                if (!s.submitted) return false;
+                if (s.send.hasEnded()) return true;
+                if (!s.send.isSubmitted()) return false;
                 s.trailer_nv = &.{};
-                s.ended = true;
+                s.send = .ended;
                 s.resume_();
                 s.unhold();
                 conn.kick();
@@ -2593,8 +2593,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
             trailer_nv: []h.nghttp3_nv = &.{},
-            submitted: bool = false,
-            ended: bool = false,
+            /// The response's send side (`Send`). Locked.
+            send: Send = .none,
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
             /// A writer found no room under the cap: the next bytes nghttp3
@@ -2641,6 +2641,52 @@ pub fn Endpoint(comptime Ctx: type) type {
                 /// What arrives is read and dropped (lingering, or past it).
                 fn dropping(r: Recv) bool {
                     return @backingInt(r) >= @backingInt(Recv.lingering);
+                }
+            };
+
+            /// The response's send side:
+            ///
+            ///   none -> submitted               the head went to nghttp3
+            ///                                   (`StreamSink.submit`)
+            ///   submitted -> ended              the body's end is queued
+            ///                                   (`StreamSink.end`, `endConnect`)
+            ///   none -> ended_unsubmitted       `end` with no head out yet:
+            ///                                   ended, then the head is
+            ///                                   submitted, or it never is
+            ///                                   (the stream was reset, the
+            ///                                   connection gone, nghttp3
+            ///                                   refused it)
+            ///   ended_unsubmitted -> ended      that submit went through
+            ///
+            /// All four are real, so this is the old pair of flags named:
+            /// bit 0 is "ended", bit 1 "submitted", and each test is one
+            /// instruction, as a flag's was.
+            const Send = enum(u8) {
+                none = 0,
+                ended_unsubmitted = 1,
+                submitted = 2,
+                ended = 3,
+
+                /// The head went to nghttp3.
+                fn isSubmitted(t: Send) bool {
+                    return @backingInt(t) >= @backingInt(Send.submitted);
+                }
+
+                /// The response ended (`end`), its head out or not.
+                fn hasEnded(t: Send) bool {
+                    return @backingInt(t) & 1 != 0;
+                }
+
+                /// After the head's submit: none -> submitted,
+                /// ended_unsubmitted -> ended (bit 1 set, an `or`).
+                fn submit(t: Send) Send {
+                    return @fromBackingInt(@intCast(@backingInt(t) | @backingInt(Send.submitted)));
+                }
+
+                /// At `end`: none -> ended_unsubmitted, submitted -> ended
+                /// (bit 0 set).
+                fn end(t: Send) Send {
+                    return @fromBackingInt(@intCast(@backingInt(t) | @backingInt(Send.ended_unsubmitted)));
                 }
             };
 
@@ -2726,7 +2772,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// ended: cancel the handler, so a wait it is in returns
             /// `error.Canceled`. Locked.
             fn cancelHandler(s: *Stream) void {
-                if (s.ended) return;
+                if (s.send.hasEnded()) return;
                 if (s.task) |t| placement.cancelTask(t);
             }
 
@@ -3391,7 +3437,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer conn.unlock();
                 // Let go before it ended (the owner gave up on a stream the
                 // peer still has open): reset it, so QUIC closes it.
-                if (!s.ended and s.refs.quic) {
+                if (!s.send.hasEnded() and s.refs.quic) {
                     s.reset = true;
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
@@ -3620,7 +3666,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn submit(self: *StreamSink) std.Io.Writer.Error!void {
                 const s = self.stream;
                 const conn = s.conn;
-                if (s.submitted) return;
+                if (s.send.isSubmitted()) return;
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
                 const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
                 const reader: h.nghttp3_data_reader = .{ .read_data = readData };
@@ -3629,7 +3675,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     log.debug("nghttp3_conn_submit_response: {s}", .{h.nghttp3_strerror(rv)});
                     return self.fail(error.ConnectionResetByPeer);
                 }
-                s.submitted = true;
+                s.send = s.send.submit();
                 conn.kick();
             }
 
@@ -3783,7 +3829,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 s.trailer_nv = trailer_nv.items;
-                s.ended = true;
+                s.send = s.send.end();
                 try self.submit();
                 s.resume_();
                 s.unhold();
@@ -4000,7 +4046,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.allSent() and s.recv == .done)) {
+                    if (!(s.send.hasEnded() and s.allSent() and s.recv == .done)) {
                         s.reset = true;
                         s.cancelHandler();
                     }
@@ -4279,7 +4325,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn readData(_: ?*h.nghttp3_conn, stream_id: i64, vec: [*c]h.nghttp3_vec, veccnt: usize, pflags: [*c]u32, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) h.nghttp3_ssize {
             const s = streamOfUser(sud) orelse return h.NGHTTP3_ERR_CALLBACK_FAILURE;
             if (s.out.allSent()) {
-                if (!s.ended or !s.allSent()) {
+                if (!s.send.hasEnded() or !s.allSent()) {
                     s.deferred = true;
                     return h.NGHTTP3_ERR_WOULDBLOCK;
                 }
@@ -4299,7 +4345,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.wants_room = false;
                 s.tx.notify(s.conn.ep.io);
             }
-            if (s.ended and s.allSent()) {
+            if (s.send.hasEnded() and s.allSent()) {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
