@@ -227,4 +227,6 @@ test {
     _ = @import("core/push_list_test.zig");
     // The HTTP/2 engine's wakes, in zio's known waiter order.
     if (@import("build_options").http2) _ = @import("h2_wake_test.zig");
+    // The new HTTP/2 engine's lock-free path, on one executor.
+    if (@import("build_options").http2) _ = @import("h2_engine_zio_test.zig");
 }

@@ -1029,6 +1029,35 @@ test "h2 conn: consumed batches WINDOW_UPDATE" {
     for (try t.drain()) |f| try expect(f.id == 0);
 }
 
+test "h2 conn: raiseWindow sends the difference and moves recv_window" {
+    const t = try ready(.{});
+    defer t.destroy();
+    t.rec.consume = false;
+    t.rec.record = false;
+    try t.feed(try t.headers(1, &post, false));
+    const before = t.stream(1).recv_window;
+    try t.c.raiseWindow(t.stream(1), 1000);
+    const out = try t.drain();
+    try expectFrames(out, &.{.{ .type = .window_update, .id = 1 }});
+    try expectEqual(1000, out[0].inc);
+    try expectEqual(before + 1000, t.stream(1).recv_window);
+    // The peer may now send the old window and the raise, unconsumed,
+    // without a FLOW_CONTROL_ERROR.
+    const chunk: [16384]u8 = @splat(7);
+    var left: usize = @intCast(before + 1000);
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        try t.feed(try t.data(1, chunk[0..n], false));
+        left -= n;
+    }
+    try expectFrames(try t.drain(), &.{});
+    try expectEqual(0, t.stream(1).recv_window);
+    // Once the peer's half ends there is nothing to raise.
+    try t.feed(try t.data(1, "", true));
+    try t.c.raiseWindow(t.stream(1), 1000);
+    try expectFrames(try t.drain(), &.{});
+}
+
 test "h2 conn: DATA cut to windows and max_frame_size" {
     const t = try ready(.{});
     defer t.destroy();

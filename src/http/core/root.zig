@@ -182,6 +182,10 @@ pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 /// Tests only: the HTTP/2 engine, for its test hooks (`test_before_*`),
 /// which anole's tests on the real zio set (src/http/h2_wake_test.zig).
 pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
+/// Tests only: the HTTP/2 codecs, protocol core and the engine on them
+/// (h2/server.zig), for anole's tests on the real zio
+/// (src/http/h2_engine_zio_test.zig).
+pub const h2_core_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("h2/root.zig") else struct {};
 
 // Client
 pub const Client = @import("client.zig").Client;

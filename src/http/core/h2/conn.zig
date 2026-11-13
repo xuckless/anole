@@ -1217,6 +1217,23 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             };
         }
 
+        /// Raises `s`'s receive window by `by`: a WINDOW_UPDATE for it now,
+        /// so the peer may send that much more before our next credit
+        /// (nghttp2_session_set_local_window_size on one stream, which
+        /// today's engine raises a body's window with as its handler keeps
+        /// reading; `Http2.stream_window_reading`). A stream whose peer half
+        /// ended, or a raise past 2^31-1, is left alone. The WINDOW_UPDATE
+        /// batching stays on the initial window (`due`): a raised stream is
+        /// credited at the same steps.
+        pub fn raiseWindow(c: *Self, s: *Stream, by: u31) Allocator.Error!void {
+            c.enter();
+            defer c.leave();
+            if (by == 0 or !s.canRecv()) return;
+            if (@as(i64, s.recv_window) + s.recv_unacked + by > frame.max_window_size) return;
+            try c.queueWindowUpdate(s.id, by);
+            s.recv_window += by;
+        }
+
         /// The response head: `:status` then `hdrs`, HEADERS split into
         /// CONTINUATIONs at the peer's SETTINGS_MAX_FRAME_SIZE, encoded now.
         /// With `end_stream` the stream may close (and `s` go) before this
