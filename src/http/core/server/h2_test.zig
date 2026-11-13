@@ -2,8 +2,6 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! HTTP/2 engine tests: a the core server with cleartext HTTP/2 (prior
-//! knowledge) on loopback, driven by a minimal nghttp2 client.
 //! HTTP/2 engine behaviour tests: a core server with cleartext HTTP/2
 //! (prior knowledge) on loopback, driven by a minimal nghttp2 client.
 //! Everything here is observable on the wire (status, bytes, frames, flow
@@ -35,11 +33,12 @@ test {
     _ = @import("h2_nghttp2_test.zig");
 }
 
-/// A skipped probe test says so: a missing probe is a gap to close.
-fn lacks(comptime E: type, comptime probe: []const u8) bool {
-    if (@hasDecl(E.mod, probe)) return false;
+/// A skipped probe test says so: a missing probe is a gap to close. The
+/// caller checks `@hasDecl` at comptime so the rest of the test body is not
+/// analysed for an engine without the probe.
+fn skipLacking(comptime probe: []const u8) error{SkipZigTest} {
     std.debug.print("skip: engine lacks {s}\n", .{probe});
-    return true;
+    return error.SkipZigTest;
 }
 
 pub fn Behaviour(comptime e: harness.Engine) type {
@@ -714,7 +713,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a handler reading before its small body arrives raises no window" {
-            if (lacks(E, "test_window")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_window")) return skipLacking("test_window");
             const io = std.testing.io;
             var fx: Fixture = undefined;
             try fx.start(io);
@@ -744,7 +743,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a body that fits the window by its content-length is never raised" {
-            if (lacks(E, "test_window")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_window")) return skipLacking("test_window");
             const io = std.testing.io;
             var fx: Fixture = undefined;
             try fx.start(io);
@@ -774,7 +773,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a long body of unknown length raises its window in steps, 256 KiB then 1 MiB" {
-            if (lacks(E, "test_window")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_window")) return skipLacking("test_window");
             const io = std.testing.io;
             var fx: Fixture = undefined;
             try fx.start(io);
@@ -799,7 +798,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a handler that reads each piece of a long body as it comes still gets its window raised" {
-            if (lacks(E, "test_window")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_window")) return skipLacking("test_window");
             // Such a handler gives the window back at each half (WINDOW_UPDATE),
             // so the window never runs out: the raise goes by what the peer sent.
             const io = std.testing.io;
@@ -900,7 +899,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to 16" {
-            if (lacks(E, "test_trim_epoch")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_trim_epoch")) return skipLacking("test_trim_epoch");
             const io = std.testing.io;
             var fx: Fixture = undefined;
             try fx.start(io);
@@ -1184,7 +1183,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a drain ends with a clean close when the peer's last frames are unread" {
-            if (lacks(E, "test_before_fill")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_before_fill")) return skipLacking("test_before_fill");
             // Windows: not supported, not pending. The probes are POSIX ioctl and
             // getsockopt through libc; the drain code is the same everywhere.
             if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
@@ -1308,7 +1307,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a drain waits for a response that is taken from the session but not yet written" {
-            if (lacks(E, "test_before_flush")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_before_flush")) return skipLacking("test_before_flush");
             // nghttp2 closes a stream when the writer takes its last frame, before
             // the write. The stream's count in the in-flight requests must last
             // until that write is done, or the drain sees zero and cancels the
@@ -1407,7 +1406,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a client that half-closes still gets the responses in flight" {
-            if (lacks(E, "test_after_peer_end")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_after_peer_end")) return skipLacking("test_after_peer_end");
             const io = std.testing.io;
             var fx: Fixture = undefined;
             try fx.start(io);
@@ -1777,7 +1776,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: the raised body windows of a connection share one budget" {
-            if (lacks(E, "test_window")) return error.SkipZigTest;
+            if (comptime !@hasDecl(E.mod, "test_window")) return skipLacking("test_window");
             const io = std.testing.io;
             var live: LiveAllocator = .{ .inner = std.testing.allocator };
             var server = E.Server(void).init(live.allocator(), io, .{

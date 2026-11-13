@@ -2,8 +2,6 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! HTTP/2 engine tests: a the core server with cleartext HTTP/2 (prior
-//! knowledge) on loopback, driven by a minimal nghttp2 client.
 //! HTTP/2 tests tied to the nghttp2 engine: its reader/writer task model
 //! (writer rounds and wakes, inline writes) and its body queue
 //! (arena/heap/block allocations, queue length). They go with the engine
