@@ -2,9 +2,8 @@
 //! translated from nghttp2 where noted (see LICENSE.nghttp2 and
 //! THIRD_PARTY_NOTICES): HPACK, frames, request field checks, the flood
 //! limits, the stream state, and the sans-IO connection core (conn.zig) with
-//! its output queue (out.zig), and the server engine on them (server.zig).
-//! The server does not use them yet: its engine is still nghttp2
-//! (src/http/core/server/h2_nghttp2.zig).
+//! its output queue (out.zig), and the server engine on them (server.zig),
+//! which serves the server's HTTP/2. The client is still on nghttp2 (M5).
 
 const std = @import("std");
 

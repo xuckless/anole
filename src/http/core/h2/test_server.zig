@@ -1,6 +1,5 @@
-//! Tests only: a server's connections served by the engine in server.zig,
-//! which `Server.run` does not pick yet (it still runs the nghttp2 engine
-//! until the switch). A loopback listener whose accept loop hands each
+//! Tests only: a server's connections served by the engine in server.zig
+//! (the one `Server.run` picks) without `Server.run`. A loopback listener whose accept loop hands each
 //! connection, as HTTP/2 with prior knowledge, to `Engine(Ctx).serve`, on
 //! the runtime's executors in turn, so the suites with their own clients
 //! (websocket/h2_test.zig, grpc/server_test.zig) can run on the engine.

@@ -1,6 +1,6 @@
 //! A request and its response built over a body slice and a sink, for an
 //! engine with no connection: `anole.testing`, and the Lambda adapter. The
-//! shape is the HTTP/2 engine's stream setup (src/http/core/server/h2_nghttp2.zig),
+//! shape is the HTTP/2 engine's stream setup (src/http/core/h2/server.zig),
 //! without the stream.
 
 const std = @import("std");

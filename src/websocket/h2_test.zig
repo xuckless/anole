@@ -1087,7 +1087,8 @@ test "WebSocket over HTTP/2: a message from another connection's task goes out w
 
 // ---------------------------------------------------------------------------
 // The same client against the HTTP/2 engine on Anole's own protocol core
-// (h2/server.zig), which `Server.run` does not pick yet.
+// (h2/server.zig) served without `Server.run` (h2/test_server.zig); the
+// tests above reach it through `Server.run`.
 
 const Serving = dusty.h2_core_for_tests.test_server.Serving(void);
 
