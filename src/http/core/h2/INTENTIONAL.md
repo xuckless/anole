@@ -202,3 +202,23 @@ side's answers would depend on when its writer ran.
    invariance found it; conn_test.zig "a DATA frame past the window is a
    FLOW_CONTROL_ERROR however the reads cut it"). Accepted when Conn ends
    with FLOW_CONTROL_ERROR, nghttp2 doesn't, and the input was cut.
+
+## The server engine (server.zig against server/h2_nghttp2.zig)
+
+Not part of the differential tests: what the engine does differently from
+the nghttp2 engine it replaces.
+
+1. **A tunnel's window is never below `stream_window`.** An extended
+   CONNECT (RFC 8441) reads at `Http2.tunnel_window`: the nghttp2 engine
+   set its local window to that (`setTunnelWindow`), shrinking it when
+   `tunnel_window` was the smaller. Conn has no way to shrink a window it
+   has granted (a WINDOW_UPDATE only adds), so a smaller `tunnel_window` is
+   left at `stream_window`; the only effect is the peer's pacing on that
+   stream. Both defaults (128 KiB over 64 KiB) raise it.
+2. **A tunnel's or a parked response's send cap counts blocks.** Their
+   sends are copied into 16 KiB blocks, cut into DATA parts at each kick
+   (at most 16 cuts a block); the cap (`max_pending`, 1 MiB for a
+   WebSocket) counts a block closed for its cuts as full, so many tiny
+   kicked sends wait sooner than on the nghttp2 engine's byte-counted
+   outbox, and never hold more than about the cap in blocks. A message is
+   still always taken when nothing is queued.

@@ -14,6 +14,8 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const DeadlineReader = @import("../server/test_socket.zig").DeadlineReader;
 const placement = @import("../placement.zig");
+const Detached = @import("../detach.zig").Detached;
+const Parked = @import("../parked.zig").Parked;
 const wait = @import("anole_test_wait");
 
 const testing = std.testing;
@@ -74,6 +76,8 @@ const Client = struct {
     peer_initial: i64 = 65535,
     conn_window: i64 = 65535,
     settings_seen: bool = false,
+    /// The server's SETTINGS_ENABLE_CONNECT_PROTOCOL, if it sent one.
+    connect_protocol: ?u32 = null,
     ping_acks: u32 = 0,
     goaway: ?ErrorCode = null,
     /// WINDOW_UPDATEs for what arrives, as it arrives.
@@ -212,6 +216,7 @@ const Client = struct {
                 while (i + 6 <= payload.len) : (i += 6) {
                     const sid = std.mem.readInt(u16, payload[i..][0..2], .big);
                     const v = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
+                    if (sid == @backingInt(frame.SettingId.enable_connect_protocol)) c.connect_protocol = v;
                     if (sid == @backingInt(frame.SettingId.initial_window_size)) {
                         const delta = @as(i64, v) - c.peer_initial;
                         c.peer_initial = v;
@@ -280,6 +285,14 @@ const Client = struct {
         try c.frameOut(.ping, 0, 0, &data);
     }
 
+    /// SETTINGS_INITIAL_WINDOW_SIZE, not flushed.
+    fn settingsWindow(c: *Client, v: u31) !void {
+        var b: [6]u8 = undefined;
+        std.mem.writeInt(u16, b[0..2], @backingInt(frame.SettingId.initial_window_size), .big);
+        std.mem.writeInt(u32, b[2..6], v, .big);
+        try c.frameOut(.settings, 0, 0, &b);
+    }
+
     fn windowUpdate(c: *Client, id: u31, inc: u31) !void {
         var b: [4]u8 = undefined;
         std.mem.writeInt(u32, &b, inc, .big);
@@ -307,6 +320,8 @@ const Fixture = struct {
     listener: config.Listener,
     future: std.Io.Future(anyerror!void),
     client: Client,
+    /// `serve` returned.
+    served: std.atomic.Value(bool),
 
     fn start(fx: *Fixture, gpa: Allocator, io: std.Io, cfg: config.ServerConfig) !void {
         fx.io = io;
@@ -318,12 +333,14 @@ const Fixture = struct {
         try fx.connection.initPlain(gpa, io, fx.server_end);
         fx.connection.write_pool = &fx.server.request_buffers;
         fx.listener = .{ .address = .{ .ip = fx.tcp.socket.address } };
+        fx.served = .init(false);
         fx.future = try io.concurrent(serve, .{fx});
         // The client's memory is the test's, never the server's.
         try fx.client.init(testing.allocator, io, client_end);
     }
 
     fn serve(fx: *Fixture) anyerror!void {
+        defer fx.served.store(true, .release);
         var busy = false;
         try E.serve(&fx.server, &fx.listener, false, &fx.connection, &busy);
     }
@@ -353,6 +370,9 @@ const Handlers = struct {
         s.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         s.router.addRouteWith(.post, "/nw/echo", echo, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/big", big, .{ .no_wait = true });
+        s.router.addRouteWith(.get, "/nw/detach", Det.handler, .{ .no_wait = true });
+        s.router.get("/park", Park.handler);
+        s.router.get("/tunnel", Tun.handler);
     }
 
     fn hello(_: *Request, res: *Response) !void {
@@ -434,6 +454,119 @@ const Handlers = struct {
     var ack_read_ok: std.atomic.Value(bool) = .init(false);
     var ack_gone: std.atomic.Value(bool) = .init(true);
     var ack_done: std.atomic.Value(u32) = .init(0);
+};
+
+/// A `no_wait` route that detaches its response (as the C ABI does) and
+/// leaves it to the test.
+const Det = struct {
+    var slot: std.atomic.Value(?*Detached) = .init(null);
+    var count: std.atomic.Value(u32) = .init(0);
+    var aborts: std.atomic.Value(u32) = .init(0);
+
+    fn handler(req: *Request, res: *Response) !void {
+        const d = try res.detach(req, .{ .abort = onAbort, .ctx = &aborts });
+        slot.store(d, .release);
+        _ = count.fetchAdd(1, .acq_rel);
+    }
+
+    fn onAbort(ctx: *anyopaque) void {
+        const n: *std.atomic.Value(u32) = @ptrCast(@alignCast(ctx));
+        _ = n.fetchAdd(1, .acq_rel);
+    }
+
+    /// The next detached response, once its handler has run.
+    fn take(seen: u32) !*Detached {
+        try wait.waitAtLeast(testing.io, "the handler detached its response", &count, seen + 1);
+        return slot.swap(null, .acq_rel).?;
+    }
+
+    /// Answers from another task: a buffered body and a trailer.
+    fn answer(d: *Detached, body: []const u8) void {
+        d.response.body = body;
+        d.response.trailer("x-later", "yes") catch {};
+        d.finish({});
+    }
+
+    /// The attached task: streams `Handlers.big_len` bytes, as the C ABI's
+    /// streamed answers do.
+    fn attached(d: *Detached) std.Io.Cancelable!void {
+        d.enter();
+        d.finish(streamBig(d.response));
+        _ = attached_done.fetchAdd(1, .acq_rel);
+    }
+    var attached_done: std.atomic.Value(u32) = .init(0);
+
+    fn streamBig(res: *Response) !void {
+        var buf: [4096]u8 = undefined;
+        var out = try res.stream(&buf);
+        for (0..Handlers.big_len / 1000) |i| out.interface.print("{d:0>999}\n", .{i}) catch |err| return out.err orelse err;
+        try out.end();
+    }
+};
+
+/// A tasked route that parks its response, as SSE does.
+const Park = struct {
+    var slot: std.atomic.Value(?*Parked) = .init(null);
+    var count: std.atomic.Value(u32) = .init(0);
+    var gone: std.atomic.Value(u32) = .init(0);
+
+    fn handler(req: *Request, res: *Response) !void {
+        const p = try res._park(req, .{ .gone = onGone, .ctx = &gone });
+        slot.store(p, .release);
+        _ = count.fetchAdd(1, .acq_rel);
+    }
+
+    fn onGone(ctx: *anyopaque) void {
+        const n: *std.atomic.Value(u32) = @ptrCast(@alignCast(ctx));
+        _ = n.fetchAdd(1, .acq_rel);
+    }
+
+    fn take(seen: u32) !*Parked {
+        try wait.waitAtLeast(testing.io, "the handler parked its response", &count, seen + 1);
+        return slot.swap(null, .acq_rel).?;
+    }
+
+    fn burst(p: *Parked, event: []const u8) !void {
+        try expect(p.begin());
+        try p.write(&.{ "data: ", event, "\n\n" });
+        p.endBurst();
+    }
+};
+
+/// An RFC 8441 tunnel on the sink's own queue (`appendParts`), as a
+/// WebSocket over HTTP/2 uses it: each read echoed; "big" answered with
+/// two messages of `big_len` over a cap of `cap`; "end" ends it.
+const Tun = struct {
+    const big_len = 200 * 1024;
+    const cap = 64 * 1024;
+    var big: [big_len]u8 = undefined;
+
+    fn handler(req: *Request, res: *Response) !void {
+        if (req.protocol == null) return error.NotATunnel;
+        res.status = .ok;
+        var out_buf: [16]u8 = undefined;
+        var out = try res.stream(&out_buf);
+        defer out.end() catch {};
+        // The 200 now, so the client may send.
+        try out.interface.flush();
+        const sink = res._sink.?;
+        try expect(sink.canAppend());
+        var in_buf: [4096]u8 = undefined;
+        var body = try req.readerLimited(&in_buf, null);
+        while (true) {
+            const got = body.interface.peekGreedy(1) catch return;
+            if (std.mem.eql(u8, got, "end")) return;
+            if (std.mem.eql(u8, got, "big")) {
+                body.interface.toss(got.len);
+                for (&big, 0..) |*b, i| b.* = @truncate(i *% 7);
+                try sink.appendParts(&.{&big}, cap, true);
+                try sink.appendParts(&.{&big}, cap, true);
+                continue;
+            }
+            try sink.appendParts(&.{ "echo:", got }, 1 << 20, true);
+            body.interface.toss(got.len);
+        }
+    }
 };
 
 fn bigBody() ![]u8 {
@@ -824,4 +957,233 @@ test "h2 engine: a warm connection serves requests without allocating" {
         try expectEqualStrings("hello", (try c.until(b)).body.items);
     }
     try expectEqual(before, counting.count.load(.monotonic));
+}
+
+// ---------------------------------------------------------------------------
+// The seams: detached and parked responses, RFC 8441 tunnels.
+
+test "h2 engine: a detached response finished later from another task; an attached one streams its body" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    // Answered whole, with a trailer.
+    const id = try c.request("GET", "/nw/detach", null);
+    const d = try Det.take(Det.count.load(.acquire));
+    var later = try testing.io.concurrent(Det.answer, .{ d, "answered later" });
+    later.await(testing.io);
+    const r = try c.until(id);
+    try expectEqual(200, r.status);
+    try expectEqualStrings("answered later", r.body.items);
+    try expectEqual(1, r.trailers.items.len);
+    try expectEqualStrings("yes", r.trailers.items[0].value);
+
+    // Attached to a task of the connection's, which streams the body.
+    const want = try bigBody();
+    defer testing.allocator.free(want);
+    const done = Det.attached_done.load(.acquire);
+    const streamed = try c.request("GET", "/nw/detach", null);
+    const d2 = try Det.take(Det.count.load(.acquire));
+    const group = d2.attach().?;
+    try placement.concurrent(group, testing.io, .local, Det.attached, .{d2});
+    const r2 = try c.until(streamed);
+    try expect(std.mem.eql(u8, want, r2.body.items));
+    try wait.waitAtLeast(testing.io, "the attached task ended", &Det.attached_done, done + 1);
+}
+
+test "h2 engine: a detached response aborted by the client's RST_STREAM" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const aborts = Det.aborts.load(.acquire);
+    const id = try c.request("GET", "/nw/detach", null);
+    // Never finished: its owner hears of the reset instead, once.
+    _ = try Det.take(Det.count.load(.acquire));
+    try c.rst(id, .cancel);
+    try c.ping("detached".*);
+    try c.flush();
+    while (c.ping_acks == 0) try c.readOne();
+    try expectEqual(aborts + 1, Det.aborts.load(.acquire));
+    // The stream let go (a leak would fail the test), and the connection
+    // carries on.
+    const next = try c.request("GET", "/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+    try expectEqual(aborts + 1, Det.aborts.load(.acquire));
+}
+
+test "h2 engine: a detached end never waits on the socket" {
+    // Connection A's client takes no bytes: once its socket's buffers are
+    // full, a write to it waits. The task that answers A then answers B,
+    // whose response must still arrive: A's answer only queued.
+    const huge = try testing.allocator.alloc(u8, 32 << 20);
+    // After A's `serve` returned (deferred first, so run last).
+    defer testing.allocator.free(huge);
+    @memset(huge, 'a');
+    var a: Fixture = undefined;
+    try a.start(testing.allocator, testing.io, .{});
+    defer a.stop();
+    var b: Fixture = undefined;
+    try b.start(testing.allocator, testing.io, .{});
+    defer b.stop();
+    // A's windows open wide, so flow control does not hold the bytes back.
+    try a.client.settingsWindow(std.math.maxInt(u31));
+    try a.client.windowUpdate(0, std.math.maxInt(u31) - 65535);
+    try a.client.flush();
+    _ = try a.client.request("GET", "/nw/detach", null);
+    const da = try Det.take(Det.count.load(.acquire));
+    const id_b = try b.client.request("GET", "/nw/detach", null);
+    const db = try Det.take(Det.count.load(.acquire));
+    const Both = struct {
+        fn run(x: *Detached, y: *Detached, body: []const u8) void {
+            Det.answer(x, body);
+            Det.answer(y, "b's answer");
+        }
+    };
+    var answering = try testing.io.concurrent(Both.run, .{ da, db, huge });
+    try expectEqualStrings("b's answer", (try b.client.until(id_b)).body.items);
+    answering.await(testing.io);
+}
+
+test "h2 engine: a parked response: bursts in order, the client's reset told once, release frees the stream" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const gone = Park.gone.load(.acquire);
+    const id = try c.request("GET", "/park", null);
+    const p = try Park.take(Park.count.load(.acquire));
+    const r = c.get(id);
+    // The head went out at the park.
+    while (r.status == 0) try c.readOne();
+    try expectEqual(200, r.status);
+    for ([_][]const u8{ "one", "two", "three" }) |event| try Park.burst(p, event);
+    const want = "data: one\n\ndata: two\n\ndata: three\n\n";
+    while (r.body.items.len < want.len) try c.readOne();
+    try expectEqualStrings(want, r.body.items);
+    try expect(!r.ended);
+    // The client resets it: the owner is told (once), then lets go.
+    try c.rst(id, .cancel);
+    try c.ping("parked..".*);
+    try c.flush();
+    while (c.ping_acks == 0) try c.readOne();
+    try expectEqual(gone + 1, Park.gone.load(.acquire));
+    try expect(!p.begin());
+    p.release();
+
+    // A reset during a burst: told at the burst's end.
+    const id2 = try c.request("GET", "/park", null);
+    const p2 = try Park.take(Park.count.load(.acquire));
+    while (c.get(id2).status == 0) try c.readOne();
+    try expect(p2.begin());
+    try c.rst(id2, .cancel);
+    try c.ping("parked.2".*);
+    try c.flush();
+    while (c.ping_acks < 2) try c.readOne();
+    try expectEqual(gone + 1, Park.gone.load(.acquire));
+    try testing.expectError(error.Gone, p2.write(&.{"data: lost\n\n"}));
+    p2.endBurst();
+    try expectEqual(gone + 2, Park.gone.load(.acquire));
+    p2.release();
+    // The connection carries on.
+    const next = try c.request("GET", "/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+}
+
+test "h2 engine: a parked response ended by its owner" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const gone = Park.gone.load(.acquire);
+    const id = try c.request("GET", "/park", null);
+    const p = try Park.take(Park.count.load(.acquire));
+    try Park.burst(p, "only");
+    try expect(p.begin());
+    p.end();
+    p.release();
+    const r = try c.until(id);
+    try expect(r.rst == null);
+    try expectEqualStrings("data: only\n\n", r.body.items);
+    try expectEqual(gone, Park.gone.load(.acquire));
+}
+
+test "h2 engine: an RFC 8441 tunnel: ENABLE_CONNECT_PROTOCOL only when configured, its window, echo, a message past the cap, reset once finished" {
+    {
+        var off: Fixture = undefined;
+        try off.start(testing.allocator, testing.io, .{});
+        defer off.stop();
+        try expect(off.client.connect_protocol == null);
+    }
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{ .http2 = .{ .enable_connect_protocol = true } });
+    defer fx.stop();
+    const c = &fx.client;
+    try expectEqual(1, c.connect_protocol.?);
+    const id = try c.open("CONNECT", "/tunnel", &.{.{ .name = ":protocol", .value = "websocket" }}, false);
+    try c.flush();
+    const r = c.get(id);
+    while (r.status == 0) try c.readOne();
+    try expectEqual(200, r.status);
+    // The window is `tunnel_window`, not `stream_window`.
+    const cfg: config.ServerConfig = .{};
+    while (r.send_window < cfg.http2.tunnel_window) try c.readOne();
+    try expectEqual(cfg.http2.tunnel_window, r.send_window);
+
+    try c.sendBody(id, "hello", false);
+    while (r.body.items.len < "echo:hello".len) try c.readOne();
+    try expectEqualStrings("echo:hello", r.body.items);
+
+    // Two messages, each past the cap: the second waits for the first to
+    // be written, and both arrive whole.
+    const before = r.body.items.len;
+    try c.sendBody(id, "big", false);
+    while (r.body.items.len < before + 2 * Tun.big_len) try c.readOne();
+    try expectEqual(before + 2 * Tun.big_len, r.body.items.len);
+    try expect(std.mem.eql(u8, &Tun.big, r.body.items[before..][0..Tun.big_len]));
+    try expect(std.mem.eql(u8, &Tun.big, r.body.items[before + Tun.big_len ..]));
+
+    // The handler ends while the client keeps its side open: END_STREAM,
+    // then RST_STREAM(NO_ERROR).
+    try c.sendBody(id, "end", false);
+    while (r.rst == null) try c.readOne();
+    try expect(r.ended);
+    try expectEqual(ErrorCode.no_error, r.rst.?);
+    const next = try c.request("GET", "/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+}
+
+test "h2 engine: teardown with detached, parked and attached streams outstanding" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    c.auto_window = false;
+    const aborts = Det.aborts.load(.acquire);
+    const gone = Park.gone.load(.acquire);
+    const done = Det.attached_done.load(.acquire);
+    // Never finished.
+    _ = try c.request("GET", "/nw/detach", null);
+    _ = try Det.take(Det.count.load(.acquire));
+    // Parked, idle.
+    _ = try c.request("GET", "/park", null);
+    const p = try Park.take(Park.count.load(.acquire));
+    // Attached, out of window mid-body.
+    const streamed = try c.request("GET", "/nw/detach", null);
+    const d = try Det.take(Det.count.load(.acquire));
+    try placement.concurrent(d.attach().?, testing.io, .local, Det.attached, .{d});
+    while (c.get(streamed).body.items.len < 65535) try c.readOne();
+    // A connection error: every stream is over.
+    try c.frameOut(.ping, 0, streamed, "12345678");
+    try c.flush();
+    while (c.goaway == null) try c.readOne();
+    try wait.waitAtLeast(testing.io, "the parked response's owner was told", &Park.gone, gone + 1);
+    try wait.waitAtLeast(testing.io, "the detached response's owner was told", &Det.aborts, aborts + 1);
+    try wait.waitAtLeast(testing.io, "the attached task ended", &Det.attached_done, done + 1);
+    try expectEqual(aborts + 1, Det.aborts.load(.acquire));
+    try expectEqual(gone + 1, Park.gone.load(.acquire));
+    // `serve` waits for the parked response's release (`stop` then
+    // waits for it to return).
+    try expect(!fx.served.load(.acquire));
+    p.release();
 }

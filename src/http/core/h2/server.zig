@@ -38,10 +38,19 @@
 //! two 16 KiB blocks. A stream's arena, body and blocks are reused or freed
 //! only once `out` no longer borrows them (`retiring`).
 //!
-//! Not here yet (PLAN §4 M3's other items): detached and parked responses,
-//! RFC 8441 tunnels, the sweeper (send deadlines, half-close probes) and the
-//! two-phase drain. The drain's flags are here and acted on as the reader
-//! next loops.
+//! **Seams** (PLAN §3.5), with the nghttp2 engine's semantics: detached
+//! responses (the C ABI's; `detach_engine`), parked ones (SSE; `H2Parked`)
+//! and RFC 8441 tunnels (WebSocket over HTTP/2). Tunnel and parked output is
+//! copied into a chain of blocks on the stream (`ChainBlock`), each let go
+//! once written. Output from outside the connection's tasks (a detached
+//! answer from the C ABI's task, a burst, a tunnel send from another task)
+//! is only queued and handed to the flusher (`kickFlush`), never written on
+//! the caller, which serves other requests (h2o's request_gathered_write, Go
+//! x/net/http2's writeFrameFromHandler).
+//!
+//! Not here yet (PLAN §4 M3's other items): the sweeper (send deadlines,
+//! half-close probes) and the two-phase drain. The drain's flags are here
+//! and acted on as the reader next loops.
 const std = @import("std");
 const builtin = @import("builtin");
 const safety = @import("anole_safety");
@@ -63,6 +72,9 @@ const admission = @import("../admission.zig");
 const gauges = @import("../gauges.zig");
 const block_cache = @import("../block_cache.zig");
 const Signal = @import("../signal.zig").Signal;
+const Detached = @import("../detach.zig").Detached;
+const parked_mod = @import("../parked.zig");
+const Parked = parked_mod.Parked;
 
 const log = std.log.scoped(.anole_h2);
 
@@ -88,6 +100,10 @@ const block_len = 16 * 1024;
 const max_vecs = 64;
 /// The PING sent with a drain's GOAWAY notice.
 const drain_ping: [8]u8 = "anole-go".*;
+/// The most bytes a tunnel or a parked response may have queued for the
+/// peer before its send waits, when the caller names no limit (the nghttp2
+/// engine's `tunnel_outbox_max`).
+const tunnel_outbox_max = 1024 * 1024;
 
 const is_test = builtin.is_test;
 
@@ -113,6 +129,13 @@ pub var test_out_high: if (is_test) ?usize else void = if (is_test) null else {}
 pub var test_trim_epoch: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: whether the last connection served ran lock-free.
 pub var test_lock_free: if (is_test) std.atomic.Value(bool) else void = if (is_test) .init(false) else {};
+/// Tests only: streaming body writers handed out (`StreamSink.body`), as
+/// the nghttp2 engine counts them (grpc/server_test.zig reads it).
+pub var test_sink_bodies: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: chain blocks allocated (tunnels, parked responses).
+pub var test_chain_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: sends that hopped to the connection's executor.
+pub var test_hops: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 
 /// The HPACK scratch `Conn.recv` decodes into, one per executor (recv never
 /// yields), from the block cache and never given back.
@@ -262,6 +285,14 @@ pub fn Engine(comptime Ctx: type) type {
             send_shut: bool = false,
             /// The reader is done.
             closing: bool = false,
+            /// The connection's group takes no more tasks (the teardown,
+            /// once the tasks are joined): no flusher is spawned, and a
+            /// detached response can't be attached.
+            tasks_closed: bool = false,
+            /// Parked responses not released yet; the teardown waits for
+            /// them (`parked_idle`), as their owners still touch them.
+            parked_open: usize = 0,
+            parked_idle: Signal = .{},
 
             /// Every stream with a hold left (`EStream.holds`).
             live: std.DoublyLinkedList = .{},
@@ -416,6 +447,12 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 }
                 es.body_done = end_stream;
+                if (es.protocol.len > 0) {
+                    // A tunnel's output is copied to its chain
+                    // (`StreamSink.appendParts`).
+                    es.chain_mode = true;
+                    if (!end_stream) conn.setTunnelWindow(es, s);
+                }
                 if (conn.inline_ok and conn.noWaitRoute(es)) {
                     conn.holdBusy();
                     es.counted = true;
@@ -485,7 +522,13 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 conn.closeBody(es);
                 conn.wakeRoom(es);
-                if (es.reset) es.cancelHandler();
+                if (es.reset) {
+                    es.cancelHandler();
+                    // Reset with its response detached: the owner lets go
+                    // now (a parked one's hears `gone`). Neither waits nor
+                    // calls back into `proto` (we are inside its call).
+                    conn.abortDetached(es);
+                }
                 es.protocol_hold = false;
                 // The response's bytes may still be borrowed by `out`.
                 const mark = conn.proto.out.mark();
@@ -609,10 +652,20 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Like the core's HTTP/1.x drain: a window more of the body is
             /// read and dropped, so a peer still sending a small one sees a
-            /// clean end; then RST_STREAM(NO_ERROR) (`onData`).
+            /// clean end; then RST_STREAM(NO_ERROR) (`onData`). A tunnel
+            /// (RFC 8441) whose handler is done has nothing left to read: it
+            /// ends with RST_STREAM(NO_ERROR) as soon as its END_STREAM is
+            /// framed (a reset before would drop it), rather than wait for a
+            /// peer that may keep its side open (the nghttp2 engine's
+            /// `startDiscard`).
             fn startDiscard(conn: *Conn, es: *EStream, s: *PStream) void {
                 es.discarding = true;
-                es.discard_left = es.windowSize(conn);
+                es.discard_left = if (es.protocol.len > 0) 0 else es.windowSize(conn);
+                if (es.protocol.len > 0) {
+                    es.reset_due = true;
+                    conn.tunnelReset(es, s);
+                    if (es.reset_due) conn.watchRoom(es);
+                }
                 if (es.body.len > 0) {
                     conn.proto.consumed(s, es.body.len) catch {};
                     es.body.clear();
@@ -759,8 +812,19 @@ pub fn Engine(comptime Ctx: type) type {
             /// Hands what is queued to the flusher task, for a caller that
             /// must not write itself (a handler mid-response, which its
             /// stream's reset may cancel).
+            /// Also the one way output from outside the connection's tasks
+            /// goes out (a detached answer, a burst, a tunnel send from
+            /// another task): never a write on the caller, which may serve
+            /// other connections' requests (the C ABI's one task per
+            /// executor). Once the tasks are closed the teardown's flush
+            /// writes it.
             fn kickFlush(conn: *Conn) void {
-                if (!conn.takeToken()) return;
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    if (conn.flushing or conn.send_shut or conn.tasks_closed) return;
+                    conn.flushing = true;
+                }
                 if (conn.spawnFlusher()) return;
                 conn.lock();
                 conn.flushing = false;
@@ -768,6 +832,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn spawnFlusher(conn: *Conn) bool {
+                if (conn.tasks_closed) return false;
                 if (conn.task_row) |r| _ = conn.server.admission.reserveTask(r, .forced);
                 placement.concurrent(conn.group, conn.io, .local, flusherRun, .{conn}) catch {
                     if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
@@ -919,11 +984,23 @@ pub fn Engine(comptime Ctx: type) type {
                 while (it) |node| {
                     it = node.next;
                     const es: *EStream = @fieldParentPtr("room_node", node);
+                    if (es.chain_mode) {
+                        conn.chainWritten(es);
+                        continue;
+                    }
                     if (!conn.roomFree(es)) continue;
                     conn.room_waiters.remove(node);
                     es.room_waiting = false;
                     es.room.notify(conn.io);
                 }
+            }
+
+            /// Keeps `es` in `room_waiters` (a chain's blocks are let go,
+            /// and a tunnel's due reset sent, after writes). Under the lock.
+            fn watchRoom(conn: *Conn, es: *EStream) void {
+                if (es.room_waiting) return;
+                es.room_waiting = true;
+                conn.room_waiters.append(&es.room_node);
             }
 
             fn wakeRoom(conn: *Conn, es: *EStream) void {
@@ -958,6 +1035,214 @@ pub fn Engine(comptime Ctx: type) type {
                 b.inflight = false;
                 b.mark = null;
                 return true;
+            }
+
+            // -- Seams: tunnels, chains, detached streams -----------------
+
+            /// Whether the caller runs on another executor than the
+            /// connection's tasks, where the lock is no lock: it must hop
+            /// (`StreamSink.onOwner`). Never off zio (the lock is a mutex).
+            fn foreign(conn: *Conn) bool {
+                if (!conn.lock_.free) return false;
+                return placement.currentExecutor(conn.io) != conn.lock_.owner;
+            }
+
+            /// A tunnel (an extended CONNECT) reads at `tunnel_window`,
+            /// fixed: its body buffer is that big from the first DATA, and
+            /// its window is raised to it now. Raised by its distance from
+            /// `stream_window`, which the peer's ACK of our SETTINGS adds
+            /// to a window opened before it, so it lands on `tunnel_window`
+            /// either way (the nghttp2 engine's `setTunnelWindow`). A
+            /// `tunnel_window` below `stream_window` is left at the latter
+            /// (INTENTIONAL.md). Under the lock.
+            fn setTunnelWindow(conn: *Conn, es: *EStream, s: *PStream) void {
+                const want = conn.config.tunnel_window;
+                if (want <= conn.config.stream_window) return;
+                conn.proto.raiseWindow(s, want - conn.config.stream_window) catch return;
+                es.window = want;
+            }
+
+            /// A finished tunnel's RST_STREAM(NO_ERROR), once its END_STREAM
+            /// is framed (`startDiscard`). Under the lock; may free `es`
+            /// (its close), so the caller does not touch it after.
+            fn tunnelReset(conn: *Conn, es: *EStream, s: *PStream) void {
+                if (es.reset or s.state != .half_closed_local) return;
+                es.reset_due = false;
+                es.reset = true;
+                conn.proto.reset(s, .no_error) catch {};
+            }
+
+            /// The stream ended with its response still detached (not
+            /// attached): the owner hears of it, and the handler's hold
+            /// goes (the caller frees `es` with `maybeFree`). A parked one's
+            /// owner hears `gone` instead, and keeps the hold until
+            /// `Parked.release`. Under the lock; never waits.
+            fn abortDetached(conn: *Conn, es: *EStream) void {
+                _ = conn;
+                if (es.parked) |p| return p.peerGone();
+                const ex = es.detached orelse return;
+                const d = ex.response.detached.?;
+                if (d.state != .detached) return;
+                es.detached = null;
+                d.abort();
+                ex.request._body_held.release();
+                ex.response.deinit();
+                es.handler_hold = false;
+            }
+
+            /// Bytes a chain holds against its cap: a block closed for its
+            /// cuts counts whole, so many tiny sends can't hold many blocks.
+            fn chainHeld(es: *const EStream) usize {
+                var n: usize = 0;
+                var it = es.chain.first;
+                while (it) |node| : (it = node.next) {
+                    const b: *const ChainBlock = @fieldParentPtr("node", node);
+                    n += if (b.closed()) ChainBlock.data_len else b.len;
+                }
+                return n;
+            }
+
+            /// Copies `parts` to the chain's tail (new blocks as needed).
+            /// Under the lock.
+            fn chainAppend(conn: *Conn, es: *EStream, parts: []const []const u8) error{OutOfMemory}!void {
+                for (parts) |part| {
+                    var rest = part;
+                    while (rest.len > 0) {
+                        const tail: *ChainBlock = tail: {
+                            if (es.chain.last) |node| {
+                                const b: *ChainBlock = @fieldParentPtr("node", node);
+                                if (!b.closed()) break :tail b;
+                            }
+                            const b = try conn.allocator.create(ChainBlock);
+                            b.* = .{};
+                            if (comptime is_test) _ = test_chain_blocks.fetchAdd(1, .monotonic);
+                            es.chain.append(&b.node);
+                            break :tail b;
+                        };
+                        const n = @min(rest.len, ChainBlock.data_len - tail.len);
+                        @memcpy(tail.data[tail.len..][0..n], rest[0..n]);
+                        tail.len += n;
+                        rest = rest[n..];
+                    }
+                }
+            }
+
+            /// Submits what the chain holds past its last cut, one DATA
+            /// part per block (borrowed until written), and watches the
+            /// stream for its blocks to be written. Under the lock.
+            fn chainSubmit(conn: *Conn, es: *EStream, s: *PStream) conn_mod.SubmitError!void {
+                var it = es.chain.first;
+                while (it) |node| : (it = node.next) {
+                    const b: *ChainBlock = @fieldParentPtr("node", node);
+                    if (b.cut == b.len) continue;
+                    b.parts[b.cuts][0] = b.data[b.cut..b.len];
+                    try conn.proto.submitData(s, &b.parts[b.cuts], false);
+                    b.cuts += 1;
+                    b.cut = b.len;
+                    es.cut_seq += 1;
+                    b.last_seq = es.cut_seq;
+                }
+                conn.watchRoom(es);
+            }
+
+            /// Lets go of the blocks at the chain's front that are cut,
+            /// framed (the stream's queue no longer holds their parts) and
+            /// written (`out.sent_total` past a mark taken once framed). A
+            /// tunnel keeps its last one for the next message; a parked
+            /// response, idle for long, keeps none. Whether any went. Under
+            /// the lock.
+            fn chainReclaim(conn: *Conn, es: *EStream) bool {
+                const s = es.cs orelse return false;
+                var queued: u64 = 0;
+                var q = s.pending.first;
+                while (q) |n| : (q = n.next) queued += 1;
+                // An end with no part of its own may be queued too: counted
+                // as a cut, it only holds a block back a little longer.
+                const framed = es.cut_seq -| queued;
+                var freed = false;
+                while (es.chain.first) |node| {
+                    const b: *ChainBlock = @fieldParentPtr("node", node);
+                    if (b.cuts == 0 or b.cut != b.len or b.last_seq > framed) break;
+                    if (b.mark == null) b.mark = conn.proto.out.mark();
+                    if (conn.proto.out.sent_total < b.mark.?) break;
+                    freed = true;
+                    if (es.chain.first == es.chain.last and es.protocol.len > 0) {
+                        b.* = .{};
+                        break;
+                    }
+                    es.chain.remove(node);
+                    conn.allocator.destroy(b);
+                }
+                return freed;
+            }
+
+            /// After a write: a chain's written blocks go and a sender
+            /// waiting for room is woken; a tunnel's due reset goes out;
+            /// a stream with nothing left to watch leaves the list. Under
+            /// the lock; may free `es`.
+            fn chainWritten(conn: *Conn, es: *EStream) void {
+                const s = es.cs orelse {
+                    conn.wakeRoom(es);
+                    return;
+                };
+                if (es.reset or conn.send_shut or conn.proto.dead or conn.chainReclaim(es)) es.room.notify(conn.io);
+                const idle = idle: {
+                    const node = es.chain.first orelse break :idle true;
+                    const b: *ChainBlock = @fieldParentPtr("node", node);
+                    break :idle node == es.chain.last and b.len == 0;
+                };
+                if ((idle or es.reset) and !es.reset_due) {
+                    es.room_waiting = false;
+                    conn.room_waiters.remove(&es.room_node);
+                }
+                if (es.reset_due) {
+                    if (es.reset) {
+                        es.reset_due = false;
+                        es.room_waiting = false;
+                        conn.room_waiters.remove(&es.room_node);
+                        return;
+                    }
+                    // Last: the reset may free `es`, list node and all.
+                    if (s.state == .half_closed_local) {
+                        es.room_waiting = false;
+                        conn.room_waiters.remove(&es.room_node);
+                        conn.tunnelReset(es, s);
+                    }
+                }
+            }
+        };
+
+        /// One block of a tunnel's or a parked response's output
+        /// (`EStream.chain`): sends are copied in, and cut into DATA parts
+        /// at each kick (`Conn.chainSubmit`), borrowed by `out` until
+        /// written. 16 KiB from malloc's slabs, as a streamed response's
+        /// block (nothing above `block_cache.malloc_max`).
+        const ChainBlock = struct {
+            node: std.DoublyLinkedList.Node = .{},
+            len: usize = 0,
+            /// Up to here submitted.
+            cut: usize = 0,
+            cuts: u8 = 0,
+            /// The stream's cut number (`EStream.cut_seq`) of its last cut.
+            last_seq: u64 = 0,
+            /// `out.mark()` once its cuts are framed.
+            mark: ?u64 = null,
+            /// Each cut's one-part list, borrowed with it.
+            // SAFETY: each entry is set when its cut is submitted, and read only after.
+            parts: [max_cuts][1][]const u8 = undefined,
+            // SAFETY: bytes up to `len` are set before they are read.
+            data: [data_len]u8 = undefined,
+
+            const max_cuts = 16;
+            const data_len = block_len - 512;
+
+            comptime {
+                std.debug.assert(@sizeOf(ChainBlock) <= block_len);
+            }
+
+            /// Takes no more bytes: full, or out of cuts.
+            fn closed(b: *const ChainBlock) bool {
+                return b.len == data_len or b.cuts == max_cuts;
             }
         };
 
@@ -1126,6 +1411,25 @@ pub fn Engine(comptime Ctx: type) type {
             room_node: std.DoublyLinkedList.Node = .{},
             room_waiting: bool = false,
 
+            // Seams.
+            /// The body goes to `chain` (a tunnel, a parked response), not
+            /// through the writer's blocks.
+            chain_mode: bool = false,
+            chain: std.DoublyLinkedList = .{},
+            /// Cuts of `chain` submitted so far (`Conn.chainReclaim`).
+            cut_seq: u64 = 0,
+            /// A finished tunnel's RST_STREAM(NO_ERROR) waits for its
+            /// END_STREAM to be framed (`Conn.startDiscard`).
+            reset_due: bool = false,
+            /// `serveStream` is in the handler: a detached response ended
+            /// meanwhile (`ended_in_handler`) is let go by its caller.
+            in_handler: bool = false,
+            ended_in_handler: bool = false,
+            /// The response, detached and not finished yet; its exchange
+            /// lives in the arena (`detachedRelocate`).
+            detached: ?*Exchange = null,
+            parked: ?*H2Parked = null,
+
             fn of(s: *PStream) ?*EStream {
                 // SAFETY: `user` is only ever set to an EStream (`onStreamOpen`).
                 return @ptrCast(@alignCast(s.user orelse return null));
@@ -1169,6 +1473,10 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 for (es.spent.items) |m| gpa.free(m);
                 es.spent = .empty;
+                while (es.chain.popFirst()) |node| {
+                    const b: *ChainBlock = @fieldParentPtr("node", node);
+                    gpa.destroy(b);
+                }
             }
 
             /// The stream is gone before the handler ended its response:
@@ -1246,8 +1554,32 @@ pub fn Engine(comptime Ctx: type) type {
             };
             conn.proto = try Proto.init(server.allocator, &conn, opts);
             defer {
-                // The tasks are joined: nothing else touches the streams.
-                conn.closing = true;
+                // The tasks are joined (the group's cancel runs first).
+                // Detached responses nobody finished: their owners hear of
+                // it. Parked ones: their owners hear the peer is gone and
+                // release once their bursts are over; the streams stay until
+                // then, so they are waited for (the nghttp2 engine's
+                // teardown order: parked told, the group canceled, detached
+                // aborted, then the wait).
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    conn.closing = true;
+                    conn.tasks_closed = true;
+                    var it = conn.live.first;
+                    while (it) |node| {
+                        it = node.next;
+                        const es: *EStream = @fieldParentPtr("node", node);
+                        if (es.detached == null and es.parked == null) continue;
+                        es.reset = true;
+                        conn.closeBody(es);
+                        conn.wakeRoom(es);
+                        conn.abortDetached(es);
+                        conn.maybeFree(es);
+                    }
+                }
+                waitParked(&conn);
+                // Nothing else touches the streams now.
                 while (conn.live.popFirst()) |node| {
                     const es: *EStream = @fieldParentPtr("node", node);
                     if (es.cs) |s| s.user = null;
@@ -1302,13 +1634,20 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 conn.closing = true;
                 var it = conn.live.first;
-                while (it) |node| : (it = node.next) {
+                while (it) |node| {
+                    it = node.next;
                     const es: *EStream = @fieldParentPtr("node", node);
-                    if (reader_failed or !es.body_done) {
+                    // A parked response has nobody to send to once the
+                    // peer closed its side of the connection.
+                    if (reader_failed or !es.body_done or es.parked != null) {
                         es.reset = true;
                         conn.closeBody(es);
                         conn.wakeRoom(es);
                         es.cancelHandler();
+                        // Detached with nobody left to send to: let go now
+                        // rather than at its deadline.
+                        conn.abortDetached(es);
+                        conn.maybeFree(es);
                     }
                 }
             }
@@ -1318,6 +1657,20 @@ pub fn Engine(comptime Ctx: type) type {
             };
             conn.flush(.all) catch return error.Canceled;
             if (linger) try lingeringClose(&conn);
+        }
+
+        /// Waits, uncancelably, until every parked response is released.
+        fn waitParked(conn: *Conn) void {
+            const protection = conn.io.swapCancelProtection(.blocked);
+            defer _ = conn.io.swapCancelProtection(protection);
+            while (true) {
+                const seen = conn.parked_idle.epoch();
+                conn.lock();
+                const open = conn.parked_open;
+                conn.unlock();
+                if (open == 0) return;
+                conn.parked_idle.wait(conn.io, seen) catch {};
+            }
         }
 
         /// How the reader ended: the peer ended its side (`eof`), the
@@ -1428,6 +1781,9 @@ pub fn Engine(comptime Ctx: type) type {
             };
             var timer: Timer = .init(null);
             var canceled = false;
+            // A handler that parked the response (`Response._park`) hands
+            // its hold on the stream to the park: `Parked.release` lets go.
+            var parked = false;
             defer {
                 const timed_out = timer.fired();
                 timer.clear(conn.io);
@@ -1437,7 +1793,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // request timer) may still be pending: the write is the
                 // flusher's then.
                 const kick = es.canceled or timed_out or canceled;
-                conn.finishHandler(es);
+                if (!parked) conn.finishHandler(es);
                 conn.unlock();
                 if (kick) conn.kickFlush() else conn.flush(.batch) catch conn.kickFlush();
             }
@@ -1446,10 +1802,11 @@ pub fn Engine(comptime Ctx: type) type {
                 return;
             }
             if (conn.server.config.timeout.request) |d| timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
-            serveStream(conn, es, &timer) catch |err| streamFailed(conn, es, err) catch {
+            const served = serveStream(conn, es, &timer) catch |err| return streamFailed(conn, es, err) catch {
                 canceled = true;
                 return error.Canceled;
             };
+            parked = served == .detached;
         }
 
         /// Runs the requests set aside for the reader (`no_wait` routes),
@@ -1461,12 +1818,21 @@ pub fn Engine(comptime Ctx: type) type {
                 const gone = es.reset;
                 conn.unlock();
                 var canceled = false;
-                if (!gone) serveStream(conn, es, null) catch |err| streamFailed(conn, es, err) catch {
-                    canceled = true;
-                };
-                conn.lock();
-                conn.finishHandler(es);
-                conn.unlock();
+                var detached = false;
+                if (!gone) {
+                    if (serveStream(conn, es, null)) |served| {
+                        detached = served == .detached;
+                    } else |err| streamFailed(conn, es, err) catch {
+                        canceled = true;
+                    };
+                }
+                // A detached response keeps the stream until it is
+                // finished (`detach_engine`).
+                if (!detached) {
+                    conn.lock();
+                    conn.finishHandler(es);
+                    conn.unlock();
+                }
                 // The reader itself is canceled: the connection is going.
                 if (canceled) return error.Canceled;
             }
@@ -1507,6 +1873,9 @@ pub fn Engine(comptime Ctx: type) type {
             if (es.cs) |s| conn.proto.reset(s, code) catch {};
         }
 
+        /// One request and its response, with what they point at: on the
+        /// handler's stack, or in the stream's arena once detached
+        /// (`detachedRelocate`).
         const Exchange = struct {
             request: Request,
             response: Response,
@@ -1514,15 +1883,21 @@ pub fn Engine(comptime Ctx: type) type {
             body_reader: BodyReader,
         };
 
+        const Served = enum { done, detached };
+
         /// Serves one request: on the reader (`timer` null, a `no_wait`
         /// route, no request timeout, whose timer would cancel the reader)
         /// or on its own task. The nghttp2 engine's `serveStream`, with
         /// the same request build, so the router, handlers and middleware
-        /// see the same request.
-        fn serveStream(conn: *Conn, es: *EStream, timer: ?*Timer) !void {
+        /// see the same request. On the reader the response may be
+        /// detached (`Detached`); on a task only to be parked. `.detached`:
+        /// the stream's handler hold went to the detached response.
+        fn serveStream(conn: *Conn, es: *EStream, timer: ?*Timer) !Served {
             const server = conn.server;
             const arena = es.arena.allocator();
             const io = conn.io;
+            // On the stack (warm, no allocation); `detachedRelocate` moves
+            // it to the stream's arena if the handler detaches.
             // SAFETY: each field is set below before it is read.
             var ex: Exchange = undefined;
             const request = &ex.request;
@@ -1557,13 +1932,27 @@ pub fn Engine(comptime Ctx: type) type {
             const response = &ex.response;
             response.* = try Response._initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
             server.configureResponse(response);
-            defer response.deinit();
+            var detached = false;
+            defer if (!detached) response.deinit();
             response._request = request;
             request._response = response;
+            response._detach_engine = &detach_engine;
+            response._detach_ctx = &ex;
+            // On its own task the response may detach only to be parked.
+            response._detach_park_only = timer != null;
+            conn.lock();
+            es.in_handler = true;
+            conn.unlock();
+            defer {
+                conn.lock();
+                es.in_handler = false;
+                conn.unlock();
+            }
 
             request.method = parseMethod(es.method) orelse {
                 response.status = .not_implemented;
-                return response.write();
+                try response.write();
+                return .done;
             };
             // An extended CONNECT (RFC 8441) is routed as the GET that the
             // HTTP/1.1 upgrade it replaces would be.
@@ -1600,7 +1989,8 @@ pub fn Engine(comptime Ctx: type) type {
                 !std.ascii.eqlIgnoreCase(host_field, es.authority))))
             {
                 response.status = .bad_request;
-                return response.write();
+                try response.write();
+                return .done;
             }
             if (!too_many and hosts == 0 and es.authority.len > 0) {
                 request.headers.add("Host", es.authority) catch {
@@ -1609,7 +1999,8 @@ pub fn Engine(comptime Ctx: type) type {
             }
             if (too_many) {
                 response.status = .request_header_fields_too_large;
-                return response.write();
+                try response.write();
+                return .done;
             }
             request._applyEntityHeaders();
             // A body declared longer than allowed is refused unread.
@@ -1618,7 +2009,8 @@ pub fn Engine(comptime Ctx: type) type {
                     response.status = .payload_too_large;
                     response.content_type = .text;
                     response.body = "413 Content Too Large\n";
-                    return response.write();
+                    try response.write();
+                    return .done;
                 };
             }
             server.applyForwarded(request, conn.connection);
@@ -1631,18 +2023,38 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.unlock();
                 } else {
                     response.status = .expectation_failed;
-                    return response.write();
+                    try response.write();
+                    return .done;
                 }
             }
 
             log.debug("Received (h2 stream {d}): {f} {s}", .{ es.id, request.method, request.url });
 
-            server.dispatch(request, response) catch |err| switch (err) {
+            const dispatched = server.dispatch(request, response);
+            // A detached response is its owner's (or over already, a park
+            // that failed having handled the error), whatever the handler
+            // returned: the stack copy is not written or freed here.
+            if (response.detached) |d| {
+                detached = true;
+                conn.lock();
+                defer conn.unlock();
+                // From here an end lets go itself.
+                es.in_handler = false;
+                // Already over (a park that failed, or a finish or release
+                // from inside the handler): `d` may be gone with the
+                // exchange, and the handler's hold is the caller's to let
+                // go, as for a response written in place.
+                if (es.ended_in_handler) return .done;
+                es.detached = exchangeOf(d);
+                return .detached;
+            }
+            dispatched catch |err| switch (err) {
                 error.ReadFailed => return body_reader.err orelse error.Unexpected,
                 error.WriteFailed => return sink_state.err orelse error.Unexpected,
                 else => |e| return e,
             };
             try response.write();
+            return .done;
         }
 
         fn setTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
@@ -1655,6 +2067,271 @@ pub fn Engine(comptime Ctx: type) type {
             // SAFETY: the context is the Timer `serveStream` set it to.
             const timer: *Timer = @ptrCast(@alignCast(context));
             return timer.fired();
+        }
+
+        // -- Detached and parked responses (the nghttp2 engine's, ported) -
+
+        /// How a detached response is finished, attached to a task, or let
+        /// go (`Detached`).
+        const detach_engine: Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter, .park = detachedPark };
+
+        /// The exchange, from the reader's stack into the stream's arena,
+        /// its pointers into itself moved along.
+        fn detachedRelocate(d: *Detached) error{OutOfMemory}!*anyopaque {
+            const old = exchangeOf(d);
+            const ex = try old.response.arena.create(Exchange);
+            ex.* = old.*;
+            // The body's share of the buffer budget moves with the request:
+            // `Server.dispatch` then gives back nothing of the old one, and
+            // the end of the exchange gives back what the copy holds (a body
+            // read after the handler returned included).
+            old.request._body_held = .{};
+            ex.request._response = &ex.response;
+            ex.response._request = &ex.request;
+            ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response._sink = ex.sink_state.sink();
+            ex.response._detach_ctx = ex;
+            // A task's request timer lives on the task's stack.
+            ex.request._timeout_context = null;
+            ex.request._set_timeout = null;
+            ex.request._claim_timeout = null;
+            d.request = &ex.request;
+            d.response = &ex.response;
+            return ex;
+        }
+
+        fn exchangeOf(d: *Detached) *Exchange {
+            // SAFETY: `engine_ctx` is the Exchange (`serveStream`, `detachedRelocate`).
+            return @ptrCast(@alignCast(d.engine_ctx));
+        }
+
+        /// Writes the response (or handles `result`'s error as a
+        /// handler's), then lets go of the stream. On the connection's
+        /// executor: the owner's task (which serves other requests, so the
+        /// output only goes to the flusher), or the task `detachedAttach`
+        /// was for.
+        fn detachedEnd(d: *Detached, result: anyerror!void) void {
+            const ex = exchangeOf(d);
+            ex.request._body_held.release();
+            const es = ex.sink_state.es;
+            const conn = es.conn;
+            if (es.parked != null) {
+                // The end of a parked response: the last DATA (or the
+                // failure's reset). The hold on the stream stays until the
+                // owner's `Parked.release`.
+                if (result) |_| {
+                    ex.sink_state.sink().end(if (ex.response.trailers) |*t| t else null) catch {};
+                } else |err| {
+                    streamFailed(conn, es, err) catch {};
+                }
+                ex.response.deinit();
+                conn.lock();
+                es.detached = null;
+                conn.unlock();
+                conn.kickFlush();
+                return;
+            }
+            if (result) |_| {
+                ex.response.write() catch |err| {
+                    streamFailed(conn, es, err) catch {};
+                };
+            } else |err| {
+                streamFailed(conn, es, err) catch {};
+            }
+            ex.response.deinit();
+            {
+                conn.lock();
+                defer conn.unlock();
+                es.detached = null;
+                if (es.in_handler) {
+                    // `serveStream` is still in the handler (a park that
+                    // failed, or a finish from inside it): it lets go when
+                    // it returns.
+                    es.ended_in_handler = true;
+                } else {
+                    es.task = null;
+                    conn.finishHandler(es);
+                }
+            }
+            conn.kickFlush();
+        }
+
+        /// The response goes on from a task: its body writes may now wait
+        /// for the peer, as a handler task's do.
+        fn detachedAttach(d: *Detached) ?*std.Io.Group {
+            const es = exchangeOf(d).sink_state.es;
+            const conn = es.conn;
+            conn.lock();
+            defer conn.unlock();
+            if (conn.tasks_closed) return null;
+            es.inline_mode = false;
+            return conn.group;
+        }
+
+        fn detachedEnter(d: *Detached) void {
+            const es = exchangeOf(d).sink_state.es;
+            const conn = es.conn;
+            conn.lock();
+            defer conn.unlock();
+            es.task = placement.currentTask(conn.io);
+        }
+
+        /// A parked response (`Response._park`): bursts of DATA from
+        /// whichever task has something to send, no task in between,
+        /// copied to the stream's chain (H3's `H3Parked`, on `parked.zig`'s
+        /// `Notice`). Its owner hears of the peer leaving through
+        /// `owner.gone`, and the stream lives until the owner's `release`,
+        /// which also lets go of the handler's hold (the park took it, on
+        /// the reader or a task alike).
+        const H2Parked = struct {
+            parked: Parked = .{ .vtable = &vtable },
+            es: *EStream,
+            ex: *Exchange,
+            d: *Detached,
+            owner: Parked.Owner,
+            /// Under the connection's lock; the stream's own `reset` is
+            /// checked next to it.
+            notice: parked_mod.Notice = .idle,
+
+            const vtable: Parked.VTable = .{
+                .begin = begin,
+                .write = write,
+                .endBurst = endBurst,
+                .end = end,
+                .abort = abort,
+                .release = release,
+            };
+
+            fn of(p: *Parked) *H2Parked {
+                // SAFETY: every `Parked` this engine hands out is an H2Parked's (`detachedPark`).
+                return @alignCast(@fieldParentPtr("parked", p));
+            }
+
+            fn begin(p: *Parked) bool {
+                const self = of(p);
+                const conn = self.es.conn;
+                conn.lock();
+                defer conn.unlock();
+                if (self.es.reset or !self.notice.begin()) return false;
+                // A reset cancels the burst's task (`cancelHandler`).
+                self.es.task = placement.currentTask(conn.io);
+                return true;
+            }
+
+            /// Copied to the stream's chain (waiting past its cap for
+            /// room); out at `endBurst`.
+            fn write(p: *Parked, parts: []const []const u8) Parked.WriteError!void {
+                const self = of(p);
+                const conn = self.es.conn;
+                conn.lock();
+                const over = self.notice == .over or self.es.reset;
+                conn.unlock();
+                if (over) return error.Gone;
+                const sink_state = &self.ex.sink_state;
+                sink_state.appendChain(parts, tunnel_outbox_max, false) catch {
+                    if (sink_state.err) |e| switch (e) {
+                        error.Canceled => return error.Canceled,
+                        error.SystemResources => return error.SystemResources,
+                        else => {},
+                    };
+                    return error.Gone;
+                };
+            }
+
+            /// Ends the burst `begin` started; a `gone` that came during
+            /// it is delivered now.
+            fn finishBurst(self: *H2Parked) void {
+                const conn = self.es.conn;
+                conn.lock();
+                self.es.task = null;
+                const deliver = self.notice.endBurst();
+                conn.unlock();
+                if (deliver) self.owner.gone(self.owner.ctx);
+            }
+
+            fn endBurst(p: *Parked) void {
+                const self = of(p);
+                self.ex.sink_state.sink().kickOut();
+                self.finishBurst();
+            }
+
+            fn end(p: *Parked) void {
+                const self = of(p);
+                const conn = self.es.conn;
+                conn.lock();
+                const already = self.notice.finish();
+                const reset = self.es.reset;
+                conn.unlock();
+                // The middleware finishers, then the end (`detachedEnd`).
+                if (!already and !reset) self.d.finish({});
+                self.finishBurst();
+            }
+
+            fn abort(p: *Parked) void {
+                const self = of(p);
+                const conn = self.es.conn;
+                conn.lock();
+                _ = self.notice.finish();
+                conn.unlock();
+                resetStream(conn, self.es, .cancel);
+                conn.kickFlush();
+                self.finishBurst();
+            }
+
+            /// The stream was reset or the connection is gone. Under the
+            /// lock; never waits.
+            fn peerGone(self: *H2Parked) void {
+                // A burst running was canceled with the stream
+                // (`cancelHandler`): `endBurst` tells the owner.
+                if (self.notice.peerGone() == .tell) self.owner.gone(self.owner.ctx);
+            }
+
+            fn release(p: *Parked) void {
+                const self = of(p);
+                const es = self.es;
+                const conn = es.conn;
+                self.ex.request._body_held.release();
+                self.ex.response.deinit();
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    // Let go before it ended (the owner gave up on a stream
+                    // the peer still has open): reset it.
+                    if (!es.ended and !es.reset) {
+                        es.reset = true;
+                        if (es.cs) |s| conn.proto.reset(s, .cancel) catch {};
+                    }
+                    es.parked = null;
+                    es.detached = null;
+                    conn.parked_open -= 1;
+                    if (conn.parked_open == 0) conn.parked_idle.notify(conn.io);
+                    // Released from inside the handler: `serveStream`'s
+                    // caller lets go when it returns. Otherwise the stream
+                    // may be freed here, with `self` in its arena.
+                    if (es.in_handler) es.ended_in_handler = true else conn.finishHandler(es);
+                }
+                conn.kickFlush();
+            }
+        };
+
+        /// `Detached.Engine.park`: the exchange is relocated and the head
+        /// recorded by the caller next; the body goes to the stream's chain
+        /// in bursts from now on.
+        fn detachedPark(d: *Detached, owner: Parked.Owner) error{ OutOfMemory, WriteFailed }!*Parked {
+            const ex = exchangeOf(d);
+            const es = ex.sink_state.es;
+            const conn = es.conn;
+            const p = try ex.response.arena.create(H2Parked);
+            p.* = .{ .es = es, .ex = ex, .d = d, .owner = owner };
+            conn.lock();
+            defer conn.unlock();
+            if (es.reset) return error.WriteFailed;
+            es.chain_mode = true;
+            // Bursts run on tasks, which may wait for the peer.
+            es.inline_mode = false;
+            es.parked = p;
+            conn.parked_open += 1;
+            return &p.parked;
         }
 
         fn parseMethod(name: []const u8) ?http.Method {
@@ -1743,6 +2420,8 @@ pub fn Engine(comptime Ctx: type) type {
                     .end = end,
                     .writeError = writeError,
                     .peerGone = peerGone,
+                    .appendParts = appendParts,
+                    .kickOut = kickOut,
                     .complete = complete,
                 } };
             }
@@ -1888,6 +2567,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// block (`drain`), so a handler that never writes a body never
             /// pays for one.
             fn body(ptr: *anyopaque) *std.Io.Writer {
+                if (comptime is_test) _ = test_sink_bodies.fetchAdd(1, .monotonic);
                 return &fromPtr(ptr).writer;
             }
 
@@ -1979,6 +2659,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
                 // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                if (self.es.chain_mode) return self.kickChain();
                 return self.submitBlock();
             }
 
@@ -1987,6 +2668,16 @@ pub fn Engine(comptime Ctx: type) type {
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
                 // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                // A chain's writer has no buffer: the bytes are copied to
+                // the chain, out at the next flush.
+                if (self.es.chain_mode) {
+                    var n: usize = 0;
+                    const last = data.len - 1;
+                    try self.appendChain(data[0..last], tunnel_outbox_max, false);
+                    for (data[0..last]) |bytes| n += bytes.len;
+                    for (0..splat) |_| try self.appendChain(data[last..], tunnel_outbox_max, false);
+                    return n + data[last].len * splat;
+                }
                 if (w.end > 0) try self.submitBlock();
                 if (w.buffer.len == 0) try self.nextBlock();
                 var n: usize = 0;
@@ -2016,6 +2707,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const es = self.es;
                 const conn = es.conn;
                 const trailer_fields = try self.trailerFields(trailers);
+                if (es.chain_mode) return self.endChain(trailer_fields);
                 const w = &self.writer;
                 var part: []const []const u8 = &.{};
                 if (w.end > 0) {
@@ -2049,6 +2741,138 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn writeError(ptr: *anyopaque) ?Response.SendError {
                 return fromPtr(ptr).err;
+            }
+
+            // -- A tunnel's or a parked response's chain (`ChainBlock`) ---
+
+            /// Appends `parts` to the body in one copy (the nghttp2 engine's
+            /// `appendOutbox` rule: waits while more than `max_pending`
+            /// bytes are queued, and always takes a message when nothing
+            /// is). With `now` they go out now; without, at `kickOut`.
+            /// From any task: one on another executor hops to the
+            /// connection's (`onOwner`). Not a tunnel or parked: through the
+            /// body writer.
+            fn appendParts(ptr: *anyopaque, parts: []const []const u8, max_pending: usize, now: bool) std.Io.Writer.Error!void {
+                const self = fromPtr(ptr);
+                if (self.es.conn.foreign()) return self.onOwner(parts, max_pending, now);
+                if (!self.es.chain_mode) {
+                    for (parts) |part| try self.writer.writeAll(part);
+                    if (now) try self.writer.flush();
+                    return;
+                }
+                return self.appendChain(parts, max_pending, now);
+            }
+
+            /// Sends what `appendParts` left without a kick.
+            fn kickOut(ptr: *anyopaque) void {
+                const self = fromPtr(ptr);
+                if (self.es.conn.foreign()) {
+                    self.onOwner(null, 0, true) catch {};
+                    return;
+                }
+                if (!self.es.chain_mode) {
+                    self.writer.flush() catch {};
+                    return;
+                }
+                self.kickChain() catch {};
+            }
+
+            /// `appendParts` (or `kickOut`, `parts` null) on the
+            /// connection's executor, where its lock is (a WebSocket's
+            /// `send` "from any task", websocket/root.zig): a task placed
+            /// there, awaited (the pattern Rooms and SSE use to reach a
+            /// socket's executor). `parts` are the caller's, alive till then.
+            fn onOwner(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool) std.Io.Writer.Error!void {
+                const conn = self.es.conn;
+                if (comptime is_test) _ = test_hops.fetchAdd(1, .monotonic);
+                var group: std.Io.Group = .init;
+                var result: std.Io.Writer.Error!void = {};
+                placement.concurrent(&group, conn.io, .{ .executor = conn.lock_.owner }, ownerRun, .{ self, parts, max_pending, now, &result }) catch
+                    return self.fail(error.SystemResources);
+                group.await(conn.io) catch {
+                    group.cancel(conn.io);
+                    return self.fail(error.Canceled);
+                };
+                return result;
+            }
+
+            fn ownerRun(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool, result: *std.Io.Writer.Error!void) std.Io.Cancelable!void {
+                const p = parts orelse return kickOut(self);
+                result.* = appendParts(self, p, max_pending, now);
+            }
+
+            fn appendChain(self: *StreamSink, parts: []const []const u8, max_pending: usize, now: bool) std.Io.Writer.Error!void {
+                const es = self.es;
+                const conn = es.conn;
+                var total: usize = 0;
+                for (parts) |part| total += part.len;
+                if (total == 0) return;
+                while (true) {
+                    const seen = es.room.epoch();
+                    {
+                        conn.lock();
+                        defer conn.unlock();
+                        const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
+                        if (es.reset or conn.send_shut) return self.fail(error.ConnectionResetByPeer);
+                        try self.submitHeadOnce(s);
+                        _ = conn.chainReclaim(es);
+                        const held = Conn.chainHeld(es);
+                        if (held == 0 or held + total <= max_pending) {
+                            conn.chainAppend(es, parts) catch return self.fail(error.SystemResources);
+                            if (now) conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);
+                            break;
+                        }
+                        // Full: what is queued goes out first, then the
+                        // wait for its blocks to be written.
+                        conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);
+                    }
+                    conn.kickFlush();
+                    es.room.wait(conn.io, seen) catch return self.fail(error.Canceled);
+                }
+                if (now) conn.kickFlush();
+            }
+
+            /// The head if not out yet, and what the chain holds past its
+            /// last cut, out. On the connection's executor.
+            fn kickChain(self: *StreamSink) std.Io.Writer.Error!void {
+                const es = self.es;
+                const conn = es.conn;
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
+                    if (es.reset) return self.fail(error.ConnectionResetByPeer);
+                    try self.submitHeadOnce(s);
+                    conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);
+                }
+                conn.kickFlush();
+            }
+
+            /// The end of a chain's body: the rest submitted, then END_STREAM
+            /// on its last DATA (or an empty one), on the trailers, or on
+            /// HEADERS when nothing went out. Output for the caller to flush.
+            fn endChain(self: *StreamSink, trailer_fields: ?[]hpack.Field) std.Io.Writer.Error!void {
+                const es = self.es;
+                const conn = es.conn;
+                conn.lock();
+                defer conn.unlock();
+                const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
+                if (es.reset) return self.fail(error.ConnectionResetByPeer);
+                es.ended = true;
+                errdefer es.ended = false;
+                if (!es.head_sent and trailer_fields == null) {
+                    es.head_sent = true;
+                    errdefer es.head_sent = false;
+                    conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, true) catch |err| return self.submitFailed(err);
+                    return;
+                }
+                try self.submitHeadOnce(s);
+                conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);
+                if (trailer_fields) |t| {
+                    conn.proto.submitTrailers(s, t) catch |err| return self.submitFailed(err);
+                } else {
+                    conn.proto.submitData(s, &.{}, true) catch |err| return self.submitFailed(err);
+                }
             }
 
             fn peerGone(ptr: *anyopaque) bool {
