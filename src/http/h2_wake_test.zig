@@ -3,14 +3,16 @@
 //! connection's writer (57fdfa9's lost wake). The core's own HTTP/2 tests
 //! run on std.Io.Threaded, whose futex wake order is the OS's; zio's is
 //! FIFO per bucket, so here the order of the waiters is known and a wake of
-//! one goes to whoever waited first.
+//! one goes to whoever waited first. Run on both engines: the nghttp2 one
+//! (a writer task, until M6) and the one that serves (no writer task; each
+//! stream waits on its own `room`, PLAN §3.3).
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
 const wait = @import("anole_test_wait");
 
-const h2 = dusty.h2_engine_for_tests;
+const h2_nghttp2 = dusty.h2_nghttp2_for_tests;
 
 /// POST /body: says it is about to read, then reads the whole body and
 /// answers with its length. On one executor the flag is seen only once the
@@ -47,7 +49,7 @@ fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello";
 }
 
-/// The writer's waits (`h2.test_before_writer_wait`).
+/// The nghttp2 engine writer's waits (`h2_nghttp2.test_before_writer_wait`).
 var writer_waits: std.atomic.Value(u32) = .init(0);
 fn countWriterWait(_: std.Io) void {
     _ = writer_waits.fetchAdd(1, .release);
@@ -208,6 +210,14 @@ const Client = struct {
 };
 
 test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wake; a parked burst, a PING and a GET all go out first" {
+    try run(.anole);
+}
+
+test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wake (nghttp2 engine)" {
+    try run(.nghttp2);
+}
+
+fn run(comptime engine: enum { anole, nghttp2 }) !void {
     // With one wake per kick, the waiters on the writer's word were the
     // writer and every handler waiting for its stream's first DATA frame,
     // in the order they went to sleep. The PING below makes the writer go
@@ -216,6 +226,8 @@ test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wak
     // which found nothing and slept again, and the burst sat until the
     // client sent something (57fdfa9). Either order of the two fails that
     // engine: the PING's own kick goes to the handler when it is first.
+    // The new engine has no writer task: there the PING's ACK is the sync
+    // point, and the burst, the GET and the body must still all go out.
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -223,13 +235,19 @@ test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wak
     body_waiting.store(false, .monotonic);
     parked = null;
     parked_opened = .unset;
-    h2.test_before_writer_wait = countWriterWait;
-    defer h2.test_before_writer_wait = null;
+    if (engine == .nghttp2) h2_nghttp2.test_before_writer_wait = countWriterWait;
+    defer if (engine == .nghttp2) {
+        h2_nghttp2.test_before_writer_wait = null;
+    };
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
     }, {});
     defer server.deinit();
+    server.test_h2_engine = switch (engine) {
+        .anole => .anole,
+        .nghttp2 => .nghttp2,
+    };
     server.router.post("/body", readBody);
     server.router.get("/live", live);
     server.router.get("/hello", hello);
@@ -275,7 +293,7 @@ test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wak
     const waits = writer_waits.load(.acquire);
     _ = c.nghttp2_submit_ping(client.session, c.NGHTTP2_FLAG_NONE, null);
     try client.flushSession();
-    try wait.waitUntil(io, "the writer answered the PING and went back to sleep", waits, struct {
+    if (engine == .nghttp2) try wait.waitUntil(io, "the writer answered the PING and went back to sleep", waits, struct {
         fn f(before: u32) bool {
             return writer_waits.load(.acquire) > before;
         }

@@ -224,15 +224,15 @@ the nghttp2 engine it replaces.
    (Rooms and SSE already hop once per socket). Listed for the lead's
    profile of the takeover; a copy on the caller posted without the await
    is the fix if it shows.
-3. **After a clean EOF, a detached response not yet attached is aborted.**
-   A peer that half-closes after its request: the nghttp2 engine keeps the
-   connection while any counted handler (detached ones too) is not done,
-   probing with PINGs, and still sends the answer; here `serve` has no task
-   to await for it and the teardown aborts it (the owner hears `abort`).
-   Accepted until the sweeper's half-close probes (M3 lifecycle), which
-   bound such a wait.
-   Still so after the lifecycle item, which brought no half-close probes
-   (none were in its spec); `closeRun` is where the wait would go.
+3. **(Resolved at the switch.) After a clean EOF, handlers still running
+   are probed for, as the nghttp2 engine does.** A peer whose side ended
+   cleanly may have only half-closed: `closeRun` sends a PING then and
+   every 500 ms while any handler (on a task, or a detached response's
+   owner) still holds its stream (`probeHalfClose`); a peer that closed
+   the whole connection answers with a TCP reset, the next write fails,
+   and every handler is canceled and every detached response aborted. One
+   that half-closed still gets its answers. Until the switch, a detached
+   response not yet attached was aborted at the EOF here.
 4. **A keep-alive close sends GOAWAY(NO_ERROR) first.** The nghttp2
    engine's reader was canceled by its keep-alive timer and closed with no
    GOAWAY; a reader whose keep-alive deadline passes queues one and writes
@@ -248,3 +248,31 @@ the nghttp2 engine it replaces.
    stop (or begins its drain if its socket wakes it first). A partial frame
    keeps the connection on its task (nginx's `state.incomplete` rule), not
    D16's spill.
+6. **Its pools keep what a burst grew them to, not a fixed size.** The
+   output buffer and the spare frame nodes (`Conn.spare`, up to 32) grow
+   to the largest burst seen and are given back when the connection
+   parks (Out also at a quiet trim interval): a burst that queues more at
+   once than any before it allocates, and how much queues at once depends
+   on how the handlers' ends and the writes interleave. The nghttp2
+   engine's spare streams and its outbound items made a burst of 100
+   allocate nothing once warm; h2_test.zig's "a warm connection serves a
+   burst of 100 streams ... without allocating" stays on that engine.
+   Not wire behaviour (RFC 9113 says nothing about it); the warm
+   single-request path is server_test.zig's "a warm connection serves
+   requests without allocating". Left to M4's profile.
+7. **An idle connection holds one task, not two.** No writer task: the
+   reader writes, and a flusher runs only while output is left over
+   (PLAN §3.3). Under `max_tasks` an idle connection takes one slot, so
+   the accept's cap (`admission.acceptCap`) admits twice the connections
+   it did; `min_task_cap` stays 3 (a reader, a flusher, a first stream).
+   h2_test.zig's task-cap test runs on both engines with each one's
+   count. Not wire behaviour.
+
+The nghttp2-only tests in server/h2_test.zig (`startWith(io, .nghttp2)` or
+`test_h2_engine = .nghttp2`) are those of that engine's internals: its
+`test_*` hooks (writer rounds and wakes, the body queue and its windows,
+`test_before_fill`/`flush`, `test_after_peer_end`) and its spare streams:
+on this engine their hooks never fire, so they would wait or measure
+nothing. The protocol behaviour under them (windows, drains, half-closes)
+is this engine's in server_test.zig, src/http/h2_park_test.zig and
+conn_test.zig. They go with h2_nghttp2.zig at M6.

@@ -2384,7 +2384,14 @@ pub const Response = struct {
             const piece = @min(left, file_piece);
             const armed = self.armWrite();
             defer self.disarmWrite(armed);
-            const sent = self.bodyOut().sendFileAll(&reader, .limited(piece)) catch |err| switch (err) {
+            const out = self.bodyOut();
+            // `sendFileAll` needs a buffer: a sink's writer may take its
+            // first only when bytes come (the HTTP/2 engine's).
+            if (out.buffer.len == 0) out.rebase(0, 1) catch {
+                self.keepalive = false;
+                return self.resolve(error.WriteFailed);
+            };
+            const sent = out.sendFileAll(&reader, .limited(piece)) catch |err| switch (err) {
                 error.WriteFailed => {
                     self.keepalive = false;
                     return self.resolve(error.WriteFailed);

@@ -160,25 +160,10 @@ pub const FillProbe = struct {
     }
 };
 
-/// The client connection preface (RFC 9113 §3.4).
-pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-/// True when the connection opens with the HTTP/2 preface. Reads only while
-/// what is buffered is still a prefix of it, so an HTTP/1.x request (which
-/// cannot start with "PRI * HTTP/2.0") is never delayed past its first byte
-/// that differs. The preface stays buffered; the session reads it.
-pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
-    while (true) {
-        const have = r.buffered();
-        const n = @min(have.len, preface.len);
-        if (!std.mem.eql(u8, have[0..n], preface[0..n])) return false;
-        if (n == preface.len) return true;
-        r.fillMore() catch |err| switch (err) {
-            error.EndOfStream => return false,
-            error.ReadFailed => return error.ReadFailed,
-        };
-    }
-}
+/// The client connection preface and its sniffing, from the engine that
+/// serves (server.zig sniffs before choosing the engine).
+pub const preface = @import("../h2/server.zig").preface;
+pub const sniffPreface = @import("../h2/server.zig").sniffPreface;
 
 /// A request body queue up to this long comes from the stream's arena,
 /// whose kept node holds it.
@@ -229,13 +214,14 @@ pub fn Engine(comptime Ctx: type) type {
     return struct {
         const Server = @import("../server.zig").Server(Ctx);
 
-        /// The server's open HTTP/2 connections, for the drain.
+        /// The server's open HTTP/2 connections, for the drain (tests only:
+        /// the server's `h2_conns_nghttp2`).
         pub const Registry = struct {
             mutex: std.Io.Mutex = .init,
             list: std.DoublyLinkedList = .{},
 
             fn server(r: *Registry) *Server {
-                return @alignCast(@fieldParentPtr("h2_conns", r));
+                return @alignCast(@fieldParentPtr("h2_conns_nghttp2", r));
             }
 
             fn add(r: *Registry, conn: *Conn) void {
@@ -1204,9 +1190,9 @@ pub fn Engine(comptime Ctx: type) type {
             // only a connection that runs more streams at once grows the
             // map and gets its hash index.
             conn.streams.ensureTotalCapacity(conn.allocator, @min(conn.max_spares, std.atomic.cache_line / @sizeOf(i32))) catch {};
-            server.h2_conns.add(&conn);
+            server.h2_conns_nghttp2.add(&conn);
             defer {
-                server.h2_conns.remove(&conn);
+                server.h2_conns_nghttp2.remove(&conn);
                 conn.lock();
                 defer conn.unlock();
                 // The drain's hold, kept until here so the drain waits

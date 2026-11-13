@@ -179,9 +179,13 @@ pub const percentDecodeLenient = @import("http.zig").percentDecodeLenient;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
-/// Tests only: the HTTP/2 engine, for its test hooks (`test_before_*`),
-/// which anole's tests on the real zio set (src/http/h2_wake_test.zig).
-pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
+/// Tests only: the HTTP/2 engine, for its test counters and hooks
+/// (`test_sink_bodies`, src/grpc/server_test.zig).
+pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("h2/server.zig") else struct {};
+/// Tests only, until M6: the nghttp2 engine, which a server picks with
+/// `test_h2_engine = .nghttp2`, for its hooks (`test_before_*`,
+/// src/http/h2_wake_test.zig).
+pub const h2_nghttp2_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
 /// Tests only: the HTTP/2 codecs, protocol core and the engine on them
 /// (h2/server.zig), for anole's tests on the real zio
 /// (src/http/h2_engine_zio_test.zig).

@@ -1,8 +1,7 @@
 //! The new HTTP/2 engine's lifecycle on the real zio, through `Server.run`
 //! (src/http/core/h2/server.zig; research/h2h3-takeover/PLAN.md §3.3,
 //! §3.5): idle connections park and resume (D16, #97), the keep-alive,
-//! write and send deadlines, and the drain's two-phase GOAWAY. The server
-//! picks the engine per instance (`test_h2_engine`) until the switch. The
+//! write and send deadlines, and the drain's two-phase GOAWAY. The
 //! shelves sweep every 20 ms here (`setParkSweepIntervalForTest`); waits
 //! are on the engine's and the server's counters, never on time.
 const std = @import("std");
@@ -278,7 +277,6 @@ const Fixture = struct {
             self.listeners[0].tls = .{ .pem = .{ .cert = self.pem.?.cert, .key = self.pem.?.key }, .alpn_protocols = &.{ "h2", "http/1.1" } };
         };
         self.server = Server.init(gpa, self.io, .{ .listeners = &self.listeners, .timeout = timeout }, {});
-        self.server.test_h2_engine = .anole;
         self.server.router.get("/", hello);
         self.server.router.get("/empty", empty);
         self.server.router.get("/held", held);

@@ -2,14 +2,18 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! HTTP/2 engine tests: a the core server with cleartext HTTP/2 (prior
+//! HTTP/2 engine tests: the core server with cleartext HTTP/2 (prior
 //! knowledge) on loopback, driven by a minimal nghttp2 client.
 const std = @import("std");
 const dusty = @import("../root.zig");
 const c = @import("nghttp2");
 const build_options = @import("build_options");
 const tls = @import("tls");
+/// The nghttp2 engine, for the tests of its internals (`test_*` hooks),
+/// which pick it per server (`test_h2_engine = .nghttp2`) until M6; every
+/// other test runs on the engine that serves (h2/server.zig).
 const h2 = @import("h2_nghttp2.zig");
+const anole_h2 = @import("../h2/server.zig");
 const wait = @import("anole_test_wait");
 const test_socket = @import("test_socket.zig");
 
@@ -48,8 +52,9 @@ const TestClient = struct {
     closes: usize = 0,
     /// WINDOW_UPDATE frames received for a stream (not the connection).
     stream_window_updates: usize = 0,
-    /// PING ACKs received.
+    /// PING ACKs received, and PINGs.
     ping_acks: usize = 0,
+    pings: usize = 0,
 
     const Resp = struct {
         status: u16 = 0,
@@ -322,7 +327,9 @@ const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
-        if (frame.*.hd.type == c.NGHTTP2_PING and frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1;
+        if (frame.*.hd.type == c.NGHTTP2_PING) {
+            if (frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1 else self.pings += 1;
+        }
         if ((frame.*.hd.type == c.NGHTTP2_DATA or frame.*.hd.type == c.NGHTTP2_HEADERS) and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) {
             if (respFor(session, frame.*.hd.stream_id)) |resp| resp.answered = true;
         }
@@ -614,13 +621,24 @@ const Fixture = struct {
     future: std.Io.Future(anyerror!void) = undefined,
 
     fn start(self: *Fixture, io: std.Io) !void {
+        return self.startWith(io, .anole);
+    }
+
+    /// `start` on `engine`: `.nghttp2` for the tests of its internals
+    /// (its `test_*` hooks), until M6.
+    fn startWith(self: *Fixture, io: std.Io, engine: enum { anole, nghttp2 }) !void {
         self.server = dusty.Server(void).init(std.testing.allocator, io, .{
             .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
             .request = .{ .max_body_size = 8 << 20 },
             // Off by default; the extended CONNECT tests need it.
             .http2 = .{ .enable_connect_protocol = true },
         }, {});
+        self.server.test_h2_engine = switch (engine) {
+            .anole => .anole,
+            .nghttp2 => .nghttp2,
+        };
         self.server.router.get("/hello", Handlers.hello);
+        self.server.router.get("/file", sendFileHandler);
         self.server.router.get("/fields", Handlers.fields);
         self.server.router.get("/users/:id", Handlers.user);
         self.server.router.post("/echo", Handlers.echo);
@@ -797,7 +815,7 @@ test "HTTP/2: a no_wait request reset with its body half sent lets its handler g
 test "HTTP/2: a body window raised before the client acknowledged SETTINGS never outgrows its buffer" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     const body = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024 + 5);
@@ -858,7 +876,7 @@ test "HTTP/2: the reader writes the responses of its no_wait requests itself, wi
     h2.test_before_writer_wait = noteWriterIdle;
     defer h2.test_before_writer_wait = null;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -897,7 +915,7 @@ test "HTTP/2: a reader whose inline write fails ends the connection, and the wri
     h2.test_before_writer_wait = noteWriterIdle;
     defer h2.test_before_writer_wait = null;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -1295,6 +1313,7 @@ test "HTTP/2: a small body's queue comes from the stream's arena, with or withou
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
     }, {});
     defer server.deinit();
+    server.test_h2_engine = .nghttp2;
     server.router.post("/sum", Handlers.sum);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};
@@ -1334,7 +1353,7 @@ test "HTTP/2: a small body's queue comes from the stream's arena, with or withou
 test "HTTP/2: a body of unknown length over several frames gets a window from block_cache" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     const body = try std.testing.allocator.alloc(u8, 20 * 1000);
@@ -1458,13 +1477,28 @@ fn waitTasks(io: std.Io, server: *dusty.Server(void), n: u32) !void {
 }
 
 test "HTTP/2: idle connections leave the task cap's last quarter to streams; past the cap a stream is refused, and served once a slot frees" {
+    try taskCapRun(.anole);
+}
+
+test "HTTP/2: idle connections leave the task cap's last quarter to streams (nghttp2 engine)" {
+    try taskCapRun(.nghttp2);
+}
+
+fn taskCapRun(comptime engine: enum { anole, nghttp2 }) !void {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
-        // Accepts stop at 2: one HTTP/2 connection's reader and writer.
+        // Accepts stop at 2: one HTTP/2 connection's reader and writer on
+        // the nghttp2 engine; two connections' readers on the engine that
+        // serves (no writer task: a flusher only while output is left
+        // over).
         .max_tasks = 3,
     }, {});
     defer server.deinit();
+    server.test_h2_engine = switch (engine) {
+        .anole => .anole,
+        .nghttp2 => .nghttp2,
+    };
     server.router.get("/hello", Handlers.hello);
     server.router.get("/wait", Waiter.handle);
     var future = try io.concurrent(Fixture.run, .{&server});
@@ -1477,6 +1511,12 @@ test "HTTP/2: idle connections leave the task cap's last quarter to streams; pas
     const first = try client.request("GET", "/hello", null);
     try client.run();
     try std.testing.expectEqualStrings("hello", client.get(first).body.items);
+    var second: TestClient = undefined;
+    if (engine == .anole) {
+        try waitTasks(io, &server, 1);
+        try second.init(std.testing.allocator, io, server.address.ip);
+    }
+    defer if (engine == .anole) second.deinit();
     try waitTasks(io, &server, 2);
 
     // A second connection waits at the accept: it can't take the slot
@@ -1508,7 +1548,7 @@ test "HTTP/2: idle connections leave the task cap's last quarter to streams; pas
 test "HTTP/2: a body that overflows its queue resets only its stream, with INTERNAL_ERROR" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -1537,7 +1577,7 @@ test "HTTP/2: a body that overflows its queue resets only its stream, with INTER
 test "HTTP/2: a handler reading before its small body arrives raises no window" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -1566,7 +1606,7 @@ test "HTTP/2: a handler reading before its small body arrives raises no window" 
 test "HTTP/2: a body that fits the window by its content-length is never raised" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -1595,7 +1635,7 @@ test "HTTP/2: a body that fits the window by its content-length is never raised"
 test "HTTP/2: a long body of unknown length raises its window in steps, 256 KiB then 1 MiB" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);
@@ -1620,7 +1660,7 @@ test "HTTP/2: a handler that reads each piece of a long body as it comes still g
     // so the window never runs out: the raise goes by what the peer sent.
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);
@@ -1680,6 +1720,12 @@ fn heldBurst(client: *TestClient, io: std.Io, count: u32, body: ?[]const u8) !vo
 }
 
 test "HTTP/2: a warm connection serves a burst of 100 streams, with or without small bodies, without allocating" {
+    // The nghttp2 engine's pools. The engine that serves keeps what a
+    // burst grew to (its output buffer, 32 spare frame nodes), so a burst
+    // queueing more at once than any before it allocates, and how much
+    // queues at once is the scheduler's (INTENTIONAL.md, the server engine
+    // 6); its warm path is h2/server_test.zig's "a warm connection serves
+    // requests without allocating".
     const io = std.testing.io;
     const safety = @import("anole_safety");
     safety.arena_poisoning.store(false, .monotonic);
@@ -1689,6 +1735,7 @@ test "HTTP/2: a warm connection serves a burst of 100 streams, with or without s
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
     }, {});
     defer server.deinit();
+    server.test_h2_engine = .nghttp2;
     server.router.get("/held", Handlers.held);
     server.router.post("/held", Handlers.heldBody);
     var future = try io.concurrent(Fixture.run, .{&server});
@@ -1705,7 +1752,7 @@ test "HTTP/2: a warm connection serves a burst of 100 streams, with or without s
         try heldBurst(&client, io, 100, body);
         try awaitStreamsFreed(&server, io);
     }
-    try std.testing.expectEqual(@as(usize, 100), server.h2_conns.sparesForTest());
+    try std.testing.expectEqual(@as(usize, 100), server.h2_conns_nghttp2.sparesForTest());
     const before = counting.count.load(.monotonic);
     for ([_]?[]const u8{ null, small, null, small }) |body| {
         try heldBurst(&client, io, 100, body);
@@ -1722,7 +1769,7 @@ fn countFill(_: std.Io, _: h2.FillProbe) std.Io.Cancelable!void {
 test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to 16" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
     h2.test_before_fill = countFill;
     defer h2.test_before_fill = null;
@@ -1732,7 +1779,7 @@ test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to
     defer client.deinit();
     try heldBurst(&client, io, 40, null);
     try awaitStreamsFreed(&fx.server, io);
-    try std.testing.expectEqual(@as(usize, 40), fx.server.h2_conns.sparesForTest());
+    try std.testing.expectEqual(@as(usize, 40), fx.server.h2_conns_nghttp2.sparesForTest());
     // Each round: a trim interval passes, and one request makes the
     // reader look (its idle check, which `test_before_fill` follows). The
     // first trim sets the low-water mark; the next frees what sat unused
@@ -1749,7 +1796,7 @@ test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to
     }
     // The floor, plus the one stream a round's request may have held
     // while the trim ran.
-    const left = fx.server.h2_conns.sparesForTest();
+    const left = fx.server.h2_conns_nghttp2.sparesForTest();
     try std.testing.expect(left >= 16 and left <= 17);
 }
 
@@ -1812,6 +1859,78 @@ test "HTTP/2: a drain closes an idle connection with GOAWAY at once" {
     try std.testing.expect(client.goaway_count >= 1);
     try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), client.goaways[0]);
     if (wait.timing()) try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
+}
+
+test "HTTP/2: a server serves h2 on the new engine by default" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    try std.testing.expect(fx.server.test_h2_engine == .anole);
+    const reads = anole_h2.test_reads.load(.monotonic);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(id).body.items);
+    try std.testing.expect(anole_h2.test_reads.load(.monotonic) > reads);
+}
+
+/// `sendFile` from `file_dir`, on its own route.
+var file_dir: std.Io.Dir = undefined;
+fn sendFileHandler(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(file_dir, "body.bin", .{});
+}
+
+test "HTTP/2: a file body goes out whole" {
+    // The engine's body writer takes its first block only when bytes come;
+    // `sendFileAll` asserts a buffered writer (Response.sendFileBody gives
+    // it one first).
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var content: [100 * 1024 + 7]u8 = undefined;
+    for (&content, 0..) |*b, i| b.* = @truncate(i *% 7 +% (i >> 8));
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.bin", .data = &content });
+    file_dir = tmp.dir;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/file", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualSlices(u8, &content, client.get(id).body.items);
+}
+
+test "HTTP/2: a drain reaches connections of both engines" {
+    // Until M6 a server's connections may be on either engine (the
+    // selector is read as each connection starts): the drain tells both
+    // registries.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.startWith(io, .nghttp2);
+    defer fx.server.deinit();
+    var clients: [2]TestClient = undefined;
+    for (&clients, 0..) |*client, i| {
+        if (i == 1) fx.server.test_h2_engine = .anole;
+        try client.init(std.testing.allocator, io, fx.server.address.ip);
+        const id = try client.request("GET", "/hello", null);
+        try client.run();
+        try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    }
+    defer for (&clients) |*client| client.deinit();
+
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+    for (&clients) |*client| {
+        try client.runUntilClosed();
+        try std.testing.expect(client.goaway_count >= 1);
+        try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), client.goaways[0]);
+    }
 }
 
 test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finishes the stream" {
@@ -1881,7 +2000,7 @@ test "HTTP/2: a drain resets an answered stream whose client keeps its request s
 test "HTTP/2: a stream answered during a drain whose client keeps its request side open is reset" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.server.deinit();
 
     var client: TestClient = undefined;
@@ -2023,7 +2142,7 @@ test "HTTP/2: a drain ends with a clean close when the peer's last frames are un
     // reads nothing once it has a GOAWAY and no stream open.
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.server.deinit();
 
     unread_held.store(false, .release);
@@ -2144,7 +2263,7 @@ test "HTTP/2: a drain waits for a response that is taken from the session but no
     // write is held 200 ms: the drain decides inside that window.
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.server.deinit();
 
     var client: TestClient = undefined;
@@ -2236,7 +2355,7 @@ test "HTTP/2: an extended CONNECT (RFC 8441) reaches a GET route with Request.pr
 test "HTTP/2: a client that half-closes still gets the responses in flight" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
-    try fx.start(io);
+    try fx.startWith(io, .nghttp2);
     defer fx.stop(io);
 
     var client: TestClient = undefined;
@@ -2272,6 +2391,46 @@ test "HTTP/2: a client that half-closes still gets the responses in flight" {
         if (rv < 0) return error.Http2Recv;
         client.r.toss(@intCast(rv));
     }
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
+}
+
+test "HTTP/2: a client that half-closes still gets the responses in flight, past the server's probe" {
+    // The engine that serves has no `test_after_peer_end`: its half-close
+    // probe (a PING, once it has read the EOF with a handler running) is
+    // the sync point, and the handler answers only after it.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    Handlers.held_gate = .unset;
+    const helds = Handlers.held_entered.load(.acquire);
+    const id = try client.request("GET", "/held", null);
+    while (true) {
+        var data: [*c]const u8 = undefined;
+        const n = c.nghttp2_session_mem_send2(client.session, &data);
+        if (n <= 0) break;
+        try client.w.writeAll(data[0..@intCast(n)]);
+    }
+    try client.w.flush();
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
+    try client.stream.shutdown(io, .send);
+    var gate_open = false;
+    while (!client.get(id).closed) {
+        const bytes = try client.r.peekGreedy(1);
+        const rv = c.nghttp2_session_mem_recv2(client.session, bytes.ptr, bytes.len);
+        if (rv < 0) return error.Http2Recv;
+        client.r.toss(@intCast(rv));
+        if (!gate_open and client.pings > 0) {
+            Handlers.held_gate.set(io);
+            gate_open = true;
+        }
+    }
+    try std.testing.expect(gate_open);
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
 }
@@ -2506,9 +2665,13 @@ const LiveAllocator = struct {
 };
 
 /// Streams whose head the server refuses: a header list past the limit,
-/// and two host fields (refused by nghttp2's own checks).
+/// and two host fields (refused by the engine's own checks). With a
+/// `max_header_list_size` of 2048, two 1000-byte fields are past it decoded
+/// (each costs its length + 32) but not on the wire (Huffman, about 875
+/// bytes each): a block over the limit on the wire ends the connection on
+/// the engine that serves (INTENTIONAL.md, limits 5).
 fn sendRefusedHeads(client: *TestClient, n: usize) !void {
-    const big: [1500]u8 = @splat('x');
+    const big: [1000]u8 = @splat('x');
     for (0..n) |i| {
         if (i % 2 == 0) {
             _ = try client.requestWith("/hello", "localhost", &.{ TestClient.nv("x-a", &big), TestClient.nv("x-b", &big) });
@@ -2610,6 +2773,7 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
         .http2 = .{ .reading_window_budget = 1024 * 1024 },
     }, {});
     defer server.deinit();
+    server.test_h2_engine = .nghttp2;
     server.router.post("/late", Handlers.late);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};

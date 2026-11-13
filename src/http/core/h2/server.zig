@@ -1,7 +1,7 @@
 //! The HTTP/2 server engine on Anole's own protocol core (conn.zig;
 //! research/h2h3-takeover/PLAN.md §3.3-§3.5, M3), in place of the nghttp2
-//! engine (src/http/core/server/h2_nghttp2.zig) once the server switches to
-//! it. A connection runs as
+//! engine (src/http/core/server/h2_nghttp2.zig, kept for tests until M6).
+//! A connection runs as
 //!
 //!   * the reader (the connection's own task, which entered `serve`): reads,
 //!     feeds `Conn.recv`, runs the `no_wait` requests that came whole in the
@@ -92,12 +92,33 @@ const parked_mod = @import("../parked.zig");
 const Parked = parked_mod.Parked;
 
 const log = std.log.scoped(.anole_h2);
+/// zio's count of the locks a task holds (`debug_held_locks`); a no-op for
+/// the core's stub zio.
+const held_locks = if (@hasDecl(@import("zio"), "held_locks")) @import("zio").held_locks else struct {
+    fn acquired() void {}
+    fn released() void {}
+};
 
-/// The client connection preface and its sniffing, shared with the nghttp2
-/// engine (server.zig calls them before choosing the engine).
-const nghttp2_engine = @import("../server/h2_nghttp2.zig");
-pub const preface = nghttp2_engine.preface;
-pub const sniffPreface = nghttp2_engine.sniffPreface;
+/// The client connection preface (RFC 9113 §3.4), shared with the nghttp2
+/// engine.
+pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// True when the connection opens with the HTTP/2 preface. Reads only while
+/// what is buffered is still a prefix of it, so an HTTP/1.x request (which
+/// cannot start with "PRI * HTTP/2.0") is never delayed past its first byte
+/// that differs. The preface stays buffered; the session reads it.
+pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
+    while (true) {
+        const have = r.buffered();
+        const n = @min(have.len, preface.len);
+        if (!std.mem.eql(u8, have[0..n], preface[0..n])) return false;
+        if (n == preface.len) return true;
+        r.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return false,
+            error.ReadFailed => return error.ReadFailed,
+        };
+    }
+}
 
 /// A request body up to this long comes from the stream's arena.
 const arena_body_max = 4 * 1024;
@@ -115,6 +136,12 @@ const block_len = 16 * 1024;
 const max_vecs = 64;
 /// The PING sent with a drain's GOAWAY notice.
 const drain_ping: [8]u8 = "anole-go".*;
+/// After the peer's side of the connection ended cleanly, while handlers
+/// still run, how often a PING asks whether the peer only half-closed (it
+/// may still read their responses) or is gone (the write after its reset
+/// fails, and the handlers are canceled). The nghttp2 engine's.
+const half_close_probe_interval: std.Io.Duration = .fromMilliseconds(500);
+const probe_ping: [8]u8 = "anole-hc".*;
 /// The most bytes a tunnel or a parked response may have queued for the
 /// peer before its send waits, when the caller names no limit (the nghttp2
 /// engine's `tunnel_outbox_max`).
@@ -187,7 +214,7 @@ pub fn Engine(comptime Ctx: type) type {
         const PStream = conn_mod.Stream;
 
         /// The server's open HTTP/2 connections, for the drain, in the
-        /// server's field `field` (the switch renames it `h2_conns`).
+        /// server's field `field`.
         /// The drain asks each connection for its GOAWAYs (`drain_req`)
         /// and gets them sent: where the connection has a mutex, now,
         /// under it; on a pinned executor, whose lock is no lock, by
@@ -204,7 +231,7 @@ pub fn Engine(comptime Ctx: type) type {
             mutex: safety.IoLock = .init,
             list: std.DoublyLinkedList = .{},
 
-            pub const field = "h2_conns_anole";
+            pub const field = "h2_conns";
 
             fn server(r: *Registry) *Server {
                 // SAFETY: the registry is the server's `field` (`registered` in `start`).
@@ -301,6 +328,10 @@ pub fn Engine(comptime Ctx: type) type {
                         std.debug.assert(placement.currentExecutor(io) == l.owner);
                         std.debug.assert(!l.held);
                         l.held = true;
+                        // Counted with zio's (`debug_held_locks`), as a
+                        // mutex is: a task that suspends under it panics at
+                        // the suspension.
+                        held_locks.acquired();
                     }
                     return;
                 }
@@ -309,7 +340,10 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn unlock(l: *ConnLock, io: std.Io) void {
                 if (l.free) {
-                    if (comptime builtin.mode == .debug) l.held = false;
+                    if (comptime builtin.mode == .debug) {
+                        l.held = false;
+                        held_locks.released();
+                    }
                     return;
                 }
                 l.mutex.unlock(io);
@@ -363,6 +397,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// them (`parked_idle`), as their owners still touch them.
             parked_open: usize = 0,
             parked_idle: Signal = .{},
+            /// Notified as a handler lets go of its stream once the
+            /// connection is `closing` (`probeHalfClose` waits on it).
+            handler_done: Signal = .{},
 
             /// Every stream with a hold left (`EStream.holds`).
             live: std.DoublyLinkedList = .{},
@@ -383,6 +420,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// the reader touches them.
             ready: std.ArrayList(*EStream) = .empty,
             awaiting: std.ArrayList(*EStream) = .empty,
+            /// Streams counted in and waiting for their task, which the
+            /// reader spawns once the read is processed (`startTasks`).
+            /// Only the reader touches it.
+            to_start: std.DoublyLinkedList = .{},
             inline_ok: bool = false,
 
             /// Streams with a handler that have not let go yet; the
@@ -644,7 +685,9 @@ pub fn Engine(comptime Ctx: type) type {
 
             pub fn onGoaway(conn: *Conn, last_id: u31, code: conn_mod.ErrorCode) void {
                 _ = conn;
-                log.debug("HTTP/2: GOAWAY from the peer, last stream {d}, {t}", .{ last_id, code });
+                // As a number: the peer may send any code (RFC 9113 §7),
+                // and a name only exists for the ones we know.
+                log.debug("HTTP/2: GOAWAY from the peer, last stream {d}, code {d}", .{ last_id, @backingInt(code) });
             }
 
             pub fn onPingAck(conn: *Conn, data: [8]u8) void {
@@ -684,17 +727,32 @@ pub fn Engine(comptime Ctx: type) type {
                 es.wake.notify(conn.io);
             }
 
-            /// A task for the stream's handler; at the task cap the stream
-            /// is refused (REFUSED_STREAM, safe for the client to retry; RFC
-            /// 9113 §8.7). Under the lock.
+            /// The stream's handler gets a task once the read is processed
+            /// (`startTasks`): a spawn may yield, which must not happen in
+            /// the middle of `recv`. Under the lock.
             fn spawnTasked(conn: *Conn, es: *EStream) void {
                 if (!es.counted) {
                     conn.holdBusy();
                     es.counted = true;
                 }
                 es.handler_hold = true;
+                conn.to_start.append(&es.start_node);
+            }
+
+            /// A task for each handler `spawnTasked` queued; at the task
+            /// cap the stream is refused (REFUSED_STREAM, safe for the
+            /// client to retry; RFC 9113 §8.7). The reader, after `recv`,
+            /// under the lock (which `spawn` may let go meanwhile).
+            fn startTasks(conn: *Conn) void {
+                while (conn.to_start.popFirst()) |node| {
+                    const es: *EStream = @fieldParentPtr("start_node", node);
+                    conn.startTask(es);
+                }
+            }
+
+            fn startTask(conn: *Conn, es: *EStream) void {
                 const slot = if (conn.task_row) |r| conn.server.admission.reserveTask(r, .stream) else true;
-                const spawned = if (!slot) error.TaskCap else placement.concurrent(conn.group, conn.io, .local, runStream, .{ conn, es });
+                const spawned = if (!slot) error.TaskCap else conn.spawn(runStream, .{ conn, es });
                 spawned catch |err| {
                     if (slot) if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
                     if (err == error.TaskCap)
@@ -709,6 +767,21 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 };
                 if (comptime is_test) _ = test_spawned.fetchAdd(1, .monotonic);
+            }
+
+            /// `placement.concurrent` into the connection's group, under
+            /// the lock, at a point where other tasks may run. On a pinned
+            /// executor, whose lock is no lock, a spawn may yield (zio's
+            /// spawn back-pressure, once its run queue is long), so the
+            /// lock is let go around it: the spawn takes the group before
+            /// any suspension, so `tasks_closed`, checked under it, still
+            /// holds. With a mutex nothing yields (zio steals, or
+            /// std.Io.Threaded) and it stays held.
+            fn spawn(conn: *Conn, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) std.Io.ConcurrentError!void {
+                if (!conn.lock_.free) return placement.concurrent(conn.group, conn.io, .local, func, args);
+                conn.unlock();
+                defer conn.lock();
+                return placement.concurrent(conn.group, conn.io, .local, func, args);
             }
 
             /// After a read: the `no_wait` requests whose body did not end
@@ -733,6 +806,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// lock.
             fn finishHandler(conn: *Conn, es: *EStream) void {
                 es.handler_hold = false;
+                if (conn.closing) conn.handler_done.notify(conn.io);
                 if (es.cs) |s| {
                     // A handler that returned without ending its response
                     // (it never does: `serveStream` writes it) would leave
@@ -750,6 +824,42 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                 }
                 conn.maybeFree(es);
+            }
+
+            /// The reader is done: no more request body can arrive. Every
+            /// stream still waiting for one, and every parked response,
+            /// is reset and its handler canceled; with `all`, every stream
+            /// (nobody left to answer). Under the lock.
+            fn cancelStreams(conn: *Conn, all: bool) void {
+                var it = conn.live.first;
+                while (it) |node| {
+                    it = node.next;
+                    const es: *EStream = @fieldParentPtr("node", node);
+                    // A parked response has nobody to send to once the
+                    // peer closed its side of the connection.
+                    if (all or !es.body_done or es.parked != null) {
+                        es.reset = true;
+                        conn.closeBody(es);
+                        conn.wakeRoom(es);
+                        es.cancelHandler();
+                        // Detached with nobody left to send to: let go now
+                        // rather than at its deadline.
+                        conn.abortDetached(es);
+                        conn.maybeFree(es);
+                    }
+                }
+            }
+
+            /// Whether a handler still holds a stream (on its task, or a
+            /// detached response's owner), parked ones aside (reset at the
+            /// EOF; the teardown waits for their release). Under the lock.
+            fn handlersRunning(conn: *Conn) bool {
+                var it = conn.live.first;
+                while (it) |node| : (it = node.next) {
+                    const es: *EStream = @fieldParentPtr("node", node);
+                    if (es.handler_hold and es.parked == null) return true;
+                }
+                return false;
             }
 
             /// `es`'s last frames are out (or never will be). Under the
@@ -1002,7 +1112,7 @@ pub fn Engine(comptime Ctx: type) type {
                     return false;
                 };
                 if (conn.task_row) |r| _ = conn.server.admission.reserveTask(r, .forced);
-                placement.concurrent(conn.group, conn.io, .local, flusherRun, .{ conn, with_token }) catch {
+                conn.spawn(flusherRun, .{ conn, with_token }) catch {
                     if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
                     log.err("HTTP/2: no task for the connection's output", .{});
                     return false;
@@ -1173,11 +1283,12 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.connection.releaseWriteBuffer();
                         conn.unflushed = false;
                         conn.flushing = false;
-                        if (conn.claimSendWaiter() and !conn.spawnFlusher(false)) conn.send_waiter = false;
                         // The final GOAWAY is out and nothing is open:
                         // nothing more is written (`shutDrained`).
                         const close_drained = conn.drained() and !conn.send_shut and !conn.closing;
                         if (close_drained) conn.send_shut = true;
+                        // Last: its spawn may let the lock go.
+                        if (conn.claimSendWaiter() and !conn.spawnFlusher(false)) conn.send_waiter = false;
                         conn.unlock();
                         if (close_drained) try conn.shutDrained();
                         return;
@@ -1701,6 +1812,8 @@ pub fn Engine(comptime Ctx: type) type {
             out_hold: bool = false,
             retire_node: std.DoublyLinkedList.Node = .{},
             retire_mark: u64 = 0,
+            /// In `Conn.to_start` until its task is spawned.
+            start_node: std.DoublyLinkedList.Node = .{},
             /// Counted in `Conn.open_streams` (a handler was started).
             counted: bool = false,
             /// Its response is whole but its last frames are not framed
@@ -2072,32 +2185,17 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.closing = true;
                 // A send-deadline waiter has nothing left to wait for.
                 if (conn.send_waiter) conn.send_wake.notify(conn.io);
-                var it = conn.live.first;
-                while (it) |node| {
-                    it = node.next;
-                    const es: *EStream = @fieldParentPtr("node", node);
-                    // A parked response has nobody to send to once the
-                    // peer closed its side of the connection.
-                    if (reader_failed or !es.body_done or es.parked != null) {
-                        es.reset = true;
-                        conn.closeBody(es);
-                        conn.wakeRoom(es);
-                        es.cancelHandler();
-                        // Detached with nobody left to send to: let go now
-                        // rather than at its deadline.
-                        conn.abortDetached(es);
-                        conn.maybeFree(es);
-                    }
-                }
+                conn.cancelStreams(reader_failed);
             }
             conn.flush(.all, timer) catch return error.Canceled;
-            conn.group.await(conn.io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-            };
-            // No task joins the group from here (`spawnFlusher`; the drain
-            // may still kick one, from its own thread where the connection
-            // has a mutex): one started meanwhile is joined now, and then
-            // the lingering close is the only writer.
+            if (result) |end| if (end == .eof) try probeHalfClose(conn, timer) else {} else |_| {}
+            // No task joins the group from here (`spawnFlusher`,
+            // `detachedAttach`), before the join: a spawn from outside the
+            // group (the drain's thread, a detached owner's, where the
+            // connection has a mutex) must not race the join's end
+            // (`std.Io.Group.await`). What the tasks still queue goes out
+            // with the flush below, and then the lingering close is the
+            // only writer.
             {
                 conn.lock();
                 defer conn.unlock();
@@ -2112,6 +2210,31 @@ pub fn Engine(comptime Ctx: type) type {
             }
             conn.flush(.all, timer) catch return error.Canceled;
             if (linger) try lingeringClose(conn);
+        }
+
+        /// After a clean EOF, while handlers still run: a PING now and
+        /// every `half_close_probe_interval` until they are done (their
+        /// tasks, and the flushers they kick, still join the group
+        /// meanwhile). A peer
+        /// that closed the whole connection answers the first with a TCP
+        /// reset, so a later write fails (`send_shut`), and the handlers
+        /// are canceled, with nobody left to answer; one that only
+        /// half-closed reads it and is still served. The nghttp2 engine's
+        /// probes (its writer's `closing` rounds).
+        fn probeHalfClose(conn: *Conn, timer: *Timer) error{Canceled}!void {
+            while (true) {
+                const seen = conn.handler_done.epoch();
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    if (!conn.handlersRunning()) return;
+                    if (conn.send_shut) return conn.cancelStreams(true);
+                    conn.proto.ping(probe_ping) catch {};
+                }
+                conn.flush(.all, timer) catch return error.Canceled;
+                conn.handler_done.waitTimeout(conn.io, seen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } }) catch
+                    return error.Canceled;
+            }
         }
 
         /// Waits, uncancelably, until every parked response is released.
@@ -2168,6 +2291,9 @@ pub fn Engine(comptime Ctx: type) type {
                         if (result) |_| {
                             if (conn.awaiting.items.len > 0) conn.startAwaiting();
                         } else |_| {}
+                        // Also after a connection error: those handlers
+                        // see their streams reset.
+                        if (conn.to_start.first != null) conn.startTasks();
                         break :result result;
                     };
                     const taken = result catch |err| switch (err) {

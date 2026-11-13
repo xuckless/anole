@@ -1271,7 +1271,7 @@ const Late = struct {
     var calls: u32 = 0;
     fn drain() void {
         calls += 1;
-        if (server) |s| _ = s.h2_conns_anole.beginDrain();
+        if (server) |s| _ = s.h2_conns.beginDrain();
     }
 };
 

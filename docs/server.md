@@ -837,9 +837,9 @@ vm.max_map_count and the mappings in use)`.
   headroom, at two per task, divided by the executors; elsewhere there is
   no cap. A quarter below the cap an HTTP/1.x accept waits (new
   connections queue in the kernel's backlog, as at `max_connections`),
-  which keeps the rest for streams: an HTTP/2 connection holds two tasks
-  (its reader and its writer) even while idle, and connections alone
-  never fill the cap. At the cap an HTTP/2 stream gets REFUSED_STREAM and
+  which keeps the rest for streams: an HTTP/2 connection holds its
+  reader's task even while idle (and a flusher's while output is left
+  over), and connections alone never fill the cap. At the cap an HTTP/2 stream gets REFUSED_STREAM and
   an HTTP/3 one H3_REQUEST_REJECTED; both are safe for the client to
   retry. A parked connection whose next request arrives is counted but
   never refused: its request is already there. At least 3. Raising
