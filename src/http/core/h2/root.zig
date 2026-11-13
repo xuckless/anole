@@ -17,6 +17,8 @@ pub const streams = @import("streams.zig");
 pub const out = @import("out.zig");
 pub const conn = @import("conn.zig");
 pub const server = @import("server.zig");
+/// Tests only: connections served by `server` without `Server.run`.
+pub const test_server = if (@import("builtin").is_test) @import("test_server.zig") else struct {};
 
 test {
     std.testing.refAllDecls(@This());
