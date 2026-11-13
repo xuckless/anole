@@ -196,6 +196,11 @@ pub const Lazy = struct {
     /// at, and nobody has claimed or taken the cancel back yet.
     poked: bool = false,
     delivered: u7 = 0,
+    /// The task is in a wait that the server's drain should end
+    /// (`Shelf.drainWake`): an HTTP/2 reader waiting for input, which then
+    /// sends the drain's GOAWAY. Set and cleared by the task around the
+    /// wait only, so a drain never cuts what it does in between (a write).
+    wake_on_drain: bool = false,
 
     pub const never = std.math.maxInt(i96);
 
@@ -277,6 +282,9 @@ pub const Shelf = struct {
     /// The driver's doorbell, rung by `stop` from any thread.
     bell: if (supported) zio.ev.Async else void = if (supported) .init() else {},
     stopping: std.atomic.Value(bool) = .init(false),
+    /// The server's drain has news for the tasks waiting with
+    /// `Lazy.wake_on_drain` (`drainWake`).
+    draining: std.atomic.Value(bool) = .init(false),
     /// The driver has ended, every connection parked here closed.
     done: std.Io.Event = .unset,
     /// For the clock.
@@ -393,6 +401,25 @@ pub const Shelf = struct {
         if (comptime !supported) return;
         self.stopping.store(true, .release);
         self.bell.notify();
+    }
+
+    /// Asks the driver to end the waits of the tasks registered with
+    /// `Lazy.wake_on_drain` set, as a deadline would: the server's drain
+    /// has something for them to send. From any thread.
+    pub fn drainWake(self: *Shelf) void {
+        if (comptime !supported) return;
+        self.draining.store(true, .release);
+        self.bell.notify();
+    }
+
+    /// The driver's answer to `drainWake`, on the shelf's executor.
+    fn pokeDraining(self: *Shelf) void {
+        var it = self.lazies.first;
+        while (it) |n| : (it = n.next) {
+            // SAFETY: only `Lazy` nodes are on `lazies` (`register`).
+            const l: *Lazy = @alignCast(@fieldParentPtr("node", n));
+            if (l.wake_on_drain and !l.poked) l.poke();
+        }
     }
 
     fn insert(self: *Shelf, p: *Parked) void {
@@ -521,6 +548,7 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
             error.Closed => break,
         };
         if (c == &shelf.bell.c) {
+            if (shelf.draining.swap(false, .acq_rel)) shelf.pokeDraining();
             if (shelf.stopping.load(.acquire)) shelf.expireAll() else shelf.cq.submit(&shelf.bell.c) catch {};
             continue;
         }

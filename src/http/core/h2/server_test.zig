@@ -877,6 +877,28 @@ test "h2 engine: Out is released at the first read after a trim interval that fi
     try expectEqualStrings("hello", (try c.until(again)).body.items);
 }
 
+test "h2 engine: a finished response the peer never takes is reset at its send deadline" {
+    // No shelf and no timers here (std.Io.Threaded): the flusher's futex
+    // wait carries the deadline (`waitSends`), as the nghttp2 engine's
+    // writer did.
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{ .timeout = .{ .request = .fromMilliseconds(300) } });
+    defer fx.stop();
+    const c = &fx.client;
+    // A stream window of zero: the head may go, never the body.
+    try c.settingsWindow(0);
+    try c.flush();
+    const resets = engine.test_send_resets.load(.acquire);
+    const id = try c.request("GET", "/hello", null);
+    const r = try c.until(id);
+    try expectEqual(200, r.status);
+    try expectEqual(ErrorCode.cancel, r.rst.?);
+    try expect(engine.test_send_resets.load(.acquire) > resets);
+    // Only that stream: a bodyless answer still goes out.
+    const head = try c.request("HEAD", "/hello", null);
+    try expectEqual(200, (try c.until(head)).status);
+}
+
 test "h2 engine: a peer reset mid-response lets the handler go and the connection carries on" {
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});

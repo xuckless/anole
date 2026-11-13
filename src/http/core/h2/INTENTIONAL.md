@@ -231,3 +231,20 @@ the nghttp2 engine it replaces.
    to await for it and the teardown aborts it (the owner hears `abort`).
    Accepted until the sweeper's half-close probes (M3 lifecycle), which
    bound such a wait.
+   Still so after the lifecycle item, which brought no half-close probes
+   (none were in its spec); `closeRun` is where the wait would go.
+4. **A keep-alive close sends GOAWAY(NO_ERROR) first.** The nghttp2
+   engine's reader was canceled by its keep-alive timer and closed with no
+   GOAWAY; a reader whose keep-alive deadline passes queues one and writes
+   it before the close, as nginx, Go's x/net/http2 (`onIdleTimer`) and h2o
+   (`on_idle_timeout`) do. A parked connection closed at its deadline by
+   the shelf gets none (no task writes it): a FIN, or close_notify on TLS,
+   as a parked HTTP/1.1 connection. RFC 9113 §6.8 allows both.
+5. **Idle connections park, and the drain does not reach a parked one.**
+   With nothing open, queued or half read for `idle_park`, a connection
+   ends its task and gives its buffers back (D16, #97); the drain's
+   GOAWAYs go to the connections with a task, and a parked one, which
+   holds no count in the server's in-flight requests, is closed at the
+   stop (or begins its drain if its socket wakes it first). A partial frame
+   keeps the connection on its task (nginx's `state.incomplete` rule), not
+   D16's spill.

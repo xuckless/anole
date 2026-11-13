@@ -328,8 +328,19 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// (the server preface, as today's engine sends it, plus D15's
         /// SETTINGS_NO_RFC7540_PRIORITIES).
         pub fn init(gpa: Allocator, handler: *H, opts: Options) Allocator.Error!Self {
+            // SAFETY: `initAt` sets every field.
+            var c: Self = undefined;
+            try c.initAt(gpa, handler, opts);
+            return c;
+        }
+
+        /// `init` into `c` (the engine's heap connection): no copy of the
+        /// whole connection (about 7 KB, its HPACK tables) passes through
+        /// the caller's stack, whose pages a connection's task keeps
+        /// (#223).
+        pub fn initAt(c: *Self, gpa: Allocator, handler: *H, opts: Options) Allocator.Error!void {
             const cw: u31 = @max(default_window, opts.connection_window);
-            var c: Self = .{
+            c.* = .{
                 .gpa = gpa,
                 .handler = handler,
                 .opts = opts,
@@ -367,7 +378,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const b = try c.out.writable(frame.header_len + n * frame.setting_len);
             c.out.commit(frame.writeSettings(b, false, entries[0..n]));
             if (cw > default_window) try c.queueWindowUpdate(0, cw - default_window);
-            return c;
         }
 
         /// Frees everything. No onStreamClose for the streams still open:
@@ -1364,6 +1374,35 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         pub fn ping(c: *Self, data: [8]u8) Allocator.Error!void {
             const b = try c.out.writable(frame.header_len + 8);
             c.out.commit(frame.writePing(b, false, data));
+        }
+
+        /// Nothing of a frame is held between `recv` calls: no DATA payload
+        /// half in, no header block waiting for its CONTINUATIONs (and,
+        /// when the caller's buffer is empty, no partial frame there). An
+        /// idle connection parks only then, as nginx keeps a connection
+        /// whose `state.incomplete` is set out of its idle mode.
+        pub fn atFrameBoundary(c: *const Self) bool {
+            return c.data_in == null and c.block == null;
+        }
+
+        /// An idle connection's memory back (PLAN §3.4, M3): the output
+        /// blocks and ready queue, the stream slab's chunks, the stream
+        /// table and the spare Pending nodes, which the next stream
+        /// allocates again. Only with no stream in the table or closing
+        /// and nothing queued. Whether it could.
+        pub fn releaseIdle(c: *Self) bool {
+            if (c.depth != 0 or c.table.size != 0 or c.closing.first != null or c.pending_nodes != 0 or !c.out.idle() or c.out.peekReady() != null) return false;
+            c.out.release();
+            c.out.ready.clearAndFree(c.gpa);
+            c.out.ready_head = 0;
+            c.slab.deinit();
+            const max_live = c.table.max_live;
+            const seed = c.table.seed;
+            c.table.deinit();
+            c.table = .init(c.gpa, max_live, seed);
+            while (c.spare.popFirst()) |node| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", node)));
+            c.spare_len = 0;
+            return true;
         }
 
         /// What to write now: queued frames, plus DATA framed from the

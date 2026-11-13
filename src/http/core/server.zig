@@ -46,6 +46,10 @@ const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2_nghttp2.zig") else struct {};
+/// Tests only, until the switch (h2-m3 item 4): the engine on Anole's own
+/// protocol core, which a test picks per server (`test_h2_engine`).
+const h2_anole = if (build_options.use_http2 and @import("builtin").is_test) @import("h2/server.zig") else struct {};
+const has_h2_anole = build_options.use_http2 and @import("builtin").is_test;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");
@@ -1346,6 +1350,11 @@ pub fn Server(comptime Ctx: type) type {
         /// GOAWAY that no new streams will be taken.
         h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
             if (build_options.use_http2) .{} else {},
+        /// Tests only, until the switch: which HTTP/2 engine serves this
+        /// server's connections, and the new engine's connections (its
+        /// `Registry.field`).
+        test_h2_engine: if (has_h2_anole) enum { nghttp2, anole } else void = if (has_h2_anole) .nghttp2 else {},
+        h2_conns_anole: if (has_h2_anole) h2_anole.Engine(Ctx).Registry else void = if (has_h2_anole) .{} else {},
         /// Bumped by the first executor's trim task every
         /// `request_buffers_trim_interval`: an HTTP/2 connection that sees
         /// it move frees the spare streams it kept unused since.
@@ -1949,7 +1958,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// The calling task's executor's shelf, when connections park.
-        fn shelfHere(self: *Self) ?*park.Shelf {
+        pub fn shelfHere(self: *Self) ?*park.Shelf {
             if (self.shelves.len == 0) return null;
             const i = placement.currentExecutor(self.io) orelse return null;
             if (i >= self.shelves.len) return null;
@@ -2473,7 +2482,9 @@ pub fn Server(comptime Ctx: type) type {
             // to `linger_timeout` for a peer that keeps its side open).
             var notice_deadline: ?std.Io.Clock.Timestamp = null;
             if (comptime build_options.use_http2) {
-                if (self.h2_conns.beginDrain())
+                var any = self.h2_conns.beginDrain();
+                if (comptime has_h2_anole) any = self.h2_conns_anole.beginDrain() or any;
+                if (any)
                     notice_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = h2_notice_wait, .clock = .awake });
             }
 
@@ -2502,6 +2513,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (notice_deadline) |nd| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, nd)) {
                         if (comptime build_options.use_http2) self.h2_conns.finishDrain();
+                        if (comptime has_h2_anole) self.h2_conns_anole.finishDrain();
                         notice_deadline = null;
                         continue;
                     }
@@ -2929,6 +2941,10 @@ pub fn Server(comptime Ctx: type) type {
                     connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
+                            if (comptime has_h2_anole) if (self.test_h2_engine == .anole) {
+                                try h2_anole.Engine(Ctx).start(self, l.config, true, connection, busy);
+                                return self.serveRequests(conn, timer, busy);
+                            };
                             // The engine's tasks have all ended when it
                             // returns, so this is the only writer left.
                             try h2.Engine(Ctx).serve(self, l.config, true, connection, busy);
@@ -3083,6 +3099,15 @@ pub fn Server(comptime Ctx: type) type {
                     return .park;
                 },
             };
+        }
+
+        /// Prior-knowledge HTTP/2 on the new engine, taking the connection
+        /// over from `handleRequests` (whose buffers the preface may sit
+        /// in: the engine's first run moves it into its own). Out of line,
+        /// so its frame is not part of the HTTP/1.x loop's (#223).
+        noinline fn startH2c(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+            try h2_anole.Engine(Ctx).start(self, conn.listener.config, false, &conn.connection, busy);
+            return self.serveAdopted(conn, timer);
         }
 
         /// The task started for a parked connection whose socket became
@@ -3487,6 +3512,10 @@ pub fn Server(comptime Ctx: type) type {
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
                         timer.clear(self.io);
+                        if (comptime has_h2_anole) if (self.test_h2_engine == .anole) {
+                            adopter_ran = true;
+                            return self.startH2c(conn, timer, busy);
+                        };
                         try h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
                         return .close;
                     }
