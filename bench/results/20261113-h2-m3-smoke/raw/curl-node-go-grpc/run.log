@@ -1,0 +1,47 @@
+[14:52:43] scenario curl-load-tls
+[14:52:43] scenario curl-load-h2c
+[14:52:43] scenario curl-abort
+[14:52:44] scenario curl-upload
+[14:52:44] scenario curl-sse
+[14:52:47] scenario curl-header-30k
+30k header: 200
+[14:52:47] scenario curl-header-200k
+200k header: 000 (000 = curl refused or the connection ended)
+[14:52:47] scenario raw-continuation
+1 fragment: 0 CONTINUATION frames, header block 42 B -> HEADERS status-byte 0x20
+8 fragments (7 CONTINUATION): 7 CONTINUATION frames, header block 223 B -> HEADERS status-byte 0x20
+9 fragments (8 CONTINUATION): 8 CONTINUATION frames, header block 223 B -> HEADERS status-byte 0x20
+10 fragments (9 CONTINUATION): 9 CONTINUATION frames, header block 223 B -> GOAWAY code 11
+21 fragments (20 CONTINUATION): 20 CONTINUATION frames, header block 223 B -> GOAWAY code 11
+48 KiB value in full frames: 3 CONTINUATION frames, header block 49177 B -> HEADERS status-byte 0x20
+70 KiB value in full frames: 4 CONTINUATION frames, header block 71705 B -> GOAWAY code 11
+[14:52:51] scenario raw-priority
+PRIORITY_UPDATE x5000 in one write -> HEADERS status-byte 0x20
+PRIORITY x5000 in one write -> HEADERS status-byte 0x20
+[14:52:53] scenario node-page
+[14:52:53] PASS node-page
+[14:52:53] scenario node-download
+downloaded 67108864
+[14:52:53] PASS node-download
+[14:52:53] scenario node-cancel
+[14:52:53] PASS node-cancel
+[14:52:53] scenario node-upload
+uploaded 9
+[14:52:53] PASS node-upload
+[14:52:53] scenario node-ping-tool-driven
+[14:52:53] PASS node-ping
+[14:52:54] scenario gohttp-tls
+gohttp get ok=100 upload=16777216 cancelled=20 of 20 non-h2=0 failures=0
+[14:52:54] PASS gohttp-tls
+[14:52:54] scenario gohttp-h2c
+gohttp get ok=100 upload=16777216 cancelled=20 of 20 non-h2=0 failures=0
+[14:52:54] PASS gohttp-h2c
+[14:52:54] direct curl 100 GETs:     100 2 200
+[14:52:54] direct curl upload echoed 16777216
+[14:52:54] PASS direct-curl
+gohttp get ok=100 upload=16777216 cancelled=20 of 20 non-h2=0 failures=0
+[14:52:54] PASS direct-gohttp
+[14:52:54] scenario grpc-go
+unary ok=1000 failed=0, cancelled=20 of 20
+[14:52:54] PASS grpc-go
+[14:52:55] report: /home/xuckl/Dev/anole-wt/h2m3-engine/bench/results/20261113-h2-m3-smoke/raw/curl-node-go-grpc/h2count.json

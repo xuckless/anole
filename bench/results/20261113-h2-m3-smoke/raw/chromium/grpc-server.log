@@ -1,0 +1,11 @@
+info: gRPC (h2c), gRPC-Web and Connect on http://127.0.0.1:18083
+info: gRPC over TLS on https://127.0.0.1:18483 (self-signed)
+info(anole): environment development (Debug build): no .env file found; 500 answers name the error
+info(anole): Debug build
+info(anole): I/O engine: io_uring
+info(anole): buffer budget 291259 KiB per executor (a quarter of RAM over the executors); at most 16380 request tasks per executor (from vm.max_map_count and the mappings in use)
+info(anole): listening on http://127.0.0.1:18083 (HTTP/1.1, HTTP/2 cleartext)
+info(anole): listening on https://127.0.0.1:18483 (HTTP/2, HTTP/1.1)
+info(anole): console: `anole console grpc` attaches (socket /run/user/1000/anole/grpc.41191.sock)
+info(anole): Graceful shutdown requested
+info(anole): signal received (term); drained and stopped

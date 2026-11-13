@@ -1,0 +1,19 @@
+h2count: tls on 127.0.0.1:19443 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19080 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19083 -> 127.0.0.1:18083
+scenario           conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+chromium-load      3      93       202    0       1     4        0      0          0      0       0       0       0    0         457     1     134
+chromium-reload    3      86       1515   0       1     4        80     80         80     0       0       0       0    0         460     1     1036
+chromium-abort     3      49       50     0       1     4        48     34         48     0       0       0       0    0         444     2     0
+chromium-sse       3      4        5      0       1     4        3      3          3      0       0       0       0    0         442     1     0
+chromium-upload    2      1        4      0       1     4        0      0          0      0       0       0       0    0         445     1     0
+chromium-download  2      2        4      0       1     4        0      0          0      0       0       0       0    0         446     30    0
+chromium-nav       3      2        3      0       1     4        0      0          0      0       0       0       0    0         459     30    0
+scenario           conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+chromium-load      3      93       202    0       1     4        0      0          0      0       0       0       0    0         457     1     134
+chromium-reload    3      86       1515   0       1     4        80     80         80     0       0       0       0    0         460     1     1036
+chromium-abort     3      49       50     0       1     4        48     34         48     0       0       0       0    0         444     2     0
+chromium-sse       3      4        5      0       1     4        3      3          3      0       0       0       0    0         442     1     0
+chromium-upload    2      1        4      0       1     4        0      0          0      0       0       0       0    0         445     1     0
+chromium-download  2      2        4      0       1     4        0      0          0      0       0       0       0    0         446     30    0
+chromium-nav       3      2        3      0       1     4        0      0          0      0       0       0       0    0         459     30    0
