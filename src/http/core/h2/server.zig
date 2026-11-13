@@ -1111,9 +1111,14 @@ pub fn Engine(comptime Ctx: type) type {
                     _ = test_late_flushers.fetchAdd(1, .monotonic);
                     return false;
                 };
-                if (conn.task_row) |r| _ = conn.server.admission.reserveTask(r, .forced);
+                // One with the token runs on the slot its run holds
+                // (`adopterServe`); a send-deadline waiter, which may run
+                // beside it, takes one of its own.
+                if (!with_token) if (conn.task_row) |r| {
+                    _ = conn.server.admission.reserveTask(r, .forced);
+                };
                 conn.spawn(flusherRun, .{ conn, with_token }) catch {
-                    if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
+                    if (!with_token) if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
                     log.err("HTTP/2: no task for the connection's output", .{});
                     return false;
                 };
@@ -1129,7 +1134,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// Its writes have a deadline of their own, on the shelf's
             /// sweep where there is one.
             fn flusherRun(conn: *Conn, with_token: bool) std.Io.Cancelable!void {
-                defer if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
+                defer if (!with_token) if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
                 var timer: Timer = .init(null);
                 timer.register(conn.server.shelfHere());
                 defer {
@@ -2047,6 +2052,15 @@ pub fn Engine(comptime Ctx: type) type {
             a.deadline = null;
             const server = conn.server;
             const connection = conn.connection;
+            // The flusher's task slot, held while the run lasts (the
+            // reader's is the accept's or the wake's): a connection on its
+            // task counts as the two tasks it may run, as the nghttp2
+            // engine's reader and writer did, so `max_tasks` bounds them;
+            // a parked one counts none. A run ends with its flushers done
+            // (a park needs `flushing` clear, their last step; a close
+            // joins them).
+            if (conn.task_row) |r| _ = server.admission.reserveTask(r, .forced);
+            defer if (conn.task_row) |r| server.admission.releaseTask(conn.io, r);
             // SAFETY: the connection's address only picks a pool shard.
             const buffers = try server.request_buffers.acquire(@intFromPtr(connection));
             conn.buffers = buffers;
@@ -2189,13 +2203,17 @@ pub fn Engine(comptime Ctx: type) type {
             }
             conn.flush(.all, timer) catch return error.Canceled;
             if (result) |end| if (end == .eof) try probeHalfClose(conn, timer) else {} else |_| {}
-            // No task joins the group from here (`spawnFlusher`,
-            // `detachedAttach`), before the join: a spawn from outside the
-            // group (the drain's thread, a detached owner's, where the
-            // connection has a mutex) must not race the join's end
-            // (`std.Io.Group.await`). What the tasks still queue goes out
-            // with the flush below, and then the lingering close is the
-            // only writer.
+            // No flusher joins the group from here (`spawnFlusher`, under
+            // the lock), before the join: a spawn from outside the group
+            // (the drain's thread, where the connection has a mutex) must
+            // not race the join's end (`std.Io.Group.await`). What the
+            // tasks still queue goes out with the flush below, and then the
+            // lingering close is the only writer. A detached owner's
+            // `attach` is checked here too, but its owner spawns after the
+            // lock: safe where the connection's tasks share an executor
+            // (pinned zio: no yield between the two), not where they don't
+            // (std.Io.Threaded). The nghttp2 engine's `attach` is the same;
+            // the fix is a `Detached` attach that spawns under the lock.
             {
                 conn.lock();
                 defer conn.unlock();
@@ -2220,8 +2238,11 @@ pub fn Engine(comptime Ctx: type) type {
         /// reset, so a later write fails (`send_shut`), and the handlers
         /// are canceled, with nobody left to answer; one that only
         /// half-closed reads it and is still served. The nghttp2 engine's
-        /// probes (its writer's `closing` rounds).
+        /// probes (its writer's `closing` rounds): a handler's end wakes
+        /// the wait to look again, and only a whole interval without one
+        /// sends the next PING.
         fn probeHalfClose(conn: *Conn, timer: *Timer) error{Canceled}!void {
+            var probe = true;
             while (true) {
                 const seen = conn.handler_done.epoch();
                 {
@@ -2229,11 +2250,12 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     if (!conn.handlersRunning()) return;
                     if (conn.send_shut) return conn.cancelStreams(true);
-                    conn.proto.ping(probe_ping) catch {};
+                    if (probe) conn.proto.ping(probe_ping) catch {};
                 }
-                conn.flush(.all, timer) catch return error.Canceled;
+                if (probe) conn.flush(.all, timer) catch return error.Canceled;
                 conn.handler_done.waitTimeout(conn.io, seen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } }) catch
                     return error.Canceled;
+                probe = conn.handler_done.epoch() == seen;
             }
         }
 
@@ -3123,7 +3145,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// The response side of a stream, for `Response._initSink`.
         const StreamSink = struct {
             es: *EStream,
-            writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = flushFn }, .buffer = &.{} },
+            writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = flushFn, .rebase = rebaseFn }, .buffer = &.{} },
             err: ?Response.SendError = null,
 
             fn sink(self: *StreamSink) Sink {
@@ -3375,6 +3397,18 @@ pub fn Engine(comptime Ctx: type) type {
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
                 if (self.es.chain_mode) return self.kickChain();
                 return self.submitBlock();
+            }
+
+            /// Room in the writer's buffer (`Response.sendFileBody`, for
+            /// `sendFileAll`): the next block, as `drain` takes it. A
+            /// chain's writer keeps no buffer (its bytes are copied to the
+            /// chain), so it refuses there, and the caller copies through
+            /// a buffer of its own.
+            fn rebaseFn(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
+                // SAFETY: the writer is a StreamSink's `writer`.
+                const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                if (self.es.chain_mode) return error.WriteFailed;
+                return std.Io.Writer.defaultRebase(w, preserve, capacity);
             }
 
             /// Moves what the block holds on, then takes what fits of

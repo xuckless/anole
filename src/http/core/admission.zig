@@ -334,8 +334,9 @@ pub const State = struct {
         /// client may retry.
         stream,
         /// Counted, never refused: a task that has to run for work already
-        /// admitted (an HTTP/2 connection's writer, a parked connection
-        /// whose request has arrived). Bounded by the connections admitted.
+        /// admitted (an HTTP/2 connection's writer or flusher, a parked
+        /// connection whose request has arrived). Bounded by the
+        /// connections admitted.
         forced,
     };
 
@@ -363,7 +364,8 @@ pub const State = struct {
     /// Where an HTTP/1.x accept starts to wait: a quarter of `task_cap`
     /// below it, at least one slot, kept for the streams that can only be
     /// refused. Connections alone (an idle HTTP/2 one holds its reader's
-    /// task) never fill the cap, so a stream always has room once they stop.
+    /// slot and its flusher's) never fill the cap, so a stream always has
+    /// room once they stop.
     pub fn acceptCap(s: *const State) u32 {
         if (s.task_cap == no_limit) return no_limit;
         return s.task_cap -| @max(1, s.task_cap / 4);

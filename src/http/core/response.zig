@@ -2377,6 +2377,10 @@ pub const Response = struct {
         // file straight into the connection's write buffer.
         var reader = body.handle.reader(self.io, &.{});
         reader.seekTo(body.offset) catch unreachable; // a new reader is positional
+        // A writer that keeps no buffer copies what it is given (an HTTP/2
+        // tunnel's or parked stream's chain): the file goes through one of
+        // the request's.
+        var copy: []u8 = &.{};
         // In pieces, so that `timeouts.write` bounds each hand-off to the
         // peer rather than the whole download.
         var left = body.size;
@@ -2386,12 +2390,15 @@ pub const Response = struct {
             defer self.disarmWrite(armed);
             const out = self.bodyOut();
             // `sendFileAll` needs a buffer: a sink's writer may take its
-            // first only when bytes come (the HTTP/2 engine's).
-            if (out.buffer.len == 0) out.rebase(0, 1) catch {
-                self.keepalive = false;
-                return self.resolve(error.WriteFailed);
+            // first only when bytes come (the HTTP/2 engine's block), or
+            // never (its chain, where `rebase` refuses).
+            if (out.buffer.len == 0 and copy.len == 0) out.rebase(0, 1) catch {
+                copy = self.arena.alloc(u8, @min(left, file_copy_len)) catch {
+                    self.keepalive = false;
+                    return self.resolve(error.WriteFailed);
+                };
             };
-            const sent = out.sendFileAll(&reader, .limited(piece)) catch |err| switch (err) {
+            const sent = (if (copy.len > 0) copyFile(out, &reader, piece, copy) else out.sendFileAll(&reader, .limited(piece))) catch |err| switch (err) {
                 error.WriteFailed => {
                     self.keepalive = false;
                     return self.resolve(error.WriteFailed);
@@ -2410,6 +2417,23 @@ pub const Response = struct {
             }
             left -= piece;
         }
+    }
+
+    /// The buffer `sendFileBody` copies a file through, for a writer that
+    /// keeps none.
+    const file_copy_len: usize = 16 * 1024;
+
+    /// Up to `n` bytes of `reader` to `out` through `buf`: as `sendFileAll`
+    /// for a writer with no buffer of its own.
+    fn copyFile(out: *std.Io.Writer, reader: *std.Io.File.Reader, n: usize, buf: []u8) std.Io.Writer.FileAllError!usize {
+        var left = n;
+        while (left > 0) {
+            const got = try reader.interface.readSliceShort(buf[0..@min(left, buf.len)]);
+            if (got == 0) break;
+            try out.writeAll(buf[0..got]);
+            left -= got;
+        }
+        return n - left;
     }
 
     /// The Content-Length the handler set, if it did.

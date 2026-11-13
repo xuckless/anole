@@ -1488,10 +1488,9 @@ fn taskCapRun(comptime engine: enum { anole, nghttp2 }) !void {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
-        // Accepts stop at 2: one HTTP/2 connection's reader and writer on
-        // the nghttp2 engine; two connections' readers on the engine that
-        // serves (no writer task: a flusher only while output is left
-        // over).
+        // Accepts stop at 2: one HTTP/2 connection's reader and writer
+        // (the nghttp2 engine), or its reader and the slot its run holds
+        // for a flusher (the engine that serves).
         .max_tasks = 3,
     }, {});
     defer server.deinit();
@@ -1511,12 +1510,6 @@ fn taskCapRun(comptime engine: enum { anole, nghttp2 }) !void {
     const first = try client.request("GET", "/hello", null);
     try client.run();
     try std.testing.expectEqualStrings("hello", client.get(first).body.items);
-    var second: TestClient = undefined;
-    if (engine == .anole) {
-        try waitTasks(io, &server, 1);
-        try second.init(std.testing.allocator, io, server.address.ip);
-    }
-    defer if (engine == .anole) second.deinit();
     try waitTasks(io, &server, 2);
 
     // A second connection waits at the accept: it can't take the slot
@@ -1902,6 +1895,34 @@ test "HTTP/2: a file body goes out whole" {
     defer client.deinit();
     const id = try client.request("GET", "/file", null);
     try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualSlices(u8, &content, client.get(id).body.items);
+}
+
+test "HTTP/2: a file body goes out whole on an extended CONNECT" {
+    // An extended CONNECT is served as a GET, its body copied to the
+    // stream's chain, whose writer keeps no buffer: Response.sendFileBody
+    // copies the file through one of its own (`rebase` refuses there).
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var content: [40 * 1024 + 3]u8 = undefined;
+    for (&content, 0..) |*b, i| b.* = @truncate(i *% 5 +% (i >> 7));
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.bin", .data = &content });
+    file_dir = tmp.dir;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // The server's SETTINGS (with ENABLE_CONNECT_PROTOCOL) must be in before
+    // nghttp2 lets a client send :protocol.
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+    const id = try client.requestProtocol("CONNECT", "/file", "websocket", null);
+    try client.runUntilDone(id);
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqualSlices(u8, &content, client.get(id).body.items);
 }

@@ -260,13 +260,14 @@ the nghttp2 engine it replaces.
    Not wire behaviour (RFC 9113 says nothing about it); the warm
    single-request path is server_test.zig's "a warm connection serves
    requests without allocating". Left to M4's profile.
-7. **An idle connection holds one task, not two.** No writer task: the
-   reader writes, and a flusher runs only while output is left over
-   (PLAN §3.3). Under `max_tasks` an idle connection takes one slot, so
-   the accept's cap (`admission.acceptCap`) admits twice the connections
-   it did; `min_task_cap` stays 3 (a reader, a flusher, a first stream).
-   h2_test.zig's task-cap test runs on both engines with each one's
-   count. Not wire behaviour.
+7. **A connection on its task counts as two tasks; a parked one as none.**
+   No writer task: the reader writes, and a flusher runs only while output
+   is left over (PLAN §3.3). Under `max_tasks` the run holds a slot for
+   its flusher beside the reader's (`adopterServe`), as the nghttp2
+   engine's writer held one, so the cap still bounds the tasks that may
+   run (a send-deadline waiter takes one more of its own); a parked
+   connection holds no task and no slot. h2_test.zig's task-cap test runs
+   on both engines with the same count. Not wire behaviour.
 
 The nghttp2-only tests in server/h2_test.zig (`startWith(io, .nghttp2)` or
 `test_h2_engine = .nghttp2`) are those of that engine's internals: its
