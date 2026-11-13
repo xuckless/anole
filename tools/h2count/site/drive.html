@@ -8,7 +8,7 @@
 const s = new URLSearchParams(location.search).get('s');
 const wait = ms => new Promise(r => setTimeout(r, ms));
 const frame = (src) => new Promise(r => { const f = document.createElement('iframe'); f.src = src; f.onload = () => r(f); document.body.append(f); });
-async function drain(res) { const rd = res.body.getReader(); while (!(await rd.read()).done); }
+async function drain(res) { const rd = res.body.getReader(); let n = 0; for (let r; !(r = await rd.read()).done;) n += r.value.length; return n; }
 const jobs = {
   async load() { for (let i = 0; i < 3; i++) { const f = await frame('/?load=' + i); await wait(500); f.remove(); } },
   async reload() { // 30 page loads cut off after 20-120 ms: their streams are reset
@@ -21,9 +21,11 @@ const jobs = {
     await Promise.all(ps); await wait(500);
   },
   async sse() { const es = [0, 1, 2].map(i => new EventSource('/sse?i=' + i)); await wait(2500); es.forEach(e => e.close()); await wait(300); },
-  async upload() { await drain(await fetch('/upload', { method: 'POST', body: new Blob([new Uint8Array(16 << 20)]) })); },
-  async download() { await drain(await fetch('/download?full=1')); },
-  async nav() { fetch('/download?nav=1').then(drain).catch(() => {}); await wait(400); location.href = '/r/1?away'; await wait(3000); },
+  async upload() { const r = await fetch('/upload', { method: 'POST', body: new Blob([new Uint8Array(16 << 20)]) }); const t = (await r.text()).trim(); if (!r.ok || t !== String(16 << 20)) throw new Error('upload ' + r.status + ' echoed ' + t); },
+  async download() { const r = await fetch('/download?full=1'); const n = await drain(r); if (!r.ok || n !== 64 << 20) throw new Error('download ' + r.status + ' got ' + n); },
+  async nav() { fetch('/download?nav=1').then(drain).catch(() => {}); await wait(400); report(1, ''); location.href = '/r/1?away'; await wait(3000); },
 };
-(jobs[s] || (async () => {}))().then(() => { document.title = 'done'; });
+// The result goes to the site's log (GET /done), which scenarios/run.sh reads: a hung or failed job shows as no line or ok=0.
+const report = (ok, err) => fetch('/done?s=' + s + '&ok=' + ok + '&err=' + encodeURIComponent(err), { keepalive: true }).catch(() => {});
+(jobs[s] || (async () => { throw new Error('unknown scenario'); }))().then(() => report(1, ''), e => report(0, String(e))).then(() => { document.title = 'done'; });
 </script>

@@ -6,25 +6,39 @@
 #   SITE_BIN=zig-out/bin/h2count-site GRPC_BIN=zig-out/bin/grpc \
 #     tools/h2count/scenarios/run.sh <outdir> [group ...]
 #
-# Groups: curl node chromium firefox grpc envoy h2load (default: all).
+# Groups: curl node gohttp chromium firefox grpc envoy h2load, and direct (curl
+# and the Go client straight at the site's own TLS port, no proxy, no counting:
+# the engine's secure path) (default: all but direct).
 # Needs: go, curl, node >= 22; chromium-browser, firefox and docker for their
 # groups (a group whose tool is missing is skipped with a note).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:?usage: run.sh <outdir> [group ...]}; shift
-groups=${*:-curl node chromium firefox grpc envoy h2load}
+groups=${*:-curl node gohttp chromium firefox grpc envoy h2load}
 mkdir -p "$out"; out=$(cd "$out" && pwd)
-SITE_PORT=18080 GRPC_PORT=18083 TLS_PORT=19443 H2C_PORT=19080 GRPC_PROXY=19083 CTL=19990
+SITE_PORT=18080 GRPC_PORT=18083 TLS_PORT=19443 DIRECT_PORT=18443 H2C_PORT=19080 GRPC_PROXY=19083 CTL=19990
 CERT=$out/cert.pem
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/h2count-run.XXXXXX")
 pids=()
 cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done; wait; docker rm -f h2count-envoy >/dev/null 2>&1; rm -rf "$tmp"; }
 trap cleanup EXIT
 note() { echo "[$(date +%T)] $*" | tee -a "$out/run.log" >&2; }
+# Browser scenarios report through the site's /done (drive.html); no line is a hang. Lines are only
+# counted past the site.log size at the scenario's start.
+verdict_since() { # <scenario> <drive name> <log size before>
+  local new; new=$(tail -c +"$(($3 + 1))" "$out/site.log" | grep "^done s=$2 ")
+  if echo "$new" | grep -q " ok=1" && ! echo "$new" | grep -q " ok=0"; then note "PASS $1"; else note "FAIL $1 (${new:-no /done line})"; fi
+}
 scn() { curl -s "127.0.0.1:$CTL/scenario?name=$1" >/dev/null; note "scenario $1"; }
 
 ( cd "$here/.." && go build -o "$tmp/h2count" . ) || exit 1
-"$SITE_BIN" "$SITE_PORT" >"$out/site.log" 2>&1 & pids+=($!)
+site_args=("$SITE_PORT")
+case " $groups " in *" direct "*)
+  command -v openssl >/dev/null && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj /CN=localhost \
+    -addext subjectAltName=DNS:localhost,IP:127.0.0.1 -keyout "$tmp/direct.key" -out "$tmp/direct.pem" 2>/dev/null &&
+    site_args+=("$DIRECT_PORT" "$tmp/direct.pem" "$tmp/direct.key") ;;
+esac
+"$SITE_BIN" "${site_args[@]}" >"$out/site.log" 2>&1 & pids+=($!)
 listens=(-listen "tls@127.0.0.1:$TLS_PORT=127.0.0.1:$SITE_PORT" -listen "h2c@127.0.0.1:$H2C_PORT=127.0.0.1:$SITE_PORT")
 if [ -n "${GRPC_BIN:-}" ]; then
   "$GRPC_BIN" "$GRPC_PORT" 18483 >"$out/grpc-server.log" 2>&1 & pids+=($!)
@@ -57,19 +71,23 @@ run_curl() {
   curl -s --http2 --cacert "$CERT" "${big[@]}" -o /dev/null -w "200k header: %{http_code} (000 = curl refused or the connection ended)\n" "$TLS/r/1" | tee -a "$out/run.log"
   scn raw-continuation
   node "$here/rawcont.mjs" 127.0.0.1 "$H2C_PORT" | tee -a "$out/run.log"
+  scn raw-priority   # synthetic: 5000 PRIORITY_UPDATE then 5000 PRIORITY, each in one write
+  node "$here/rawprio.mjs" 127.0.0.1 "$H2C_PORT" | tee -a "$out/run.log"
 }
 
 run_node() {
   for ph in page download cancel upload ping; do
     [ $ph = ping ] && scn node-ping-tool-driven || scn "node-$ph"
-    timeout 60 node "$here/node-h2.mjs" "$TLS" "$CERT" $ph >>"$out/run.log" 2>&1
+    timeout 60 node "$here/node-h2.mjs" "$TLS" "$CERT" $ph >>"$out/run.log" 2>&1 && note "PASS node-$ph" || note "FAIL node-$ph (exit $?)"
   done
 }
 
 browser_scenarios() { # <name> <launcher: function taking url seconds>
   for s in load:10 reload:10 abort:10 sse:8 upload:12 download:20 nav:8; do
     scn "$1-${s%%:*}"
+    local before; before=$(stat -c %s "$out/site.log")
     "$2" "$TLS/drive?s=${s%%:*}" "${s##*:}"
+    verdict_since "$1-${s%%:*}" "${s%%:*}" "$before"
   done
 }
 launch_chromium() {
@@ -87,6 +105,24 @@ run_grpc() {
   [ -n "${GRPC_BIN:-}" ] || { note "skipped grpc: no GRPC_BIN"; return; }
   scn grpc-go
   ( cd "$here/../clients/grpcgo" && go run . -addr "127.0.0.1:$GRPC_PROXY" ) 2>&1 | tee -a "$out/run.log"
+  [ "${PIPESTATUS[0]}" = 0 ] && note "PASS grpc-go" || note "FAIL grpc-go"
+}
+
+run_gohttp() { # through the proxy: TLS (ALPN h2) and h2c prior knowledge, both counted
+  ( cd "$here/../clients/gohttp" && go build -o "$tmp/gohttp" . ) || { note "FAIL gohttp build"; return; }
+  scn gohttp-tls
+  "$tmp/gohttp" -url "$TLS" -ca "$CERT" 2>&1 | tee -a "$out/run.log"; [ "${PIPESTATUS[0]}" = 0 ] && note "PASS gohttp-tls" || note "FAIL gohttp-tls"
+  scn gohttp-h2c
+  "$tmp/gohttp" -url "$H2C" -h2c 2>&1 | tee -a "$out/run.log"; [ "${PIPESTATUS[0]}" = 0 ] && note "PASS gohttp-h2c" || note "FAIL gohttp-h2c"
+}
+
+run_direct() { # the site's own TLS port: not counted, only success (the proxy would hide the engine's secure path)
+  [ -s "$tmp/direct.pem" ] || { note "skipped direct: no openssl"; return; }
+  ( cd "$here/../clients/gohttp" && go build -o "$tmp/gohttp" . ) || { note "FAIL direct build"; return; }
+  local u="https://localhost:$DIRECT_PORT" c; c=$(curl -s -Z --parallel-max 100 --http2 --cacert "$tmp/direct.pem" -o /dev/null -w "%{http_version} %{http_code}\n" "$u/r/[1-100].png" | sort | uniq -c)
+  note "direct curl 100 GETs: $c"; echo "$c" | grep -q " 2 200" && ! echo "$c" | grep -qv " 2 200" || note "FAIL direct-curl-get"
+  local n; n=$(curl -s --http2 --cacert "$tmp/direct.pem" --data-binary @"$tmp/up.bin" "$u/upload"); note "direct curl upload echoed $n"; [ "$n" = $((16 << 20)) ] && note "PASS direct-curl" || note "FAIL direct-curl-upload"
+  "$tmp/gohttp" -url "$u" -ca "$tmp/direct.pem" 2>&1 | tee -a "$out/run.log"; [ "${PIPESTATUS[0]}" = 0 ] && note "PASS direct-gohttp" || note "FAIL direct-gohttp"
 }
 
 run_envoy() {
@@ -122,6 +158,8 @@ for g in $groups; do
     node) run_node ;;
     chromium) has chromium-browser chromium && browser_scenarios chromium launch_chromium ;;
     firefox) has firefox firefox && browser_scenarios firefox launch_firefox ;;
+    gohttp) run_gohttp ;;
+    direct) run_direct ;;
     grpc) run_grpc ;;
     envoy) run_envoy ;;
     h2load) run_h2load ;;
