@@ -53,6 +53,13 @@ print("|---|---|---|")
 for (n, k), v in sorted(codes.items()):
     if k.startswith("s2c_"):
         print(f"| {n} | {k} | {v} |")
+# Client-sent GOAWAY with a code other than NO_ERROR (a browser closing a session with live streams says INTERNAL_ERROR).
+print()
+print("| scenario | client GOAWAY code | count |")
+print("|---|---|---|")
+for (n, k), v in sorted(codes.items()):
+    if k.startswith("c2s_goaway:") and k != "c2s_goaway:0x0":
+        print(f"| {n} | {k[len('c2s_goaway:'):]} | {v} |")
 for n, d in debug:
     print(f"\nGOAWAY debug data in {n}: `{d}`")
 print()
@@ -61,7 +68,7 @@ print("|---|---|")
 for k, v in sorted(server_settings.items()):
     print(f"| {k} | {v} |")
 
-# Headroom: engine default (limits.zig) over the highest legitimate observed value; below 2.5x is flagged.
+# Headroom: engine default (limits.zig and config.zig; keep these values in step with them) over the highest legitimate observed value; below 2.5x is flagged.
 # Rates a budget does not charge (PRIORITY, PRIORITY_UPDATE) are listed with their limit as "exempt".
 LIMITS = [("empty DATA/HEADERS/CONT per second", 100, "data_empty/s"), ("SETTINGS entries per frame", 32, "settings_entries_per_frame"),
           ("CONTINUATION per block", 8, "continuations_per_block"), ("peak concurrent streams", 250, "peak_streams"),

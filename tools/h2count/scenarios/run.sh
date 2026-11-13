@@ -55,14 +55,14 @@ has() { command -v "$1" >/dev/null || { note "skipped $2: $1 not found"; return 
 
 run_curl() {
   scn curl-load-tls
-  curl -s -Z --parallel-max 100 --http2 --cacert "$CERT" -o /dev/null "$TLS/r/[1-100].png"
+  curl -sf -Z --parallel-max 100 --http2 --cacert "$CERT" -o /dev/null "$TLS/r/[1-100].png" || note "FAIL curl-load-tls"
   scn curl-load-h2c
-  curl -s -Z --parallel-max 100 --http2-prior-knowledge -o /dev/null "$H2C/r/[1-100].png"
+  curl -sf -Z --parallel-max 100 --http2-prior-knowledge -o /dev/null "$H2C/r/[1-100].png" || note "FAIL curl-load-h2c"
   scn curl-abort
   for _ in 1 2 3; do curl -s --max-time 1 --http2 --cacert "$CERT" -o /dev/null "$TLS/download"; done
   curl -s -Z --max-time 1 --http2 --cacert "$CERT" -o /dev/null "$TLS/download?[1-20]"
   scn curl-upload
-  curl -s --http2 --cacert "$CERT" --data-binary @"$tmp/up.bin" -o /dev/null "$TLS/upload"
+  n=$(curl -sf --http2 --cacert "$CERT" --data-binary @"$tmp/up.bin" "$TLS/upload"); [ "$n" = $((16 << 20)) ] || note "FAIL curl-upload (echo '$n')"
   scn curl-sse
   curl -s -N --max-time 3 --http2 --cacert "$CERT" -o /dev/null "$TLS/sse"
   scn curl-header-30k

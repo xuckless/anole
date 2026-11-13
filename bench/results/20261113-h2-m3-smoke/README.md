@@ -48,10 +48,10 @@ engine (bench/results/20261111-h2-limits-calibration) still hold now that the en
 | Firefox 160 | the same seven | PASS x7 |
 | Envoy 1.34.1 | default, keepalive (5 s PING), 100 GETs, 10 cancelled, SSE | completed; 1 PING/s |
 | raw (rawcont.mjs) | header block over CONTINUATIONs | 8 CONTINUATIONs served, 9 or more: GOAWAY(ENHANCE_YOUR_CALM) "too many CONTINUATION frames"; 70 KiB block: "header block too large". Expected (the budgets working) |
-| raw (rawprio.mjs, new) | 5000 PRIORITY_UPDATE, then 5000 PRIORITY, each in one write, then a GET | no GOAWAY, the GET answered both times |
+| raw (rawprio.mjs, new) | 5000 PRIORITY_UPDATE, then 5000 PRIORITY, each in one write, then a GET (run before the 2026-11-13 review; rawprio.mjs now sends 20000 of each, past the 10000 burst, and wants a rerun) | no GOAWAY, the GET answered both times. 5000 is half the burst, so this row did not yet discriminate |
 
 Server-sent GOAWAY and RST_STREAM codes over the whole run: the only GOAWAY with a code other than NO_ERROR is the
-`raw-continuation` row above (3, all ENHANCE_YOUR_CALM, all on purpose). No other server GOAWAY, no RST_STREAM
+`raw-continuation` row above (3, all ENHANCE_YOUR_CALM, all on purpose). On the client side, Firefox sent GOAWAY(INTERNAL_ERROR) once, closing `firefox-abort` connection 0 (49 requests, 14 client RST CANCEL) when the harness ended it with streams in flight; the nghttp2 baseline (20261111-h2-limits-calibration) also counted a client GOAWAY on that connection, and Firefox maps a session closed with live transactions to INTERNAL_ERROR. Not checked against a server frame log, so not proven to be unrelated to the engine; summarize.py now lists client GOAWAY codes. No other server GOAWAY, no RST_STREAM
 the clients did not cause, `unknown` frames 0, empty-frame counters 0, no desync in either direction. The site logs
 (`raw/*/site.log`) show no engine error.
 
@@ -89,11 +89,14 @@ The expected switch did not show in the data:
   without the setting) and **sent no PRIORITY_UPDATE** although 0x9=1 reached it in the first SETTINGS. Firefox sent
   neither before and neither now. I did not investigate why Chromium ignores the setting here (a feature gate in a
   headless build is a guess, not a finding).
-- **The exemption holds.** PRIORITY, at 657/s, ran above the 330/s glitch rate for a second in Chromium's reload with
-  no GOAWAY and no RST from the server; and the synthetic `raw-priority` run (rawprio.mjs: 5000 PRIORITY_UPDATE and
-  5000 PRIORITY in a single write, a GET after them) left the connection open and answered. For PRIORITY_UPDATE
-  the browsers give no organic rate (0), so the exemption is shown by the synthetic run and the unit tests
-  (`conn_limits_test.zig` "PRIORITY_UPDATE is not counted as an unknown frame"), not by a real client's rate.
+- **The exemption is shown by the unit tests and the synthetic run, not by Chromium.** The glitch budget is a token
+  bucket (burst 10000, refill 330/s): Chromium's 1036 PRIORITY frames per connection at 657/s for about a second
+  cost at most 1036 tokens if they were charged, so this reload could not have tripped it either way. It
+  would take a long-lived connection held above 330/s for about 30 s, which no scenario measures. The evidence is
+  `conn_limits_test.zig` (tight limits: "PRIORITY_UPDATE is not counted as an unknown frame" and the PRIORITY
+  twin) and `raw-priority` (rawprio.mjs sends 20000 PRIORITY_UPDATE and 20000 PRIORITY in one write, past the burst,
+  then a GET; a charged frame would end the connection with GOAWAY(ENHANCE_YOUR_CALM)); that run has to be repeated
+  on the new script. For PRIORITY_UPDATE the browsers give no organic rate (0).
   If a browser version starts sending PRIORITY_UPDATE, the expected rate is about one per prioritized stream
   (Chromium's per-load PRIORITY count: 117 for a 100-subresource load).
 
@@ -110,7 +113,7 @@ The expected switch did not show in the data:
 | PING | queued control budget 1000 (not a rate) | 22/s (grpc-go) | n/a |
 | PRIORITY, PRIORITY_UPDATE | not charged | 657/s, 0 | exempt |
 
-Every row keeps at least 2.5x. Unchanged against the calibration: the stream cap is exactly at the 2.5x line
+Every row keeps at least 2.5x (the refused-stream budget is unused: no server REFUSED_STREAM in any scenario; the glitch bucket is not observable by the proxy, and no ENHANCE_YOUR_CALM appeared outside raw-continuation). The limits in summarize.py are copied from limits.zig and config.zig by hand. Unchanged against the calibration: the stream cap is exactly at the 2.5x line
 because the clients' own cap (curl `--parallel-max 100`, a Node page of 100) is what is observed, and the header
 block row is a deliberate 30 KB header. The sustained RST_STREAM rate (33/s refill) is still not observable by a
 scenario this short: the highest 1 s count is 80 and the bucket's burst is 1000.
@@ -129,3 +132,11 @@ scenario this short: the highest 1 s count is 80 and the bucket's burst is 1000.
 - Keep the PRIORITY / PRIORITY_UPDATE exemption: Chromium's PRIORITY rate alone is 2x the 330/s glitch rate.
 - Re-measure if a browser release starts sending PRIORITY_UPDATE (the sensors are in the proxy now: `priority_update`).
 - The engine's GOAWAY on a client's odd last_stream_id was the one real finding (fixed in this item).
+
+## Review (2026-11-13): what the PASS lines mean
+
+After the review the scripts check outcomes where they did not: node-h2.mjs (200 on every page stream, download 67108864
+bytes, upload echo 16777216, exit 1 otherwise), curl load/upload (`-f`, echo compared), drive.html (load renders
+content, SSE `tick` seen on every stream, nav needs the download to start), and the raw scripts decode the status past
+the HPACK size update. This run's data predates those checks: its PASS lines for curl abort/sse and the browsers'
+abort rows mean "did not hang, no server RST or GOAWAY", not "every body was right"; a rerun is needed to upgrade them.

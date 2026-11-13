@@ -1,5 +1,5 @@
 // Hand-built PRIORITY_UPDATE (RFC 9218) and PRIORITY frames at thousands per
-// second, well past the glitch rate (330/s, burst 10000): neither is charged
+// second, well past the glitch bucket (burst 10000, refill 330/s): neither is charged
 // to any budget, so the connection must stay open and still answer a request.
 // Synthetic: no browser has been seen sending enough of them (see the M3
 // smoke README). usage: node rawprio.mjs <host> <port>   (h2c prior knowledge)
@@ -29,7 +29,7 @@ function run(label, type, n) {
         const len = buf.readUIntBE(0, 3);
         if (buf.length < 9 + len) break;
         const t = buf[3], pl = buf.subarray(9, 9 + len);
-        if (t === 1) seen.push(pl[0] === 0x88 ? 'HEADERS 200' : `HEADERS status-byte 0x${pl[0].toString(16)}`);
+        if (t === 1) { let i = 0; while (i < pl.length && (pl[i] & 0xe0) === 0x20) i++; /* dynamic table size updates */ seen.push(pl[i] === 0x88 ? 'HEADERS 200' : `HEADERS status-byte 0x${(pl[i] ?? 0).toString(16)}`); }
         else if (t === 7) seen.push(`GOAWAY code ${pl.readUInt32BE(4)}`);
         buf = buf.subarray(9 + len);
       }
@@ -39,5 +39,6 @@ function run(label, type, n) {
     setTimeout(() => s.end(), 800);
   });
 }
-await run('PRIORITY_UPDATE', 0x10, 5000);
-await run('PRIORITY', 0x02, 5000);
+// 20000 > the 10000 burst: were either frame charged, the connection would end with GOAWAY(ENHANCE_YOUR_CALM).
+await run('PRIORITY_UPDATE', 0x10, 20000);
+await run('PRIORITY', 0x02, 20000);
