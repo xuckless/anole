@@ -226,6 +226,15 @@ pub const Lazy = struct {
         return self.task.checkAutoCancel();
     }
 
+    /// Ends the task's wait now, as its deadline would, if it is in a
+    /// wait the drain may end (`wake_on_drain`) and no cancel of this
+    /// deadline is pending: the drain's bell (`Shelf.drainWake`), or
+    /// another task of the same connection with news for it. On the
+    /// task's executor, while it is registered.
+    pub fn wakeWait(self: *Lazy) void {
+        if (self.wake_on_drain and !self.poked) self.poke();
+    }
+
     fn retract(self: *Lazy) void {
         if (comptime !supported) return;
         if (!self.poked) return;
@@ -418,7 +427,7 @@ pub const Shelf = struct {
         while (it) |n| : (it = n.next) {
             // SAFETY: only `Lazy` nodes are on `lazies` (`register`).
             const l: *Lazy = @alignCast(@fieldParentPtr("node", n));
-            if (l.wake_on_drain and !l.poked) l.poke();
+            l.wakeWait();
         }
     }
 

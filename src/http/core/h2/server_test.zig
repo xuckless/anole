@@ -1263,3 +1263,59 @@ test "h2 engine: teardown with detached, parked and attached streams outstanding
     try expect(!fx.served.load(.acquire));
     p.release();
 }
+
+/// The drain asking a connection whose tasks are all joined: from the
+/// close's last join and from the teardown (`engine.test_after_join`).
+const Late = struct {
+    var server: ?*Server = null;
+    var calls: u32 = 0;
+    fn drain() void {
+        calls += 1;
+        if (server) |s| _ = s.h2_conns_anole.beginDrain();
+    }
+};
+
+test "h2 engine: the drain reaching a closing connection starts no task in its joined group" {
+    // std.Io.Threaded: the connection has a mutex, so the drain acts on it
+    // under its lock from the drain's thread (`Registry.request`), and a
+    // flusher it started there would outlive the group's last join (the
+    // teardown frees the connection under it, or it writes alongside the
+    // lingering close).
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    {
+        errdefer fx.stop();
+        const id = try fx.client.request("GET", "/hello", null);
+        try expectEqualStrings("hello", (try fx.client.until(id)).body.items);
+    }
+    Late.server = &fx.server;
+    Late.calls = 0;
+    engine.test_after_join = Late.drain;
+    defer {
+        engine.test_after_join = null;
+        Late.server = null;
+    }
+    const late = engine.test_late_flushers.load(.acquire);
+    // The client hangs up: the close, then the teardown.
+    fx.stop();
+    try expectEqual(2, Late.calls);
+    try expectEqual(late, engine.test_late_flushers.load(.acquire));
+}
+
+test "h2 engine: a response ended before its request starts no send-deadline waiter" {
+    // An answer before the body (here the router's, to a method the route
+    // does not take) frames its END_STREAM with its write, while the peer
+    // keeps its side open: nothing waits for the peer's credit.
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const waiters = engine.test_send_waiters.load(.acquire);
+    const id = try c.open("POST", "/hello", &.{}, false);
+    try c.flush();
+    try expect((try c.until(id)).ended);
+    // A round trip after it: the token holder that wrote it has let go.
+    const next = try c.request("GET", "/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+    try expectEqual(waiters, engine.test_send_waiters.load(.acquire));
+}

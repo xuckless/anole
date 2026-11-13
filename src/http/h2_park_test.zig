@@ -251,6 +251,12 @@ const Client = struct {
     fn untilClosed(self: *Client) void {
         while (true) self.readOne() catch return;
     }
+
+    /// Reads until the server hangs up: how (`error.EndOfStream` for a
+    /// clean end, `error.ReadFailed` for a reset).
+    fn closeCause(self: *Client) anyerror {
+        while (true) self.readOne() catch |err| return err;
+    }
 };
 
 const Fixture = struct {
@@ -550,6 +556,64 @@ test "h2 lifecycle: the drain's final GOAWAY comes without the PING's answer" {
 
 test "h2 lifecycle: the drain over TLS" {
     try drainInFlight(true, true);
+}
+
+test "h2 lifecycle: the drain's close lets the peer's late frames in, and it reads a clean end" {
+    if (!features.http2) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    sweepFast();
+    defer sweepNormal();
+    var f: Fixture = undefined;
+    try f.start(gpa, false, .{ .idle_park = .fromMilliseconds(30) });
+    defer f.stop(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.addr(), false, .{});
+    defer c.close();
+    held_gate = .unset;
+    const entered = held_entered.load(.acquire);
+    const id = try c.get("/held");
+    try wait.waitAtLeast(f.io, "the held request's handler runs", &held_entered, entered + 1);
+    const closes = engine.test_drain_closes.load(.acquire);
+    var stopper = try f.io.concurrent(Fixture.stopper, .{&f});
+    defer stopper.await(f.io);
+    while (c.goaway_count < 2) try c.readOne();
+    held_gate.set(f.io);
+    try wait.waitAtLeast(f.io, "the drained connection's send side shut", &engine.test_drain_closes, closes + 1);
+    // The peer still talks after the server's last frame (credit, a PING),
+    // as a client reading a large response does: the server reads and
+    // drops it rather than answer it with a reset.
+    try c.windowUpdate(0, 1024);
+    try c.frameOut(.ping, 0, 0, "late....");
+    try c.flush();
+    const rs = try c.until(id);
+    try std.testing.expectEqual(200, rs.status);
+    try std.testing.expectEqual("held but whole".len, rs.body_len);
+    try std.testing.expectEqual(error.EndOfStream, c.closeCause());
+}
+
+test "h2 lifecycle: keepalive closes a connection with a TLS record half read" {
+    if (!have_tls or !features.http2) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    sweepFast();
+    defer sweepNormal();
+    var f: Fixture = undefined;
+    try f.start(gpa, true, .{ .idle_park = .fromMilliseconds(30), .keepalive = .fromMilliseconds(300) });
+    defer f.stop(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.addr(), true, .{});
+    defer c.close();
+    const closes = engine.test_keepalive_closes.load(.acquire);
+    try std.testing.expectEqual(200, try c.status("/"));
+    // One byte of the next record's header, then silence: the connection
+    // can't park with a record half read, and each park delay wakes it
+    // for nothing; the keep-alive runs from when it went idle all the same.
+    try c.tcp_writer.interface.writeAll(&.{0x17});
+    try c.tcp_writer.interface.flush();
+    try wait.waitAtLeast(f.io, "the connection closed at its keep-alive", &engine.test_keepalive_closes, closes + 1);
+    c.untilClosed();
+    try f.waitClosed();
 }
 
 test "h2 lifecycle: a parked idle connection is closed at the stop" {

@@ -164,6 +164,15 @@ pub var test_read_buffers: if (is_test) std.atomic.Value(i32) else void = if (is
 /// their keep-alive deadline.
 pub var test_drain_wakes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 pub var test_keepalive_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: called once the connection's group is joined for the last
+/// time (`closeRun`'s join, the teardown's cancel), where nothing may
+/// join it any more; and the flushers asked for after that point.
+pub var test_after_join: if (is_test) ?*const fn () void else void = if (is_test) null else {};
+pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: send-deadline waiters started (`waitSends`), and drained
+/// connections whose send side was shut (`shutDrained`).
+pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 
 /// The HPACK scratch `Conn.recv` decodes into, one per executor (recv never
 /// yields), from the block cache and never given back.
@@ -187,7 +196,12 @@ pub fn Engine(comptime Ctx: type) type {
         /// at its next read. A parked connection is not woken: it begins
         /// its drain if its socket wakes it, and the stop closes it.
         pub const Registry = struct {
-            mutex: safety.Mutex(.table) = .init,
+            /// Held across the drain's walk, which waits for each
+            /// connection's lock where it has a mutex (`request`): SAFETY.md
+            /// L2's exception, as no other lock may be held while waiting
+            /// for one (the nghttp2 engine's registry is an unranked
+            /// `std.Io.Mutex` for the same walk). Taken with no lock held.
+            mutex: safety.IoLock = .init,
             list: std.DoublyLinkedList = .{},
 
             pub const field = "h2_conns_anole";
@@ -390,9 +404,17 @@ pub fn Engine(comptime Ctx: type) type {
             /// drain's notice to the teardown, so the drain also waits for
             /// the final GOAWAY and the lingering close (#135).
             drain_hold: bool = false,
-            /// The final GOAWAY is out and nothing is open: the reader's
-            /// side was shut down (`closeDrained`), so its read ends.
-            drain_closed: bool = false,
+            /// The reader's deadline while it waits for input on a pinned
+            /// executor (`waitInput`), for a token holder to end that wait
+            /// (`wakeReader`): when it closes a drained connection, or lets
+            /// go of the last stream of one whose reader waits for that to
+            /// park (`park_on_free`).
+            reader_wait: if (have_auto_cancel) ?*park.Lazy else void = if (have_auto_cancel) null else {},
+            /// The reader's last idle wait found streams open, so it waits
+            /// with no park delay (no wake per `idle_park` for a
+            /// long-lived stream) until the last one is let go, which
+            /// wakes it (`maybeFree`). Pinned executors only.
+            park_on_free: bool = false,
             node: std.DoublyLinkedList.Node = .{},
 
             /// Finished responses whose last frames wait for the peer's
@@ -401,6 +423,8 @@ pub fn Engine(comptime Ctx: type) type {
             send_waits: usize = 0,
             send_waiter: bool = false,
             send_wake: Signal = .{},
+            /// Tests only: the group was joined for the last time.
+            test_joined: if (is_test) bool else void = if (is_test) false else {},
 
             fn lock(conn: *Conn) void {
                 conn.lock_.lock(conn.io);
@@ -770,6 +794,10 @@ pub fn Engine(comptime Ctx: type) type {
                 if (es.body.len > 0 and !conn.closing) conn.proto.consumed(null, es.body.len) catch {};
                 conn.sendDone(es);
                 conn.live.remove(&es.node);
+                if (conn.park_on_free and conn.live.first == null) {
+                    conn.park_on_free = false;
+                    conn.wakeReader();
+                }
                 gauges.add(conn.io, .h2_streams, -1);
                 conn.raised_bytes -= es.raised_bytes;
                 if (es.counted) {
@@ -955,29 +983,34 @@ pub fn Engine(comptime Ctx: type) type {
             /// executor). Once the tasks are closed the teardown's flush
             /// writes it.
             fn kickFlush(conn: *Conn) void {
-                {
-                    conn.lock();
-                    defer conn.unlock();
-                    if (conn.flushing or conn.send_shut or conn.tasks_closed) return;
-                    conn.flushing = true;
-                }
-                if (conn.spawnFlusher(true)) return;
                 conn.lock();
-                conn.flushing = false;
-                conn.unlock();
+                defer conn.unlock();
+                if (conn.flushing or conn.send_shut or conn.tasks_closed) return;
+                conn.flushing = true;
+                if (!conn.spawnFlusher(true)) conn.flushing = false;
             }
 
             /// The flusher, with the token (`with_token`) or to wait for
-            /// send deadlines only (`waitSends`).
+            /// send deadlines only (`waitSends`). Under the lock, so that
+            /// `tasks_closed` can't be set between its check and the
+            /// spawn: nothing joins the group once it is joined for the
+            /// last time (`closeRun`, `teardown`).
             fn spawnFlusher(conn: *Conn, with_token: bool) bool {
                 if (conn.tasks_closed) return false;
+                if (comptime is_test) if (conn.test_joined) {
+                    _ = test_late_flushers.fetchAdd(1, .monotonic);
+                    return false;
+                };
                 if (conn.task_row) |r| _ = conn.server.admission.reserveTask(r, .forced);
                 placement.concurrent(conn.group, conn.io, .local, flusherRun, .{ conn, with_token }) catch {
                     if (conn.task_row) |r| conn.server.admission.releaseTask(conn.io, r);
                     log.err("HTTP/2: no task for the connection's output", .{});
                     return false;
                 };
-                if (comptime is_test) _ = test_flushers.fetchAdd(1, .monotonic);
+                if (comptime is_test) {
+                    _ = test_flushers.fetchAdd(1, .monotonic);
+                    if (!with_token) _ = test_send_waiters.fetchAdd(1, .monotonic);
+                }
                 return true;
             }
 
@@ -1002,6 +1035,22 @@ pub fn Engine(comptime Ctx: type) type {
             fn claimSendWaiter(conn: *Conn) bool {
                 if (conn.send_waits == 0 or conn.send_waiter or conn.send_shut or conn.tasks_closed or conn.closing) return false;
                 if (conn.sendTimeout() == null) return false;
+                // Those whose END_STREAM went out with this write, on a
+                // stream the peer keeps open (an early answer to an upload,
+                // a bidi stream the server ends first): nothing to wait
+                // for, and no task for it. Only while some are marked.
+                var it = conn.live.first;
+                while (it) |node| {
+                    it = node.next;
+                    const es: *EStream = @fieldParentPtr("node", node);
+                    if (!es.send_wait) continue;
+                    const s = es.cs orelse {
+                        conn.sendDone(es);
+                        continue;
+                    };
+                    if (!s.canSend()) conn.sendDone(es);
+                }
+                if (conn.send_waits == 0) return false;
                 conn.send_waiter = true;
                 return true;
             }
@@ -1124,17 +1173,13 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.connection.releaseWriteBuffer();
                         conn.unflushed = false;
                         conn.flushing = false;
-                        const waiter = conn.claimSendWaiter();
-                        const close_drained = conn.drained() and !conn.drain_closed and !conn.closing;
-                        if (close_drained) conn.drain_closed = true;
+                        if (conn.claimSendWaiter() and !conn.spawnFlusher(false)) conn.send_waiter = false;
+                        // The final GOAWAY is out and nothing is open:
+                        // nothing more is written (`shutDrained`).
+                        const close_drained = conn.drained() and !conn.send_shut and !conn.closing;
+                        if (close_drained) conn.send_shut = true;
                         conn.unlock();
-                        if (waiter and !conn.spawnFlusher(false)) {
-                            conn.lock();
-                            conn.send_waiter = false;
-                            conn.unlock();
-                        }
-                        // Nothing more will come: the reader's wait ends.
-                        if (close_drained) conn.connection.stream.shutdown(conn.io, .recv) catch {};
+                        if (close_drained) try conn.shutDrained();
                         return;
                     } orelse {
                         conn.writeFailed();
@@ -1209,6 +1254,43 @@ pub fn Engine(comptime Ctx: type) type {
             /// Nothing more can go out: both directions are shut, so the
             /// reader stops too, the streams waiting for room are told, and
             /// the token goes (nobody takes it again).
+            /// A drained connection's end of our side, once (the nghttp2
+            /// engine's `shutSend`): close_notify under TLS, bounded by
+            /// `linger_timeout`, then the send side shut, so the peer reads
+            /// a clean end after the final GOAWAY. The receive side stays
+            /// open: what the peer still sends (a WINDOW_UPDATE, the PING's
+            /// answer) is read and thrown away by the lingering close, as
+            /// data arriving at a socket shut for reading, or unread at its
+            /// close, draws a reset, with which the peer may throw away
+            /// what it has not read yet. The reader's wait ends here where
+            /// it can (`wakeReader`, a pinned executor), for that close;
+            /// elsewhere at the peer's hang-up or the keep-alive.
+            noinline fn shutDrained(conn: *Conn) std.Io.Cancelable!void {
+                defer conn.wakeReader();
+                if (comptime is_test) _ = test_drain_closes.fetchAdd(1, .monotonic);
+                {
+                    var t: Timer = .init(null);
+                    if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
+                    defer t.clear(conn.io);
+                    conn.connection.closeNotify() catch |err| {
+                        conn.connection.stream.shutdown(conn.io, .both) catch {};
+                        return err;
+                    };
+                }
+                conn.connection.stream.shutdown(conn.io, .send) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {},
+                };
+            }
+
+            /// Ends the reader's wait for input, as its deadline would, if
+            /// it waits on this executor (`reader_wait`); it then looks at
+            /// the connection again at the top of its loop.
+            fn wakeReader(conn: *Conn) void {
+                if (comptime !have_auto_cancel) return;
+                if (conn.reader_wait) |l| l.wakeWait();
+            }
+
             fn writeFailed(conn: *Conn) void {
                 conn.connection.stream.shutdown(conn.io, .both) catch {};
                 conn.lock();
@@ -1890,13 +1972,24 @@ pub fn Engine(comptime Ctx: type) type {
         noinline fn teardown(conn: *Conn) void {
             const io = conn.io;
             const server = conn.server;
-            conn.group.cancel(io);
+            // Out of the drain's reach, and no task joins the group from
+            // here (`spawnFlusher`), before the group is canceled: a
+            // flusher started after that would outlive the connection.
             if (comptime registered()) @field(server, Registry.field).remove(conn);
             {
                 conn.lock();
                 defer conn.unlock();
                 conn.closing = true;
                 conn.tasks_closed = true;
+            }
+            conn.group.cancel(io);
+            if (comptime is_test) {
+                conn.test_joined = true;
+                if (test_after_join) |hook| hook();
+            }
+            {
+                conn.lock();
+                defer conn.unlock();
                 var it = conn.live.first;
                 while (it) |node| {
                     it = node.next;
@@ -2001,6 +2094,22 @@ pub fn Engine(comptime Ctx: type) type {
             conn.group.await(conn.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };
+            // No task joins the group from here (`spawnFlusher`; the drain
+            // may still kick one, from its own thread where the connection
+            // has a mutex): one started meanwhile is joined now, and then
+            // the lingering close is the only writer.
+            {
+                conn.lock();
+                defer conn.unlock();
+                conn.tasks_closed = true;
+            }
+            conn.group.await(conn.io) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+            };
+            if (comptime is_test) {
+                conn.test_joined = true;
+                if (test_after_join) |hook| hook();
+            }
             conn.flush(.all, timer) catch return error.Canceled;
             if (linger) try lingeringClose(conn);
         }
@@ -2035,8 +2144,9 @@ pub fn Engine(comptime Ctx: type) type {
         /// bell). With nothing half read, the wait ends at the park delay
         /// (`burst.park_after`, `Burst.waitInput`), and the connection
         /// parks if nothing is open or in flight by then; one whose
-        /// streams are still open waits another park delay (a wake per
-        /// `idle_park`, as an adopted WebSocket's `Watch`).
+        /// streams are still open waits with no park delay until the last
+        /// is let go (`park_on_free`), where that can wake it, and with
+        /// one (a wake per `idle_park`) elsewhere.
         fn readerLoop(conn: *Conn, burst: *server_mod.Burst) !ReaderEnd {
             const reader = conn.connection.reader;
             const timer = burst.timer;
@@ -2071,6 +2181,8 @@ pub fn Engine(comptime Ctx: type) type {
                         error.OutOfMemory => return error.OutOfMemory,
                     };
                     reader.toss(taken);
+                    // Input: the keep-alive counts from the next idle wait.
+                    if (taken > 0) conn.keepalive_at = null;
                     if (conn.ready.items.len > 0) try runInline(conn);
                     try conn.flush(.batch, timer);
                     if (conn.send_shut) return .done;
@@ -2082,15 +2194,20 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.lock();
                     defer conn.unlock();
                     conn.trimIdle();
+                    if (conn.live.first == null) conn.park_on_free = false;
                     break :state .{
                         conn.open_streams == 0,
                         conn.drained(),
-                        conn.proto.atFrameBoundary() and !conn.drain_notice and !conn.goaway_sent,
+                        conn.proto.atFrameBoundary() and !conn.drain_notice and !conn.goaway_sent and !conn.park_on_free,
                     };
                 };
                 if (drained) return .drained;
                 if (idle) {
-                    conn.keepalive_at = if (conn.server.config.timeout.keepalive) |d|
+                    // From when the connection went idle (or last read
+                    // something), not from each wait: a wake that brought
+                    // nothing (the park delay, a TLS record half read, the
+                    // drain's bell) does not move it.
+                    if (conn.keepalive_at == null) conn.keepalive_at = if (conn.server.config.timeout.keepalive) |d|
                         (std.Io.Clock.Timestamp{ .raw = park.now(conn.io), .clock = .awake }).addDuration(.{ .raw = d, .clock = .awake })
                     else
                         null;
@@ -2113,18 +2230,20 @@ pub fn Engine(comptime Ctx: type) type {
                         if (comptime is_test) _ = test_drain_wakes.fetchAdd(1, .monotonic);
                         continue;
                     },
-                    else => |e| {
-                        // The final GOAWAY's shutdown of our read side
-                        // (`writeOut`): over TLS a read error, not an end.
-                        if (conn.drain_closed) return .eof;
-                        return e;
-                    },
+                    else => |e| return e,
                 };
                 if (input == .idle) {
                     if (prepPark(conn)) return .park;
-                    // Busy after all (a stream open, a write): the park
-                    // delay again from here, not at once (`Burst.repark`).
+                    // Busy after all (a write, a flusher): the park delay
+                    // again from here, not at once (`Burst.repark`). With
+                    // streams open, no park delay until the last one is
+                    // let go (`park_on_free`), where that can wake us.
                     burst.repark = false;
+                    if (comptime have_auto_cancel) if (conn.lock_.free and burst.timer.shelf != null) {
+                        conn.lock();
+                        defer conn.unlock();
+                        if (conn.live.first != null) conn.park_on_free = true;
+                    };
                 }
             }
         }
@@ -2148,9 +2267,15 @@ pub fn Engine(comptime Ctx: type) type {
         fn waitInput(conn: *Conn, burst: *server_mod.Burst, may_park: bool) !server_mod.Burst.Input {
             const reader = conn.connection.reader;
             const lazy = if (comptime have_auto_cancel) &burst.timer.lazy else {};
-            if (comptime have_auto_cancel) lazy.wake_on_drain = true;
+            if (comptime have_auto_cancel) {
+                lazy.wake_on_drain = true;
+                // Registered with this executor's shelf: a task of the
+                // connection may end the wait (`wakeReader`).
+                if (conn.lock_.free and burst.timer.shelf != null) conn.reader_wait = lazy;
+            }
             defer if (comptime have_auto_cancel) {
                 lazy.wake_on_drain = false;
+                conn.reader_wait = null;
             };
             if (reader.bufferedLen() == 0) return burst.waitInput();
             if (comptime is_test) if (may_park) {
