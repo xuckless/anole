@@ -1807,6 +1807,19 @@ test "h2 conn: submit_data" {
     try expectEqual(ErrorCode.no_error, t.rec.closeCode(1).?);
 }
 
+test "h2 conn: an empty end behind queued DATA ends on its last frame" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    try t.c.submitHead(t.stream(1), 200, &.{}, false);
+    try t.c.submitData(t.stream(1), &.{"hello"}, false);
+    try t.c.submitData(t.stream(1), &.{}, true);
+    const out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data, .flags = F.end_stream } });
+    try expectEqualStrings("hello", out[1].data);
+    try expectEqual(ErrorCode.no_error, t.rec.closeCode(1).?);
+}
+
 test "h2 conn: submit_data_read_length_too_large" {
     const t = try ready(.{});
     defer t.destroy();

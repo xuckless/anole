@@ -39,6 +39,8 @@ const Resp = struct {
     trailers: std.ArrayList(hpack.Field) = .empty,
     body: std.ArrayList(u8) = .empty,
     ended: bool = false,
+    /// DATA frames received.
+    data_frames: u32 = 0,
     rst: ?ErrorCode = null,
     /// Our send credit on the stream.
     send_window: i64 = 0,
@@ -260,6 +262,7 @@ const Client = struct {
             .data => {
                 const resp = c.resps.get(h.stream_id) orelse return error.UnknownStream;
                 try resp.body.appendSlice(c.gpa, payload);
+                resp.data_frames += 1;
                 if (h.flags & F.end_stream != 0) resp.ended = true;
                 if (c.auto_window and payload.len > 0) {
                     var b: [4]u8 = undefined;
@@ -346,6 +349,7 @@ const Handlers = struct {
         s.router.get("/big", big);
         s.router.get("/trailers", trailers);
         s.router.get("/held", held);
+        s.router.post("/ack", ack);
         s.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         s.router.addRouteWith(.post, "/nw/echo", echo, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/big", big, .{ .no_wait = true });
@@ -410,6 +414,26 @@ const Handlers = struct {
     }
     var held_gate: std.Io.Event = .unset;
     var held_entered: std.atomic.Value(u32) = .init(0);
+
+    /// Once the test sets `ack_gate`: 204 at once, then the whole body
+    /// read, as an ack-then-process handler does.
+    fn ack(req: *Request, res: *Response) !void {
+        try wait.waitEvent(req.io, "the test opened the ack gate", &ack_gate);
+        res.status = .no_content;
+        try res.write();
+        var in_buf: [4096]u8 = undefined;
+        var body = try req.reader(&in_buf);
+        var all: std.Io.Writer.Allocating = .init(req.arena);
+        const read = if (body.interface.streamRemaining(&all.writer)) |_| true else |_| false;
+        ack_read_ok.store(read and std.mem.eql(u8, all.written(), ack_body), .release);
+        ack_gone.store(res.peerGone(), .release);
+        _ = ack_done.fetchAdd(1, .acq_rel);
+    }
+    const ack_body = "the whole request body";
+    var ack_gate: std.Io.Event = .unset;
+    var ack_read_ok: std.atomic.Value(bool) = .init(false);
+    var ack_gone: std.atomic.Value(bool) = .init(true);
+    var ack_done: std.atomic.Value(u32) = .init(0);
 };
 
 fn bigBody() ![]u8 {
@@ -521,6 +545,91 @@ test "h2 engine: a streamed body larger than the window" {
     try expect(std.mem.eql(u8, want, (try c.until(inl)).body.items));
 }
 
+test "h2 engine: a small streamed body takes one block, and its end rides on its DATA" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    // On the reader: the last flush takes no second block, and the end
+    // that follows it joins the queued DATA (one frame).
+    var blocks = engine.test_blocks.load(.acquire);
+    const inl = try c.request("POST", "/nw/echo", "tiny");
+    const r = try c.until(inl);
+    try expectEqualStrings("tiny", r.body.items);
+    try expectEqual(1, r.data_frames);
+    try expectEqual(blocks + 1, engine.test_blocks.load(.acquire));
+    // On a task the same block count (the flusher may frame the DATA
+    // before the end comes, so not the frame count).
+    blocks = engine.test_blocks.load(.acquire);
+    const tasked = try c.request("POST", "/echo", "tiny");
+    try expectEqualStrings("tiny", (try c.until(tasked)).body.items);
+    try expectEqual(blocks + 1, engine.test_blocks.load(.acquire));
+}
+
+test "h2 engine: a read's many small responses go out in one write" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const reads = engine.test_reads.load(.acquire);
+    const writes = server_mod.Connection.TestSocketWrites.get();
+    const flushers = engine.test_flushers.load(.acquire);
+    var ids: [100]u31 = undefined;
+    for (&ids) |*id| id.* = try c.open("GET", "/nw/hello", &.{}, true);
+    try c.flush();
+    try c.untilAll();
+    for (ids) |id| try expectEqualStrings("hello", c.get(id).body.items);
+    // Far less than a write buffer of output per read: one write each at
+    // most (the reads that carry only WINDOW_UPDATEs write nothing).
+    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads);
+    try expectEqual(flushers, engine.test_flushers.load(.acquire));
+}
+
+test "h2 engine: a response with no body on a stream the peer has ended is no reset" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    Handlers.ack_gate.reset();
+    defer Handlers.ack_gate.reset();
+    const done = Handlers.ack_done.load(.acquire);
+    const id = try c.request("POST", "/ack", Handlers.ack_body);
+    // The PING's ACK comes after the server took the whole body: the 204
+    // then closes the stream inside its own submit.
+    try c.ping("ack-body".*);
+    try c.flush();
+    while (c.ping_acks == 0) try c.readOne();
+    Handlers.ack_gate.set(testing.io);
+    const r = try c.until(id);
+    try expectEqual(204, r.status);
+    try expect(r.rst == null);
+    try wait.waitAtLeast(testing.io, "the ack handler read its body", &Handlers.ack_done, done + 1);
+    try expect(Handlers.ack_read_ok.load(.acquire));
+    try expect(!Handlers.ack_gone.load(.acquire));
+}
+
+test "h2 engine: a connection error mid-stream lets the streaming handler go and the connection close" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    c.auto_window = false;
+    const failed = Handlers.big_failed.load(.acquire);
+    const id = try c.request("GET", "/big", null);
+    const r = c.get(id);
+    // A window's worth arrives; the handler then waits for room.
+    while (r.body.items.len < 65535) try c.readOne();
+    // A PING on a stream is a connection error (RFC 9113 §6.7): no more
+    // DATA is framed, so the handler must be let go, not left waiting.
+    try c.frameOut(.ping, 0, id, "12345678");
+    try c.flush();
+    while (c.goaway == null) try c.readOne();
+    try expectEqual(ErrorCode.protocol_error, c.goaway.?);
+    try wait.waitAtLeast(testing.io, "the streaming handler failed its write", &Handlers.big_failed, failed + 1);
+    // `stop` then waits for `serve`, which returns only once the handler
+    // is gone.
+}
+
 test "h2 engine: 100-continue sends a 1xx HEADERS without END_STREAM before the final head" {
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});
@@ -602,7 +711,7 @@ test "h2 engine: one writer at a time" {
     try expectEqual(1, engine.test_max_writers.load(.acquire));
 }
 
-test "h2 engine: Out and the write buffer are released when idle" {
+test "h2 engine: Out is released at the first read after a trim interval that finds the connection idle" {
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();

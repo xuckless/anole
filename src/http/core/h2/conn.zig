@@ -1266,6 +1266,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (!s.canSend() or !s.flags.head_sent or s.flags.answered) return error.StreamClosed;
             var total: u64 = 0;
             for (parts) |p| total += p.len;
+            // An empty end behind queued DATA rides on its last frame (a
+            // body flushed, then ended), as `submitTrailers` does.
+            if (total == 0 and end_stream) if (s.pending.last) |node| {
+                const last: *Pending = @fieldParentPtr("node", node);
+                if (!last.end_stream and last.trailers == null) {
+                    last.end_stream = true;
+                    s.flags.answered = true;
+                    return;
+                }
+            };
             const p = try c.newPending();
             p.* = .{ .parts = parts, .left = total, .end_stream = end_stream };
             s.pending.append(&p.node);

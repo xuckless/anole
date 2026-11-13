@@ -31,8 +31,9 @@
 //!
 //! **Memory** (PLAN §3.4): the read buffer from `RequestBuffers`; the write
 //! buffer from the same pool only while the token is held; `out`'s 16 KiB
-//! blocks from malloc's slabs, freed when the connection idles across a trim
-//! interval; the HPACK scratch one per executor (`scratch`); a request body
+//! blocks from malloc's slabs, freed at the first read after a trim interval
+//! that finds the connection idle (one that reads nothing more keeps them
+//! until its keep-alive deadline); the HPACK scratch one per executor (`scratch`); a request body
 //! sized as the nghttp2 engine's (`BodyBuf`); a streamed response in at most
 //! two 16 KiB blocks. A stream's arena, body and blocks are reused or freed
 //! only once `out` no longer borrows them (`retiring`).
@@ -82,8 +83,9 @@ const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
 /// A streamed response's block: the body writer's buffer, then borrowed by
 /// `out` until written. Two per stream on a task.
 const block_len = 16 * 1024;
-/// Iovecs per write.
-const max_vecs = 32;
+/// Iovecs per `pending` round. Rounds go into the connection's buffered
+/// writer back to back, with one flush at the end (`writeOut`).
+const max_vecs = 64;
 /// The PING sent with a drain's GOAWAY notice.
 const drain_ping: [8]u8 = "anole-go".*;
 
@@ -101,6 +103,8 @@ pub var test_out_releases: if (is_test) std.atomic.Value(u32) else void = if (is
 /// Tests only: streams kept for `out`'s borrowed bytes past their close,
 /// then let go once written.
 pub var test_retired: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: reads the reader fed to `Conn.recv`.
+pub var test_reads: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: response blocks allocated (`StreamSink`).
 pub var test_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: in place of `limits.Limits.out_high`.
@@ -250,6 +254,9 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// The flush token: a task is writing `proto`'s output.
             flushing: bool = false,
+            /// The token holder's: bytes sit in the connection's writer,
+            /// not flushed yet (passed on with the token to the flusher).
+            unflushed: bool = false,
             /// Nothing more is written: a write failed (both directions
             /// are shut) or the connection is over.
             send_shut: bool = false,
@@ -454,7 +461,10 @@ pub fn Engine(comptime Ctx: type) type {
                     // Cannot overflow: the ring holds the window, and Conn
                     // takes no DATA past it.
                     if (!es.body.put(bytes)) return conn.resetBody(es, s, bytes.len);
-                    if (es.wake.sleepers.load(.monotonic) > 0) es.wake.notify(conn.io);
+                    // Always: a handler between its look at the ring and
+                    // its wait has not counted itself a sleeper yet, and
+                    // only the epoch moving tells it (Signal's contract).
+                    es.wake.notify(conn.io);
                     if (!es.raise_due and conn.mayRaise(es)) {
                         es.since_raise += bytes.len;
                         if (es.since_raise >= es.windowSize(conn)) es.raise_due = true;
@@ -773,15 +783,25 @@ pub fn Engine(comptime Ctx: type) type {
                 return conn.writeOut(.all);
             }
 
-            /// With the token: `pending` written and `advance`d, round after
-            /// round, until it is empty (looked at under the lock, where the
-            /// token is let go, so nothing queued meanwhile is stranded), or
-            /// after one round in `batch` mode with the rest handed to the
-            /// flusher (with the token and the write buffer). The write
+            /// With the token: `pending` written into the connection's
+            /// buffered writer and `advance`d, round after round, then one
+            /// flush, until nothing is left (looked at under the lock, where
+            /// the token is let go, so nothing queued meanwhile is
+            /// stranded). In `batch` mode, past one write buffer's worth the
+            /// rest goes to the flusher (with the token, the write buffer and
+            /// what it holds). `advance` right after a round is safe: what
+            /// `writeVecAll` returned from is copied or sent. The write
             /// buffer is the pool's only while the token is held.
             fn writeOut(conn: *Conn, mode: FlushMode) std.Io.Cancelable!void {
                 var vecs: [max_vecs][]const u8 = undefined;
-                var rounds: usize = 0;
+                // A peer that stops reading must not hold the connection,
+                // and with it every stream, for good (until the sweeper):
+                // armed again every write buffer's worth.
+                var timer: Timer = .init(null);
+                defer timer.clear(conn.io);
+                const step = @max(1, conn.server.config.response.write_buffer_size);
+                var since_arm: ?usize = null;
+                var written: usize = 0;
                 while (true) {
                     const got: []const []const u8 = got: {
                         conn.lock();
@@ -792,25 +812,42 @@ pub fn Engine(comptime Ctx: type) type {
                             error.OutOfMemory => break :got null,
                         };
                         if (got.len > 0) {
-                            if (mode == .batch and rounds > 0 and conn.spawnFlusher()) return;
+                            if (mode == .batch and written >= step and conn.spawnFlusher()) return;
                             break :got got;
                         }
+                        if (conn.unflushed and !conn.send_shut) break :got got;
                         conn.connection.releaseWriteBuffer();
+                        conn.unflushed = false;
                         conn.flushing = false;
                         return;
                     } orelse {
                         conn.writeFailed();
                         return;
                     };
+                    if (since_arm == null or since_arm.? >= step) {
+                        if (conn.server.config.timeout.write) |d| timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
+                        since_arm = 0;
+                    }
+                    if (got.len == 0) {
+                        conn.flushWriter(&timer) catch |err| {
+                            conn.writeFailed();
+                            if (err == error.Canceled) return error.Canceled;
+                            return;
+                        };
+                        conn.unflushed = false;
+                        continue;
+                    }
                     conn.connection.prepareWrite();
-                    rounds += 1;
                     var total: usize = 0;
                     for (got) |b| total += b.len;
-                    conn.writeVecs(got) catch |err| {
+                    conn.writeVecs(vecs[0..got.len], &timer) catch |err| {
                         conn.writeFailed();
                         if (err == error.Canceled) return error.Canceled;
                         return;
                     };
+                    conn.unflushed = true;
+                    written += total;
+                    since_arm.? += total;
                     conn.lock();
                     defer conn.unlock();
                     conn.proto.advance(total);
@@ -819,10 +856,10 @@ pub fn Engine(comptime Ctx: type) type {
                 }
             }
 
-            /// One write of `got` and a flush, bounded by `timeout.write`.
-            /// error.WriteFailed for a failure of the connection,
-            /// error.Canceled when the calling task was.
-            fn writeVecs(conn: *Conn, got: []const []const u8) (std.Io.Cancelable || error{WriteFailed})!void {
+            /// `vecs` into the connection's writer (a syscall only when its
+            /// buffer fills). error.WriteFailed for a failure of the
+            /// connection, error.Canceled when the calling task was.
+            fn writeVecs(conn: *Conn, vecs: [][]const u8, timer: *Timer) (std.Io.Cancelable || error{WriteFailed})!void {
                 if (comptime is_test) {
                     const in = test_writers_in.fetchAdd(1, .acq_rel) + 1;
                     _ = test_max_writers.fetchMax(in, .acq_rel);
@@ -830,16 +867,11 @@ pub fn Engine(comptime Ctx: type) type {
                 defer if (comptime is_test) {
                     _ = test_writers_in.fetchSub(1, .acq_rel);
                 };
-                var data: [max_vecs][]const u8 = undefined;
-                @memcpy(data[0..got.len], got);
-                const w = conn.connection.writer;
-                // A peer that stops reading must not hold the connection,
-                // and with it every stream, for good (until the sweeper).
-                var timer: Timer = .init(null);
-                defer timer.clear(conn.io);
-                if (conn.server.config.timeout.write) |d| timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
-                w.writeVecAll(data[0..got.len]) catch return conn.writeError(&timer);
-                w.flush() catch return conn.writeError(&timer);
+                conn.connection.writer.writeVecAll(vecs) catch return conn.writeError(timer);
+            }
+
+            fn flushWriter(conn: *Conn, timer: *Timer) (std.Io.Cancelable || error{WriteFailed})!void {
+                conn.connection.writer.flush() catch return conn.writeError(timer);
             }
 
             fn writeError(conn: *Conn, timer: *Timer) (std.Io.Cancelable || error{WriteFailed}) {
@@ -858,6 +890,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 conn.send_shut = true;
                 conn.flushing = false;
+                conn.unflushed = false;
                 conn.connection.releaseWriteBuffer();
                 while (conn.room_waiters.popFirst()) |node| {
                     const es: *EStream = @fieldParentPtr("room_node", node);
@@ -906,12 +939,13 @@ pub fn Engine(comptime Ctx: type) type {
             /// holds it: blocks go in order, the other one after it) and
             /// written (`out.sent_total` past a mark taken once it was
             /// framed). True as well when the stream or the connection is
-            /// gone, for the waiter to find out. Under the lock.
+            /// gone (a connection error frames no more DATA), for the
+            /// waiter to find out. Under the lock.
             fn roomFree(conn: *Conn, es: *EStream) bool {
                 const b = &es.blocks[es.cur];
                 if (!b.inflight) return true;
                 const s = es.cs orelse return true;
-                if (conn.send_shut) return true;
+                if (es.reset or conn.send_shut or conn.proto.dead) return true;
                 if (b.mark == null) {
                     var queued: usize = 0;
                     var it = s.pending.first;
@@ -1240,7 +1274,10 @@ pub fn Engine(comptime Ctx: type) type {
             var reader_failed = false;
             var linger = false;
             if (readerLoop(&conn)) |end| {
-                linger = end == .done;
+                linger = end != .eof;
+                // A connection error frames no more DATA: no response can
+                // finish (the nghttp2 engine's Http2ProtocolError).
+                reader_failed = end == .dead;
             } else |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
@@ -1258,7 +1295,8 @@ pub fn Engine(comptime Ctx: type) type {
             // one is told the stream is gone and canceled. After a clean
             // end of the peer's side (maybe a half-close) a handler with
             // its whole request keeps running, for a response that may
-            // still go out; after a read error every one is canceled.
+            // still go out; after a read or protocol error every one is
+            // canceled.
             {
                 conn.lock();
                 defer conn.unlock();
@@ -1282,10 +1320,11 @@ pub fn Engine(comptime Ctx: type) type {
             if (linger) try lingeringClose(&conn);
         }
 
-        /// How the reader ended: the peer ended its side (`eof`), or the
+        /// How the reader ended: the peer ended its side (`eof`), the
         /// connection is over with the peer's side still open (`done`: a
-        /// GOAWAY for an error, or a failed write).
-        const ReaderEnd = enum { eof, done };
+        /// failed write), or a connection error's GOAWAY went out
+        /// (`dead`).
+        const ReaderEnd = enum { eof, done, dead };
 
         /// Reads the connection and feeds `Conn.recv` until the peer is
         /// done or the connection is. Holds the keepalive deadline while no
@@ -1305,6 +1344,7 @@ pub fn Engine(comptime Ctx: type) type {
                         const scratch = try conn.scratch();
                         const now = placement.tickNow(conn.io) orelse std.Io.Clock.awake.now(conn.io);
                         const result = conn.proto.recv(buffered, @intCast(@max(0, now.toSeconds())), scratch);
+                        if (comptime is_test) _ = test_reads.fetchAdd(1, .monotonic);
                         if (result) |_| {
                             conn.applyDrain();
                             if (conn.awaiting.items.len > 0) conn.startAwaiting();
@@ -1316,7 +1356,7 @@ pub fn Engine(comptime Ctx: type) type {
                         // lingering close.
                         error.ConnectionError => {
                             try conn.flush(.all);
-                            return .done;
+                            return .dead;
                         },
                         error.BadPreface => return error.Http2BadPreface,
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1769,9 +1809,16 @@ pub fn Engine(comptime Ctx: type) type {
                 const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                 if (es.reset) return self.fail(error.ConnectionResetByPeer);
                 const bare = list.len == 0 and trailer_fields == null;
-                conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, bare) catch |err| return self.submitFailed(err);
+                // Before the submit: an END_STREAM on a stream whose peer
+                // half is closed closes it inside the call, and
+                // `onStreamClose` must see a normal end, not a reset.
                 es.head_sent = true;
                 es.ended = true;
+                conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, bare) catch |err| {
+                    es.head_sent = false;
+                    es.ended = false;
+                    return self.submitFailed(err);
+                };
                 if (bare) return;
                 if (list.len > 0) conn.proto.submitData(s, list, trailer_fields == null) catch |err| return self.submitFailed(err);
                 if (trailer_fields) |t| conn.proto.submitTrailers(s, t) catch |err| return self.submitFailed(err);
@@ -1837,19 +1884,11 @@ pub fn Engine(comptime Ctx: type) type {
                 self.kick();
             }
 
+            /// The writer starts with no buffer: its first write takes a
+            /// block (`drain`), so a handler that never writes a body never
+            /// pays for one.
             fn body(ptr: *anyopaque) *std.Io.Writer {
-                const self = fromPtr(ptr);
-                const es = self.es;
-                // A handler that never writes a body never pays for it.
-                if (self.writer.buffer.len == 0) {
-                    const b = &es.blocks[es.cur];
-                    if (b.mem.len == 0) b.mem = es.conn.allocator.alloc(u8, block_len) catch &.{};
-                    if (comptime is_test) if (b.mem.len > 0) {
-                        _ = test_blocks.fetchAdd(1, .monotonic);
-                    };
-                    self.writer.buffer = b.mem;
-                }
-                return &self.writer;
+                return &fromPtr(ptr).writer;
             }
 
             /// The head with no END_STREAM, once. Under the lock.
@@ -1861,11 +1900,12 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             /// Submits what the writer holds as one DATA part (by
-            /// reference: the block is borrowed until written), and gives
-            /// the writer its next block: on a task the other one, once
-            /// written (waiting on `room`); on the reader a fresh one, the
-            /// spent ones kept until the stream is freed (the reader can't
-            /// wait for the writer).
+            /// reference: the block is borrowed until written), with the
+            /// head if it has not gone yet, and hands the output on. The
+            /// writer is left with no buffer, so nothing it is asked to
+            /// write lands in a borrowed block: the next block is taken
+            /// only when more bytes come (`nextBlock`), so a last flush
+            /// before the end takes none.
             fn submitBlock(self: *StreamSink) std.Io.Writer.Error!void {
                 const es = self.es;
                 const conn = es.conn;
@@ -1876,43 +1916,52 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                     if (es.reset) return self.fail(error.ConnectionResetByPeer);
+                    const head_new = !es.head_sent;
                     try self.submitHeadOnce(s);
-                    if (n == 0) return;
-                    const part = es.arena.allocator().alloc([]const u8, 1) catch return self.fail(error.SystemResources);
-                    part[0] = w.buffer[0..n];
-                    conn.proto.submitData(s, part, false) catch |err| return self.submitFailed(err);
-                    w.end = 0;
-                    if (es.inline_mode) {
-                        es.spent.append(es.arena.allocator(), es.blocks[es.cur].mem) catch {
-                            // Kept by no one: it is freed with the stream
-                            // after all, as the current block.
-                            return self.fail(error.SystemResources);
-                        };
-                        es.blocks[es.cur] = .{};
-                        const next = conn.allocator.alloc(u8, block_len) catch return self.fail(error.SystemResources);
-                        if (comptime is_test) _ = test_blocks.fetchAdd(1, .monotonic);
-                        es.blocks[es.cur].mem = next;
-                        w.buffer = next;
-                        return;
+                    if (n == 0) {
+                        if (!head_new) return;
+                    } else {
+                        const part = es.arena.allocator().alloc([]const u8, 1) catch return self.fail(error.SystemResources);
+                        // Room first: nothing may fail once the block is
+                        // borrowed.
+                        if (es.inline_mode) es.spent.ensureUnusedCapacity(es.arena.allocator(), 1) catch return self.fail(error.SystemResources);
+                        part[0] = w.buffer[0..n];
+                        conn.proto.submitData(s, part, false) catch |err| return self.submitFailed(err);
+                        if (es.inline_mode) {
+                            // The reader can't wait for the writer: the
+                            // block is kept until the stream is freed.
+                            es.spent.appendAssumeCapacity(es.blocks[es.cur].mem);
+                            es.blocks[es.cur] = .{};
+                        } else {
+                            es.blocks[es.cur].inflight = true;
+                            es.cur ^= 1;
+                        }
+                        w.buffer = &.{};
+                        w.end = 0;
                     }
-                    es.blocks[es.cur].inflight = true;
-                    es.cur ^= 1;
                 }
                 self.kick();
-                // The next block: allocated, or free once written.
+            }
+
+            /// The writer's next block: on the reader a fresh one; on a
+            /// task `blocks[cur]`, once free (waiting on `room` while the
+            /// other one is still borrowed by `out`).
+            fn nextBlock(self: *StreamSink) std.Io.Writer.Error!void {
+                const es = self.es;
+                const conn = es.conn;
                 while (true) {
                     const seen = es.room.epoch();
                     {
                         conn.lock();
                         defer conn.unlock();
-                        if (conn.roomFree(es)) {
+                        if (es.inline_mode or conn.roomFree(es)) {
                             if (es.cs == null or es.reset or conn.send_shut) return self.fail(error.ConnectionResetByPeer);
                             const b = &es.blocks[es.cur];
                             if (b.mem.len == 0) {
                                 b.mem = conn.allocator.alloc(u8, block_len) catch return self.fail(error.SystemResources);
                                 if (comptime is_test) _ = test_blocks.fetchAdd(1, .monotonic);
                             }
-                            w.buffer = b.mem;
+                            self.writer.buffer = b.mem;
                             return;
                         }
                         if (!es.room_waiting) {
@@ -1930,17 +1979,16 @@ pub fn Engine(comptime Ctx: type) type {
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
                 // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
-                try self.submitBlock();
-                self.kick();
+                return self.submitBlock();
             }
 
-            /// Moves a full block on, then takes what fits of `data` into
-            /// the next.
+            /// Moves what the block holds on, then takes what fits of
+            /// `data` into the next.
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
                 // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
-                if (w.buffer.len == 0) return self.fail(error.SystemResources);
-                try self.submitBlock();
+                if (w.end > 0) try self.submitBlock();
+                if (w.buffer.len == 0) try self.nextBlock();
                 var n: usize = 0;
                 for (data[0 .. data.len - 1]) |bytes| {
                     const k = @min(bytes.len, w.buffer.len - w.end);
@@ -1979,18 +2027,24 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                 if (es.reset) return self.fail(error.ConnectionResetByPeer);
+                // Before the submits, as in `complete`: the last one may
+                // close the stream inside the call.
+                es.ended = true;
+                errdefer es.ended = false;
                 if (!es.head_sent and part.len == 0 and trailer_fields == null) {
-                    conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, true) catch |err| return self.submitFailed(err);
                     es.head_sent = true;
-                    es.ended = true;
+                    errdefer es.head_sent = false;
+                    conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, true) catch |err| return self.submitFailed(err);
                     return;
                 }
                 try self.submitHeadOnce(s);
+                // An empty end joins the DATA still queued (Conn.submitData).
                 if (part.len > 0 or trailer_fields == null)
                     conn.proto.submitData(s, part, trailer_fields == null) catch |err| return self.submitFailed(err);
+                // The block is borrowed now: no more writes into it.
+                w.buffer = &.{};
                 w.end = 0;
                 if (trailer_fields) |t| conn.proto.submitTrailers(s, t) catch |err| return self.submitFailed(err);
-                es.ended = true;
             }
 
             fn writeError(ptr: *anyopaque) ?Response.SendError {
