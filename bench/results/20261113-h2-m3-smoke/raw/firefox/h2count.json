@@ -1,0 +1,1394 @@
+{
+ "tool": "h2count",
+ "generated": "2026-11-13T19:58:05.555273297Z",
+ "scenarios": [
+  {
+   "name": "firefox-load",
+   "connections": 2,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 286,
+    "frames/100ms": 204,
+    "frames/conn_total": 615,
+    "frames/s": 411,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 281,
+    "headers/100ms": 102,
+    "headers/conn_total": 306,
+    "headers/s": 204,
+    "peak_streams": 71,
+    "requests/100ms": 102,
+    "requests/conn_total": 306,
+    "requests/s": 204,
+    "s2c_data/100ms": 102,
+    "s2c_data/conn_total": 305,
+    "s2c_data/s": 204,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 102,
+    "window_update/conn_total": 307,
+    "window_update/s": 205
+   },
+   "rollup_total": {
+    "frames": 618,
+    "goaway": 1,
+    "headers": 306,
+    "requests": 306,
+    "s2c_data": 305,
+    "s2c_settings": 2,
+    "settings": 2,
+    "settings_ack": 1,
+    "settings_entries": 8,
+    "window_update": 308
+   },
+   "conns": [
+    {
+     "id": 1,
+     "scenario": "firefox-load",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:7174",
+     "start": "2026-11-13T14:56:30.34996088-05:00",
+     "duration_s": 10.072393321,
+     "bytes_c2s": 15465,
+     "bytes_s2c": 81040,
+     "rates": {
+      "frames": {
+       "total": 615,
+       "peak_1s": 411,
+       "peak_100ms": 204
+      },
+      "headers": {
+       "total": 306,
+       "peak_1s": 204,
+       "peak_100ms": 102
+      },
+      "requests": {
+       "total": 306,
+       "peak_1s": 204,
+       "peak_100ms": 102
+      },
+      "s2c_data": {
+       "total": 305,
+       "peak_1s": 204,
+       "peak_100ms": 102
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 307,
+       "peak_1s": 205,
+       "peak_100ms": 102
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 286,
+      "header_block_bytes": 281,
+      "peak_streams": 71,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 2,
+     "scenario": "firefox-load",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:7188",
+     "start": "2026-11-13T14:56:30.957512033-05:00",
+     "duration_s": 0.000572003,
+     "bytes_c2s": 87,
+     "bytes_s2c": 55,
+     "rates": {
+      "frames": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "frame_len": 24,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x0": 1,
+      "c2s_goaway_last_stream:0x0": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-reload",
+   "connections": 2,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 288,
+    "frames/100ms": 406,
+    "frames/conn_total": 5917,
+    "frames/s": 3030,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 283,
+    "headers/100ms": 203,
+    "headers/conn_total": 2953,
+    "headers/s": 1515,
+    "peak_streams": 52,
+    "requests/100ms": 203,
+    "requests/conn_total": 2953,
+    "requests/s": 1515,
+    "rst/100ms": 8,
+    "rst/conn_total": 8,
+    "rst/s": 8,
+    "rst_unanswered/100ms": 8,
+    "rst_unanswered/conn_total": 8,
+    "rst_unanswered/s": 8,
+    "s2c_data/100ms": 204,
+    "s2c_data/conn_total": 2952,
+    "s2c_data/s": 1515,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 203,
+    "window_update/conn_total": 2954,
+    "window_update/s": 1515
+   },
+   "rollup_total": {
+    "frames": 5920,
+    "goaway": 1,
+    "headers": 2953,
+    "requests": 2953,
+    "rst": 8,
+    "rst_unanswered": 8,
+    "s2c_data": 2952,
+    "s2c_settings": 2,
+    "settings": 2,
+    "settings_ack": 1,
+    "settings_entries": 8,
+    "window_update": 2955
+   },
+   "conns": [
+    {
+     "id": 3,
+     "scenario": "firefox-reload",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:60366",
+     "start": "2026-11-13T14:56:42.903353006-05:00",
+     "duration_s": 10.076407093,
+     "bytes_c2s": 144769,
+     "bytes_s2c": 768023,
+     "rates": {
+      "frames": {
+       "total": 5917,
+       "peak_1s": 3030,
+       "peak_100ms": 406
+      },
+      "headers": {
+       "total": 2953,
+       "peak_1s": 1515,
+       "peak_100ms": 203
+      },
+      "requests": {
+       "total": 2953,
+       "peak_1s": 1515,
+       "peak_100ms": 203
+      },
+      "rst": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "rst_unanswered": {
+       "total": 8,
+       "peak_1s": 8,
+       "peak_100ms": 8
+      },
+      "s2c_data": {
+       "total": 2952,
+       "peak_1s": 1515,
+       "peak_100ms": 204
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 2954,
+       "peak_1s": 1515,
+       "peak_100ms": 203
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 288,
+      "header_block_bytes": 283,
+      "peak_streams": 52,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_rst:0x8": 8
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 4,
+     "scenario": "firefox-reload",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:60374",
+     "start": "2026-11-13T14:56:43.510155365-05:00",
+     "duration_s": 0.000625451,
+     "bytes_c2s": 87,
+     "bytes_s2c": 55,
+     "rates": {
+      "frames": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "frame_len": 24,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x0": 1,
+      "c2s_goaway_last_stream:0x0": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-abort",
+   "connections": 3,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 287,
+    "frames/100ms": 128,
+    "frames/conn_total": 133,
+    "frames/s": 133,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 282,
+    "headers/100ms": 48,
+    "headers/conn_total": 49,
+    "headers/s": 49,
+    "peak_streams": 48,
+    "requests/100ms": 48,
+    "requests/conn_total": 49,
+    "requests/s": 49,
+    "rst/100ms": 15,
+    "rst/conn_total": 26,
+    "rst/s": 26,
+    "rst_unanswered/100ms": 15,
+    "rst_unanswered/conn_total": 26,
+    "rst_unanswered/s": 26,
+    "s2c_data/100ms": 2991,
+    "s2c_data/conn_total": 2992,
+    "s2c_data/s": 2992,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 65,
+    "window_update/conn_total": 67,
+    "window_update/s": 67
+   },
+   "rollup_total": {
+    "frames": 221,
+    "goaway": 2,
+    "headers": 77,
+    "requests": 77,
+    "rst": 40,
+    "rst_unanswered": 40,
+    "s2c_data": 2993,
+    "s2c_settings": 3,
+    "settings": 3,
+    "settings_ack": 2,
+    "settings_entries": 12,
+    "window_update": 97
+   },
+   "conns": [
+    {
+     "id": 5,
+     "scenario": "firefox-abort",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:63754",
+     "start": "2026-11-13T14:56:55.436024635-05:00",
+     "duration_s": 0.109109244,
+     "bytes_c2s": 3273,
+     "bytes_s2c": 49041244,
+     "rates": {
+      "frames": {
+       "total": 133,
+       "peak_1s": 133,
+       "peak_100ms": 128
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "headers": {
+       "total": 49,
+       "peak_1s": 49,
+       "peak_100ms": 48
+      },
+      "requests": {
+       "total": 49,
+       "peak_1s": 49,
+       "peak_100ms": 48
+      },
+      "rst": {
+       "total": 14,
+       "peak_1s": 14,
+       "peak_100ms": 14
+      },
+      "rst_unanswered": {
+       "total": 14,
+       "peak_1s": 14,
+       "peak_100ms": 14
+      },
+      "s2c_data": {
+       "total": 2992,
+       "peak_1s": 2992,
+       "peak_100ms": 2991
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 67,
+       "peak_1s": 67,
+       "peak_100ms": 65
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 287,
+      "header_block_bytes": 282,
+      "peak_streams": 48,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x2": 1,
+      "c2s_goaway_last_stream:0x0": 1,
+      "c2s_rst:0x8": 14
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 6,
+     "scenario": "firefox-abort",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:63766",
+     "start": "2026-11-13T14:56:55.548596772-05:00",
+     "duration_s": 9.959762185,
+     "bytes_c2s": 2110,
+     "bytes_s2c": 178,
+     "rates": {
+      "frames": {
+       "total": 85,
+       "peak_1s": 85,
+       "peak_100ms": 66
+      },
+      "headers": {
+       "total": 28,
+       "peak_1s": 28,
+       "peak_100ms": 26
+      },
+      "requests": {
+       "total": 28,
+       "peak_1s": 28,
+       "peak_100ms": 26
+      },
+      "rst": {
+       "total": 26,
+       "peak_1s": 26,
+       "peak_100ms": 15
+      },
+      "rst_unanswered": {
+       "total": 26,
+       "peak_1s": 26,
+       "peak_100ms": 15
+      },
+      "s2c_data": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 29,
+       "peak_1s": 29,
+       "peak_100ms": 27
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 229,
+      "header_block_bytes": 224,
+      "peak_streams": 26,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_rst:0x8": 26
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 7,
+     "scenario": "firefox-abort",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:63774",
+     "start": "2026-11-13T14:56:56.046868767-05:00",
+     "duration_s": 0.000471598,
+     "bytes_c2s": 87,
+     "bytes_s2c": 55,
+     "rates": {
+      "frames": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "frame_len": 24,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x0": 1,
+      "c2s_goaway_last_stream:0x0": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-sse",
+   "connections": 2,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 285,
+    "frames/100ms": 11,
+    "frames/conn_total": 18,
+    "frames/s": 13,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 280,
+    "headers/100ms": 4,
+    "headers/conn_total": 6,
+    "headers/s": 5,
+    "peak_streams": 4,
+    "requests/100ms": 4,
+    "requests/conn_total": 6,
+    "requests/s": 5,
+    "rst/100ms": 3,
+    "rst/conn_total": 3,
+    "rst/s": 3,
+    "rst_unanswered/100ms": 3,
+    "rst_unanswered/conn_total": 3,
+    "rst_unanswered/s": 3,
+    "s2c_data/100ms": 4,
+    "s2c_data/conn_total": 77,
+    "s2c_data/s": 32,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 5,
+    "window_update/conn_total": 7,
+    "window_update/s": 6
+   },
+   "rollup_total": {
+    "frames": 21,
+    "goaway": 1,
+    "headers": 6,
+    "requests": 6,
+    "rst": 3,
+    "rst_unanswered": 3,
+    "s2c_data": 77,
+    "s2c_settings": 2,
+    "settings": 2,
+    "settings_ack": 1,
+    "settings_entries": 8,
+    "window_update": 8
+   },
+   "conns": [
+    {
+     "id": 8,
+     "scenario": "firefox-sse",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:50572",
+     "start": "2026-11-13T14:57:07.915674741-05:00",
+     "duration_s": 8.068516138,
+     "bytes_c2s": 857,
+     "bytes_s2c": 5917,
+     "rates": {
+      "frames": {
+       "total": 18,
+       "peak_1s": 13,
+       "peak_100ms": 11
+      },
+      "headers": {
+       "total": 6,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "requests": {
+       "total": 6,
+       "peak_1s": 5,
+       "peak_100ms": 4
+      },
+      "rst": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "rst_unanswered": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "s2c_data": {
+       "total": 77,
+       "peak_1s": 32,
+       "peak_100ms": 4
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 7,
+       "peak_1s": 6,
+       "peak_100ms": 5
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 285,
+      "header_block_bytes": 280,
+      "peak_streams": 4,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_rst:0x8": 3
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 9,
+     "scenario": "firefox-sse",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:50580",
+     "start": "2026-11-13T14:57:08.28201865-05:00",
+     "duration_s": 0.000738276,
+     "bytes_c2s": 87,
+     "bytes_s2c": 55,
+     "rates": {
+      "frames": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "frame_len": 24,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x0": 1,
+      "c2s_goaway_last_stream:0x0": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-upload",
+   "connections": 1,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "data/100ms": 1578,
+    "data/conn_total": 1578,
+    "data/s": 1578,
+    "frame_len": 16000,
+    "frames/100ms": 1582,
+    "frames/conn_total": 1589,
+    "frames/s": 1589,
+    "header_block_bytes": 283,
+    "headers/100ms": 2,
+    "headers/conn_total": 4,
+    "headers/s": 4,
+    "peak_streams": 1,
+    "requests/100ms": 2,
+    "requests/conn_total": 4,
+    "requests/s": 4,
+    "s2c_data/100ms": 2,
+    "s2c_data/conn_total": 3,
+    "s2c_data/s": 3,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 3,
+    "window_update/conn_total": 5,
+    "window_update/s": 5
+   },
+   "rollup_total": {
+    "data": 1578,
+    "frames": 1589,
+    "headers": 4,
+    "requests": 4,
+    "s2c_data": 3,
+    "s2c_settings": 1,
+    "settings": 1,
+    "settings_ack": 1,
+    "settings_entries": 4,
+    "window_update": 5
+   },
+   "conns": [
+    {
+     "id": 10,
+     "scenario": "firefox-upload",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:50798",
+     "start": "2026-11-13T14:57:18.410555835-05:00",
+     "duration_s": 12.085111911,
+     "bytes_c2s": 16792140,
+     "bytes_s2c": 9493,
+     "rates": {
+      "data": {
+       "total": 1578,
+       "peak_1s": 1578,
+       "peak_100ms": 1578
+      },
+      "frames": {
+       "total": 1589,
+       "peak_1s": 1589,
+       "peak_100ms": 1582
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 2
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 3
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 16000,
+      "header_block_bytes": 283,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-download",
+   "connections": 1,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 289,
+    "frames/100ms": 137,
+    "frames/conn_total": 228,
+    "frames/s": 228,
+    "header_block_bytes": 284,
+    "headers/100ms": 2,
+    "headers/conn_total": 4,
+    "headers/s": 4,
+    "peak_streams": 1,
+    "requests/100ms": 2,
+    "requests/conn_total": 4,
+    "requests/s": 4,
+    "s2c_data/100ms": 3245,
+    "s2c_data/conn_total": 4098,
+    "s2c_data/s": 4098,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 135,
+    "window_update/conn_total": 222,
+    "window_update/s": 222
+   },
+   "rollup_total": {
+    "frames": 228,
+    "headers": 4,
+    "requests": 4,
+    "s2c_data": 4098,
+    "s2c_settings": 1,
+    "settings": 1,
+    "settings_ack": 1,
+    "settings_entries": 4,
+    "window_update": 222
+   },
+   "conns": [
+    {
+     "id": 11,
+     "scenario": "firefox-download",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:41824",
+     "start": "2026-11-13T14:57:32.974422092-05:00",
+     "duration_s": 20.080310662,
+     "bytes_c2s": 3521,
+     "bytes_s2c": 67148836,
+     "rates": {
+      "frames": {
+       "total": 228,
+       "peak_1s": 228,
+       "peak_100ms": 137
+      },
+      "headers": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 4098,
+       "peak_1s": 4098,
+       "peak_100ms": 3245
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 222,
+       "peak_1s": 222,
+       "peak_100ms": 135
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 289,
+      "header_block_bytes": 284,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "firefox-nav",
+   "connections": 2,
+   "rollup_max_over_connections": {
+    "continuations_per_block": 0,
+    "frame_len": 286,
+    "frames/100ms": 194,
+    "frames/conn_total": 228,
+    "frames/s": 228,
+    "goaway/100ms": 1,
+    "goaway/conn_total": 1,
+    "goaway/s": 1,
+    "header_block_bytes": 281,
+    "headers/100ms": 2,
+    "headers/conn_total": 5,
+    "headers/s": 5,
+    "peak_streams": 1,
+    "requests/100ms": 2,
+    "requests/conn_total": 5,
+    "requests/s": 5,
+    "s2c_data/100ms": 3010,
+    "s2c_data/conn_total": 4103,
+    "s2c_data/s": 4103,
+    "s2c_settings/100ms": 1,
+    "s2c_settings/conn_total": 1,
+    "s2c_settings/s": 1,
+    "settings/100ms": 1,
+    "settings/conn_total": 1,
+    "settings/s": 1,
+    "settings_ack/100ms": 1,
+    "settings_ack/conn_total": 1,
+    "settings_ack/s": 1,
+    "settings_entries/100ms": 4,
+    "settings_entries/conn_total": 4,
+    "settings_entries/s": 4,
+    "settings_entries_per_frame": 4,
+    "window_update/100ms": 193,
+    "window_update/conn_total": 221,
+    "window_update/s": 221
+   },
+   "rollup_total": {
+    "frames": 231,
+    "goaway": 1,
+    "headers": 5,
+    "requests": 5,
+    "s2c_data": 4103,
+    "s2c_settings": 2,
+    "settings": 2,
+    "settings_ack": 1,
+    "settings_entries": 8,
+    "window_update": 222
+   },
+   "conns": [
+    {
+     "id": 12,
+     "scenario": "firefox-nav",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:18790",
+     "start": "2026-11-13T14:57:55.48476129-05:00",
+     "duration_s": 8.063322998,
+     "bytes_c2s": 3536,
+     "bytes_s2c": 67149090,
+     "rates": {
+      "frames": {
+       "total": 228,
+       "peak_1s": 228,
+       "peak_100ms": 194
+      },
+      "headers": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 2
+      },
+      "requests": {
+       "total": 5,
+       "peak_1s": 5,
+       "peak_100ms": 2
+      },
+      "s2c_data": {
+       "total": 4103,
+       "peak_1s": 4103,
+       "peak_100ms": 3010
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_ack": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 221,
+       "peak_1s": 221,
+       "peak_100ms": 193
+      }
+     },
+     "max": {
+      "continuations_per_block": 0,
+      "frame_len": 286,
+      "header_block_bytes": 281,
+      "peak_streams": 1,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    },
+    {
+     "id": 13,
+     "scenario": "firefox-nav",
+     "listener": "tls@127.0.0.1:19443",
+     "client_addr": "127.0.0.1:18806",
+     "start": "2026-11-13T14:57:55.956905418-05:00",
+     "duration_s": 0.000577752,
+     "bytes_c2s": 87,
+     "bytes_s2c": 55,
+     "rates": {
+      "frames": {
+       "total": 3,
+       "peak_1s": 3,
+       "peak_100ms": 3
+      },
+      "goaway": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "s2c_settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      },
+      "settings_entries": {
+       "total": 4,
+       "peak_1s": 4,
+       "peak_100ms": 4
+      },
+      "window_update": {
+       "total": 1,
+       "peak_1s": 1,
+       "peak_100ms": 1
+      }
+     },
+     "max": {
+      "frame_len": 24,
+      "settings_entries_per_frame": 4
+     },
+     "settings_ids": {
+      "0x0001": 1,
+      "0x0002": 1,
+      "0x0004": 1,
+      "0x0005": 1
+     },
+     "error_codes": {
+      "c2s_goaway:0x0": 1,
+      "c2s_goaway_last_stream:0x0": 1
+     },
+     "server_settings": {
+      "0x0003=250": 1,
+      "0x0004=65536": 1,
+      "0x0006=65536": 1,
+      "0x0009=1": 1
+     }
+    }
+   ]
+  }
+ ],
+ "caveat": "client-to-server frames seen by a TLS-terminating TCP proxy; peaks are over 0.9-1.0 s windows; unanswered RSTs are judged from END_STREAM on the wire"
+}

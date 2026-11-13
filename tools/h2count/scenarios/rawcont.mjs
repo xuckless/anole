@@ -42,7 +42,7 @@ function run(label, valueLen, frames) { // frames: header block fragments (HEADE
         const len = buf.readUIntBE(0, 3);
         if (buf.length < 9 + len) break;
         const t = buf[3], pl = buf.subarray(9, 9 + len);
-        if (t === 1) seen.push(pl[0] === 0x88 ? 'HEADERS 200' : `HEADERS status-byte 0x${pl[0].toString(16)}`);
+        if (t === 1) { let i = 0; while (i < pl.length && (pl[i] & 0xe0) === 0x20) i++; /* dynamic table size updates */ seen.push(pl[i] === 0x88 ? 'HEADERS 200' : `HEADERS status-byte 0x${(pl[i] ?? 0).toString(16)}`); }
         else if (t === 3) seen.push(`RST_STREAM code ${pl.readUInt32BE(0)}`);
         else if (t === 7) seen.push(`GOAWAY code ${pl.readUInt32BE(4)}`);
         buf = buf.subarray(9 + len);

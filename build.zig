@@ -2061,7 +2061,7 @@ pub fn build(b: *std.Build) void {
 fn resolveFeatures(b: *std.Build) Features {
     const profile = b.option(Profile, "profile", "Feature preset: minimal (HTTP/1.1 only), web, full (default)") orelse .full;
     const tls = b.option(Tls, "tls", "TLS backend: boringssl or none (overrides the profile)");
-    const http2 = b.option(bool, "http2", "HTTP/2 via nghttp2 (overrides the profile)");
+    const http2 = b.option(bool, "http2", "HTTP/2: the server engine in Zig, the client via nghttp2 (overrides the profile)");
     const http3 = b.option(bool, "http3", "HTTP/3 via ngtcp2 + nghttp3; needs -Dtls=boringssl (overrides the profile)");
     const grpc = b.option(bool, "grpc", "gRPC; needs -Dhttp2=true (overrides the profile)");
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");

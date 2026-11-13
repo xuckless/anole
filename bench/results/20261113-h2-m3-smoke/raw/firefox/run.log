@@ -1,0 +1,15 @@
+[14:56:29] scenario firefox-load
+[14:56:41] PASS firefox-load
+[14:56:41] scenario firefox-reload
+[14:56:54] PASS firefox-reload
+[14:56:54] scenario firefox-abort
+[14:57:07] PASS firefox-abort
+[14:57:07] scenario firefox-sse
+[14:57:17] PASS firefox-sse
+[14:57:17] scenario firefox-upload
+[14:57:31] PASS firefox-upload
+[14:57:32] scenario firefox-download
+[14:57:54] PASS firefox-download
+[14:57:54] scenario firefox-nav
+[14:58:05] PASS firefox-nav
+[14:58:05] report: /home/xuckl/Dev/anole-wt/h2m3-engine/bench/results/20261113-h2-m3-smoke/raw/firefox/h2count.json

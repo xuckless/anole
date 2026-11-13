@@ -19,9 +19,9 @@ pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// The engines the behaviour tests (h2_test.zig) run on; one place to add
 /// the next one.
-pub const Engine = enum { nghttp2 };
+pub const Engine = enum { anole, nghttp2 };
 
-pub const engines = [_]Engine{.nghttp2};
+pub const engines = [_]Engine{ .anole, .nghttp2 };
 
 /// What a behaviour test may know about an engine: the server type with
 /// that engine, its module for the optional test probes (read under
@@ -29,13 +29,39 @@ pub const engines = [_]Engine{.nghttp2};
 /// policy checks hold for it.
 pub fn Desc(comptime e: Engine) type {
     return switch (e) {
+        // The engine that serves (h2/server.zig).
+        .anole => struct {
+            pub const mod = @import("../h2/server.zig");
+            pub fn Server(comptime Ctx: type) type {
+                return dusty.Server(Ctx);
+            }
+            /// The server's registry of this engine's connections.
+            pub const registry = "h2_conns";
+            /// Picks this engine for the server's next connections.
+            pub fn select(s: anytype) void {
+                if (@TypeOf(s.test_h2_engine) != void) s.test_h2_engine = .anole;
+            }
+            /// It keeps what a burst grew to, so a burst queueing more than
+            /// any before it allocates (INTENTIONAL.md, the server engine 6);
+            /// its warm path is h2/server_test.zig's.
+            pub const warm_zero_alloc = false;
+            /// Its half-close probe (a PING) is the sync point; there is no
+            /// `test_after_peer_end`.
+            pub const half_close_probe = true;
+        },
+        // Until M6.
         .nghttp2 => struct {
             pub const mod = @import("h2_nghttp2.zig");
             pub fn Server(comptime Ctx: type) type {
                 return dusty.Server(Ctx);
             }
+            pub const registry = "h2_conns_nghttp2";
+            pub fn select(s: anytype) void {
+                if (@TypeOf(s.test_h2_engine) != void) s.test_h2_engine = .nghttp2;
+            }
             /// A warm connection serves requests without allocating.
             pub const warm_zero_alloc = true;
+            pub const half_close_probe = false;
         },
     };
 }
@@ -73,8 +99,9 @@ pub const TestClient = struct {
     closes: usize = 0,
     /// WINDOW_UPDATE frames received for a stream (not the connection).
     stream_window_updates: usize = 0,
-    /// PING ACKs received.
+    /// PING ACKs received, and PINGs.
     ping_acks: usize = 0,
+    pings: usize = 0,
 
     pub const Resp = struct {
         status: u16 = 0,
@@ -347,7 +374,9 @@ pub const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
-        if (frame.*.hd.type == c.NGHTTP2_PING and frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1;
+        if (frame.*.hd.type == c.NGHTTP2_PING) {
+            if (frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1 else self.pings += 1;
+        }
         if ((frame.*.hd.type == c.NGHTTP2_DATA or frame.*.hd.type == c.NGHTTP2_HEADERS) and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) {
             if (respFor(session, frame.*.hd.stream_id)) |resp| resp.answered = true;
         }
@@ -637,7 +666,14 @@ pub const SentGate = struct {
 /// initial window (65535), one byte under the server's `stream_window`.
 pub const default_window = 65535;
 
-pub fn Fixture(comptime Srv: type) type {
+/// `sendFile` from `file_dir`, on its own route.
+pub var file_dir: std.Io.Dir = undefined;
+fn sendFileHandler(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(file_dir, "body.bin", .{});
+}
+
+pub fn Fixture(comptime E: type) type {
+    const Srv = E.Server(void);
     return struct {
         const Self = @This();
         server: Srv,
@@ -650,7 +686,9 @@ pub fn Fixture(comptime Srv: type) type {
                 // Off by default; the extended CONNECT tests need it.
                 .http2 = .{ .enable_connect_protocol = true },
             }, {});
+            E.select(&self.server);
             self.server.router.get("/hello", Handlers.hello);
+            self.server.router.get("/file", sendFileHandler);
             self.server.router.get("/fields", Handlers.fields);
             self.server.router.get("/users/:id", Handlers.user);
             self.server.router.post("/echo", Handlers.echo);

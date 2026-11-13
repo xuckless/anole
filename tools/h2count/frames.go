@@ -16,6 +16,7 @@ const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 const (
 	tData, tHeaders, tPriority, tRst, tSettings            = 0, 1, 2, 3, 4
 	tPushPromise, tPing, tGoaway, tWindowUpdate, tContinue = 5, 6, 7, 8, 9
+	tPriorityUpdate                                        = 0x10 // RFC 9218 section 7.1
 )
 
 const (
@@ -36,7 +37,7 @@ type frameHdr struct {
 // framer splits a byte stream into frames and calls on once per frame, when
 // its payload has fully arrived. first is the payload's first byte (the pad
 // length of a padded frame); payload holds the first payloadKeep bytes (the
-// SETTINGS entries).
+// SETTINGS entries, the error code of a GOAWAY or RST_STREAM).
 type framer struct {
 	pre     int // client preface bytes still expected
 	seen    []byte
@@ -111,7 +112,7 @@ func (f *framer) feed(b []byte) {
 		if !f.hasInit && n > 0 {
 			f.first, f.hasInit = b[0], true
 		}
-		if f.cur.Type == tSettings && len(f.pay) < payloadKeep {
+		if (f.cur.Type == tSettings || f.cur.Type == tGoaway || f.cur.Type == tRst) && len(f.pay) < payloadKeep {
 			f.pay = append(f.pay, b[:min(int(n), payloadKeep-len(f.pay))]...)
 		}
 		f.remain -= n
@@ -149,8 +150,14 @@ type Conn struct {
 	Max      map[string]int64 `json:"max"`
 	Unknown  map[string]int64 `json:"unknown_types,omitempty"`
 	Settings map[string]int64 `json:"settings_ids,omitempty"`
-	DesyncC  bool             `json:"desync_c2s,omitempty"`
-	DesyncS  bool             `json:"desync_s2c,omitempty"`
+	// Codes counts GOAWAY and RST_STREAM error codes per direction ("s2c_goaway:0xb").
+	Codes map[string]int64 `json:"error_codes,omitempty"`
+	// GoawayDebug is the debug data of the server's GOAWAY frames (the engine puts its reason there).
+	GoawayDebug []string `json:"s2c_goaway_debug,omitempty"`
+	// ServerSettings counts the server's SETTINGS entries as "0x0009=1".
+	ServerSettings map[string]int64 `json:"server_settings,omitempty"`
+	DesyncC        bool             `json:"desync_c2s,omitempty"`
+	DesyncS        bool             `json:"desync_s2c,omitempty"`
 
 	now     func() time.Duration
 	streams map[uint32]*stream
@@ -164,7 +171,7 @@ type Conn struct {
 func newConn(now func() time.Duration) *Conn {
 	c := &Conn{
 		Rates: map[string]*Ctr{}, Max: map[string]int64{},
-		Unknown: map[string]int64{}, Settings: map[string]int64{},
+		Unknown: map[string]int64{}, Settings: map[string]int64{}, Codes: map[string]int64{}, ServerSettings: map[string]int64{},
 		now: now, streams: map[uint32]*stream{},
 	}
 	c.cf = newFramer(true, c.fromClient)
@@ -199,6 +206,14 @@ func payloadLen(h frameHdr, first byte, hasFirst bool) int64 {
 		n -= 1 + int64(first)
 	}
 	return n
+}
+
+// code counts the error code at payload[off:off+4] of a GOAWAY or RST_STREAM.
+func (c *Conn) code(name string, payload []byte, off int) {
+	if len(payload) >= off+4 {
+		v := uint32(payload[off])<<24 | uint32(payload[off+1])<<16 | uint32(payload[off+2])<<8 | uint32(payload[off+3])
+		c.Codes[fmt.Sprintf("%s:0x%x", name, v)]++
+	}
 }
 
 func (c *Conn) finishBlock() {
@@ -264,8 +279,11 @@ func (c *Conn) fromClient(h frameHdr, first byte, hasFirst bool, payload []byte)
 		}
 	case tPriority:
 		c.add("priority", 1)
+	case tPriorityUpdate:
+		c.add("priority_update", 1)
 	case tRst:
 		c.add("rst", 1)
+		c.code("c2s_rst", payload, 0)
 		if s := c.streams[h.Stream]; s != nil {
 			if !s.serverEnd {
 				c.add("rst_unanswered", 1)
@@ -291,6 +309,8 @@ func (c *Conn) fromClient(h frameHdr, first byte, hasFirst bool, payload []byte)
 		}
 	case tGoaway:
 		c.add("goaway", 1)
+		c.code("c2s_goaway", payload, 4)
+		c.code("c2s_goaway_last_stream", payload, 0)
 	case tWindowUpdate:
 		c.add("window_update", 1)
 	case tPushPromise:
@@ -303,7 +323,7 @@ func (c *Conn) fromClient(h frameHdr, first byte, hasFirst bool, payload []byte)
 
 // fromServer only follows streams (so that a client RST can be told from
 // one for an answered stream) and counts a few frames for ratios.
-func (c *Conn) fromServer(h frameHdr, _ byte, _ bool, _ []byte) {
+func (c *Conn) fromServer(h frameHdr, _ byte, _ bool, payload []byte) {
 	end := h.Flags&fEndStream != 0
 	switch h.Type {
 	case tData:
@@ -316,12 +336,22 @@ func (c *Conn) fromServer(h frameHdr, _ byte, _ bool, _ []byte) {
 		}
 	case tRst:
 		c.add("s2c_rst", 1)
+		c.code("s2c_rst", payload, 0)
 		delete(c.streams, h.Stream)
 	case tGoaway:
 		c.add("s2c_goaway", 1)
+		c.code("s2c_goaway", payload, 4)
+		if len(payload) > 8 && len(c.GoawayDebug) < 8 {
+			c.GoawayDebug = append(c.GoawayDebug, string(payload[8:]))
+		}
 	case tSettings:
 		if h.Flags&fAck == 0 {
 			c.add("s2c_settings", 1)
+			for i := 0; i+6 <= len(payload); i += 6 {
+				id := uint16(payload[i])<<8 | uint16(payload[i+1])
+				v := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 | uint32(payload[i+4])<<8 | uint32(payload[i+5])
+				c.ServerSettings[fmt.Sprintf("0x%04x=%d", id, v)]++
+			}
 		}
 	case tPing:
 		if h.Flags&fAck == 0 {

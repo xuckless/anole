@@ -17,7 +17,7 @@ const harness = @import("h2_harness_test.zig");
 const awaitStreamsFreed = harness.awaitStreamsFreed;
 const E = harness.Desc(.nghttp2);
 const h2 = E.mod;
-const Fixture = harness.Fixture(E.Server(void));
+const Fixture = harness.Fixture(E);
 
 const loopback_addr = harness.loopback_addr;
 const TestClient = harness.TestClient;
@@ -126,6 +126,7 @@ test "HTTP/2: a small body's queue comes from the stream's arena, with or withou
     var server = E.Server(void).init(counting.allocator(), io, .{
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
     }, {});
+    E.select(&server);
     defer server.deinit();
     server.router.post("/sum", Handlers.sum);
     var future = try io.concurrent(Fixture.run, .{&server});

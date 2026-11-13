@@ -48,6 +48,22 @@ comptime {
 /// A zio with the placement API.
 const have_zio = !is_stub;
 
+/// Whether a task spawned `.local` is pinned to its executor, never runs at
+/// the same time as its spawner, and only switches at a yield: real zio
+/// with pinned scheduling (the root's `zio_options`, as src/server.zig's
+/// check reads them; Anole's build of zio is pinned by default). Then state
+/// one connection's tasks share needs no lock while nothing in between
+/// yields (the HTTP/2 engine's `ConnLock`, research/h2h3-takeover/PLAN.md
+/// §3.3). Only half the answer: the same build also runs on
+/// `std.Io.Threaded` (the tests), where `concurrent` is an OS thread, so a
+/// caller also checks at run time that its `Io` is zio's
+/// (`currentExecutor(io) != null`).
+pub const single_executor_guarantee = have_zio and blk: {
+    const root = @import("root");
+    if (!@hasDecl(root, "zio_options")) break :blk true;
+    break :blk root.zio_options.scheduling != .work_stealing;
+};
+
 pub const Where = union(enum) {
     /// The executor of the calling task.
     local,

@@ -2,8 +2,8 @@
 //! translated from nghttp2 where noted (see LICENSE.nghttp2 and
 //! THIRD_PARTY_NOTICES): HPACK, frames, request field checks, the flood
 //! limits, the stream state, and the sans-IO connection core (conn.zig) with
-//! its output queue (out.zig). Nothing uses them yet: the engine is still
-//! nghttp2 (src/http/core/server/h2_nghttp2.zig).
+//! its output queue (out.zig), and the server engine on them (server.zig),
+//! which serves the server's HTTP/2. The client is still on nghttp2 (M5).
 
 const std = @import("std");
 
@@ -15,6 +15,9 @@ pub const limits = @import("limits.zig");
 pub const streams = @import("streams.zig");
 pub const out = @import("out.zig");
 pub const conn = @import("conn.zig");
+pub const server = @import("server.zig");
+/// Tests only: connections served by `server` without `Server.run`.
+pub const test_server = if (@import("builtin").is_test) @import("test_server.zig") else struct {};
 
 test {
     std.testing.refAllDecls(@This());
@@ -29,5 +32,7 @@ test {
     if (@import("build_options").use_http2) {
         _ = @import("hpack_diff_test.zig");
         _ = @import("conn_diff_test.zig");
+        // `Server(Ctx)` has its HTTP/2 fields only then.
+        _ = @import("server_test.zig");
     }
 }

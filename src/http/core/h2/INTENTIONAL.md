@@ -202,3 +202,88 @@ side's answers would depend on when its writer ran.
    invariance found it; conn_test.zig "a DATA frame past the window is a
    FLOW_CONTROL_ERROR however the reads cut it"). Accepted when Conn ends
    with FLOW_CONTROL_ERROR, nghttp2 doesn't, and the input was cut.
+6. **A GOAWAY's last_stream_id of the peer's own parity is not an error.**
+   nghttp2 answers GOAWAY(PROTOCOL_ERROR, "GOAWAY: invalid last_stream_id")
+   when a client's GOAWAY names an odd id (the id must be one the server
+   opened, and a server opens none). grpc-go's client closes every
+   connection with GOAWAY(NO_ERROR) naming its own highest stream (found
+   by the M3 smoke, bench/results/20261113-h2-m3-smoke: one such GOAWAY
+   per gRPC connection close, counted by tools/h2count). The id means
+   nothing to a server, so only the RFC 9113 §6.8 rule that it never
+   grows is kept. conn_test.zig "a GOAWAY's last_stream_id of the peer's
+   own parity is accepted"; the differential only sends 0.
+
+## The server engine (server.zig against server/h2_nghttp2.zig)
+
+Not part of the differential tests: what the engine does differently from
+the nghttp2 engine it replaces.
+
+1. **A tunnel's window is never below `stream_window`.** An extended
+   CONNECT (RFC 8441) reads at `Http2.tunnel_window`: the nghttp2 engine
+   set its local window to that (`setTunnelWindow`), shrinking it when
+   `tunnel_window` was the smaller. Conn has no way to shrink a window it
+   has granted (a WINDOW_UPDATE only adds), so a smaller `tunnel_window` is
+   left at `stream_window`; the only effect is the peer's pacing on that
+   stream. Both defaults (128 KiB over 64 KiB) raise it.
+2. **A send from another executor waits for the connection's.** A
+   WebSocket-over-HTTP/2 `send` (or `kickOut`) from a task on another
+   executor than the connection's hops there (`StreamSink.onOwner`: a task
+   placed on the connection's executor, awaited), where the nghttp2 engine
+   appended under its mutex and woke its writer without the sender
+   waiting. Same bytes on the wire; a cross-thread round trip per such send
+   (Rooms and SSE already hop once per socket). Listed for the lead's
+   profile of the takeover; a copy on the caller posted without the await
+   is the fix if it shows.
+3. **(Resolved at the switch.) After a clean EOF, handlers still running
+   are probed for, as the nghttp2 engine does.** A peer whose side ended
+   cleanly may have only half-closed: `closeRun` sends a PING then and
+   every 500 ms while any handler (on a task, or a detached response's
+   owner) still holds its stream (`probeHalfClose`); a peer that closed
+   the whole connection answers with a TCP reset, the next write fails,
+   and every handler is canceled and every detached response aborted. One
+   that half-closed still gets its answers. Until the switch, a detached
+   response not yet attached was aborted at the EOF here.
+4. **A keep-alive close sends GOAWAY(NO_ERROR) first.** The nghttp2
+   engine's reader was canceled by its keep-alive timer and closed with no
+   GOAWAY; a reader whose keep-alive deadline passes queues one and writes
+   it before the close, as nginx, Go's x/net/http2 (`onIdleTimer`) and h2o
+   (`on_idle_timeout`) do. A parked connection closed at its deadline by
+   the shelf gets none (no task writes it): a FIN, or close_notify on TLS,
+   as a parked HTTP/1.1 connection. RFC 9113 §6.8 allows both.
+5. **Idle connections park, and the drain does not reach a parked one.**
+   With nothing open, queued or half read for `idle_park`, a connection
+   ends its task and gives its buffers back (D16, #97); the drain's
+   GOAWAYs go to the connections with a task, and a parked one, which
+   holds no count in the server's in-flight requests, is closed at the
+   stop (or begins its drain if its socket wakes it first). A partial frame
+   keeps the connection on its task (nginx's `state.incomplete` rule), not
+   D16's spill.
+6. **Its pools keep what a burst grew them to, not a fixed size.** The
+   output buffer and the spare frame nodes (`Conn.spare`, up to 32) grow
+   to the largest burst seen and are given back when the connection
+   parks (Out also at a quiet trim interval): a burst that queues more at
+   once than any before it allocates, and how much queues at once depends
+   on how the handlers' ends and the writes interleave. The nghttp2
+   engine's spare streams and its outbound items made a burst of 100
+   allocate nothing once warm; h2_test.zig's "a warm connection serves a
+   burst of 100 streams ... without allocating" stays on that engine.
+   Not wire behaviour (RFC 9113 says nothing about it); the warm
+   single-request path is server_test.zig's "a warm connection serves
+   requests without allocating". Left to M4's profile.
+7. **A connection on its task counts as two tasks; a parked one as none.**
+   No writer task: the reader writes, and a flusher runs only while output
+   is left over (PLAN §3.3). Under `max_tasks` the run holds a slot for
+   its flusher beside the reader's (`adopterServe`), as the nghttp2
+   engine's writer held one, so the cap still bounds the tasks that may
+   run (a send-deadline waiter takes one more of its own); a parked
+   connection holds no task and no slot. h2_test.zig's task-cap test runs
+   on both engines with the same count. Not wire behaviour.
+
+The nghttp2-only tests in server/h2_test.zig (`startWith(io, .nghttp2)` or
+`test_h2_engine = .nghttp2`) are those of that engine's internals: its
+`test_*` hooks (writer rounds and wakes, the body queue and its windows,
+`test_before_fill`/`flush`, `test_after_peer_end`) and its spare streams:
+on this engine their hooks never fire, so they would wait or measure
+nothing. The protocol behaviour under them (windows, drains, half-closes)
+is this engine's in server_test.zig, src/http/h2_park_test.zig and
+conn_test.zig. They go with h2_nghttp2.zig at M6.

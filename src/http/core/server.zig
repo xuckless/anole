@@ -43,9 +43,15 @@ const admission = @import("admission.zig");
 const qsbr = @import("qsbr.zig");
 const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
-/// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
-const h2 = if (build_options.use_http2) @import("server/h2_nghttp2.zig") else struct {};
+/// The HTTP/2 engine (on Anole's own protocol core), with the `-Dhttp2`
+/// build option.
+const h2 = if (build_options.use_http2) @import("h2/server.zig") else struct {};
+/// Tests only, until M6: the nghttp2 engine, which a test picks per server
+/// (`test_h2_engine`) for its internal hooks and the behaviour suite's
+/// second run.
+const h2_nghttp2 = if (build_options.use_http2 and @import("builtin").is_test) @import("server/h2_nghttp2.zig") else struct {};
+const has_h2_nghttp2 = build_options.use_http2 and @import("builtin").is_test;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");
@@ -1346,6 +1352,10 @@ pub fn Server(comptime Ctx: type) type {
         /// GOAWAY that no new streams will be taken.
         h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
             if (build_options.use_http2) .{} else {},
+        /// Tests only, until M6: which HTTP/2 engine serves this server's
+        /// connections, and the nghttp2 engine's connections.
+        test_h2_engine: if (has_h2_nghttp2) enum { anole, nghttp2 } else void = if (has_h2_nghttp2) .anole else {},
+        h2_conns_nghttp2: if (has_h2_nghttp2) h2_nghttp2.Engine(Ctx).Registry else void = if (has_h2_nghttp2) .{} else {},
         /// Bumped by the first executor's trim task every
         /// `request_buffers_trim_interval`: an HTTP/2 connection that sees
         /// it move frees the spare streams it kept unused since.
@@ -1643,7 +1653,7 @@ pub fn Server(comptime Ctx: type) type {
                 @memset(a.rows, .{});
             }
             if (self.config.max_tasks) |n| if (n < admission.State.min_task_cap) {
-                self.logProtected(.err, "config.max_tasks is {d}, below {d}: an HTTP/2 connection holds two tasks, and its first stream needs a third", .{ n, admission.State.min_task_cap });
+                self.logProtected(.err, "config.max_tasks is {d}, below {d}: an HTTP/2 connection may hold two tasks, and its first stream needs a third", .{ n, admission.State.min_task_cap });
                 return error.NoTasksAllowed;
             };
             const budget = try resolveBudgets(self.io, self.config.buffer_budget, self.config.max_tasks, executors);
@@ -1949,7 +1959,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// The calling task's executor's shelf, when connections park.
-        fn shelfHere(self: *Self) ?*park.Shelf {
+        pub fn shelfHere(self: *Self) ?*park.Shelf {
             if (self.shelves.len == 0) return null;
             const i = placement.currentExecutor(self.io) orelse return null;
             if (i >= self.shelves.len) return null;
@@ -2473,7 +2483,9 @@ pub fn Server(comptime Ctx: type) type {
             // to `linger_timeout` for a peer that keeps its side open).
             var notice_deadline: ?std.Io.Clock.Timestamp = null;
             if (comptime build_options.use_http2) {
-                if (self.h2_conns.beginDrain())
+                var any = self.h2_conns.beginDrain();
+                if (comptime has_h2_nghttp2) any = self.h2_conns_nghttp2.beginDrain() or any;
+                if (any)
                     notice_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = h2_notice_wait, .clock = .awake });
             }
 
@@ -2502,6 +2514,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (notice_deadline) |nd| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, nd)) {
                         if (comptime build_options.use_http2) self.h2_conns.finishDrain();
+                        if (comptime has_h2_nghttp2) self.h2_conns_nghttp2.finishDrain();
                         notice_deadline = null;
                         continue;
                     }
@@ -2929,11 +2942,15 @@ pub fn Server(comptime Ctx: type) type {
                     connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
-                            // The engine's tasks have all ended when it
-                            // returns, so this is the only writer left.
-                            try h2.Engine(Ctx).serve(self, l.config, true, connection, busy);
-                            try self.closeNotify(connection, timer);
-                            return .close;
+                            if (comptime has_h2_nghttp2) if (self.test_h2_engine == .nghttp2) {
+                                // The engine's tasks have all ended when it
+                                // returns, so this is the only writer left.
+                                try h2_nghttp2.Engine(Ctx).serve(self, l.config, true, connection, busy);
+                                try self.closeNotify(connection, timer);
+                                return .close;
+                            };
+                            try h2.Engine(Ctx).start(self, l.config, true, connection, busy);
+                            return self.serveRequests(conn, timer, busy);
                         };
                     }
                     // An HTTP/2-only listener, and ALPN did not agree on it.
@@ -3083,6 +3100,15 @@ pub fn Server(comptime Ctx: type) type {
                     return .park;
                 },
             };
+        }
+
+        /// Prior-knowledge HTTP/2 on the engine, taking the connection
+        /// over from `handleRequests` (whose buffers the preface may sit
+        /// in: the engine's first run moves it into its own). Out of line,
+        /// so its frame is not part of the HTTP/1.x loop's (#223).
+        noinline fn startH2c(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+            try h2.Engine(Ctx).start(self, conn.listener.config, false, &conn.connection, busy);
+            return self.serveAdopted(conn, timer);
         }
 
         /// The task started for a parked connection whose socket became
@@ -3487,8 +3513,12 @@ pub fn Server(comptime Ctx: type) type {
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
                         timer.clear(self.io);
-                        try h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
-                        return .close;
+                        if (comptime has_h2_nghttp2) if (self.test_h2_engine == .nghttp2) {
+                            try h2_nghttp2.Engine(Ctx).serve(self, l.config, false, connection, busy);
+                            return .close;
+                        };
+                        adopter_ran = true;
+                        return self.startH2c(conn, timer, busy);
                     }
                 }
                 // An HTTP/2-only cleartext listener: no preface, no service.

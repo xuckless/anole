@@ -1084,3 +1084,96 @@ test "WebSocket over HTTP/2: a message from another connection's task goes out w
         try std.testing.expectEqualStrings("from another connection", try a.nextFrame(&op, &back));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The same client against the HTTP/2 engine on Anole's own protocol core
+// (h2/server.zig) served without `Server.run` (h2/test_server.zig); the
+// tests above reach it through `Server.run`.
+
+const Serving = dusty.h2_core_for_tests.test_server.Serving(void);
+
+test "WebSocket over HTTP/2 on the new engine: echo, ping, close" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .http2 = .{ .enable_connect_protocol = true } }, {});
+    defer server.deinit();
+    server.router.get("/chat", echo);
+    var serving: Serving = undefined;
+    try serving.start(&server);
+    defer serving.stop();
+
+    var client: Client = undefined;
+    try client.init(io, serving.address);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try client.sendFrame(.text, "hello over h2");
+    try std.testing.expectEqualStrings("hello over h2", try client.nextFrame(&op, &buf));
+    try std.testing.expectEqual(wsc.Opcode.text, op);
+    try client.sendFrame(.ping, "are you there");
+    try std.testing.expectEqualStrings("are you there", try client.nextFrame(&op, &buf));
+    try std.testing.expectEqual(wsc.Opcode.pong, op);
+    try client.sendFrame(.binary, &.{ 0, 1, 2, 255 });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 255 }, try client.nextFrame(&op, &buf));
+
+    // Close 1000: echoed, then the server ends the stream.
+    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xe8 }, closing);
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+}
+
+test "WebSocket over HTTP/2 on the new engine: a send from a task on another executor hops to the socket's" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .http2 = .{ .enable_connect_protocol = true } }, {});
+    defer server.deinit();
+    server.router.get("/park", park);
+    server.router.get("/poke", poke);
+    var serving: Serving = undefined;
+    try serving.start(&server);
+    defer serving.stop();
+
+    // Connections go to the executors in turn: A on one, B on the other.
+    var a: Client = undefined;
+    try a.init(io, serving.address);
+    defer a.deinit();
+    a.path = "/park";
+    try a.open();
+    try std.testing.expectEqual(@as(u16, 200), a.status);
+    var b: Client = undefined;
+    try b.init(io, serving.address);
+    defer b.deinit();
+    b.path = "/poke";
+    try b.open();
+    try std.testing.expectEqual(@as(u16, 200), b.status);
+    try test_wait.waitUntil(io, "the parked handler ran", {}, struct {
+        fn ran(_: void) bool {
+            return parked_socket.load(.acquire) != null;
+        }
+    }.ran);
+
+    const hops = dusty.h2_core_for_tests.server.test_hops.load(.acquire);
+    var back: [256]u8 = undefined;
+    var op: wsc.Opcode = undefined;
+    for (0..3) |_| {
+        try b.sendFrame(.text, "go");
+        try std.testing.expectEqualStrings("sent", try b.nextFrame(&op, &back));
+        try std.testing.expectEqualStrings("from another connection", try a.nextFrame(&op, &back));
+    }
+    try std.testing.expect(dusty.h2_core_for_tests.server.test_hops.load(.acquire) >= hops + 3);
+}

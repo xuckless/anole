@@ -319,6 +319,71 @@ fn withEchoServer(comptime echo_options: grpc.RegisterOptions, comptime body: fn
     try body(&env);
 }
 
+/// `withEchoServer` with the connections served by the HTTP/2 engine on
+/// Anole's own protocol core (h2/server.zig), which `Server.run` does not
+/// pick yet.
+fn withEngineEchoServer(comptime body: fn (*EchoEnv) anyerror!void) !void {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{}, {});
+    defer server.deinit();
+    grpc.registerWith(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    }, .{});
+    var serving: dusty.h2_core_for_tests.test_server.Serving(void) = undefined;
+    try serving.start(&server);
+    defer serving.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var env: EchoEnv = .{ .gpa = gpa, .io = io, .addr = serving.address, .port = serving.address.getPort(), .arena = arena_state.allocator() };
+    try body(&env);
+}
+
+test "gRPC on the new HTTP/2 engine: unary answered whole (no streaming body writer), server and client streams" {
+    try withEngineEchoServer(struct {
+        fn run(env: *EchoEnv) !void {
+            const bodies = &dusty.h2_core_for_tests.server.test_sink_bodies;
+            const before = bodies.load(.monotonic);
+            for ([_][]const u8{ "hello", "", "bin-trailer" }) |message| {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = message }}, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(u16, 200), cl.status);
+                try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+                const rs = try cl.responses(env.arena);
+                try std.testing.expectEqual(@as(usize, 1), rs.len);
+                try std.testing.expectEqualStrings(message, rs[0].message);
+            }
+            {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = "fail" }}, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(?u32, @backingInt(grpc.Code.not_found)), cl.grpc_status);
+            }
+            try std.testing.expectEqual(before, bodies.load(.monotonic));
+            {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/ServerStream", &.{.{ .message = "tick", .repeat = 5 }}, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+                const rs = try cl.responses(env.arena);
+                try std.testing.expectEqual(@as(usize, 5), rs.len);
+                try std.testing.expectEqual(@as(i32, 4), rs[4].index);
+                try std.testing.expect(bodies.load(.monotonic) > before);
+            }
+            {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/ClientStream", &.{ .{ .message = "a" }, .{ .message = "b" }, .{ .message = "c" } }, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+                const rs = try cl.responses(env.arena);
+                try std.testing.expectEqualStrings("abc", rs[0].message);
+            }
+        }
+    }.run);
+}
+
 test "gRPC: the four call modes and trailing metadata over h2 (raw nghttp2 client)" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
