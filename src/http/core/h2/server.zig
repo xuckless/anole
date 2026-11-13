@@ -132,7 +132,7 @@ pub var test_lock_free: if (is_test) std.atomic.Value(bool) else void = if (is_t
 /// Tests only: streaming body writers handed out (`StreamSink.body`), as
 /// the nghttp2 engine counts them (grpc/server_test.zig reads it).
 pub var test_sink_bodies: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: chain blocks allocated (tunnels, parked responses).
+/// Tests only: chain blocks alive (tunnels, parked responses).
 pub var test_chain_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: sends that hopped to the connection's executor.
 pub var test_hops: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
@@ -1090,38 +1090,27 @@ pub fn Engine(comptime Ctx: type) type {
                 es.handler_hold = false;
             }
 
-            /// Bytes a chain holds against its cap: a block closed for its
-            /// cuts counts whole, so many tiny sends can't hold many blocks.
-            fn chainHeld(es: *const EStream) usize {
-                var n: usize = 0;
-                var it = es.chain.first;
-                while (it) |node| : (it = node.next) {
-                    const b: *const ChainBlock = @fieldParentPtr("node", node);
-                    n += if (b.closed()) ChainBlock.data_len else b.len;
-                }
-                return n;
-            }
-
-            /// Copies `parts` to the chain's tail (new blocks as needed).
-            /// Under the lock.
+            /// Copies `parts` to the chain's tail, new blocks sized to what
+            /// is left (`ChainBlock.create`). Under the lock.
             fn chainAppend(conn: *Conn, es: *EStream, parts: []const []const u8) error{OutOfMemory}!void {
+                var left: usize = 0;
+                for (parts) |part| left += part.len;
                 for (parts) |part| {
                     var rest = part;
                     while (rest.len > 0) {
+                        const prev: ?*ChainBlock = if (es.chain.last) |node| .of(node) else null;
                         const tail: *ChainBlock = tail: {
-                            if (es.chain.last) |node| {
-                                const b: *ChainBlock = @fieldParentPtr("node", node);
-                                if (!b.closed()) break :tail b;
-                            }
-                            const b = try conn.allocator.create(ChainBlock);
-                            b.* = .{};
-                            if (comptime is_test) _ = test_chain_blocks.fetchAdd(1, .monotonic);
+                            if (prev) |b| if (b.len < b.data().len) break :tail b;
+                            const b: *ChainBlock = try .create(conn.allocator, left, if (prev) |p| p.size else 0);
                             es.chain.append(&b.node);
                             break :tail b;
                         };
-                        const n = @min(rest.len, ChainBlock.data_len - tail.len);
-                        @memcpy(tail.data[tail.len..][0..n], rest[0..n]);
+                        const data = tail.data();
+                        const n = @min(rest.len, data.len - tail.len);
+                        @memcpy(data[tail.len..][0..n], rest[0..n]);
                         tail.len += n;
+                        es.chain_bytes += n;
+                        left -= n;
                         rest = rest[n..];
                     }
                 }
@@ -1129,49 +1118,49 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Submits what the chain holds past its last cut, one DATA
             /// part per block (borrowed until written), and watches the
-            /// stream for its blocks to be written. Under the lock.
+            /// stream for its blocks to be written. A block's cut still
+            /// queued takes the new bytes (`Proto.growData`), so sends
+            /// faster than the flushes go out as one DATA run per block,
+            /// as the nghttp2 engine's outbox did. Under the lock.
             fn chainSubmit(conn: *Conn, es: *EStream, s: *PStream) conn_mod.SubmitError!void {
                 var it = es.chain.first;
                 while (it) |node| : (it = node.next) {
-                    const b: *ChainBlock = @fieldParentPtr("node", node);
+                    const b: *ChainBlock = .of(node);
                     if (b.cut == b.len) continue;
-                    b.parts[b.cuts][0] = b.data[b.cut..b.len];
-                    try conn.proto.submitData(s, &b.parts[b.cuts], false);
-                    b.cuts += 1;
+                    const more = b.len - b.cut;
+                    if (b.cut > 0 and try conn.proto.growData(s, &b.part, more)) {
+                        b.part[0] = b.part[0].ptr[0 .. b.part[0].len + more];
+                    } else {
+                        // Its previous cut, if any, is framed whole: the
+                        // queue holds a block's cut only while it is the
+                        // last one (bytes go to the tail only).
+                        b.part[0] = b.data()[b.cut..b.len];
+                        try conn.proto.submitData(s, &b.part, false);
+                    }
                     b.cut = b.len;
-                    es.cut_seq += 1;
-                    b.last_seq = es.cut_seq;
+                    // Written once the new cut is, not the old one.
+                    b.mark = null;
                 }
                 conn.watchRoom(es);
             }
 
             /// Lets go of the blocks at the chain's front that are cut,
-            /// framed (the stream's queue no longer holds their parts) and
-            /// written (`out.sent_total` past a mark taken once framed). A
-            /// tunnel keeps its last one for the next message; a parked
-            /// response, idle for long, keeps none. Whether any went. Under
-            /// the lock.
+            /// framed (the stream's queue no longer holds their part: the
+            /// front block's is the queue's first if queued) and written
+            /// (`out.sent_total` past a mark taken once framed). An idle
+            /// chain keeps none. Whether any went. Under the lock.
             fn chainReclaim(conn: *Conn, es: *EStream) bool {
                 const s = es.cs orelse return false;
-                var queued: u64 = 0;
-                var q = s.pending.first;
-                while (q) |n| : (q = n.next) queued += 1;
-                // An end with no part of its own may be queued too: counted
-                // as a cut, it only holds a block back a little longer.
-                const framed = es.cut_seq -| queued;
                 var freed = false;
                 while (es.chain.first) |node| {
-                    const b: *ChainBlock = @fieldParentPtr("node", node);
-                    if (b.cuts == 0 or b.cut != b.len or b.last_seq > framed) break;
+                    const b: *ChainBlock = .of(node);
+                    if (b.cut != b.len or conn.proto.queuedFirst(s, &b.part)) break;
                     if (b.mark == null) b.mark = conn.proto.out.mark();
                     if (conn.proto.out.sent_total < b.mark.?) break;
                     freed = true;
-                    if (es.chain.first == es.chain.last and es.protocol.len > 0) {
-                        b.* = .{};
-                        break;
-                    }
                     es.chain.remove(node);
-                    conn.allocator.destroy(b);
+                    es.chain_bytes -= b.len;
+                    b.destroy(conn.allocator);
                 }
                 return freed;
             }
@@ -1186,11 +1175,7 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 };
                 if (es.reset or conn.send_shut or conn.proto.dead or conn.chainReclaim(es)) es.room.notify(conn.io);
-                const idle = idle: {
-                    const node = es.chain.first orelse break :idle true;
-                    const b: *ChainBlock = @fieldParentPtr("node", node);
-                    break :idle node == es.chain.last and b.len == 0;
-                };
+                const idle = es.chain.first == null;
                 if ((idle or es.reset) and !es.reset_due) {
                     es.room_waiting = false;
                     conn.room_waiters.remove(&es.room_node);
@@ -1213,36 +1198,55 @@ pub fn Engine(comptime Ctx: type) type {
         };
 
         /// One block of a tunnel's or a parked response's output
-        /// (`EStream.chain`): sends are copied in, and cut into DATA parts
+        /// (`EStream.chain`): sends are copied in, and cut into a DATA part
         /// at each kick (`Conn.chainSubmit`), borrowed by `out` until
-        /// written. 16 KiB from malloc's slabs, as a streamed response's
-        /// block (nothing above `block_cache.malloc_max`).
+        /// written. The header, then its bytes, in one allocation sized
+        /// like an ArrayList's growth: a power of two fitting what is left
+        /// to copy, at least twice the block before, from `min_size` up to
+        /// 16 KiB (malloc's slabs, as a streamed response's block), so a
+        /// small message holds a small block.
         const ChainBlock = struct {
             node: std.DoublyLinkedList.Node = .{},
+            /// The allocation's size, the header included.
+            size: usize,
             len: usize = 0,
             /// Up to here submitted.
             cut: usize = 0,
-            cuts: u8 = 0,
-            /// The stream's cut number (`EStream.cut_seq`) of its last cut.
-            last_seq: u64 = 0,
-            /// `out.mark()` once its cuts are framed.
+            /// Its newest cut's one-part list, borrowed with it: grown
+            /// while that cut is still queued, reused once it is framed.
+            part: [1][]const u8 = .{&.{}},
+            /// `out.mark()` once its newest cut is framed.
             mark: ?u64 = null,
-            /// Each cut's one-part list, borrowed with it.
-            // SAFETY: each entry is set when its cut is submitted, and read only after.
-            parts: [max_cuts][1][]const u8 = undefined,
-            // SAFETY: bytes up to `len` are set before they are read.
-            data: [data_len]u8 = undefined,
 
-            const max_cuts = 16;
-            const data_len = block_len - 512;
+            const min_size = 256;
+            const max_size = block_len;
 
-            comptime {
-                std.debug.assert(@sizeOf(ChainBlock) <= block_len);
+            fn of(node: *std.DoublyLinkedList.Node) *ChainBlock {
+                return @fieldParentPtr("node", node);
             }
 
-            /// Takes no more bytes: full, or out of cuts.
-            fn closed(b: *const ChainBlock) bool {
-                return b.len == data_len or b.cuts == max_cuts;
+            fn create(gpa: std.mem.Allocator, want: usize, prev_size: usize) error{OutOfMemory}!*ChainBlock {
+                const fit = std.math.ceilPowerOfTwoAssert(usize, @min(@sizeOf(ChainBlock) + want, max_size));
+                const size = @min(max_size, @max(min_size, fit, prev_size * 2));
+                const mem = try gpa.alignedAlloc(u8, .of(ChainBlock), size);
+                // SAFETY: `mem` is aligned for and larger than a ChainBlock.
+                const b: *ChainBlock = @ptrCast(mem.ptr);
+                b.* = .{ .size = size };
+                if (comptime is_test) _ = test_chain_blocks.fetchAdd(1, .monotonic);
+                return b;
+            }
+
+            fn destroy(b: *ChainBlock, gpa: std.mem.Allocator) void {
+                // SAFETY: `b` heads the allocation `create` made, `size` bytes.
+                const base: [*]align(@alignOf(ChainBlock)) u8 = @ptrCast(b);
+                gpa.free(base[0..b.size]);
+                if (comptime is_test) _ = test_chain_blocks.fetchSub(1, .monotonic);
+            }
+
+            fn data(b: *ChainBlock) []u8 {
+                // SAFETY: `b` heads its allocation; its bytes follow the header.
+                const base: [*]u8 = @ptrCast(b);
+                return base[@sizeOf(ChainBlock)..b.size];
             }
         };
 
@@ -1416,8 +1420,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// through the writer's blocks.
             chain_mode: bool = false,
             chain: std.DoublyLinkedList = .{},
-            /// Cuts of `chain` submitted so far (`Conn.chainReclaim`).
-            cut_seq: u64 = 0,
+            /// Bytes `chain` holds, against its cap (`appendChain`).
+            chain_bytes: usize = 0,
             /// A finished tunnel's RST_STREAM(NO_ERROR) waits for its
             /// END_STREAM to be framed (`Conn.startDiscard`).
             reset_due: bool = false,
@@ -1473,10 +1477,8 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 for (es.spent.items) |m| gpa.free(m);
                 es.spent = .empty;
-                while (es.chain.popFirst()) |node| {
-                    const b: *ChainBlock = @fieldParentPtr("node", node);
-                    gpa.destroy(b);
-                }
+                while (es.chain.popFirst()) |node| ChainBlock.of(node).destroy(gpa);
+                es.chain_bytes = 0;
             }
 
             /// The stream is gone before the handler ended its response:
@@ -2301,16 +2303,21 @@ pub fn Engine(comptime Ctx: type) type {
                         es.reset = true;
                         if (es.cs) |s| conn.proto.reset(s, .cancel) catch {};
                     }
-                    es.parked = null;
-                    es.detached = null;
-                    conn.parked_open -= 1;
-                    if (conn.parked_open == 0) conn.parked_idle.notify(conn.io);
-                    // Released from inside the handler: `serveStream`'s
-                    // caller lets go when it returns. Otherwise the stream
-                    // may be freed here, with `self` in its arena.
-                    if (es.in_handler) es.ended_in_handler = true else conn.finishHandler(es);
                 }
+                // Before the count drops: once it is 0 the teardown
+                // (`waitParked`) may free `conn`, so the hold below that
+                // drops it is the last touch of `conn`.
                 conn.kickFlush();
+                conn.lock();
+                defer conn.unlock();
+                es.parked = null;
+                es.detached = null;
+                // Released from inside the handler: `serveStream`'s caller
+                // lets go when it returns. Otherwise the stream may be
+                // freed here, with `self` in its arena.
+                if (es.in_handler) es.ended_in_handler = true else conn.finishHandler(es);
+                conn.parked_open -= 1;
+                if (conn.parked_open == 0) conn.parked_idle.notify(conn.io);
             }
         };
 
@@ -2816,7 +2823,7 @@ pub fn Engine(comptime Ctx: type) type {
                         if (es.reset or conn.send_shut) return self.fail(error.ConnectionResetByPeer);
                         try self.submitHeadOnce(s);
                         _ = conn.chainReclaim(es);
-                        const held = Conn.chainHeld(es);
+                        const held = es.chain_bytes;
                         if (held == 0 or held + total <= max_pending) {
                             conn.chainAppend(es, parts) catch return self.fail(error.SystemResources);
                             if (now) conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);

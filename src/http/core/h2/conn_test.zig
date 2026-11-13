@@ -1297,6 +1297,44 @@ test "h2 conn: out slices stay put while more is queued" {
     try expectEqual(80000, sent);
 }
 
+test "h2 conn: growData extends the last queued DATA, partly framed or not, and only that" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    const s = t.stream(1);
+    const body = try t.arena().alloc(u8, 70000);
+    for (body, 0..) |*b, i| b.* = @truncate(i);
+    try t.c.submitHead(s, 200, &.{}, false);
+    // The part a caller grows in place.
+    var part: [1][]const u8 = .{body[0..60000]};
+    try t.c.submitData(s, &part, false);
+    try expect(t.c.queuedFirst(s, &part));
+    // Framed up to the connection window (65535): queued still, partly.
+    var out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data }, .{ .type = .data }, .{ .type = .data }, .{ .type = .data } });
+    try expect(!t.c.queuedFirst(s, &part));
+    // Framed whole: not grown.
+    try expect(!try t.c.growData(s, &part, 1));
+    part[0] = body[60000..61000];
+    try t.c.submitData(s, &part, false);
+    try expect(try t.c.growData(s, &part, 9000));
+    part[0] = body[60000..70000];
+    // Another list is not the last queued.
+    const other: [1][]const u8 = .{"x"};
+    try expect(!try t.c.growData(s, &other, 1));
+    out = try t.drain();
+    try expectEqual(65535 - 60000, out[0].data.len);
+    try t.feed(try t.windowUpdate(0, 1 << 20));
+    try t.feed(try t.windowUpdate(1, 1 << 20));
+    out = try t.drain();
+    try expectFrames(out, &.{.{ .type = .data }});
+    try expectEqual(70000 - 65535, out[0].data.len);
+    try testing.expectEqualSlices(u8, body[65535..], out[0].data);
+    // Nor once the stream's end is queued.
+    try t.c.submitData(s, &part, true);
+    try expectError(error.StreamClosed, t.c.growData(s, &part, 1));
+}
+
 test "h2 conn: running out of memory while framing DATA queues nothing" {
     var failing: testing.FailingAllocator = .init(testing.allocator, .{});
     const t = try T.createSplit(testing.allocator, failing.allocator(), .{});

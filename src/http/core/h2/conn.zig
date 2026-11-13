@@ -1287,6 +1287,35 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (end_stream) s.flags.answered = true;
         }
 
+        /// `n` more bytes for the stream's last queued DATA, when that is
+        /// `parts` (the same list, by identity) and does not end the
+        /// stream: the caller grows its last part in place by `n` once
+        /// this returns true, so sends queued faster than they are framed
+        /// go out as one DATA run (nghttp2's data provider reads whatever
+        /// its source holds when it frames). False, and nothing changed,
+        /// when the last queued DATA is another or none (`parts` framed
+        /// whole already).
+        pub fn growData(c: *Self, s: *Stream, parts: []const []const u8, n: usize) SubmitError!bool {
+            c.enter();
+            defer c.leave();
+            if (!s.canSend() or s.flags.answered) return error.StreamClosed;
+            const node = s.pending.last orelse return false;
+            const p: *Pending = @fieldParentPtr("node", node);
+            if (p.parts.ptr != parts.ptr or p.end_stream or p.trailers != null) return false;
+            if (s.send_window > 0) try c.makeReady(s);
+            p.left += n;
+            return true;
+        }
+
+        /// Whether `parts` (by identity) is the stream's first queued DATA,
+        /// not framed whole yet.
+        pub fn queuedFirst(c: *const Self, s: *const Stream, parts: []const []const u8) bool {
+            _ = c;
+            const node = s.pending.first orelse return false;
+            const p: *const Pending = @fieldParentPtr("node", node);
+            return p.parts.ptr == parts.ptr;
+        }
+
         /// Trailers, by reference, sent with END_STREAM once the queued
         /// DATA has gone (now, if none is queued).
         pub fn submitTrailers(c: *Self, s: *Stream, hdrs: []const hpack.Field) SubmitError!void {

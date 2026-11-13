@@ -215,10 +215,19 @@ the nghttp2 engine it replaces.
    has granted (a WINDOW_UPDATE only adds), so a smaller `tunnel_window` is
    left at `stream_window`; the only effect is the peer's pacing on that
    stream. Both defaults (128 KiB over 64 KiB) raise it.
-2. **A tunnel's or a parked response's send cap counts blocks.** Their
-   sends are copied into 16 KiB blocks, cut into DATA parts at each kick
-   (at most 16 cuts a block); the cap (`max_pending`, 1 MiB for a
-   WebSocket) counts a block closed for its cuts as full, so many tiny
-   kicked sends wait sooner than on the nghttp2 engine's byte-counted
-   outbox, and never hold more than about the cap in blocks. A message is
-   still always taken when nothing is queued.
+2. **A send from another executor waits for the connection's.** A
+   WebSocket-over-HTTP/2 `send` (or `kickOut`) from a task on another
+   executor than the connection's hops there (`StreamSink.onOwner`: a task
+   placed on the connection's executor, awaited), where the nghttp2 engine
+   appended under its mutex and woke its writer without the sender
+   waiting. Same bytes on the wire; a cross-thread round trip per such send
+   (Rooms and SSE already hop once per socket). Listed for the lead's
+   profile of the takeover; a copy on the caller posted without the await
+   is the fix if it shows.
+3. **After a clean EOF, a detached response not yet attached is aborted.**
+   A peer that half-closes after its request: the nghttp2 engine keeps the
+   connection while any counted handler (detached ones too) is not done,
+   probing with PINGs, and still sends the answer; here `serve` has no task
+   to await for it and the teardown aborts it (the owner hears `abort`).
+   Accepted until the sweeper's half-close probes (M3 lifecycle), which
+   bound such a wait.

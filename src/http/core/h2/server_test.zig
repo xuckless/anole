@@ -540,6 +540,9 @@ const Tun = struct {
     const big_len = 200 * 1024;
     const cap = 64 * 1024;
     var big: [big_len]u8 = undefined;
+    const seq_msg = 100;
+    const seq_count = 1000;
+    var seq_done: std.atomic.Value(u32) = .init(0);
 
     fn handler(req: *Request, res: *Response) !void {
         if (req.protocol == null) return error.NotATunnel;
@@ -556,6 +559,17 @@ const Tun = struct {
         while (true) {
             const got = body.interface.peekGreedy(1) catch return;
             if (std.mem.eql(u8, got, "end")) return;
+            if (std.mem.eql(u8, got, "seq")) {
+                body.interface.toss(got.len);
+                // Many small sends, each kicked, with no wait between.
+                var msg: [seq_msg]u8 = undefined;
+                for (0..seq_count) |i| {
+                    for (&msg, 0..) |*b, j| b.* = @truncate(i * seq_msg + j);
+                    try sink.appendParts(&.{&msg}, 1 << 20, true);
+                }
+                _ = seq_done.fetchAdd(1, .release);
+                continue;
+            }
             if (std.mem.eql(u8, got, "big")) {
                 body.interface.toss(got.len);
                 for (&big, 0..) |*b, i| b.* = @truncate(i *% 7);
@@ -1151,6 +1165,46 @@ test "h2 engine: an RFC 8441 tunnel: ENABLE_CONNECT_PROTOCOL only when configure
     try expectEqual(ErrorCode.no_error, r.rst.?);
     const next = try c.request("GET", "/hello", null);
     try expectEqualStrings("hello", (try c.until(next)).body.items);
+}
+
+test "h2 engine: a tunnel's small sends queued meanwhile go out as one DATA run per block, and its blocks go once written while it stays open" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{ .http2 = .{ .enable_connect_protocol = true } });
+    defer fx.stop();
+    const c = &fx.client;
+    const blocks = engine.test_chain_blocks.load(.acquire);
+    const id = try c.open("CONNECT", "/tunnel", &.{.{ .name = ":protocol", .value = "websocket" }}, false);
+    try c.flush();
+    const r = c.get(id);
+    while (r.status == 0) try c.readOne();
+    const total = Tun.seq_msg * Tun.seq_count;
+    for (0..2) |round| {
+        // No credit back: the server frames up to the windows (64 KiB on
+        // the first round), and the rest waits queued while the handler
+        // sends on. The second round has credit: blocks reused after all
+        // went.
+        c.auto_window = false;
+        const before = r.body.items.len;
+        const done = Tun.seq_done.load(.acquire);
+        try c.sendBody(id, "seq", false);
+        try wait.waitAtLeast(testing.io, "the handler's sends", &Tun.seq_done, done + 1);
+        const window: usize = if (round == 0) 65535 else 0;
+        while (r.body.items.len < before + window) try c.readOne();
+        const frames = r.data_frames;
+        // The rest: about 34 KiB in a few blocks, each one queued DATA
+        // (a cut per send would be 345 frames).
+        try c.windowUpdate(0, 1 << 20);
+        try c.windowUpdate(id, 1 << 20);
+        try c.flush();
+        c.auto_window = true;
+        while (r.body.items.len < before + total) try c.readOne();
+        if (round == 0) try expect(r.data_frames - frames <= 12);
+        for (r.body.items[before..], 0..) |b, k| try expectEqual(@as(u8, @truncate(k)), b);
+        // All written: no block is kept while the tunnel idles.
+        try wait.waitEqual(testing.io, "the chain's blocks let go", &engine.test_chain_blocks, blocks);
+    }
+    try c.sendBody(id, "end", false);
+    while (r.rst == null) try c.readOne();
 }
 
 test "h2 engine: teardown with detached, parked and attached streams outstanding" {
