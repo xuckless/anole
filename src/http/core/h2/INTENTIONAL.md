@@ -202,6 +202,16 @@ side's answers would depend on when its writer ran.
    invariance found it; conn_test.zig "a DATA frame past the window is a
    FLOW_CONTROL_ERROR however the reads cut it"). Accepted when Conn ends
    with FLOW_CONTROL_ERROR, nghttp2 doesn't, and the input was cut.
+6. **A GOAWAY's last_stream_id of the peer's own parity is not an error.**
+   nghttp2 answers GOAWAY(PROTOCOL_ERROR, "GOAWAY: invalid last_stream_id")
+   when a client's GOAWAY names an odd id (the id must be one the server
+   opened, and a server opens none). grpc-go's client closes every
+   connection with GOAWAY(NO_ERROR) naming its own highest stream (found
+   by the M3 smoke, bench/results/20261113-h2-m3-smoke: one such GOAWAY
+   per gRPC connection close, counted by tools/h2count). The id means
+   nothing to a server, so only the RFC 9113 §6.8 rule that it never
+   grows is kept. conn_test.zig "a GOAWAY's last_stream_id of the peer's
+   own parity is accepted"; the differential only sends 0.
 
 ## The server engine (server.zig against server/h2_nghttp2.zig)
 

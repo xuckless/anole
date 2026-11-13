@@ -1748,6 +1748,16 @@ test "h2 conn: on_goaway_received" {
     try expectEqualStrings("GOAWAY: invalid last_stream_id", out[0].data);
 }
 
+test "h2 conn: a GOAWAY's last_stream_id of the peer's own parity is accepted" {
+    // grpc-go's client closes with GOAWAY(NO_ERROR) naming its own highest stream (odd), not 0.
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    try t.feed(try t.goaway(1, .no_error));
+    try expectEqual(1, t.rec.count(.goaway));
+    try expectEqual(0, (try t.drain()).len);
+}
+
 test "h2 conn: on_window_update_received" {
     const t = try ready(.{});
     defer t.destroy();

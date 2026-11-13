@@ -963,10 +963,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.out.commit(frame.writePing(b, true, p.data));
         }
 
-        /// nghttp2_session_on_goaway_received. A server opens no streams,
-        /// so none close.
+        /// nghttp2_session_on_goaway_received, but an id of the peer's own
+        /// parity is not an error (INTENTIONAL.md, the session 6). A server
+        /// opens no streams, so none close.
         fn onGoaway(c: *Self, g: frame.Goaway) RecvError!void {
-            if ((g.last_stream_id > 0 and g.last_stream_id & 1 == 1) or g.last_stream_id > c.remote_last)
+            if (g.last_stream_id > c.remote_last)
                 return c.terminate(.protocol_error, "GOAWAY: invalid last_stream_id");
             c.remote_last = g.last_stream_id;
             c.handler.onGoaway(g.last_stream_id, g.code);
