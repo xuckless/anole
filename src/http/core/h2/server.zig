@@ -128,10 +128,11 @@ pub fn Engine(comptime Ctx: type) type {
         /// executor only sets a connection's flag (`drain_req`); the reader
         /// acts on it.
         pub const Registry = struct {
-            mutex: std.Io.Mutex = .init,
+            mutex: safety.Mutex(.table) = .init,
             list: std.DoublyLinkedList = .{},
 
             fn server(r: *Registry) *Server {
+                // SAFETY: the registry is the server's `h2_conns` field (`registered` in `serve`).
                 return @alignCast(@fieldParentPtr("h2_conns", r));
             }
 
@@ -167,6 +168,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer r.mutex.unlock(io);
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
+                    // SAFETY: every node in the list is a Conn's `node` (`add`).
                     const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     _ = conn.drain_req.fetchMax(what, .acq_rel);
                 }
@@ -182,6 +184,7 @@ pub fn Engine(comptime Ctx: type) type {
                 var n: usize = 0;
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
+                    // SAFETY: every node in the list is a Conn's `node` (`add`).
                     const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     conn.lock();
                     defer conn.unlock();
@@ -199,7 +202,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// (`placement.single_executor_guarantee` and a zio `Io`), else a
         /// mutex. Nothing under it may yield.
         const ConnLock = struct {
-            mutex: std.Io.Mutex = .init,
+            mutex: safety.Mutex(.protocol) = .init,
             free: bool = false,
             owner: usize = 0,
             held: if (builtin.mode == .debug) bool else void = if (builtin.mode == .debug) false else {},
@@ -1090,6 +1093,7 @@ pub fn Engine(comptime Ctx: type) type {
             room_waiting: bool = false,
 
             fn of(s: *PStream) ?*EStream {
+                // SAFETY: `user` is only ever set to an EStream (`onStreamOpen`).
                 return @ptrCast(@alignCast(s.user orelse return null));
             }
 
@@ -1157,6 +1161,7 @@ pub fn Engine(comptime Ctx: type) type {
                 server.finishRequest();
             }
             const io = server.io;
+            // SAFETY: the connection's address only picks a pool shard.
             const buffers = try server.request_buffers.acquire(@intFromPtr(connection));
             defer server.request_buffers.release(buffers);
             // Conn takes a frame other than DATA only once it is whole.
@@ -1478,12 +1483,15 @@ pub fn Engine(comptime Ctx: type) type {
             const server = conn.server;
             const arena = es.arena.allocator();
             const io = conn.io;
+            // SAFETY: each field is set below before it is read.
             var ex: Exchange = undefined;
             const request = &ex.request;
             request.* = .{
                 .arena = arena,
                 .io = io,
+                // SAFETY: never read on HTTP/2: the body comes from `_body_source`.
                 ._parser = undefined,
+                // SAFETY: never read on HTTP/2: the body comes from `_body_source`.
                 ._transport = undefined,
                 ._config = server.config.request,
                 .listener = conn.listener,
@@ -1496,7 +1504,7 @@ pub fn Engine(comptime Ctx: type) type {
                 ._timeout_context = if (timer) |t| t else null,
                 ._set_timeout = if (timer != null) setTimeout else null,
                 ._claim_timeout = if (timer != null) claimTimeout else null,
-                // Its entry table is never read past `len`: not zeroed.
+                // SAFETY: its entry table is never read past `len`: not zeroed.
                 .session = undefined,
             };
             request.session._empty();
@@ -1598,11 +1606,13 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         fn setTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
+            // SAFETY: the context is the Timer `serveStream` set it to.
             const timer: *Timer = @ptrCast(@alignCast(context));
             timer.set(io, timeout);
         }
 
         fn claimTimeout(context: *anyopaque) bool {
+            // SAFETY: the context is the Timer `serveStream` set it to.
             const timer: *Timer = @ptrCast(@alignCast(context));
             return timer.fired();
         }
@@ -1631,11 +1641,13 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn errorOf(r: *std.Io.Reader) ?Transport.ReadError {
+                // SAFETY: the reader is a BodyReader's `interface`.
                 const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
                 return self.err;
             }
 
             fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                // SAFETY: the reader is a BodyReader's `interface`.
                 const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
                 const es = self.es;
                 const conn = es.conn;
@@ -1696,6 +1708,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn fromPtr(ptr: *anyopaque) *StreamSink {
+                // SAFETY: the sink's ptr is the StreamSink (`sink`).
                 return @ptrCast(@alignCast(ptr));
             }
 
@@ -1915,6 +1928,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// that stays open (an event stream) gets its HEADERS out before
             /// its first DATA.
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
+                // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
                 try self.submitBlock();
                 self.kick();
@@ -1923,6 +1937,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// Moves a full block on, then takes what fits of `data` into
             /// the next.
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+                // SAFETY: the writer is a StreamSink's `writer`.
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
                 if (w.buffer.len == 0) return self.fail(error.SystemResources);
                 try self.submitBlock();
