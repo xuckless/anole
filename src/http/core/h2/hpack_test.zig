@@ -613,12 +613,16 @@ test "h2 hpack: secrets and fields over the cap are never memoized" {
     const a = arena.allocator();
     hpack.memoReset();
     var e: hpack.Encoder = .{ .size_update_pending = false };
-    const long: [97 - 4]u8 = @splat('v');
+    const long: [65 - 4]u8 = @splat('v');
     const fields = [_]Field{
         .{ .name = "authorization", .value = "Bearer x" },
         .{ .name = "cookie", .value = "short" },
         .{ .name = "x-a", .value = "flagged", .never_index = true },
-        // name + value = 97 bytes, one past the cap.
+        // Not never-indexed, but credentials by name.
+        .{ .name = "cookie", .value = "session=0123456789abcdef0123456789abcdef" },
+        .{ .name = "set-cookie", .value = "sid=0123456789abcdef; Path=/; HttpOnly" },
+        .{ .name = "proxy-authorization", .value = "Basic dXNlcjpwYXNz" },
+        // name + value = 65 bytes, one past the cap.
         .{ .name = "x-ab", .value = &long },
     };
     for (0..2) |_| _ = try expectSameAsUncached(a, &e, &fields);
@@ -636,15 +640,51 @@ test "h2 hpack: colliding memo slots return each field's own bytes" {
     const a = arena.allocator();
     hpack.memoReset();
     var e: hpack.Encoder = .{ .size_update_pending = false };
-    // 40 keys into 32 slots, in turn, three rounds.
-    var fields: [40]Field = undefined;
+    // 100 keys into 64 slots (16 sets of 4), in turn, three rounds.
+    var fields: [100]Field = undefined;
     for (&fields, 0..) |*f, i| f.* = .{ .name = "x-key", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}) };
     for (0..3) |_| for (fields) |f| {
         _ = try expectSameAsUncached(a, &e, &.{f});
     };
     const st = hpack.memoStats();
-    try testing.expectEqual(120, st.hits + st.misses);
-    try testing.expect(st.misses >= 40);
+    try testing.expectEqual(300, st.hits + st.misses);
+    try testing.expect(st.misses >= 100);
+}
+
+test "h2 hpack: a one-off value per response doesn't evict the hot fields" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    hpack.memoReset();
+    var e: hpack.Encoder = .{ .size_update_pending = false };
+    // The gRPC and h2c response fields of one app on one executor.
+    const hot = [_]Field{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-accept-encoding", .value = "identity,gzip" },
+        .{ .name = "date", .value = "Sat, 14 Nov 2026 07:18:55 GMT" },
+        .{ .name = "grpc-status", .value = "0" },
+        .{ .name = "grpc-message", .value = "" },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "content-length", .value = "13" },
+        .{ .name = "server", .value = "anole" },
+        .{ .name = "content-encoding", .value = "gzip" },
+        .{ .name = "vary", .value = "accept-encoding" },
+    };
+    var fields: [hot.len + 2]Field = undefined;
+    @memcpy(fields[0..hot.len], &hot);
+    var warm: @TypeOf(hpack.memoStats()) = undefined;
+    for (0..200) |i| {
+        if (i == 10) warm = hpack.memoStats();
+        fields[hot.len] = .{ .name = "content-length", .value = try std.fmt.allocPrint(a, "{d}", .{1000 + i}) };
+        fields[hot.len + 1] = .{ .name = "x-request-id", .value = try std.fmt.allocPrint(a, "req-{x}", .{i *% 0x9e3779b9}) };
+        _ = try expectSameAsUncached(a, &e, &fields);
+    }
+    // Once warm every hot field hits on every response; only the two
+    // one-off fields miss.
+    const st = hpack.memoStats();
+    try testing.expectEqual(hot.len * 190, st.hits - warm.hits);
+    try testing.expectEqual(2 * 190, st.misses - warm.misses);
 }
 
 test "h2 hpack: a memo hit that doesn't fit is NoSpaceLeft, and keeps the size update" {

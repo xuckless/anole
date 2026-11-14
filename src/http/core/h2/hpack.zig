@@ -526,13 +526,12 @@ pub const Encoder = struct {
             // deflate_nv's rule, "the same criteria used in Firefox".
             const never = f.never_index or std.mem.eql(u8, f.name, "authorization") or
                 (std.mem.eql(u8, f.name, "cookie") and f.value.len < 20);
-            // Never-indexed fields (secrets among them) are not kept.
-            if (!memoize or never or f.name.len + f.value.len > Memo.key_cap) {
+            if (!memoize or never or !Memo.keeps(f)) {
                 try encodeField(out, &w, f, never);
                 continue;
             }
-            const slot = &memo.slots[Memo.index(f)];
-            if (slot.holds(f)) {
+            const set = &memo.sets[Memo.index(f)];
+            if (set.find(f)) |slot| {
                 if (is_test) memo.hits += 1;
                 const enc = slot.enc[0..slot.enc_len];
                 if (out.len - w < enc.len) return error.NoSpaceLeft;
@@ -543,7 +542,7 @@ pub const Encoder = struct {
             if (is_test) memo.misses += 1;
             const start = w;
             try encodeField(out, &w, f, never);
-            slot.store(f, out[start..w]);
+            set.offer(f, out[start..w]);
         }
         // Only once the block is whole: a NoSpaceLeft retry still sends it.
         e.size_update_pending = false;
@@ -606,31 +605,75 @@ pub const Encoder = struct {
     }
 };
 
-/// Encoded fields by (name, value), per thread: 32 direct-mapped slots of
-/// about 210 bytes, zero (in .tbss, so resident only once used), shared by
-/// every connection the thread serves; nothing is kept per connection. A
-/// lookup checks the whole key, so a collision is a miss, never wrong
-/// bytes. A miss always replaces the slot. Safe without a lock: `encode`
-/// never yields, so one call has the thread's table to itself.
+/// Encoded fields by (name, value), per thread: 16 sets of four slots of
+/// 135 bytes, about 8.4 KiB of zeroed TLS that glibc clears (and so makes
+/// resident) on every thread it creates, shared by every connection the
+/// thread serves; nothing is kept per connection. A lookup checks the
+/// whole key, so a collision is a miss, never wrong bytes. Replacement is
+/// second chance (CLOCK within a set): a miss takes an empty slot or one
+/// not hit since the last miss that found the set full of hit slots; that
+/// miss stores nothing and only clears the marks. So a one-off value (a
+/// new content-length, a request id) never evicts fields that every
+/// response uses, and a stale Date goes on the next miss after it. Safe
+/// without a lock: `encode` never yields, so one call has the thread's
+/// table to itself.
 const Memo = struct {
-    const slot_count = 32;
+    const set_count = 16;
+    const way_count = 4;
     /// name + value bytes of a field kept: the common response fields
     /// (content-type, date, grpc-*) fit, long one-off values don't.
-    const key_cap = 96;
+    const key_cap = 64;
     /// A literal on a new name: one index byte, two length bytes (both
     /// lengths < 127) and the key's bytes at most (Huffman only shorter).
     const enc_cap = key_cap + 3;
 
-    slots: [slot_count]Slot = @splat(.{}),
+    sets: [set_count]Set = @splat(.{}),
     hits: if (is_test) u32 else void = if (is_test) 0 else {},
     misses: if (is_test) u32 else void = if (is_test) 0 else {},
     stores: if (is_test) u32 else void = if (is_test) 0 else {},
+
+    /// Whether `f` (never-indexed fields already excluded) may be kept:
+    /// short, and not a credential by name. Cookies of any length and
+    /// set-cookie hold session tokens that the never-index rule lets
+    /// through; other secrets in custom headers are the caller's to mark
+    /// `never_index` (RFC 7541 §7.1.3), which keeps them out too.
+    fn keeps(f: Field) bool {
+        if (f.name.len + f.value.len > key_cap) return false;
+        return !(std.mem.eql(u8, f.name, "cookie") or std.mem.eql(u8, f.name, "set-cookie") or
+            std.mem.eql(u8, f.name, "proxy-authorization"));
+    }
+
+    const Set = struct {
+        ways: [way_count]Slot = @splat(.{}),
+
+        fn find(s: *Set, f: Field) ?*Slot {
+            for (&s.ways) |*slot| {
+                if (slot.holds(f)) {
+                    slot.hit = true;
+                    return slot;
+                }
+            }
+            return null;
+        }
+
+        /// A miss's bytes: into the first slot not hit lately (an empty
+        /// one among them), or, when all were, into none, their marks
+        /// cleared.
+        fn offer(s: *Set, f: Field, enc: []const u8) void {
+            for (&s.ways) |*slot| {
+                if (!slot.hit) return slot.store(f, enc);
+            }
+            for (&s.ways) |*slot| slot.hit = false;
+        }
+    };
 
     const Slot = struct {
         /// 0 while empty: a field encodes to at least one byte.
         enc_len: u8 = 0,
         name_len: u8 = 0,
         value_len: u8 = 0,
+        /// Stored or hit since a miss last cleared the set's marks.
+        hit: bool = false,
         key: [key_cap]u8 = @splat(0),
         enc: [enc_cap]u8 = @splat(0),
 
@@ -648,12 +691,15 @@ const Memo = struct {
             @memcpy(s.key[f.name.len..][0..f.value.len], f.value);
             @memcpy(s.enc[0..enc.len], enc);
             s.enc_len = @intCast(enc.len);
+            // Marked, or the set's next miss would take it back before
+            // its second use.
+            s.hit = true;
         }
     };
 
     fn index(f: Field) usize {
         const h = std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, f.name), f.value);
-        return @intCast(h % slot_count);
+        return @intCast(h % set_count);
     }
 };
 
