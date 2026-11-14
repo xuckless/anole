@@ -545,6 +545,150 @@ test "h2 hpack: encoder output round-trips through the decoder within bound()" {
     try testing.expectEqual(0, d.tableLen());
 }
 
+// The memo: `encode` must give `encodeUncached`'s bytes, hit or miss.
+
+/// Encodes `fields` both ways from the same state and checks the bytes.
+fn expectSameAsUncached(a: std.mem.Allocator, e: *hpack.Encoder, fields: []const Field) ![]u8 {
+    const want = try a.alloc(u8, hpack.Encoder.bound(fields));
+    var ref = e.*;
+    const wn = try ref.encodeUncached(want, fields);
+    const got = try a.alloc(u8, hpack.Encoder.bound(fields));
+    const n = try e.encode(got, fields);
+    try testing.expectEqualSlices(u8, want[0..wn], got[0..n]);
+    try testing.expectEqual(ref.size_update_pending, e.size_update_pending);
+    return got[0..n];
+}
+
+test "h2 hpack: memoized blocks equal uncached ones, first pass and all-hit second" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng: std.Random.DefaultPrng = .init(0x6d656d6f);
+    const r = prng.random();
+    var lists: std.ArrayList([]const Field) = .empty;
+    for (vectors.rfc_groups) |g| for (g.vectors) |v| try lists.append(a, v.fields);
+    const names = [_][]const u8{ ":status", "content-type", "date", "cookie", "authorization", "grpc-status", "x-custom", "" };
+    for (0..300) |_| {
+        const fields = try a.alloc(Field, r.uintAtMost(usize, 8));
+        for (fields) |*f| {
+            const name = if (r.boolean()) names[r.uintLessThan(usize, names.len)] else try randomBytes(a, r, 30);
+            f.* = .{ .name = name, .value = try randomBytes(a, r, 120), .never_index = r.uintLessThan(u8, 8) == 0 };
+            if (r.uintLessThan(u8, 4) == 0) f.* = hpack.static_table[r.uintLessThan(usize, hpack.static_table.len)];
+        }
+        try lists.append(a, fields);
+    }
+    hpack.memoReset();
+    var e: hpack.Encoder = .{};
+    for (0..2) |_| for (lists.items) |fields| {
+        _ = try expectSameAsUncached(a, &e, fields);
+    };
+    try testing.expect(hpack.memoStats().hits > 0);
+}
+
+test "h2 hpack: a memo hit needs the same name, value and never flag" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    hpack.memoReset();
+    var e: hpack.Encoder = .{ .size_update_pending = false };
+    const f: Field = .{ .name = "x-custom", .value = "nghttp2" };
+    _ = try expectSameAsUncached(a, &e, &.{f});
+    _ = try expectSameAsUncached(a, &e, &.{f});
+    try testing.expectEqual(1, hpack.memoStats().hits);
+    // Another value, another name: misses with their own bytes.
+    _ = try expectSameAsUncached(a, &e, &.{.{ .name = "x-custom", .value = "nghttp3" }});
+    _ = try expectSameAsUncached(a, &e, &.{.{ .name = "x-customs", .value = "nghttp2" }});
+    try testing.expectEqual(1, hpack.memoStats().hits);
+    try testing.expectEqual(3, hpack.memoStats().misses);
+    // Never indexed: the 0x10 representation, never from or into the memo.
+    const nv = try expectSameAsUncached(a, &e, &.{.{ .name = "x-custom", .value = "nghttp2", .never_index = true }});
+    try testing.expectEqual(0x10, nv[0]);
+    try testing.expectEqual(1, hpack.memoStats().hits);
+    try testing.expectEqual(3, hpack.memoStats().stores);
+}
+
+test "h2 hpack: secrets and fields over the cap are never memoized" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    hpack.memoReset();
+    var e: hpack.Encoder = .{ .size_update_pending = false };
+    const long: [97 - 4]u8 = @splat('v');
+    const fields = [_]Field{
+        .{ .name = "authorization", .value = "Bearer x" },
+        .{ .name = "cookie", .value = "short" },
+        .{ .name = "x-a", .value = "flagged", .never_index = true },
+        // name + value = 97 bytes, one past the cap.
+        .{ .name = "x-ab", .value = &long },
+    };
+    for (0..2) |_| _ = try expectSameAsUncached(a, &e, &fields);
+    const st = hpack.memoStats();
+    try testing.expectEqual(0, st.hits + st.misses + st.stores);
+    // Exactly at the cap it is kept.
+    const at = [_]Field{.{ .name = "x-ab", .value = long[1..] }};
+    for (0..2) |_| _ = try expectSameAsUncached(a, &e, &at);
+    try testing.expectEqual(1, hpack.memoStats().hits);
+}
+
+test "h2 hpack: colliding memo slots return each field's own bytes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    hpack.memoReset();
+    var e: hpack.Encoder = .{ .size_update_pending = false };
+    // 40 keys into 32 slots, in turn, three rounds.
+    var fields: [40]Field = undefined;
+    for (&fields, 0..) |*f, i| f.* = .{ .name = "x-key", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}) };
+    for (0..3) |_| for (fields) |f| {
+        _ = try expectSameAsUncached(a, &e, &.{f});
+    };
+    const st = hpack.memoStats();
+    try testing.expectEqual(120, st.hits + st.misses);
+    try testing.expect(st.misses >= 40);
+}
+
+test "h2 hpack: a memo hit that doesn't fit is NoSpaceLeft, and keeps the size update" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    hpack.memoReset();
+    const f: Field = .{ .name = "content-type", .value = "application/grpc" };
+    // Into the memo from another connection's encoder.
+    var other: hpack.Encoder = .{};
+    _ = try expectSameAsUncached(a, &other, &.{f});
+    var e: hpack.Encoder = .{};
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, e.encode(buf[0..4], &.{f}));
+    try testing.expectError(error.NoSpaceLeft, e.encodeUncached(buf[0..4], &.{f}));
+    try testing.expect(e.size_update_pending);
+    // The first block through a hit starts with the size update, the
+    // second doesn't.
+    const first = try expectSameAsUncached(a, &e, &.{f});
+    try testing.expectEqual(0x20, first[0]);
+    const second = try expectSameAsUncached(a, &e, &.{f});
+    try testing.expectEqualSlices(u8, first[1..], second);
+    try testing.expectEqual(3, hpack.memoStats().hits);
+}
+
+test "h2 hpack: encodeStatus writes what encode writes for :status" {
+    for ([_]u16{ 100, 103, 200, 201, 204, 206, 304, 400, 404, 421, 500, 503, 999 }) |code| {
+        var digits: [3]u8 = undefined;
+        _ = try std.fmt.bufPrint(&digits, "{d}", .{code});
+        const f = [_]Field{.{ .name = ":status", .value = &digits }};
+        for ([_]bool{ true, false }) |pending| {
+            var e1: hpack.Encoder = .{ .size_update_pending = pending };
+            var e2 = e1;
+            var b1: [32]u8 = undefined;
+            var b2: [32]u8 = undefined;
+            const n1 = try e1.encodeUncached(&b1, &f);
+            const n2 = try e2.encodeStatus(&b2, code);
+            try testing.expectEqualSlices(u8, b1[0..n1], b2[0..n2]);
+            try testing.expect(!e2.size_update_pending);
+            try testing.expect(n2 <= hpack.Encoder.bound(&f));
+        }
+    }
+}
+
 test "h2 hpack: nghttp2 deflate_bound" {
     const fields = [_]Field{ .{ .name = ":method", .value = "GET" }, .{ .name = "alpha", .value = "bravo" } };
     try testing.expectEqual(12 + 6 * 2 * 2 + 7 + 3 + 5 + 5, hpack.Encoder.bound(&fields));

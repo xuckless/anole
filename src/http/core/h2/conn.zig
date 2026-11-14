@@ -1527,24 +1527,17 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// block is encoded in place, then cut at the peer's maximum frame
         /// size with the frame headers moved in between.
         fn writeHeaders(c: *Self, id: u31, status: ?u16, hdrs: []const hpack.Field, end_stream: bool) SubmitError!void {
-            var digits: [3]u8 = undefined;
-            var st_buf: [1]hpack.Field = undefined;
-            var st: []const hpack.Field = &.{};
-            if (status) |code| {
-                std.debug.assert(code >= 100 and code <= 999);
-                _ = std.fmt.bufPrint(&digits, "{d}", .{code}) catch unreachable;
-                st_buf[0] = .{ .name = ":status", .value = &digits };
-                st = &st_buf;
-            }
             // Past what could encode under the limit: refused before the
             // buffer is sized for it.
             if (minEncoded(hdrs) > max_headers_len) return error.HeadersTooLarge;
-            const bound = hpack.Encoder.bound(st) + hpack.Encoder.bound(hdrs);
+            const st_bound = if (status == null) 0 else hpack.Encoder.bound(&.{.{ .name = ":status", .value = "000" }});
+            const bound = st_bound + hpack.Encoder.bound(hdrs);
             const mfs: usize = c.remote.max_frame_size;
             const room = bound + frame.header_len * (bound / mfs + 1);
             const buf = try c.out.writable(room);
             const size_update = c.encoder.size_update_pending;
-            var len = c.encoder.encode(buf[frame.header_len..], st) catch unreachable;
+            var len: usize = 0;
+            if (status) |code| len = c.encoder.encodeStatus(buf[frame.header_len..], code) catch unreachable;
             len += c.encoder.encode(buf[frame.header_len + len ..], hdrs) catch unreachable;
             if (len > max_headers_len) {
                 // Not queued: the next block still starts with the size

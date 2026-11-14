@@ -143,6 +143,8 @@ pub const OutFrame = struct {
     last_id: u31 = 0,
     data: []const u8 = "",
     fields: []const Field = &.{},
+    /// The HEADERS block's bytes, CONTINUATIONs joined.
+    block: []const u8 = "",
     settings: []const frame.Setting = &.{},
     /// HEADERS frames in the block (1 + CONTINUATIONs).
     frames: usize = 1,
@@ -265,6 +267,7 @@ pub const T = struct {
                         end = g.parsed.frame.continuation.end_headers;
                         o.frames += 1;
                     }
+                    o.block = whole.items;
                     o.fields = try t.decode(whole.items);
                 },
                 .rst_stream => |code| o.code = code,
@@ -1259,6 +1262,38 @@ test "h2 conn: interim responses before the final one" {
     try expectEqualStrings("link", out[1].fields[1].name);
     try expectEqualStrings("200", out[2].fields[0].value);
     try expectEqualStrings("done", out[3].data);
+}
+
+test "h2 conn: equal response heads encode to equal blocks, a new Date to its own" {
+    const t = try ready(.{});
+    defer t.destroy();
+    const head = [_]Field{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "date", .value = "Sat, 14 Nov 2026 10:00:00 GMT" },
+        .{ .name = "content-length", .value = "42" },
+    };
+    var later = head;
+    later[1].value = "Sat, 14 Nov 2026 10:00:01 GMT";
+    const heads = [_][]const Field{ &head, &head, &head, &later };
+    for (heads, 0..) |h, i| {
+        const id: u31 = @intCast(1 + 2 * i);
+        try t.feed(try t.headers(id, &get, true));
+        try t.c.submitHead(t.stream(id), 200, h, true);
+    }
+    const out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers, .id = 1 }, .{ .type = .headers, .id = 3 }, .{ .type = .headers, .id = 5 }, .{ .type = .headers, .id = 7 } });
+    // The first block alone starts with the size update to 0.
+    try expectEqual(0x20, out[0].block[0]);
+    try testing.expectEqualSlices(u8, out[0].block[1..], out[1].block);
+    try testing.expectEqualSlices(u8, out[1].block, out[2].block);
+    try expect(!std.mem.eql(u8, out[2].block, out[3].block));
+    for (out, heads) |o, h| {
+        try expectEqualStrings("200", o.fields[0].value);
+        for (h, o.fields[1..]) |w, g| {
+            try expectEqualStrings(w.name, g.name);
+            try expectEqualStrings(w.value, g.value);
+        }
+    }
 }
 
 test "h2 conn: out slices stay put while more is queued" {
