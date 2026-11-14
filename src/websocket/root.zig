@@ -645,11 +645,12 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
                 try res.header("Sec-WebSocket-Extensions", try req.arena.dupe(u8, accepted.response));
                 const d = try alloc.create(deflate_impl.Deflate);
                 // Its buffers apart from the request's arena, which is not
-                // thread-safe over HTTP/1.1: other tasks compress what they
-                // send (`Rooms`). The server's allocator there; over HTTP/2
-                // and HTTP/3 the stream's arena is a `std.heap.ArenaAllocator`
-                // over the server's allocator, which is thread-safe.
-                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res._conn.?.allocator);
+                // thread-safe: other tasks, on other executors, compress
+                // what they send (`Rooms`). The server's allocator over
+                // HTTP/1.1; over HTTP/2 and HTTP/3 the process's, the
+                // stream having no allocator of its own here. Freed by
+                // `Socket.deinit`.
+                d.* = .init(accepted.config, options.deflate, if (h2) safety.process_gpa else res._conn.?.allocator);
                 deflate = d;
             }
         }

@@ -419,7 +419,7 @@ socket's internals.
 | `id`, `trace_id`, `span_id` | Set by the request ID and tracing middleware. |
 | `setLocal(key, value)`, `local(T, key)` | Values a middleware hands to the handler for this request; see [Request locals](#request-locals). |
 | `route` | The matched route; `route.?.path` is its pattern. |
-| `arena` | An allocator freed after the response. Not thread-safe: only the handler's task may use it. |
+| `arena` | An allocator freed after the response. Not thread-safe: it belongs to the handler's task. A call the handler awaits (a blocking-pool job, say) may use it while the handler waits; a task started with `io.concurrent`, or a thread, needs memory of its own. Two tasks allocating from it at once corrupt it (Debug builds panic). |
 | `io` | The server's `std.Io`; see [Async work](#async-work-in-handlers). |
 
 The body is read once, whole or as a stream:
@@ -863,8 +863,9 @@ returns.
 
 For several calls at once, use `req.io.concurrent` and await each future, or
 cancel it on the way out after an error. Those tasks may run on other
-executors and the request's arena is not thread-safe, so give each one memory
-of its own. [examples/io](../examples/io/main.zig) makes two outbound
+executors and the request's arena is not thread-safe (it belongs to the
+handler's task; Debug builds panic when two tasks allocate from it at once),
+so give each one memory of its own. [examples/io](../examples/io/main.zig) makes two outbound
 requests in parallel this way and reads files through the `Io`
 (`zig build run-io`).
 

@@ -33,6 +33,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const placement = @import("../placement.zig");
 const safety = @import("anole_safety");
+const LocalArena = @import("../arena.zig").LocalArena;
 
 /// A set is aligned to this, so that its first page is the first 4 KiB of
 /// it (or more of it, with bigger pages).
@@ -42,7 +43,7 @@ const set_alignment: std.mem.Alignment = .fromByteUnits(4096);
 const slab_target_len = 256 * 1024;
 
 /// The arena's chunks inside a set are aligned to this, which is as much as
-/// `std.heap.ArenaAllocator` asks of its nodes.
+/// `LocalArena` (as std's arena) asks of its nodes.
 const chunk_alignment: std.mem.Alignment = .@"16";
 
 /// The arena's first chunk, on the set's first page: what an ordinary
@@ -53,7 +54,7 @@ const chunk_alignment: std.mem.Alignment = .@"16";
 /// (`RequestBuffersPool.arena_reserve`).
 pub const first_chunk_len = 2 * 1024;
 
-/// Headroom for `std.heap.ArenaAllocator`'s node header, which its reset
+/// Headroom for `LocalArena`'s node header, which its reset
 /// counts outside the capacity it keeps.
 const arena_node_headroom = 64;
 
@@ -65,7 +66,7 @@ const arena_node_headroom = 64;
 pub const RequestBuffers = struct {
     /// Its chunks are `first_chunk` and `second_chunk` while they last,
     /// then `pool.allocator` (`chunkAllocator`).
-    arena: std.heap.ArenaAllocator,
+    arena: LocalArena,
     read_buffer: []u8,
     first_chunk: []u8,
     second_chunk: []u8,
@@ -95,7 +96,7 @@ pub const RequestBuffers = struct {
         _ = self.arena.reset(self.retainMode());
     }
 
-    fn retainMode(self: *const RequestBuffers) std.heap.ArenaAllocator.ResetMode {
+    fn retainMode(self: *const RequestBuffers) LocalArena.ResetMode {
         return if (self.first_chunk.len > arena_node_headroom)
             .{ .retain_with_limit = self.first_chunk.len - arena_node_headroom }
         else

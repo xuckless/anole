@@ -178,8 +178,9 @@ pub fn allocUninit(a: std.mem.Allocator, n: usize) error{OutOfMemory}![]u8 {
 /// builds every chunk goes back to the arena's child allocator
 /// (`.free_all`), which poisons it or makes it inaccessible, so a slice
 /// kept past its request reads poison or faults; otherwise `mode` as
-/// given (the retained capacity is the point of it in production).
-pub inline fn resetArena(arena: *std.heap.ArenaAllocator, mode: std.heap.ArenaAllocator.ResetMode) bool {
+/// given (the retained capacity is the point of it in production). For
+/// `std.heap.ArenaAllocator` and the core's `LocalArena` alike.
+pub inline fn resetArena(arena: anytype, mode: std.heap.ArenaAllocator.ResetMode) bool {
     const free_all = enabled and (!builtin.is_test or arena_poisoning.load(.monotonic));
     return arena.reset(if (free_all) .free_all else mode);
 }

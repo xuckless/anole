@@ -260,7 +260,8 @@ pub const ResponseCache = struct {
             it += 6;
             const name = rest[it..][0..name_len];
             it += name_len;
-            try res.headers.put(name, rest[it..][0..value_len]);
+            // Grown as res.header grows it: a sink response starts small.
+            try res._putHeader(name, rest[it..][0..value_len]);
             it += value_len;
         }
         res.status = head.status;

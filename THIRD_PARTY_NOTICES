@@ -282,6 +282,14 @@ tests/nghttp2_session_test.c)
             0f8bc1c4271f4380409071eade31830e6e436bd6 (branch anole)
   Linked:   tests only (until the engine uses it, M3)
 
+src/http/core/arena.zig (the request and stream arenas' allocator)
+  Derived from Zig's std.heap.ArenaAllocator with its atomics and free
+  list taken out; the file carries an attribution header.
+  Licence:  MIT (Expat). Copyright (c) Zig contributors
+  Source:   https://codeberg.org/ziglang/zig, tag 0.17.0,
+            lib/std/heap/ArenaAllocator.zig
+  Linked:   always
+
 src/nats/core/ (the NATS protocol engine and client: parser, encoder,
 connection, reconnect, subscriptions, requests, drain, its tests and fake
 server)

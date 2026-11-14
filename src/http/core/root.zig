@@ -58,6 +58,9 @@ pub const _Timer = @import("deadline.zig").Timer;
 /// A wait point with a sleeper count, for one task's waits that others
 /// notify (HTTP/2 and HTTP/3 streams, their writers).
 pub const Signal = @import("signal.zig").Signal;
+/// The request, stream and response arenas' allocator: std's arena for
+/// one owner at a time, without its atomics (#171).
+pub const LocalArena = @import("arena.zig").LocalArena;
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
 /// The cgroup's CPU and memory limits (HTTP/3 sizes its send memory by it).
@@ -217,6 +220,8 @@ comptime {
     _ = @import("parked_test.zig");
     _ = @import("parked.zig");
     _ = @import("server/request_buffers.zig");
+    _ = @import("arena.zig");
+    _ = @import("arena_test.zig");
     _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");
     _ = @import("client.zig");
