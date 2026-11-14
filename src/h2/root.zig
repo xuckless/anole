@@ -1,5 +1,5 @@
-//! HTTP/2 (-Dhttp2): the client connection, on nghttp2 1.70.0 (MIT, bound
-//! through the official translate-c package). The server side needs
+//! HTTP/2 (-Dhttp2): the client connection, on the HTTP core's own
+//! protocol core (src/http/core/h2/conn.zig's client role). The server side needs
 //! nothing from here: `anole.App` serves HTTP/2 over TLS (ALPN "h2") and
 //! cleartext (h2c) through the HTTP core's engine
 //! (src/http/core/h2/server.zig).
@@ -34,7 +34,8 @@ pub const StreamError = client.StreamError;
 const c = @import("anole_nghttp2_c");
 
 /// The library under HTTP/2 in this build, as "nghttp2/1.70.0".
-/// `anole.h3.version()` has the same shape.
+/// `anole.h3.version()` has the same shape. nghttp2 is still linked (the
+/// test engines and differentials) until M6 removes it, and this with it.
 pub fn version() []const u8 {
     return "nghttp2/" ++ c.NGHTTP2_VERSION;
 }

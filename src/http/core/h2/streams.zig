@@ -36,7 +36,14 @@ pub const Flags = packed struct(u8) {
     /// The stream's ID is in conn.zig's ready queue (out.zig): it has
     /// output to frame and send credit.
     ready: bool = false,
-    _: u3 = 0,
+    /// The client role: no final (non-1xx) response head yet, so DATA or
+    /// END_STREAM is malformed (nghttp2's
+    /// NGHTTP2_HTTP_FLAG_EXPECT_FINAL_RESPONSE).
+    expect_final: bool = false,
+    /// The client role: the request was HEAD, so the response has no body
+    /// (nghttp2's NGHTTP2_HTTP_FLAG_METH_HEAD).
+    head_request: bool = false,
+    _: u1 = 0,
 };
 
 /// One stream. END_STREAM received and sent are the state (half_closed_remote
@@ -102,18 +109,20 @@ pub const Stream = struct {
     /// nghttp2_http_on_data_chunk: `n` bytes of DATA arrived. More than the
     /// declared content-length makes the request malformed (RFC 9113 §8.1.1).
     /// One counter replaces nghttp2's two (`content_length` and
-    /// `recv_content_length`). The client role's EXPECT_FINAL_RESPONSE check
-    /// is M5's.
+    /// `recv_content_length`). For the client role, DATA before the final
+    /// response head is malformed too.
     pub fn onDataChunk(s: *Stream, n: usize) error{Malformed}!void {
+        if (s.flags.expect_final) return error.Malformed;
         if (s.content_left == -1) return;
         if (n > s.content_left) return error.Malformed;
         s.content_left -= @intCast(n);
     }
 
     /// nghttp2_http_on_remote_end_stream: at END_STREAM the DATA must add up
-    /// to the declared content-length.
+    /// to the declared content-length (and a client must have had its
+    /// final response head).
     pub fn onRemoteEnd(s: *const Stream) error{Malformed}!void {
-        if (s.content_left > 0) return error.Malformed;
+        if (s.flags.expect_final or s.content_left > 0) return error.Malformed;
     }
 };
 
@@ -374,7 +383,9 @@ pub const StreamTable = struct {
 
     /// nghttp2_map_each as a cursor, so the caller's errors propagate:
     /// `var i: usize = 0; while (t.next(&i)) |s| ...`. The table must not
-    /// change during the walk.
+    /// change during the walk, except by `remove` of the stream just
+    /// returned followed by `i -= 1` (the backward shift fills that slot
+    /// from the rest of its run; what wraps lands in slots already read).
     pub fn next(t: *const StreamTable, i: *usize) ?*Stream {
         const n = t.slots();
         while (i.* < n) {

@@ -942,6 +942,12 @@ const Scripted = struct {
     listener: std.Io.net.Server,
     near: std.Io.net.Stream,
     far: std.Io.net.Stream,
+    /// With `hold` set, the client's next write stops in `drain` (and
+    /// says so in `held`) until `gate` is set: what it writes from stays
+    /// lent to it meanwhile.
+    hold: std.atomic.Value(bool) = .init(false),
+    held: std.atomic.Value(bool) = .init(false),
+    gate: std.Io.Event = .unset,
 
     fn create(gpa: std.mem.Allocator, io: std.Io) !*Scripted {
         const self = try gpa.create(Scripted);
@@ -1006,6 +1012,10 @@ const Scripted = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Scripted = @alignCast(@fieldParentPtr("sent_writer", w));
+        if (self.hold.load(.acquire)) {
+            self.held.store(true, .release);
+            self.gate.waitUncancelable(self.io);
+        }
         self.record(w.buffered());
         w.end = 0;
         var n: usize = 0;
@@ -1022,23 +1032,51 @@ const Scripted = struct {
     /// the stream is open on its side: a frame sent for it before that
     /// would be on an idle stream, which is a connection error.
     fn waitHeadersSent(self: *Scripted, id: u31) !void {
+        try self.waitFrameSent(0x1, id);
+    }
+
+    /// Waits until the client has written a frame of type `kind` on
+    /// stream `id`.
+    fn waitFrameSent(self: *Scripted, kind: u8, id: u31) !void {
         const C = struct {
             p: *Scripted,
+            kind: u8,
             id: u31,
             fn sent(c: @This()) bool {
-                const bytes = c.p.sent[0..c.p.sent_len.load(.acquire)];
-                // After the 24-byte client preface, whole frames.
-                var at: usize = 24;
-                while (bytes.len >= at + 9) {
-                    const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
-                    const stream_id = std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big) & 0x7fff_ffff;
-                    if (bytes[at + 3] == 0x1 and stream_id == c.id) return true;
-                    at += 9 + len;
-                }
-                return false;
+                return c.p.findFrame(c.kind, c.id) != null;
             }
         };
-        try wait.waitUntil(self.io, "the client sent the stream's HEADERS", C{ .p = self, .id = id }, C.sent);
+        try wait.waitUntil(self.io, "the client sent the frame", C{ .p = self, .kind = kind, .id = id }, C.sent);
+    }
+
+    /// The payload of the first frame of type `kind` on stream `id` the
+    /// client wrote, if it has.
+    fn findFrame(self: *Scripted, kind: u8, id: u31) ?[]const u8 {
+        const bytes = self.sent[0..self.sent_len.load(.acquire)];
+        // After the 24-byte client preface, whole frames.
+        var at: usize = 24;
+        while (bytes.len >= at + 9) {
+            const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+            const stream_id = std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big) & 0x7fff_ffff;
+            if (bytes.len < at + 9 + len) return null;
+            if (bytes[at + 3] == kind and stream_id == id) return bytes[at + 9 ..][0..len];
+            at += 9 + len;
+        }
+        return null;
+    }
+
+    /// The client's writer stopped in `drain` (`hold`).
+    fn waitHeld(self: *Scripted) !void {
+        try wait.waitUntil(self.io, "the client's writer is held", self, struct {
+            fn f(p: *Scripted) bool {
+                return p.held.load(.acquire);
+            }
+        }.f);
+    }
+
+    fn openGate(self: *Scripted) void {
+        self.hold.store(false, .release);
+        self.gate.set(self.io);
     }
 
     /// The client reads the end of the connection.
@@ -1251,4 +1289,329 @@ test "h2 client: after GOAWAY(last=1) stream 3 is unprocessed and stream 1, whic
     try std.testing.expect(std.meta.isError(second.waitHead()));
     try std.testing.expect(second.unprocessed());
     try std.testing.expect(!first.unprocessed());
+}
+
+fn millis(ms: i64) std.Io.Timeout {
+    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+}
+
+test "h2 client: a canceled request sends RST_STREAM(CANCEL), what the server sent on it is ignored, and its window comes back" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try peer.waitHeadersSent(1);
+    s.cancel();
+    try std.testing.expectError(error.Canceled, s.waitHead());
+    try std.testing.expect(s.canceledLocally());
+    try peer.waitFrameSent(0x3, 1);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 8 }, peer.findFrame(0x3, 1).?);
+    // The server's answer crossed the reset.
+    try peer.send(&frame(1, 0x4, 1, &.{0x88}));
+    try peer.send(&frame(0, 0x1, 1, "late"));
+    // The connection carries on.
+    const t = try request(conn, "/", .{});
+    defer t.release();
+    try peer.waitHeadersSent(3);
+    try peer.send(&frame(1, 0x5, 3, &.{0x88}));
+    try t.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), t.status);
+    // The ignored DATA's connection credit came back (not yet announced).
+    conn.mutex.lockUncancelable(io);
+    defer conn.mutex.unlock(io);
+    try std.testing.expectEqual(@as(i64, conn.max_data), @as(i64, conn.proto.recv_window) + conn.proto.recv_unacked);
+}
+
+test "h2 client: a lost connection fails every stream waiting, the head and the body writer alike, and new requests" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    const up = try request(conn, "/", .{ .body = true });
+    defer up.release();
+    try peer.waitHeadersSent(3);
+    peer.end();
+    try std.testing.expectError(error.ConnectionClosed, s.waitHead());
+    try up.writer().writeAll("body");
+    try std.testing.expectError(error.WriteFailed, up.writer().flush());
+    try std.testing.expectEqual(error.ConnectionClosed, up.writeError().?);
+    try std.testing.expectError(error.ConnectionClosed, up.waitHead());
+    try std.testing.expectError(error.ConnectionClosed, request(conn, "/", .{}));
+    try std.testing.expect(!conn.isOpen());
+}
+
+test "h2 client: a body writer waiting for send credit fails with Timeout at the request's deadline" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    // SETTINGS_INITIAL_WINDOW_SIZE 0: no stream may send DATA.
+    try peer.send(&frame(4, 0, 0, &.{ 0, 4, 0, 0, 0, 0 }));
+    try peer.waitTaken(conn);
+    const s = try request(conn, "/", .{ .body = true, .timeout = millis(100) });
+    defer s.release();
+    // Both 16 KiB blocks go to the core, then the writer waits for the
+    // first to be written, which it can't be.
+    const body: [40 * 1024]u8 = @splat('b');
+    try std.testing.expectError(error.WriteFailed, s.writer().writeAll(&body));
+    try std.testing.expectEqual(error.Timeout, s.writeError().?);
+    try std.testing.expectError(error.Timeout, s.waitHead());
+}
+
+test "h2 client: past the server's MAX_CONCURRENT_STREAMS a request waits for a stream to close, within its deadline" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    // SETTINGS_MAX_CONCURRENT_STREAMS 1.
+    try peer.send(&frame(4, 0, 0, &.{ 0, 3, 0, 0, 0, 1 }));
+    try peer.waitTaken(conn);
+    const a = try request(conn, "/", .{});
+    defer a.release();
+    try peer.waitHeadersSent(1);
+    try std.testing.expectError(error.Timeout, request(conn, "/", .{ .timeout = millis(50) }));
+    var next = try io.concurrent(struct {
+        fn f(c: *h2.ClientConnection) anyerror!*h2.Stream {
+            return request(c, "/", .{});
+        }
+    }.f, .{conn});
+    // Stream 1 ends: room for the waiting one.
+    try peer.send(&frame(1, 0x5, 1, &.{0x88}));
+    const b = try next.await(io);
+    defer b.release();
+    try std.testing.expectEqual(@as(i32, 3), b.id);
+    try a.waitHead();
+}
+
+test "h2 client: requests made while a write is under way go out together in the next one (#148)" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    try peer.waitTaken(conn);
+    try peer.waitFrameSent(0x4, 0);
+    // The first request's write stops in the transport; 19 more come
+    // meanwhile.
+    peer.hold.store(true, .release);
+    var streams: [20]*h2.Stream = undefined;
+    streams[0] = try request(conn, "/", .{});
+    try peer.waitHeld();
+    for (streams[1..]) |*s| s.* = try request(conn, "/", .{});
+    conn.mutex.lockUncancelable(io);
+    const before = conn.test_writes;
+    conn.mutex.unlock(io);
+    peer.openGate();
+    try peer.waitHeadersSent(39);
+    conn.mutex.lockUncancelable(io);
+    const writes = conn.test_writes - before;
+    conn.mutex.unlock(io);
+    // The held one, then one for the other 19.
+    try std.testing.expectEqual(@as(u32, 2), writes);
+    for (streams) |s| s.release();
+}
+
+test "h2 client: a request body the writer is still writing from outlives its released stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    try peer.waitTaken(conn);
+    try peer.waitFrameSent(0x4, 0);
+    peer.hold.store(true, .release);
+    const body: [8 * 1024]u8 = @splat('b');
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/up" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body_bytes = &body });
+    // The writer is in the middle of writing the body from the stream's
+    // copy when the stream goes.
+    try peer.waitHeld();
+    s.release();
+    {
+        conn.mutex.lockUncancelable(io);
+        defer conn.mutex.unlock(io);
+        try std.testing.expect(conn.retiring.first != null);
+    }
+    peer.openGate();
+    try peer.waitFrameSent(0x0, 1);
+    // Written from live memory (a freed copy would read as the debug
+    // allocator's 0xaa).
+    const data = peer.findFrame(0x0, 1).?;
+    try std.testing.expectEqual(body.len, data.len);
+    try std.testing.expectEqualSlices(u8, &body, data);
+    try wait.waitUntil(io, "the writer let go of the released stream", conn, struct {
+        fn f(c: *h2.ClientConnection) bool {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            return c.retiring.first == null;
+        }
+    }.f);
+}
+
+test "h2 client: a HEADERS frame longer than the reader's buffer is gathered whole" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try peer.waitHeadersSent(1);
+    // :status 200 and a 16370-byte literal: a 16386-byte frame, past the
+    // 16 KiB the scripted reader buffers.
+    const head = [_]u8{ 0x88, 0x00, 1, 'x', 0x7f, 0xf3, 0x7e } ++ @as([16370]u8, @splat('v'));
+    try std.testing.expect(9 + head.len > peer.read_buf.len);
+    try peer.send(&frame(1, 0x5, 1, &head));
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    try std.testing.expectEqual(@as(usize, 16370), s.header("x").?.len);
+}
+
+test "h2 client: once the connection is gone the writer frames no more of a released stream's body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    var closed = false;
+    defer if (!closed) conn.close();
+
+    // SETTINGS_INITIAL_WINDOW_SIZE 1024: the body goes out 1 KiB at first.
+    try peer.send(&frame(4, 0, 0, &.{ 0, 4, 0, 0, 4, 0 }));
+    try peer.waitTaken(conn);
+    try wait.waitUntil(io, "the client acknowledged the SETTINGS", peer, struct {
+        fn f(p: *Scripted) bool {
+            const bytes = p.sent[0..p.sent_len.load(.acquire)];
+            var at: usize = 24;
+            while (bytes.len >= at + 9) {
+                const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+                if (bytes[at + 3] == 0x4 and bytes[at + 4] & 0x1 != 0) return true;
+                at += 9 + len;
+            }
+            return false;
+        }
+    }.f);
+    peer.hold.store(true, .release);
+    const body: [100 * 1024]u8 = @splat('b');
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/up" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body_bytes = &body });
+    try peer.waitHeld();
+    // Credit for more of the body, then the connection ends: the stream is
+    // released while most of its body is still unframed.
+    try peer.send(&frame(8, 0, 1, &.{ 0, 1, 0, 0 }));
+    peer.end();
+    try std.testing.expectError(error.ConnectionClosed, s.waitHead());
+    s.release();
+    peer.openGate();
+    closed = true;
+    conn.close();
+    // Every DATA byte written came from the live body (freed memory would
+    // read as the debug allocator's 0xaa), and none after the end.
+    const bytes = peer.sent[0..peer.sent_len.load(.acquire)];
+    var at: usize = 24;
+    var data: usize = 0;
+    while (bytes.len >= at + 9) {
+        const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+        if (bytes.len < at + 9 + len) break;
+        if (bytes[at + 3] == 0x0) {
+            for (bytes[at + 9 ..][0..len]) |b| try std.testing.expectEqual(@as(u8, 'b'), b);
+            data += len;
+        }
+        at += 9 + len;
+    }
+    try std.testing.expectEqual(@as(usize, 1024), data);
+}
+
+test "h2 client: a body writer whose stream the server ended gets WriteFailed, not a block still being written from" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    try peer.waitTaken(conn);
+    try peer.waitFrameSent(0x4, 0);
+    // The writer stops on the request's HEADERS, so the body's blocks stay
+    // lent to the core.
+    peer.hold.store(true, .release);
+    const s = try request(conn, "/", .{ .body = true });
+    defer s.release();
+    try peer.waitHeld();
+    var next = try io.concurrent(struct {
+        fn f(st: *h2.Stream) anyerror!void {
+            // Block 0 goes, block 1 fills and goes, then the writer waits
+            // for block 0, which is still lent.
+            const body: [20 * 1024]u8 = @splat('b');
+            try st.writer().writeAll(&body);
+            try st.writer().flush();
+        }
+    }.f, .{s});
+    try wait.waitUntil(io, "the body writer waits for a block", s, struct {
+        fn f(st: *h2.Stream) bool {
+            st.conn.mutex.lockUncancelable(st.conn.io);
+            defer st.conn.mutex.unlock(st.conn.io);
+            return st.waiting_room;
+        }
+    }.f);
+    // The server answers in full, then ends the stream (grpc-go after an
+    // early status): no cause, the response is complete.
+    try peer.send(&frame(1, 0x5, 1, &.{0x88}));
+    try peer.send(&frame(3, 0, 1, &.{ 0, 0, 0, 0 }));
+    try std.testing.expectError(error.WriteFailed, next.await(io));
+    try std.testing.expectEqual(error.StreamReset, s.writeError().?);
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    peer.openGate();
 }

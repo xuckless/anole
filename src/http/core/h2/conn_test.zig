@@ -2443,12 +2443,12 @@ test "h2 conn: http_ignore_regular_header" {
 // Fuzz
 
 /// Tracks the bytes live and the most ever live.
-const Peak = struct {
+pub const Peak = struct {
     child: Allocator,
     live: usize = 0,
     peak: usize = 0,
 
-    fn allocator(p: *Peak) Allocator {
+    pub fn allocator(p: *Peak) Allocator {
         return .{ .ptr = p, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 

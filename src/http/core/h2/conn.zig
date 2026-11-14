@@ -5,7 +5,8 @@
 // THIRD_PARTY_NOTICES. The output side (the submit functions, DATA framing
 // in `pending`, the WINDOW_UPDATE batching) is Anole's own.
 
-//! The sans-IO HTTP/2 protocol core (research/h2h3-takeover/PLAN.md §3.2):
+//! The sans-IO HTTP/2 protocol core (research/h2h3-takeover/PLAN.md §3.2),
+//! for a server (`Conn(.server, H)`) or a client (`Conn(.client, H)`, M5):
 //! `recv` takes the bytes the transport read, runs RFC 9113's connection
 //! and stream state machines over them and calls the handler; the submit
 //! functions queue output in `out`, which the transport drains with
@@ -53,6 +54,19 @@
 //!
 //! A handler may call the submit functions, `reset` and `consumed` from
 //! inside a callback; Conn re-checks the stream after each one.
+//!
+//! **The client role** opens its streams with `submitRequest` (which takes
+//! the caller's `user`), so its handler has no onStreamOpen; the callbacks
+//! carry the response instead: `onField`/`onHeadersEnd` for each head, an
+//! informational (1xx) one with `s.flags.expect_final` still set after it,
+//! then the final one, then trailers (`s.flags.in_trailers`); `onData` the
+//! response body. One more callback, `onHeadRefused(h, s) void`: a response
+//! head or trailers past max_header_list_size, about to be reset with
+//! INTERNAL_ERROR. The client sends the preface and ENABLE_PUSH=0, takes
+//! the server's limit on its streams as 100 until its SETTINGS (no limit
+//! when they leave it out), closes its streams above a GOAWAY's last-stream-id with
+//! REFUSED_STREAM, and charges no reset or refused budget (those guard a
+//! server against its clients; CVE-2023-44487).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -93,10 +107,31 @@ pub const SubmitError = error{
     HeadersTooLarge,
 };
 
+/// What `submitRequest` (the client role) fails with.
+pub const RequestError = error{
+    OutOfMemory,
+    /// The encoded header block is over `max_headers_len`.
+    HeadersTooLarge,
+    /// The server's SETTINGS_MAX_CONCURRENT_STREAMS are open: wait for one
+    /// to close (RFC 9113 §5.1.2; nghttp2 queues the request, Go's
+    /// Transport waits).
+    StreamLimit,
+    /// The server sent GOAWAY, or we did, or the connection failed: no new
+    /// streams on it.
+    GoawayReceived,
+    /// Every client stream ID was used (RFC 9113 §5.1.1): a new connection.
+    StreamIdsExhausted,
+};
+
 /// RFC 9113 §3.4.
 pub const client_magic = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// RFC 9113 §6.9.2: the windows before SETTINGS say otherwise.
 pub const default_window = 65535;
+/// The client role's assumption about the server's
+/// SETTINGS_MAX_CONCURRENT_STREAMS until its SETTINGS arrive (Go's
+/// x/net/http2 defaultMaxConcurrentStreams; RFC 9113 §6.5.2 recommends at
+/// least 100), so a burst before them can't pass what a server would refuse.
+pub const client_initial_peer_streams = 100;
 /// The largest header block we send (nghttp2's NGHTTP2_MAX_HEADERSLEN).
 pub const max_headers_len = 65536;
 /// RFC 9218 §7.1's PRIORITY_UPDATE; frame.zig reports it as unknown.
@@ -163,9 +198,12 @@ const Remote = struct {
     no_rfc7540_priorities: ?bool = null,
 };
 
-fn checkHandler(comptime H: type) void {
-    const want = .{
-        .{ "onStreamOpen", fn (*H, *Stream) Error!void },
+fn checkHandler(comptime role: Role, comptime H: type) void {
+    const by_role = switch (role) {
+        .server => .{.{ "onStreamOpen", fn (*H, *Stream) Error!void }},
+        .client => .{.{ "onHeadRefused", fn (*H, *Stream) void }},
+    };
+    const want = by_role ++ .{
         .{ "onField", fn (*H, *Stream, []const u8, []const u8) Error!void },
         .{ "onHeadersEnd", fn (*H, *Stream, bool) Error!void },
         .{ "onData", fn (*H, *Stream, []const u8, bool) Error!void },
@@ -217,10 +255,7 @@ const Pending = struct {
 };
 
 pub fn Conn(comptime role: Role, comptime H: type) type {
-    comptime {
-        if (role != .server) @compileError("h2 conn: the client role comes with M5");
-        checkHandler(H);
-    }
+    comptime checkHandler(role, H);
     return struct {
         const Self = @This();
 
@@ -243,6 +278,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// (last_proc_stream_id, GOAWAY's last-stream-id).
         last_recv: u31 = 0,
         last_proc: u31 = 0,
+        /// The client role: the highest stream ID we opened (nghttp2's
+        /// last_sent_stream_id).
+        last_sent: u31 = 0,
         /// The connection's windows: the peer's credit for us, and ours for
         /// the peer (consumed bytes not yet announced in `recv_unacked`).
         send_window: i32 = default_window,
@@ -256,11 +294,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         data_in: ?DataIn = null,
         /// The header block being assembled (HEADERS without END_HEADERS).
         block: ?Block = null,
-        /// One request's (or trailers') field checks, per block.
-        req: fields.Request = .{},
+        /// One request's (or trailers') field checks, per block; a
+        /// response's for the client role.
+        req: if (role == .server) fields.Request else fields.Response = .{},
         /// The GOAWAY we sent, and the last stream ID of the peer's.
         goaway_sent: ?ErrorCode = null,
         remote_last: u31 = std.math.maxInt(u31),
+        /// The client role: the server sent GOAWAY, so no new streams.
+        goaway_recv: bool = false,
         /// A connection error was answered: nothing more is read
         /// (nghttp2's IB_IGN_ALL).
         dead: bool = false,
@@ -334,7 +375,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         /// Queues our SETTINGS and the connection window's WINDOW_UPDATE
         /// (the server preface, as today's engine sends it, plus D15's
-        /// SETTINGS_NO_RFC7540_PRIORITIES).
+        /// SETTINGS_NO_RFC7540_PRIORITIES); for the client role the client
+        /// magic first, ENABLE_PUSH=0 and no MAX_CONCURRENT_STREAMS (as
+        /// nghttp2's and Go's clients send).
         pub fn init(gpa: Allocator, handler: *H, opts: Options) Allocator.Error!Self {
             // SAFETY: `initAt` sets every field.
             var c: Self = undefined;
@@ -355,7 +398,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .out = .init(gpa),
                 .decoder = .init(.{}),
                 .slab = .init(gpa),
-                .table = .init(gpa, opts.max_concurrent_streams, opts.seed),
+                // A client's streams count against the server's limit,
+                // which may be anything.
+                .table = .init(gpa, if (role == .server) opts.max_concurrent_streams else std.math.maxInt(u32), opts.seed),
                 .recv_window = cw,
                 .spare_cap = @intCast(@max(1, @min(max_spare, opts.max_concurrent_streams))),
                 .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
@@ -364,10 +409,20 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .glitch_budget = .init(opts.limits.glitch_burst, opts.limits.glitch_rate),
             };
             errdefer c.out.deinit();
+            if (role == .client) {
+                c.magic_left = 0;
+                c.remote.max_concurrent_streams = client_initial_peer_streams;
+                const m = try c.out.writable(client_magic.len);
+                @memcpy(m[0..client_magic.len], client_magic);
+                c.out.commit(client_magic.len);
+            }
             var entries: [6]frame.Setting = undefined;
             var n: usize = 0;
             for ([_]frame.Setting{
-                .{ .id = .max_concurrent_streams, .value = opts.max_concurrent_streams },
+                if (role == .server)
+                    .{ .id = .max_concurrent_streams, .value = opts.max_concurrent_streams }
+                else
+                    .{ .id = .enable_push, .value = 0 },
                 .{ .id = .initial_window_size, .value = opts.initial_window },
                 .{ .id = .max_header_list_size, .value = opts.max_header_list_size },
             }) |e| {
@@ -504,6 +559,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .settings => |st| try c.onSettings(st),
                 // nghttp2_session_on_push_promise_received: a server never
                 // takes one.
+                // For a client, which sends ENABLE_PUSH=0, the same (RFC
+                // 9113 §6.6).
                 .push_promise => return c.terminate(.protocol_error, "PUSH_PROMISE: push disabled"),
                 .ping => |pg| try c.onPing(pg),
                 .goaway => |g| try c.onGoaway(g),
@@ -511,7 +568,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 // RFC 9113 §4.1: ignored; D15 point 2 counts it as empty,
                 // except RFC 9218's PRIORITY_UPDATE (INTENTIONAL.md, limits
                 // 9).
-                .unknown => |payload| if (@backingInt(p.header.type) == priority_update_type)
+                // A client takes PRIORITY_UPDATE as nghttp2's does with the
+                // extension off: an unknown frame.
+                .unknown => |payload| if (role == .server and @backingInt(p.header.type) == priority_update_type)
                     try c.onPriorityUpdate(id, payload)
                 else
                     try c.chargeEmptyFrame(),
@@ -519,13 +578,21 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         /// session_detect_idle_stream for a server: the client's IDs above
-        /// the highest it opened, and every ID of ours (we open none).
+        /// the highest it opened, and every ID of ours (we open none). For
+        /// a client: our IDs above the highest we opened, and every even
+        /// one (no pushes).
         fn idle(c: *const Self, id: u31) bool {
-            return id & 1 == 0 or id > c.last_recv;
+            return id & 1 == 0 or id > c.lastOpened();
+        }
+
+        /// The highest odd ID opened (by the peer for a server, by us for a
+        /// client): the closed-stream memory is of odd IDs either way.
+        fn lastOpened(c: *const Self) u31 {
+            return if (role == .server) c.last_recv else c.last_sent;
         }
 
         fn peerFate(c: *const Self, id: u31) streams.Fate {
-            return streams.peerFate(&c.closed, &c.opened, 1, c.last_recv, id);
+            return streams.peerFate(&c.closed, &c.opened, 1, c.lastOpened(), id);
         }
 
         /// nghttp2_session_terminate_session_with_reason: GOAWAY with the
@@ -671,8 +738,25 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         fn headersKind(c: *Self, id: u31, hd: frame.Headers) RecvError!Kind {
             if (c.table.get(id)) |s| {
                 if (s.state == .half_closed_remote) return c.terminate(.stream_closed, "HEADERS: stream closed");
+                // A response head (informational or final) until the final
+                // one is in (nghttp2's NGHTTP2_HCAT_RESPONSE).
+                if (role == .client and !s.flags.headers_received) return .request;
                 s.flags.in_trailers = true;
                 return .trailers;
+            }
+            if (role == .client) {
+                // nghttp2_session_on_request_headers_received for a client:
+                // an idle ID (a push, or one we never opened) is a
+                // connection error; a stream we closed, as for DATA.
+                if (c.idle(id)) return c.terminate(.protocol_error, "request HEADERS: client received request");
+                switch (c.peerFate(id)) {
+                    .never_opened => return c.terminate(.protocol_error, "HEADERS: stream never opened"),
+                    .rst_received => try c.provokedRst(id, .stream_closed),
+                    .end_stream => return c.terminate(.stream_closed, "HEADERS: stream closed after END_STREAM"),
+                    .rst_sent, .unknown => {},
+                }
+                try c.chargeGlitch();
+                return .ignore;
             }
             if (id & 1 == 0) return c.terminate(.protocol_error, "request HEADERS: invalid stream_id");
             if (id <= c.last_recv) {
@@ -772,7 +856,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                     error.HeaderListTooLarge => return c.refuseHead(s, &blk, trailers, end_stream),
                     else => return c.blockError(s, err),
                 }) orelse break;
-                const v = if (trailers) c.req.trailer(f.name, f.value, fo) else c.req.field(f.name, f.value, fo);
+                const v = if (role == .client)
+                    (if (trailers) c.req.trailer(f.name, f.value) else c.req.field(f.name, f.value))
+                else if (trailers) c.req.trailer(f.name, f.value, fo) else c.req.field(f.name, f.value, fo);
                 switch (v) {
                     .ok => {},
                     .ignore => continue,
@@ -781,7 +867,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                         return c.skipBlock(s, &blk);
                     },
                 }
-                if (f.name[0] != ':') {
+                // A client counts only the bytes (max_header_list_size), as
+                // nghttp2's did.
+                if (role == .server and f.name[0] != ':') {
                     const crumb = std.mem.eql(u8, f.name, "cookie");
                     if (!crumb or !cookie) count += 1;
                     cookie = cookie or crumb;
@@ -793,6 +881,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 };
                 if (s.state == .closed) return c.skipBlock(s, &blk);
             }
+            if (role == .client) return c.endResponseBlock(s, trailers, end_stream);
             // nghttp2_http_on_request_headers / on_trailer_headers (trailers
             // must end the stream) / on_remote_end_stream.
             const valid = if (trailers) end_stream else c.req.end();
@@ -800,6 +889,33 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (!trailers) {
                 s.content_left = if (c.req.content_length) |n| @intCast(n) else -1;
                 s.flags.headers_received = true;
+            }
+            if (end_stream) {
+                s.onRemoteEnd() catch return c.provokedReset(s, .protocol_error);
+                c.endRemote(s);
+            }
+            c.handler.onHeadersEnd(s, end_stream) catch return c.handlerReset(s);
+            s.flags.in_trailers = false;
+        }
+
+        /// The client role's end of a response block:
+        /// nghttp2_http_on_response_headers (an informational head leaves
+        /// the stream expecting the final one; a final one with no body,
+        /// to HEAD or as 204 or 304, must carry none), on_trailer_headers
+        /// and on_remote_end_stream.
+        fn endResponseBlock(c: *Self, s: *Stream, trailers: bool, end_stream: bool) RecvError!void {
+            if (trailers) {
+                if (!end_stream) return c.provokedReset(s, .protocol_error);
+            } else {
+                const status = c.req.status orelse return c.provokedReset(s, .protocol_error);
+                if (status < 200) {
+                    s.content_left = -1;
+                } else {
+                    s.flags.expect_final = false;
+                    s.flags.headers_received = true;
+                    const body = !s.flags.head_request and status != 204 and status != 304;
+                    s.content_left = if (!body) 0 else if (c.req.content_length) |n| @intCast(n) else -1;
+                }
             }
             if (end_stream) {
                 s.onRemoteEnd() catch return c.provokedReset(s, .protocol_error);
@@ -838,6 +954,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         fn refuseHead(c: *Self, s: *Stream, blk: *hpack.Block, trailers: bool, end_stream: bool) RecvError!void {
             try c.skipBlock(s, blk);
             if (s.state == .closed) return;
+            // A client resets the stream: the server's doing, but no flood
+            // (the size is per block, the block already paid for).
+            if (role == .client) {
+                c.handler.onHeadRefused(s);
+                return c.handlerReset(s);
+            }
             if (trailers or s.flags.head_sent) return c.provokedReset(s, .internal_error);
             try c.chargeRefused();
             c.writeHeaders(s.id, 431, &.{}, true) catch |err| switch (err) {
@@ -893,7 +1015,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // RST_STREAM; D15 point 1 only those on streams we hadn't
             // answered (a browser's navigation or a gRPC cancel after the
             // response is ordinary traffic). INTENTIONAL.md, limits 1.
-            if (!answered) try c.chargeReset();
+            if (role == .server and !answered) try c.chargeReset();
         }
 
         /// nghttp2_session_on_settings_received.
@@ -903,6 +1025,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 c.settings_in_flight = false;
                 return c.applyLocalSettings();
             }
+            // A server's SETTINGS without MAX_CONCURRENT_STREAMS leaves it
+            // unlimited (RFC 9113 §6.5.2): the assumption ends with its
+            // first (nghttp2_session_on_settings_received, :4495, as
+            // NGHTTP2_DEFAULT_MAX_CONCURRENT_STREAMS).
+            if (role == .client and c.first_settings) c.remote.max_concurrent_streams = std.math.maxInt(u32);
             c.first_settings = false;
             // nghttp2's early flood check (:5897): with the budget spent,
             // the entries aren't applied.
@@ -911,7 +1038,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             var it = st.iterator();
             while (it.next()) |e| switch (e.id) {
                 // The encoder is static-only (INTENTIONAL.md, HPACK 4).
-                .header_table_size, .enable_push => {},
+                .header_table_size => {},
+                // RFC 9113 §6.5.2: a server must not enable push.
+                .enable_push => if (role == .client and e.value != 0)
+                    return c.terminate(.protocol_error, "SETTINGS: server attempted to enable push"),
                 .max_concurrent_streams => c.remote.max_concurrent_streams = e.value,
                 .initial_window_size => {
                     const new: u31 = @intCast(e.value);
@@ -972,14 +1102,40 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.out.commit(frame.writePing(b, true, p.data));
         }
 
-        /// nghttp2_session_on_goaway_received, but an id of the peer's own
-        /// parity is not an error (INTENTIONAL.md, the session 6). A server
-        /// opens no streams, so none close.
+        /// nghttp2_session_on_goaway_received, but for a server an id of
+        /// the peer's own parity is not an error (INTENTIONAL.md, the
+        /// session 6), and as a server opens no streams, none close. A
+        /// client checks the parity (:4810) and closes its streams above
+        /// the last-stream-id with REFUSED_STREAM, unsent RST_STREAM
+        /// (session_close_stream_on_goaway): the server never processed
+        /// them, so they may be retried (RFC 9113 §6.8).
         fn onGoaway(c: *Self, g: frame.Goaway) RecvError!void {
+            if (role == .client and g.last_stream_id & 1 == 0 and g.last_stream_id != 0)
+                return c.terminate(.protocol_error, "GOAWAY: invalid last_stream_id");
             if (g.last_stream_id > c.remote_last)
                 return c.terminate(.protocol_error, "GOAWAY: invalid last_stream_id");
             c.remote_last = g.last_stream_id;
+            if (role == .client) {
+                c.goaway_recv = true;
+                c.refuseAbove(g.last_stream_id);
+            }
             c.handler.onGoaway(g.last_stream_id, g.code);
+        }
+
+        /// Closes our streams above `last` as REFUSED_STREAM, remembered as
+        /// reset by us (what the server still sends on them is ignored).
+        /// One walk: `closeStream` only removes the stream from the table,
+        /// and the removal's backward shift moves the rest of its run one
+        /// slot back, into the slot just read, so that slot is read again
+        /// (StreamTable.next). What wraps past the end lands in slots
+        /// already read, whose streams above `last` are gone.
+        fn refuseAbove(c: *Self, last: u31) void {
+            var i: usize = 0;
+            while (c.table.next(&i)) |s| {
+                if (s.id <= last) continue;
+                c.closeStream(s, .refused_stream, .rst_sent);
+                i -= 1;
+            }
         }
 
         /// nghttp2_session_on_window_update_received.
@@ -1114,7 +1270,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// Rapid reset (CVE-2023-44487) and provoked resets. nghttp2 answers
         /// a graceful GOAWAY INTERNAL_ERROR (:4196); PLAN §5.4 and
         /// INTENTIONAL.md, limits 2: ENHANCE_YOUR_CALM, and close.
+        /// Not for the client role (PLAN M5: a busy server's refusals and
+        /// cancels are ordinary traffic): what a client queues in answer
+        /// still counts against the control budget.
         fn chargeReset(c: *Self) RecvError!void {
+            if (role == .client) return;
             return c.charge(&c.reset_budget, "too many stream resets");
         }
 
@@ -1253,6 +1413,58 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (@as(i64, s.recv_window) + s.recv_unacked + by > frame.max_window_size) return;
             try c.queueWindowUpdate(s.id, by);
             s.recv_window += by;
+        }
+
+        /// The client role: a new stream for a request whose head is
+        /// `hdrs` (pseudo-headers first; HEAD is noted, its response has
+        /// no body), on the next odd ID, its HEADERS queued now; `user` is
+        /// the stream's before any callback can see it. With `end_stream`
+        /// the request has no body; else `submitData` and
+        /// `submitTrailers` send it, as a server's response.
+        /// nghttp2_submit_request2 and nghttp2_session_open_stream.
+        pub fn submitRequest(c: *Self, hdrs: []const hpack.Field, end_stream: bool, user: ?*anyopaque) RequestError!*Stream {
+            comptime std.debug.assert(role == .client);
+            c.enter();
+            defer c.leave();
+            if (c.dead or c.goaway_recv or c.goaway_sent != null) return error.GoawayReceived;
+            if (c.table.size >= c.remote.max_concurrent_streams) return error.StreamLimit;
+            if (c.last_sent > std.math.maxInt(u31) - 2) return error.StreamIdsExhausted;
+            const id: u31 = if (c.last_sent == 0) 1 else c.last_sent + 2;
+            const s = try c.slab.create(id, c.remote.initial_window, c.local.initial_window);
+            c.table.insert(s) catch |err| {
+                c.slab.destroy(s);
+                return err;
+            };
+            c.writeHeaders(id, null, hdrs, end_stream) catch |err| {
+                _ = c.table.remove(id);
+                c.slab.destroy(s);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.HeadersTooLarge => error.HeadersTooLarge,
+                    error.StreamClosed => unreachable,
+                };
+            };
+            c.opened.markOpened(c.last_sent, id);
+            c.last_sent = id;
+            s.state = .open;
+            s.user = user;
+            s.flags.expect_final = true;
+            s.flags.head_sent = true;
+            for (hdrs) |f| if (std.mem.eql(u8, f.name, ":method")) {
+                s.flags.head_request = std.mem.eql(u8, f.value, "HEAD");
+                break;
+            };
+            if (end_stream) {
+                s.flags.answered = true;
+                c.endLocal(s);
+            }
+            return s;
+        }
+
+        /// The client role: whether `submitRequest` would find room under
+        /// the server's limit (and no GOAWAY).
+        pub fn canOpen(c: *const Self) bool {
+            return !c.dead and !c.goaway_recv and c.goaway_sent == null and c.table.size < c.remote.max_concurrent_streams;
         }
 
         /// The response head: `:status` then `hdrs`, HEADERS split into
