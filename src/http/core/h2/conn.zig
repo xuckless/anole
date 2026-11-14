@@ -273,9 +273,13 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// Spare Pending nodes, at most `spare_cap`, so that a warm
         /// connection's responses allocate nothing (PLAN §2.2, K1/K2),
         /// a burst of up to max_concurrent_streams included. Only nodes
-        /// once live are kept, and `releaseIdle` frees them all.
+        /// once live are kept; `trimSpares` frees those a whole trim
+        /// interval left unused (a burst's high-water mark on a connection
+        /// that keeps a stream open) and `releaseIdle` frees them all.
         spare: std.DoublyLinkedList = .{},
         spare_len: u8 = 0,
+        /// The fewest spares since the last `trimSpares`.
+        spare_low: u8 = 0,
         /// min(128, max_concurrent_streams), the engine's EStream rule.
         spare_cap: u8,
         /// The caller's time in whole seconds, for the flood budgets.
@@ -1036,6 +1040,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         fn newPending(c: *Self) Allocator.Error!*Pending {
             const p: *Pending = if (c.spare.popFirst()) |node| blk: {
                 c.spare_len -= 1;
+                c.spare_low = @min(c.spare_low, c.spare_len);
                 break :blk @fieldParentPtr("node", node);
             } else try c.gpa.create(Pending);
             c.pending_nodes += 1;
@@ -1408,7 +1413,17 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.table = .init(c.gpa, max_live, seed);
             while (c.spare.popFirst()) |node| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", node)));
             c.spare_len = 0;
+            c.spare_low = 0;
             return true;
+        }
+
+        /// Once a trim interval: the spare Pending nodes unused since the
+        /// last call go, down to `floor` (as the server's EStream spares).
+        pub fn trimSpares(c: *Self, floor: u8) void {
+            const n = @min(c.spare_low, c.spare_len -| floor);
+            for (0..n) |_| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", c.spare.popFirst().?)));
+            c.spare_len -= n;
+            c.spare_low = c.spare_len;
         }
 
         /// What to write now: queued frames, plus DATA framed from the

@@ -513,6 +513,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const n = @min(conn.spare_low, conn.spares.items.len -| min_spare_streams);
                 for (0..n) |_| conn.spares.pop().?.destroy(conn.allocator);
                 conn.spare_low = conn.spares.items.len;
+                conn.proto.trimSpares(min_spare_streams);
                 if (!conn.flushing and conn.open_streams == 0 and conn.proto.out.idle() and conn.proto.out.blocks.items.len > 0) {
                     conn.proto.out.release();
                     if (comptime is_test) _ = test_out_releases.fetchAdd(1, .monotonic);

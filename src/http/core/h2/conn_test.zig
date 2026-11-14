@@ -1465,6 +1465,39 @@ test "h2 conn: a burst of 100 responses on a warm connection allocates nothing" 
     try expectEqual(0, t.c.spare_len);
 }
 
+test "h2 conn: a burst's spare Pending nodes are trimmed while a stream stays open" {
+    const t = try ready(.{});
+    defer t.destroy();
+    t.rec.answer = true;
+    t.rec.record = false;
+    // A long-lived stream: the client never ends it, so releaseIdle can't run.
+    try t.feed(try t.headers(1, &get, false));
+    _ = try t.drain();
+    var in: [100][]const u8 = undefined;
+    var id: u31 = 3;
+    for (&in) |*b| {
+        b.* = try t.headers(id, &get, true);
+        id += 2;
+    }
+    try t.feed(try std.mem.concat(t.arena(), u8, &in));
+    _ = try t.drain();
+    try expectEqual(100, t.c.spare_len);
+    try expect(!t.c.releaseIdle());
+    // The first trim interval saw the burst use them all; the second
+    // finds them unused and keeps the floor.
+    t.c.trimSpares(16);
+    try expectEqual(100, t.c.spare_len);
+    t.c.trimSpares(16);
+    try expectEqual(16, t.c.spare_len);
+    // A spare taken in an interval is not trimmed at its end.
+    try t.feed(try t.headers(id, &get, true));
+    _ = try t.drain();
+    t.c.trimSpares(0);
+    try expectEqual(1, t.c.spare_len);
+    t.c.trimSpares(0);
+    try expectEqual(0, t.c.spare_len);
+}
+
 test "h2 conn: spare Pending nodes are capped at max_concurrent_streams" {
     const t = try ready(.{ .max_concurrent_streams = 8 });
     defer t.destroy();
