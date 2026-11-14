@@ -1165,16 +1165,38 @@ test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" 
     try fx.start(counting.allocator(), testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    // More than the old 32 spare Pending nodes: the cap follows
-    // max_concurrent_streams (250 here) up to 128, as the EStream spares.
-    for (0..3) |round| {
+    // The spares (Pending nodes and EStreams, capped at
+    // min(128, max_concurrent_streams), 250 here) keep the most a burst
+    // ever had alive at once, and how many that is depends on how far the
+    // handlers get before the flusher frames their DATA. So the warm-up
+    // takes the worst case on purpose: with the server's send windows shut,
+    // every response is queued (its HEADERS out, its DATA held) before any
+    // DATA is framed, all 100 streams and their Pending nodes alive at once.
+    var freed = engine.test_freed.load(.acquire);
+    try c.settingsWindow(0);
+    var warm: [100]u31 = undefined;
+    for (&warm, 0..) |*id, i| id.* = try c.open("GET", if (i % 2 == 0) "/users/1" else "/nw/hello", &.{}, true);
+    try c.flush();
+    // A response's DATA is queued under the same lock as its HEADERS.
+    for (warm) |id| while (c.get(id).status == 0) try c.readOne();
+    try c.settingsWindow(65535);
+    try c.flush();
+    try c.untilAll();
+    for (warm, 0..) |id, i| try expectEqualStrings(if (i % 2 == 0) "user 1" else "hello", c.get(id).body.items);
+    // Every stream of a burst is let go before the next one starts, so the
+    // next one has the spares of all 100 (a stream outlives its response
+    // by the flusher's `advance`, which may come after the client read it).
+    try wait.waitAtLeast(testing.io, "the server let the warm-up's streams go", &engine.test_freed, freed + 100);
+    for (0..2) |round| {
         var ids: [100]u31 = undefined;
         const before = counting.count.load(.monotonic);
+        freed = engine.test_freed.load(.acquire);
         for (&ids, 0..) |*id, i| id.* = try c.open("GET", if (i % 2 == 0) "/users/1" else "/nw/hello", &.{}, true);
         try c.flush();
         try c.untilAll();
+        try wait.waitAtLeast(testing.io, "the server let the burst's streams go", &engine.test_freed, freed + 100);
         for (ids, 0..) |id, i| try expectEqualStrings(if (i % 2 == 0) "user 1" else "hello", c.get(id).body.items);
-        if (round == 2) try expectEqual(before, counting.count.load(.monotonic));
+        if (round == 1) try expectEqual(before, counting.count.load(.monotonic));
     }
 }
 

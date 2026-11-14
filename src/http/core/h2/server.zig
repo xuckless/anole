@@ -215,6 +215,8 @@ pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is
 /// Tests only: the most arena one stream's exchange used (bytes handed
 /// out over its nodes), read before its reset (`maybeFree`).
 pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
+/// Tests only: streams let go (`maybeFree`), to the spares or freed.
+pub var test_freed: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: the arena the last stream put back to the spares kept.
 pub var test_arena_kept: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
 
@@ -918,6 +920,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// arena trimmed, or to the allocator. Under the lock.
             fn maybeFree(conn: *Conn, es: *EStream) void {
                 if (es.protocol_hold or es.handler_hold or es.out_hold) return;
+                defer if (comptime is_test) {
+                    _ = test_freed.fetchAdd(1, .release);
+                };
                 if (es.room_waiting) {
                     conn.room_waiters.remove(&es.room_node);
                     es.room_waiting = false;
