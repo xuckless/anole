@@ -14,6 +14,7 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const DeadlineReader = @import("../server/test_socket.zig").DeadlineReader;
 const placement = @import("../placement.zig");
+const block_cache = @import("../block_cache.zig");
 const Detached = @import("../detach.zig").Detached;
 const Parked = @import("../parked.zig").Parked;
 const wait = @import("anole_test_wait");
@@ -368,6 +369,7 @@ const Handlers = struct {
         s.router.get("/held", held);
         s.router.post("/ack", ack);
         s.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
+        s.router.addRouteWith(.get, "/nw/baseline", baseline, .{ .no_wait = true });
         s.router.addRouteWith(.post, "/nw/echo", echo, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/big", big, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/detach", Det.handler, .{ .no_wait = true });
@@ -377,6 +379,13 @@ const Handlers = struct {
 
     fn hello(_: *Request, res: *Response) !void {
         res.body = "hello";
+    }
+
+    /// HttpArena's baseline route: the sum of two query integers.
+    fn baseline(req: *Request, res: *Response) !void {
+        const a = std.fmt.parseInt(i64, req.queryParam("a") orelse "0", 10) catch 0;
+        const b = std.fmt.parseInt(i64, req.queryParam("b") orelse "0", 10) catch 0;
+        try res.print(.text, "{d}", .{a + b});
     }
 
     fn user(req: *Request, res: *Response) !void {
@@ -715,7 +724,7 @@ test "h2 engine: a small streamed body takes one block, and its end rides on its
     try expectEqual(blocks + 1, engine.test_blocks.load(.acquire));
 }
 
-test "h2 engine: a read's many small responses go out in one write" {
+test "h2 budget: a read's many small responses go out in at most one write each" {
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
@@ -1007,6 +1016,8 @@ test "h2 engine: concurrent upload and download with small windows" {
 const CountingAllocator = struct {
     inner: Allocator,
     count: std.atomic.Value(usize) = .init(0),
+    /// The largest size asked for (alloc, remap or in-place growth).
+    max_len: std.atomic.Value(usize) = .init(0),
 
     fn allocator(self: *CountingAllocator) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -1014,15 +1025,18 @@ const CountingAllocator = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.max_len.fetchMax(len, .monotonic);
         return self.inner.rawAlloc(len, alignment, ra);
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.max_len.fetchMax(new_len, .monotonic);
         return self.inner.rawResize(memory, alignment, new_len, ra);
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.max_len.fetchMax(new_len, .monotonic);
         return self.inner.rawRemap(memory, alignment, new_len, ra);
     }
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
@@ -1031,7 +1045,7 @@ const CountingAllocator = struct {
     }
 };
 
-test "h2 engine: a warm connection serves requests without allocating" {
+test "h2 budget: a warm connection serves requests without allocating" {
     // The release behaviour: a spare stream keeps its arena's memory.
     const safety = @import("anole_safety");
     safety.arena_poisoning.store(false, .monotonic);
@@ -1053,11 +1067,35 @@ test "h2 engine: a warm connection serves requests without allocating" {
     const before = counting.count.load(.monotonic);
     for (0..20) |_| {
         const a = try c.request("GET", "/users/2", null);
-        const b = try c.request("GET", "/nw/hello", null);
+        const b = try c.request("GET", "/nw/baseline?a=1&b=1", null);
         try expectEqualStrings("user 2", (try c.until(a)).body.items);
-        try expectEqualStrings("hello", (try c.until(b)).body.items);
+        try expectEqualStrings("2", (try c.until(b)).body.items);
     }
     try expectEqual(before, counting.count.load(.monotonic));
+}
+
+test "h2 budget: no allocation above malloc_max on the body and out paths" {
+    var counting: CountingAllocator = .{ .inner = testing.allocator };
+    var fx: Fixture = undefined;
+    try fx.start(counting.allocator(), testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    // A 64 KiB request body and a 1 MB response: bodies past malloc_max go
+    // to block_cache and the out blocks are 16 KiB, so the server's
+    // allocator never sees more (stream arena growth is not a body or out
+    // path, and these requests stay inside its first node).
+    const body = try pattern(64 * 1024);
+    defer testing.allocator.free(body);
+    // The server's own setup (its pools, 252 KiB at the pin) is not the path.
+    counting.max_len.store(0, .monotonic);
+    for (0..3) |_| {
+        const up = try c.request("POST", "/echo", body);
+        const down = try c.request("GET", "/big", null);
+        try c.untilAll();
+        try expect(std.mem.eql(u8, body, c.get(up).body.items));
+        try expectEqual(Handlers.big_len, c.get(down).body.items.len);
+    }
+    try expect(counting.max_len.load(.monotonic) <= block_cache.malloc_max);
 }
 
 test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" {

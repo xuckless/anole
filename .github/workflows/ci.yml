@@ -367,6 +367,28 @@ jobs:
       - name: h2spec over h2c and over TLS
         run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/full
 
+  h2-budgets:
+    # M4: catches the HTTP/2 engine growing allocations or writes on its hot
+    # path. Counts only (allocations per warm request, writes per read,
+    # largest body/out allocation), never timings; the ratio budgets stay in
+    # the local atlas (TESTING.md D6). Budget table: research/s2/h2-m4/budgets.md.
+    name: h2-budgets (HTTP/2 allocation and write counts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: h2-budgets
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: HTTP/2 budgets (counts, not timings)
+        run: zig build core-test -Dtest-filter="h2 budget" --summary all
+
   autobahn:
     # K2: catches WebSocket protocol conformance (24 failing cases in release-0.2.0).
     name: Autobahn (WebSocket conformance, HTTP/1.1)
