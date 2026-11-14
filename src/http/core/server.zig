@@ -1307,6 +1307,17 @@ pub const Burst = struct {
                 const e = self.connection.getReadError() orelse error.Unexpected;
                 if (!self.watch.end(e == error.Canceled)) return e;
                 self.connection.clearReadError();
+                // The driver may end the wait with a deadline's cancel too,
+                // in the same pass (a sweep due with a look), and one wait
+                // reports one of the two. The other's error is still
+                // pending: taken here, it is the caller's to claim
+                // (`Timer.fired`). Left, it would fail the next wait after
+                // the caller re-set its deadline, which takes a claim back
+                // only while no error was reported since (`Lazy.retract`,
+                // zio's `retractAutoCancel`): nobody's cancel then, which
+                // the HTTP/2 reader takes for the server stopping (a TLS
+                // record half read was never closed at its keep-alive).
+                try self.io.checkCancel();
                 // Mid-record on TLS, say: the reads that follow wait.
                 return if (self.connection.parkable()) .idle else .ready;
             },
