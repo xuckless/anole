@@ -270,10 +270,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         closing_last: ?*std.SinglyLinkedList.Node = null,
         /// Pending nodes alive (borrowed parts not yet framed).
         pending_nodes: usize = 0,
-        /// Spare Pending nodes, at most `max_spare`, so that a warm
-        /// connection's responses allocate nothing (PLAN §2.2, K1/K2).
+        /// Spare Pending nodes, at most `spare_cap`, so that a warm
+        /// connection's responses allocate nothing (PLAN §2.2, K1/K2),
+        /// a burst of up to max_concurrent_streams included. Only nodes
+        /// once live are kept, and `releaseIdle` frees them all.
         spare: std.DoublyLinkedList = .{},
         spare_len: u8 = 0,
+        /// min(128, max_concurrent_streams), the engine's EStream rule.
+        spare_cap: u8,
         /// The caller's time in whole seconds, for the flood budgets.
         now_s: u64 = 0,
         /// PLAN §5.4's flood budgets: rapid and provoked resets (D15 point
@@ -296,7 +300,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         control_sealed: ControlEpoch = .{},
         control_open: ControlEpoch = .{},
 
-        const max_spare = 32;
+        const max_spare = 128;
 
         const ControlEpoch = struct {
             n: u32 = 0,
@@ -349,6 +353,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .slab = .init(gpa),
                 .table = .init(gpa, opts.max_concurrent_streams, opts.seed),
                 .recv_window = cw,
+                .spare_cap = @intCast(@max(1, @min(max_spare, opts.max_concurrent_streams))),
                 .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
                 .refused_budget = .init(opts.refused_stream_burst, opts.refused_stream_rate),
                 .empty_budget = .init(opts.limits.empty_frame_burst, opts.limits.empty_frame_rate),
@@ -1040,7 +1045,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// `p` is off its stream's list.
         fn freePending(c: *Self, p: *Pending) void {
             c.pending_nodes -= 1;
-            if (c.spare_len == max_spare) return c.gpa.destroy(p);
+            if (c.spare_len >= c.spare_cap) return c.gpa.destroy(p);
             p.node = .{};
             c.spare.prepend(&p.node);
             c.spare_len += 1;

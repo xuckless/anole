@@ -1433,6 +1433,88 @@ test "h2 conn: a warm connection's request and response allocate nothing" {
     try expectFrames(out, &.{ .{ .type = .headers, .id = 5 }, .{ .type = .headers, .id = 7 }, .{ .type = .data, .id = 5 }, .{ .type = .data, .id = 7 } });
 }
 
+test "h2 conn: a burst of 100 responses on a warm connection allocates nothing" {
+    var counting: testing.FailingAllocator = .init(testing.allocator, .{});
+    const t = try T.createSplit(testing.allocator, counting.allocator(), .{});
+    defer t.destroy();
+    t.rec.answer = true;
+    t.rec.record = false;
+    try t.handshake();
+    // Each response's DATA holds a Pending node until framed; a burst of
+    // 100 warms 100 spares (the cap is min(128, max_concurrent_streams)).
+    var id: u31 = 1;
+    for (0..2) |round| {
+        var in: [100][]const u8 = undefined;
+        for (&in) |*b| {
+            b.* = try t.headers(id, &get, true);
+            id += 2;
+        }
+        const bytes = try std.mem.concat(t.arena(), u8, &in);
+        const before = counting.allocations;
+        try t.feed(bytes);
+        var data: usize = 0;
+        for (try t.drain()) |f| {
+            if (f.type == .data) data += 1;
+        }
+        try expectEqual(100, data);
+        if (round == 1) try expectEqual(before, counting.allocations);
+        try expectEqual(100, t.c.spare_len);
+    }
+    // An idle connection gives them back.
+    try expect(t.c.releaseIdle());
+    try expectEqual(0, t.c.spare_len);
+}
+
+test "h2 conn: spare Pending nodes are capped at max_concurrent_streams" {
+    const t = try ready(.{ .max_concurrent_streams = 8 });
+    defer t.destroy();
+    try expectEqual(8, t.c.spare_cap);
+    t.rec.record = false;
+    // Two DATA submits a stream: 16 Pending nodes live at once.
+    var id: u31 = 1;
+    while (id < 16) : (id += 2) {
+        try t.feed(try t.headers(id, &get, true));
+        const s = t.stream(id);
+        try t.c.submitHead(s, 200, &.{}, false);
+        try t.c.submitData(s, &.{"a"}, false);
+        try t.c.submitData(s, &.{"b"}, true);
+    }
+    try expectEqual(16, t.c.pending_nodes);
+    _ = try t.drain();
+    try expectEqual(0, t.c.pending_nodes);
+    try expectEqual(8, t.c.spare_len);
+}
+
+test "h2 conn: WINDOW_UPDATEs per KiB consumed follow the half-window rule" {
+    const t = try ready(.{ .initial_window = 65535, .connection_window = 1024 * 1024 });
+    defer t.destroy();
+    t.rec.record = false;
+    try t.feed(try t.headers(1, &post, false));
+    _ = try t.drain();
+    const kib: [1024]u8 = @splat(1);
+    // Under half of either window: nothing.
+    for (0..31) |_| try t.feed(try t.data(1, &kib, false));
+    try expectFrames(try t.drain(), &.{});
+    // 1 MiB in all: a stream update every 32 KiB (half of 65535 rounds
+    // down to 32767), a connection update every 512 KiB, each for all
+    // consumed since the last.
+    for (31..1024) |_| try t.feed(try t.data(1, &kib, false));
+    var stream_updates: usize = 0;
+    var conn_updates: usize = 0;
+    for (try t.drain()) |f| {
+        try expectEqual(frame.Type.window_update, f.type);
+        if (f.id == 0) {
+            conn_updates += 1;
+            try expectEqual(512 * 1024, f.inc);
+        } else {
+            stream_updates += 1;
+            try expectEqual(32 * 1024, f.inc);
+        }
+    }
+    try expectEqual(32, stream_updates);
+    try expectEqual(2, conn_updates);
+}
+
 test "h2 conn: a head that can't fit 64 KiB is refused before the buffer grows" {
     var peak: Peak = .{ .child = testing.allocator };
     const t = try T.createSplit(testing.allocator, peak.allocator(), .{});

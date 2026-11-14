@@ -1060,6 +1060,28 @@ test "h2 engine: a warm connection serves requests without allocating" {
     try expectEqual(before, counting.count.load(.monotonic));
 }
 
+test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" {
+    const safety = @import("anole_safety");
+    safety.arena_poisoning.store(false, .monotonic);
+    defer safety.arena_poisoning.store(true, .monotonic);
+    var counting: CountingAllocator = .{ .inner = testing.allocator };
+    var fx: Fixture = undefined;
+    try fx.start(counting.allocator(), testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    // More than the old 32 spare Pending nodes: the cap follows
+    // max_concurrent_streams (250 here) up to 128, as the EStream spares.
+    for (0..3) |round| {
+        var ids: [100]u31 = undefined;
+        const before = counting.count.load(.monotonic);
+        for (&ids, 0..) |*id, i| id.* = try c.open("GET", if (i % 2 == 0) "/users/1" else "/nw/hello", &.{}, true);
+        try c.flush();
+        try c.untilAll();
+        for (ids, 0..) |id, i| try expectEqualStrings(if (i % 2 == 0) "user 1" else "hello", c.get(id).body.items);
+        if (round == 2) try expectEqual(before, counting.count.load(.monotonic));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The seams: detached and parked responses, RFC 8441 tunnels.
 
