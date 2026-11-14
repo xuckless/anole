@@ -96,6 +96,8 @@ const Client = struct {
     answered_protocol_len: usize = 0,
     answered_user: [32]u8 = undefined,
     answered_user_len: usize = 0,
+    /// The `sec-websocket-extensions` header to send, if any.
+    extensions: ?[]const u8 = null,
     path: []const u8 = "/chat",
     /// The answer's `retry-after`, in seconds; 0 for none.
     retry_after: u16 = 0,
@@ -186,6 +188,10 @@ const Client = struct {
         }
         if (self.protocols) |p| {
             nva_buf[n] = nv("sec-websocket-protocol", p);
+            n += 1;
+        }
+        if (self.extensions) |e| {
+            nva_buf[n] = nv("sec-websocket-extensions", e);
             n += 1;
         }
         const nva = nva_buf;
@@ -1176,4 +1182,46 @@ test "WebSocket over HTTP/2 on the new engine: a send from a task on another exe
         try std.testing.expectEqualStrings("from another connection", try a.nextFrame(&op, &back));
     }
     try std.testing.expect(dusty.h2_core_for_tests.server.test_hops.load(.acquire) >= hops + 3);
+}
+
+const features = @import("build_options");
+
+/// Whether the last socket `deflateHandler` opened compresses outside the
+/// stream's arena.
+var deflate_apart: std.atomic.Value(bool) = .init(false);
+
+fn deflateHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    if (comptime features.compression) if (ws._deflate) |d| deflate_apart.store(d.allocator.ptr != req.arena.ptr, .release);
+    ws.close(.normal, "") catch {};
+}
+
+// The stream's arena has one owner at a time (`dusty.LocalArena`), and
+// tasks on other executors compress what they send (`Rooms`), so the
+// compressor's buffers must not come from it (#171).
+test "WebSocket over HTTP/2 on the new engine: permessage-deflate keeps its buffers out of the stream's arena" {
+    if (comptime !features.compression) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .http2 = .{ .enable_connect_protocol = true } }, {});
+    defer server.deinit();
+    server.router.get("/deflate", deflateHandler);
+    var serving: Serving = undefined;
+    try serving.start(&server);
+    defer serving.stop();
+
+    var client: Client = undefined;
+    try client.init(io, serving.address);
+    defer client.deinit();
+    client.path = "/deflate";
+    client.extensions = "permessage-deflate";
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    try test_wait.waitFlag(io, "the deflate handler saw its buffers apart from the arena", &deflate_apart);
 }
