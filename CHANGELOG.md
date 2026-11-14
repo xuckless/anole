@@ -3,6 +3,23 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Performance
+
+- **Request arenas without atomics** (#171): the request, HTTP/2 stream
+  and HTTP/3 stream arenas are Zig 0.17's arena minus its lock-free
+  machinery (src/http/core/arena.zig), which cost about 9% of an HTTP/2
+  request's CPU. `req.arena` was always documented as not thread-safe;
+  that is unchanged, but Debug builds now panic when two tasks allocate
+  from it at once, where the old arena hid it.
+
+### Fixed
+
+- WebSocket permessage-deflate over HTTP/2 and HTTP/3 keeps its buffers out
+  of the stream's arena: tasks on other executors (`Rooms`) compress what
+  they send, which the non-atomic arena does not allow.
+
 ## 0.5.4 (2026-11-12)
 
 S2 tier 3 without the HTTP/2 engine: zio's upstream merged, HTTP/1.x deadlines on a once-a-second sweep, per-executor byte budgets and a task cap, direct UDP batches on io_uring; two batches of bug fixes; and the HTTP/2 takeover's protocol core (M1 and M2, added but not used yet).

@@ -960,3 +960,57 @@ test "deadline sweep: a lazy deadline less than a sweep away gets an exact timer
 }
 
 const park_sweep = dusty._park.sweep_interval;
+
+test "deadline sweep: a deadline the sweep ends in the same pass as the park delay is the timer's to claim" {
+    if (!dusty._park.supported) return error.SkipZigTest;
+    try onTask(struct {
+        fn body(io: std.Io, shelf: *Shelf) !void {
+            const gpa = std.testing.allocator;
+            var listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{});
+            defer listener.deinit(io);
+            const peer = try listener.socket.address.connect(io, .{ .mode = .stream });
+            defer peer.close(io);
+            const end = try listener.accept(io);
+            defer end.close(io);
+            var connection: dusty.Connection = undefined;
+            try connection.initPlain(gpa, io, end);
+            defer connection.deinit();
+            var read_buffer: [64]u8 = undefined;
+            connection.useReadBuffer(&read_buffer);
+
+            var timer: Timer = .init(null);
+            timer.register(shelf);
+            defer timer.unregister();
+            var burst: dusty.Burst = .{
+                .connection = &connection,
+                .io = io,
+                .timer = &timer,
+                .park_after = .fromMilliseconds(30),
+                .deadline = null,
+            };
+            shelf.watch(&burst.watch);
+            defer shelf.unwatch(&burst.watch);
+            // The keep-alive, say: on the sweep.
+            const d = due(io);
+            timer.setLazy(io, d);
+            // The driver, while the read waits: the wait has lasted the park
+            // delay at the same pass as the sweep finds the deadline past,
+            // so the task is canceled twice before it runs again.
+            var driver = try io.concurrent(struct {
+                fn run(s: *Shelf, deadline: std.Io.Clock.Timestamp) void {
+                    for (0..4) |_| s.lookAtWatches();
+                    s.sweep(at(deadline, 0));
+                }
+            }.run, .{ shelf, d });
+            const input = burst.waitInput();
+            driver.await(io);
+            // The park delay's cancel ended the wait; the deadline's is
+            // reported too, for the timer to claim, rather than left to fail
+            // a later wait as nobody's (the server stopping, to the reader).
+            try std.testing.expectError(error.Canceled, input);
+            try std.testing.expect(timer.fired());
+            try io.checkCancel();
+            try std.testing.expectEqual(1, shelf.test_lazy_fired.load(.monotonic));
+        }
+    }.body);
+}

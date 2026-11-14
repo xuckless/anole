@@ -2322,7 +2322,6 @@ const Core = struct {
                             if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)][@intFromBool(libdeflate)] = h2ClientModule(
                                 b,
                                 dusty_mod,
-                                c_mods.nghttp2.?,
                                 if (tls) seam else null,
                                 safety,
                                 target,
@@ -2346,11 +2345,11 @@ const Core = struct {
 
     /// The HTTP/2 client, as its own module so dusty's client can take it
     /// (`h2_client`): a TLS connection on which ALPN picks "h2" is handed
-    /// to it. The two modules import each other.
+    /// to it. The two modules import each other. It runs on dusty's HTTP/2
+    /// protocol core (`dusty.h2_proto`), not nghttp2 (M5).
     fn h2ClientModule(
         b: *std.Build,
         dusty_mod: *std.Build.Module,
-        nghttp2: *std.Build.Module,
         tls: ?*std.Build.Module,
         safety: *std.Build.Module,
         target: std.Build.ResolvedTarget,
@@ -2365,7 +2364,6 @@ const Core = struct {
         const opts = b.addOptions();
         opts.addOption(bool, "tls", tls != null);
         mod.addOptions("anole_h2_options", opts);
-        mod.addImport("anole_nghttp2_c", nghttp2);
         mod.addImport("dusty", dusty_mod);
         mod.addImport("anole_safety", safety);
         if (tls) |m| mod.addImport("anole_dusty_tls", m);

@@ -3,7 +3,8 @@
 //! THIRD_PARTY_NOTICES): HPACK, frames, request field checks, the flood
 //! limits, the stream state, and the sans-IO connection core (conn.zig) with
 //! its output queue (out.zig), and the server engine on them (server.zig),
-//! which serves the server's HTTP/2. The client is still on nghttp2 (M5).
+//! which serves the server's HTTP/2. src/h2/client.zig is the client on the
+//! core's client role (`conn.Conn(.client, H)`, M5).
 
 const std = @import("std");
 
@@ -27,6 +28,7 @@ test {
     _ = @import("limits_test.zig");
     _ = @import("streams_test.zig");
     _ = @import("conn_test.zig");
+    _ = @import("conn_client_test.zig");
     _ = @import("conn_limits_test.zig");
     // Against nghttp2's own inflater; compiled out with -Dhttp2=false.
     if (@import("build_options").use_http2) {

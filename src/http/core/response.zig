@@ -946,6 +946,10 @@ pub const Response = struct {
     /// that an ordinary one takes little of the arena. The table grows to
     /// `max_headers` for one with more.
     const initial_header_room = 16;
+    /// The same for a response to a sink (an HTTP/2 or HTTP/3 stream):
+    /// fewer, as every stream a connection has open at once, and every
+    /// spare one, keeps an arena of its own (M4, #179).
+    const initial_sink_header_room = 8;
 
     /// A response written to an HTTP/1.x connection. Made by the server;
     /// handlers get theirs. The body buffer's first segment is taken once
@@ -969,7 +973,7 @@ pub const Response = struct {
             .arena = arena,
             ._sink = sink,
             .io = io,
-            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_sink_header_room)),
             ._max_headers = max_headers,
         };
     }
@@ -983,8 +987,9 @@ pub const Response = struct {
         return true;
     }
 
-    /// `headers.put`, the table grown first if it is full.
-    fn putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+    /// `headers.put`, the table grown first if it is full. Public for the
+    /// response cache, which replays headers it already checked.
+    pub fn _putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
         if (self.headers.get(name) == null and !self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.put(name, value);
     }
@@ -1226,7 +1231,7 @@ pub const Response = struct {
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
-        try self.putHeader(name, value);
+        try self._putHeader(name, value);
     }
 
     /// Adds a header even if the response has one by that name already:
@@ -1238,7 +1243,7 @@ pub const Response = struct {
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
-        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self.putHeader(name, value);
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self._putHeader(name, value);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add(name, value);
     }
@@ -1304,6 +1309,12 @@ pub const Response = struct {
             self._chunked = true;
         }
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
+        // A sink sizes its body writer once the head is recorded, on its
+        // first `body()` after it. Taken here, on the handler's task: the
+        // first write may come from a task on another executor (a
+        // WebSocket's `send`), and the buffer comes from the stream's
+        // arena, which is not thread-safe (#171).
+        if (self._sink) |sink| _ = sink.body();
         self.liftDeadline();
         return .init(self, buf, compressor);
     }
@@ -1814,7 +1825,7 @@ pub const Response = struct {
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;
         try self.header("Upgrade", "websocket");
-        try self.putHeader("Connection", "Upgrade");
+        try self._putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self._streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
@@ -2364,7 +2375,7 @@ pub const Response = struct {
     fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
         if (self._send_date and self.headers.get("Date") == null) {
             const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
-            self.putHeader("Date", date) catch {};
+            self._putHeader("Date", date) catch {};
         }
     }
 
@@ -5804,6 +5815,8 @@ const TestSink = struct {
     content_type: []const u8 = "",
     interim: ?http.Status = null,
     heads: usize = 0,
+    /// `body()` calls after the head was recorded.
+    bodies_after_head: usize = 0,
     ends: usize = 0,
     trailer_grpc_status: []const u8 = "",
     body_buf: [4096]u8 = undefined,
@@ -5842,6 +5855,7 @@ const TestSink = struct {
     }
     fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
+        if (self.heads != 0) self.bodies_after_head += 1;
         return &self.body_writer;
     }
     fn end(ptr: *anyopaque, trailers: ?*const http.Headers) std.Io.Writer.Error!void {
@@ -5893,6 +5907,24 @@ test "Response sink: a streamed body is unframed, of unknown length, and ends on
 
     try std.testing.expectEqualStrings("hello streamed world", ts.body());
     try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: a streamed body's writer is taken before stream returns, on the handler's task" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var buf: [8]u8 = undefined;
+    var body = try response.stream(&buf);
+    // The sink has been asked for its writer with the head recorded, so it
+    // has sized its buffer (from the stream's arena, for HTTP/3) before
+    // any other task can write the first bytes (#171).
+    try std.testing.expectEqual(@as(usize, 1), ts.bodies_after_head);
+    try body.interface.writeAll("x");
+    try body.end();
+    try response.write();
 }
 
 test "Response sink: trailers reach the end of the message" {

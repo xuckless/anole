@@ -58,6 +58,9 @@ pub const _Timer = @import("deadline.zig").Timer;
 /// A wait point with a sleeper count, for one task's waits that others
 /// notify (HTTP/2 and HTTP/3 streams, their writers).
 pub const Signal = @import("signal.zig").Signal;
+/// The request, stream and response arenas' allocator: std's arena for
+/// one owner at a time, without its atomics (#171).
+pub const LocalArena = @import("arena.zig").LocalArena;
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
 /// The cgroup's CPU and memory limits (HTTP/3 sizes its send memory by it).
@@ -186,6 +189,17 @@ pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("buil
 /// `test_h2_engine = .nghttp2`, for its hooks (`test_before_*`,
 /// src/http/h2_wake_test.zig).
 pub const h2_nghttp2_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
+/// The HTTP/2 protocol core and its codecs, for Anole's HTTP/2 client
+/// (src/h2/client.zig, on `conn.Conn(.client, H)`). Nothing here is analysed
+/// unless that client uses it.
+pub const h2_proto = struct {
+    pub const conn = @import("h2/conn.zig");
+    pub const fields = @import("h2/fields.zig");
+    pub const hpack = @import("h2/hpack.zig");
+    pub const frame = @import("h2/frame.zig");
+    pub const out = @import("h2/out.zig");
+    pub const streams = @import("h2/streams.zig");
+};
 /// Tests only: the HTTP/2 codecs, protocol core and the engine on them
 /// (h2/server.zig), for anole's tests on the real zio
 /// (src/http/h2_engine_zio_test.zig).
@@ -217,6 +231,8 @@ comptime {
     _ = @import("parked_test.zig");
     _ = @import("parked.zig");
     _ = @import("server/request_buffers.zig");
+    _ = @import("arena.zig");
+    _ = @import("arena_test.zig");
     _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");
     _ = @import("client.zig");

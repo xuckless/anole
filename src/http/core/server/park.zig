@@ -369,7 +369,7 @@ pub const Shelf = struct {
 
     /// The driver's look at the watches: ends each wait seen going on at
     /// the last three looks too.
-    fn lookAtWatches(self: *Shelf) void {
+    pub fn lookAtWatches(self: *Shelf) void {
         if (self.closed) return;
         var it = self.watches.first;
         while (it) |n| : (it = n.next) {

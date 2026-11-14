@@ -4,7 +4,8 @@
 // lib/nghttp2_hd.c. See LICENSE.nghttp2 and THIRD_PARTY_NOTICES.
 
 //! HPACK (RFC 7541): a decoder with the full dynamic table, and an encoder
-//! that uses only the static table and literals. No allocation.
+//! that uses only the static table and literals, its short fields kept
+//! encoded in a per-thread memo (`Memo`). No allocation.
 //!
 //! The decoder takes one complete header block (conn.zig concatenates
 //! HEADERS and CONTINUATION first), so nghttp2's 17-state incremental
@@ -27,6 +28,8 @@
 
 const std = @import("std");
 const huffman = @import("huffman.zig");
+
+const is_test = @import("builtin").is_test;
 
 pub const Field = struct {
     name: []const u8,
@@ -473,33 +476,93 @@ pub const Encoder = struct {
         return n;
     }
 
+    /// The block for `fields`. Each field's bytes are a pure function of
+    /// (name, value, never), so short fields that may be indexed come from
+    /// the thread's `memo` when seen before: the same bytes, without the
+    /// static-table search and the Huffman passes.
     pub fn encode(e: *Encoder, out: []u8, fields: []const Field) error{NoSpaceLeft}!usize {
+        return e.encodeBlock(out, fields, true);
+    }
+
+    /// `encode` without the memo, the reference its output is tested
+    /// against.
+    pub fn encodeUncached(e: *Encoder, out: []u8, fields: []const Field) error{NoSpaceLeft}!usize {
+        return e.encodeBlock(out, fields, false);
+    }
+
+    /// A `:status` field on its own, the way `encode` writes it (with the
+    /// first block's size update) without formatting the digits: the codes
+    /// in the static table are one indexed byte (h2o's encode_status,
+    /// nginx's ngx_http_v2_header_filter), the rest a literal on its name.
+    pub fn encodeStatus(e: *Encoder, out: []u8, code: u16) error{NoSpaceLeft}!usize {
+        std.debug.assert(code >= 100 and code <= 999);
+        var w: usize = 0;
+        if (e.size_update_pending) try putInt(out, &w, 0x20, 5, 0);
+        const index: u8 = switch (code) {
+            200 => 8,
+            204 => 9,
+            206 => 10,
+            304 => 11,
+            400 => 12,
+            404 => 13,
+            500 => 14,
+            else => 0,
+        };
+        if (index != 0) {
+            try putInt(out, &w, 0x80, 7, index);
+        } else {
+            const digits = [3]u8{ '0' + @as(u8, @intCast(code / 100)), '0' + @as(u8, @intCast(code / 10 % 10)), '0' + @as(u8, @intCast(code % 10)) };
+            try putInt(out, &w, 0x00, 4, 8);
+            try putString(out, &w, &digits);
+        }
+        e.size_update_pending = false;
+        return w;
+    }
+
+    fn encodeBlock(e: *Encoder, out: []u8, fields: []const Field, comptime memoize: bool) error{NoSpaceLeft}!usize {
         var w: usize = 0;
         if (e.size_update_pending) try putInt(out, &w, 0x20, 5, 0);
         for (fields) |f| {
             // deflate_nv's rule, "the same criteria used in Firefox".
             const never = f.never_index or std.mem.eql(u8, f.name, "authorization") or
                 (std.mem.eql(u8, f.name, "cookie") and f.value.len < 20);
-            const first: usize = static_names.get(f.name) orelse 0;
-            if (first != 0 and !never) {
-                // search_static_table: the exact match among the entries
-                // that share the name.
-                var i = first;
-                const match = while (i <= static_table.len and std.mem.eql(u8, static_table[i - 1].name, f.name)) : (i += 1) {
-                    if (std.mem.eql(u8, static_table[i - 1].value, f.value)) break i;
-                } else 0;
-                if (match != 0) {
-                    try putInt(out, &w, 0x80, 7, match);
-                    continue;
-                }
+            if (!memoize or never or !Memo.keeps(f)) {
+                try encodeField(out, &w, f, never);
+                continue;
             }
-            try putInt(out, &w, if (never) 0x10 else 0x00, 4, first);
-            if (first == 0) try putString(out, &w, f.name);
-            try putString(out, &w, f.value);
+            const set = &memo.sets[Memo.index(f)];
+            if (set.find(f)) |slot| {
+                if (is_test) memo.hits += 1;
+                const enc = slot.enc[0..slot.enc_len];
+                if (out.len - w < enc.len) return error.NoSpaceLeft;
+                @memcpy(out[w..][0..enc.len], enc);
+                w += enc.len;
+                continue;
+            }
+            if (is_test) memo.misses += 1;
+            const start = w;
+            try encodeField(out, &w, f, never);
+            set.offer(f, out[start..w]);
         }
         // Only once the block is whole: a NoSpaceLeft retry still sends it.
         e.size_update_pending = false;
         return w;
+    }
+
+    fn encodeField(out: []u8, w: *usize, f: Field, never: bool) error{NoSpaceLeft}!void {
+        const first: usize = static_names.get(f.name) orelse 0;
+        if (first != 0 and !never) {
+            // search_static_table: the exact match among the entries that
+            // share the name.
+            var i = first;
+            const match = while (i <= static_table.len and std.mem.eql(u8, static_table[i - 1].name, f.name)) : (i += 1) {
+                if (std.mem.eql(u8, static_table[i - 1].value, f.value)) break i;
+            } else 0;
+            if (match != 0) return putInt(out, w, 0x80, 7, match);
+        }
+        try putInt(out, w, if (never) 0x10 else 0x00, 4, first);
+        if (first == 0) try putString(out, w, f.name);
+        try putString(out, w, f.value);
     }
 
     /// encode_length with the representation's bits in `first`.
@@ -541,3 +604,115 @@ pub const Encoder = struct {
         }
     }
 };
+
+/// Encoded fields by (name, value), per thread: 16 sets of four slots of
+/// 135 bytes, about 8.4 KiB of zeroed TLS that glibc clears (and so makes
+/// resident) on every thread it creates, shared by every connection the
+/// thread serves; nothing is kept per connection. A lookup checks the
+/// whole key, so a collision is a miss, never wrong bytes. Replacement is
+/// second chance (CLOCK within a set): a miss takes an empty slot or one
+/// not hit since the last miss that found the set full of hit slots; that
+/// miss stores nothing and only clears the marks. So a one-off value (a
+/// new content-length, a request id) never evicts fields that every
+/// response uses, and a stale Date goes on the next miss after it. Safe
+/// without a lock: `encode` never yields, so one call has the thread's
+/// table to itself.
+const Memo = struct {
+    const set_count = 16;
+    const way_count = 4;
+    /// name + value bytes of a field kept: the common response fields
+    /// (content-type, date, grpc-*) fit, long one-off values don't.
+    const key_cap = 64;
+    /// A literal on a new name: one index byte, two length bytes (both
+    /// lengths < 127) and the key's bytes at most (Huffman only shorter).
+    const enc_cap = key_cap + 3;
+
+    sets: [set_count]Set = @splat(.{}),
+    hits: if (is_test) u32 else void = if (is_test) 0 else {},
+    misses: if (is_test) u32 else void = if (is_test) 0 else {},
+    stores: if (is_test) u32 else void = if (is_test) 0 else {},
+
+    /// Whether `f` (never-indexed fields already excluded) may be kept:
+    /// short, and not a credential by name. Cookies of any length and
+    /// set-cookie hold session tokens that the never-index rule lets
+    /// through; other secrets in custom headers are the caller's to mark
+    /// `never_index` (RFC 7541 §7.1.3), which keeps them out too.
+    fn keeps(f: Field) bool {
+        if (f.name.len + f.value.len > key_cap) return false;
+        return !(std.mem.eql(u8, f.name, "cookie") or std.mem.eql(u8, f.name, "set-cookie") or
+            std.mem.eql(u8, f.name, "proxy-authorization"));
+    }
+
+    const Set = struct {
+        ways: [way_count]Slot = @splat(.{}),
+
+        fn find(s: *Set, f: Field) ?*Slot {
+            for (&s.ways) |*slot| {
+                if (slot.holds(f)) {
+                    slot.hit = true;
+                    return slot;
+                }
+            }
+            return null;
+        }
+
+        /// A miss's bytes: into the first slot not hit lately (an empty
+        /// one among them), or, when all were, into none, their marks
+        /// cleared.
+        fn offer(s: *Set, f: Field, enc: []const u8) void {
+            for (&s.ways) |*slot| {
+                if (!slot.hit) return slot.store(f, enc);
+            }
+            for (&s.ways) |*slot| slot.hit = false;
+        }
+    };
+
+    const Slot = struct {
+        /// 0 while empty: a field encodes to at least one byte.
+        enc_len: u8 = 0,
+        name_len: u8 = 0,
+        value_len: u8 = 0,
+        /// Stored or hit since a miss last cleared the set's marks.
+        hit: bool = false,
+        key: [key_cap]u8 = @splat(0),
+        enc: [enc_cap]u8 = @splat(0),
+
+        fn holds(s: *const Slot, f: Field) bool {
+            return s.enc_len != 0 and s.name_len == f.name.len and s.value_len == f.value.len and
+                std.mem.eql(u8, s.key[0..s.name_len], f.name) and
+                std.mem.eql(u8, s.key[s.name_len..][0..s.value_len], f.value);
+        }
+
+        fn store(s: *Slot, f: Field, enc: []const u8) void {
+            if (is_test) memo.stores += 1;
+            s.name_len = @intCast(f.name.len);
+            s.value_len = @intCast(f.value.len);
+            @memcpy(s.key[0..f.name.len], f.name);
+            @memcpy(s.key[f.name.len..][0..f.value.len], f.value);
+            @memcpy(s.enc[0..enc.len], enc);
+            s.enc_len = @intCast(enc.len);
+            // Marked, or the set's next miss would take it back before
+            // its second use.
+            s.hit = true;
+        }
+    };
+
+    fn index(f: Field) usize {
+        const h = std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, f.name), f.value);
+        return @intCast(h % set_count);
+    }
+};
+
+threadlocal var memo: Memo = .{};
+
+/// Tests: the thread's memo counters since the last `memoReset`.
+pub fn memoStats() struct { hits: u32, misses: u32, stores: u32 } {
+    comptime std.debug.assert(is_test);
+    return .{ .hits = memo.hits, .misses = memo.misses, .stores = memo.stores };
+}
+
+/// Tests: empties the thread's memo and zeroes its counters.
+pub fn memoReset() void {
+    comptime std.debug.assert(is_test);
+    memo = .{};
+}

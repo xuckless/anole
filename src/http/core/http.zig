@@ -558,6 +558,12 @@ pub const Headers = struct {
     /// whose fields are joined onto the first one with "; " (RFC 9113
     /// §8.2.3, RFC 9114 §4.2.1), in `allocator` (the request's arena).
     pub fn addRequestField(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8) error{ TooManyHeaders, OutOfMemory }!void {
+        return self.addRequestFieldUpTo(allocator, name, value, self.keys.len);
+    }
+
+    /// `addRequestField` into a table that starts small: a full one grows
+    /// in `allocator` (`grow`) up to `max` entries first.
+    pub fn addRequestFieldUpTo(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8, max: usize) error{ TooManyHeaders, OutOfMemory }!void {
         if (std.ascii.eqlIgnoreCase(name, "cookie")) {
             const h = hashFn(name);
             for (self.hashes[0..self.len], 0..) |hh, i| {
@@ -566,6 +572,16 @@ pub const Headers = struct {
                     return;
                 }
             }
+        }
+        try self.addUpTo(allocator, name, value, max);
+    }
+
+    /// `add`, a full table first growing in `allocator` (`grow`) up to
+    /// `max` entries.
+    pub fn addUpTo(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8, max: usize) error{ TooManyHeaders, OutOfMemory }!void {
+        if (self.len >= self.keys.len) {
+            if (self.keys.len >= max) return error.TooManyHeaders;
+            if (!self.grow(allocator, max)) return error.OutOfMemory;
         }
         try self.add(name, value);
     }
@@ -821,6 +837,21 @@ test "Headers: addRequestField joins cookie crumbs and adds other repeats" {
     // A crumb joins even at capacity: it takes no entry.
     try headers.addRequestField(a, "cookie", "d=4");
     try std.testing.expectEqualStrings("a=1; b=2; c=3; d=4", headers.get("cookie").?);
+}
+
+test "Headers: addRequestFieldUpTo grows a small table to its limit; crumbs join past it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var headers = try Headers.init(a, 2);
+    for (0..5) |_| try headers.addRequestFieldUpTo(a, "x", "y", 5);
+    try std.testing.expectEqual(5, headers.count());
+    try std.testing.expectError(error.TooManyHeaders, headers.addRequestFieldUpTo(a, "z", "y", 5));
+    try std.testing.expectError(error.TooManyHeaders, headers.addUpTo(a, "z", "y", 5));
+    try headers.addRequestFieldUpTo(a, "cookie", "a=1", 6);
+    try headers.addRequestFieldUpTo(a, "cookie", "b=2", 6);
+    try std.testing.expectEqual(6, headers.count());
+    try std.testing.expectEqualStrings("a=1; b=2", headers.get("cookie").?);
 }
 
 test "Headers: error on overflow" {
