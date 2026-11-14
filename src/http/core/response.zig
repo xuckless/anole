@@ -946,6 +946,10 @@ pub const Response = struct {
     /// that an ordinary one takes little of the arena. The table grows to
     /// `max_headers` for one with more.
     const initial_header_room = 16;
+    /// The same for a response to a sink (an HTTP/2 or HTTP/3 stream):
+    /// fewer, as every stream a connection has open at once, and every
+    /// spare one, keeps an arena of its own (M4, #179).
+    const initial_sink_header_room = 8;
 
     /// A response written to an HTTP/1.x connection. Made by the server;
     /// handlers get theirs. The body buffer's first segment is taken once
@@ -969,7 +973,7 @@ pub const Response = struct {
             .arena = arena,
             ._sink = sink,
             .io = io,
-            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_sink_header_room)),
             ._max_headers = max_headers,
         };
     }

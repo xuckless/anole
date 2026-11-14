@@ -373,6 +373,42 @@ const Handlers = struct {
         s.router.addRouteWith(.get, "/nw/detach", Det.handler, .{ .no_wait = true });
         s.router.get("/park", Park.handler);
         s.router.get("/tunnel", Tun.handler);
+        s.router.addRouteWith(.get, "/nw/baseline", baseline, .{ .no_wait = true });
+        s.router.addRouteWith(.post, "/nw/baseline", baseline, .{ .no_wait = true });
+        s.router.addRouteWith(.get, "/nw/json", jsonItems, .{ .no_wait = true });
+        s.router.get("/headers", headerCount);
+    }
+
+    /// HttpArena's baseline: the sum of `a`, `b` and a small body.
+    fn baseline(req: *Request, res: *Response) !void {
+        var sum: i64 = (req.query.getInt(i64, "a") orelse 0) + (req.query.getInt(i64, "b") orelse 0);
+        if (req.method == .post) {
+            if (try req.body()) |body| sum += std.fmt.parseInt(i64, std.mem.trim(u8, body, " \t\r\n"), 10) catch 0;
+        }
+        try res.print(.text, "{d}", .{sum});
+    }
+
+    /// HttpArena's json: `n` items, built in the arena, as JSON.
+    fn jsonItems(req: *Request, res: *Response) !void {
+        const Item = struct { id: u32, name: []const u8, category: []const u8, price: f64, quantity: u32, active: bool, tags: []const []const u8, total: f64 };
+        const n = req.query.getInt(usize, "n") orelse 1;
+        const items = try res.arena.alloc(Item, n);
+        for (items, 0..) |*it, i| it.* = .{
+            .id = @intCast(i),
+            .name = "Widget",
+            .category = "tools",
+            .price = 9.5,
+            .quantity = 3,
+            .active = true,
+            .tags = &.{ "a", "b" },
+            .total = 28.5,
+        };
+        try res.json(.{ .items = items, .count = n });
+    }
+
+    /// The request's header count and its `cookie`.
+    fn headerCount(req: *Request, res: *Response) !void {
+        try res.print(.text, "{d} {s}", .{ req.headers.count(), req.headers.get("cookie") orelse "-" });
     }
 
     fn hello(_: *Request, res: *Response) !void {
@@ -1383,4 +1419,100 @@ test "h2 engine: a response ended before its request starts no send-deadline wai
     const next = try c.request("GET", "/hello", null);
     try expectEqualStrings("hello", (try c.until(next)).body.items);
     try expectEqual(waiters, engine.test_send_waiters.load(.acquire));
+}
+
+test "h2 engine: an ordinary exchange fits a new stream's first arena node; a bigger one grows the node once, to the limit" {
+    // The release behaviour: a spare stream keeps its arena's node.
+    const safety = @import("anole_safety");
+    safety.arena_poisoning.store(false, .monotonic);
+    defer safety.arena_poisoning.store(true, .monotonic);
+    var counting: CountingAllocator = .{ .inner = testing.allocator };
+    var fx: Fixture = undefined;
+    try fx.start(counting.allocator(), testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    // h2load's fields, and one more.
+    const fields: []const hpack.Field = &.{
+        .{ .name = "user-agent", .value = "h2load nghttp2/1.66.0" },
+        .{ .name = "accept-encoding", .value = "gzip, br, zstd" },
+    };
+    const Shape = struct { method: []const u8, path: []const u8, body: ?[]const u8, want: []const u8 };
+    const ordinary = [_]Shape{
+        .{ .method = "GET", .path = "/nw/baseline?a=1&b=2", .body = null, .want = "3" },
+        .{ .method = "POST", .path = "/nw/baseline?a=1&b=2", .body = "20", .want = "23" },
+        .{ .method = "GET", .path = "/nw/hello", .body = null, .want = "hello" },
+        .{ .method = "GET", .path = "/users/1", .body = null, .want = "user 1" },
+    };
+    // One at a time: each runs on the one spare the first made.
+    for (ordinary) |sh| {
+        resetArenaProbes();
+        const id = try c.requestWith(sh.method, sh.path, fields, sh.body);
+        try expectEqualStrings(sh.want, (try c.until(id)).body.items);
+        try awaitArenaHigh();
+        try expect(engine.test_arena_high.load(.monotonic) <= engine.arena_first_node);
+        try expectEqual(engine.arena_first_node, engine.test_arena_kept.load(.monotonic));
+    }
+    resetArenaProbes();
+    const r1 = try c.requestWith("GET", "/nw/json?n=1", fields, null);
+    try expect(std.mem.startsWith(u8, (try c.until(r1)).body.items, "{\"items\":[{\"id\":0,"));
+    try awaitArenaHigh();
+    try expect(engine.test_arena_high.load(.monotonic) <= engine.arena_first_node);
+
+    // Past the first node: served, and the spare keeps the limit from then
+    // on, so the same request again allocates nothing.
+    for (0..2) |round| {
+        resetArenaProbes();
+        const before = counting.count.load(.monotonic);
+        const id = try c.requestWith("GET", "/nw/json?n=20", fields, null);
+        try expect(std.mem.endsWith(u8, (try c.until(id)).body.items, "],\"count\":20}"));
+        try awaitArenaHigh();
+        try expect(engine.test_arena_high.load(.monotonic) > engine.arena_first_node);
+        const kept = engine.test_arena_kept.load(.monotonic);
+        try expect(kept > engine.arena_first_node and kept <= engine.arena_retain_limit);
+        if (round == 1) try expectEqual(before, counting.count.load(.monotonic));
+    }
+}
+
+fn resetArenaProbes() void {
+    engine.test_arena_high.store(0, .monotonic);
+    engine.test_arena_kept.store(0, .release);
+}
+
+/// The stream of the last answered request is let go just after its
+/// response is out, and only then are the probes set.
+fn awaitArenaHigh() !void {
+    try wait.waitUntil(testing.io, "the last stream went back to the spares", {}, struct {
+        fn f(_: void) bool {
+            return engine.test_arena_kept.load(.acquire) > 0;
+        }
+    }.f);
+}
+
+test "h2 engine: a request's header table grows past its first room up to max_header_count; one more is 431; cookie crumbs still join" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const max = (config.ServerConfig.Request{}).max_header_count;
+    var names: [max][8]u8 = undefined;
+    var fields: [max]hpack.Field = undefined;
+    for (&fields, &names, 0..) |*f, *n, i| f.* = .{ .name = std.fmt.bufPrint(n, "x-h-{d:0>2}", .{i}) catch unreachable, .value = "v" };
+    // The engine adds `host` from `:authority`: n fields are n + 1 entries.
+    for ([_]usize{ 0, 7, 8, 16, max - 1 }) |n| {
+        const id = try c.requestWith("GET", "/headers", fields[0..n], null);
+        const r = try c.until(id);
+        try expectEqual(200, r.status);
+        var want: [16]u8 = undefined;
+        try expectEqualStrings(try std.fmt.bufPrint(&want, "{d} -", .{n + 1}), r.body.items);
+    }
+    const over = try c.requestWith("GET", "/headers", fields[0..max], null);
+    try expectEqual(431, (try c.until(over)).status);
+    // Crumbs take one entry however many there are, at any table size.
+    var crumbs: [20]hpack.Field = undefined;
+    for (crumbs[0..17]) |*f| f.* = .{ .name = "x-a", .value = "1" };
+    crumbs[17] = .{ .name = "cookie", .value = "a=1" };
+    crumbs[18] = .{ .name = "cookie", .value = "b=2" };
+    crumbs[19] = .{ .name = "cookie", .value = "c=3" };
+    const id = try c.requestWith("GET", "/headers", &crumbs, null);
+    try expectEqualStrings("19 a=1; b=2; c=3", (try c.until(id)).body.items);
 }

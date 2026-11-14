@@ -123,12 +123,22 @@ pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
 
 /// A request body up to this long comes from the stream's arena.
 const arena_body_max = 4 * 1024;
+/// Request header entries a stream's table starts with (h2load sends one,
+/// a browser a dozen); it grows up to `max_header_count`.
+const initial_header_room = 8;
 /// Spare streams a connection keeps for reuse (as the nghttp2 engine).
 const max_spare_streams = 128;
 const min_spare_streams = 16;
-/// What a stream's arena keeps between requests (as the nghttp2 engine:
-/// an 8 KiB malloc class with the arena's node header).
-const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
+/// The most a stream's arena keeps between requests (as the nghttp2
+/// engine: an 8 KiB malloc class with the arena's node header).
+pub const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
+/// What a new stream's arena starts with: a 2 KiB malloc class, which
+/// holds an ordinary exchange (h2load's baseline, a small JSON answer:
+/// about 1.8 KiB). A stream that needs more grows its node once, at its
+/// reset, up to `arena_retain_limit`: every stream open at once and every
+/// spare keeps its node, so starting at the limit made each one a touched
+/// 4 KiB page (M4, #179).
+pub const arena_first_node = 2 * 1024 - 4 * @sizeOf(usize);
 /// A streamed response's block: the body writer's buffer, then borrowed by
 /// `out` until written. Two per stream on a task.
 const block_len = 16 * 1024;
@@ -206,6 +216,12 @@ pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void 
 /// connections whose send side was shut (`shutDrained`).
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: the most arena one stream's exchange used (bytes handed
+/// out over its nodes), read before its reset (`maybeFree`): what
+/// `arena_first_node` has to hold for an ordinary one.
+pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
+/// Tests only: the arena the last stream put back to the spares kept.
+pub var test_arena_kept: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
 
 /// The HPACK scratch `Conn.recv` decodes into, one per executor (recv never
 /// yields), from the block cache and never given back.
@@ -924,8 +940,15 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.releaseBusyIfIdle();
                 }
                 es.releaseMemory(conn.allocator);
+                if (is_test) {
+                    var used: usize = 0;
+                    var it = es.arena.used;
+                    while (it) |n| : (it = n.next) used += n.end_index;
+                    _ = test_arena_high.fetchMax(used, .monotonic);
+                }
                 if (conn.spares.items.len < conn.max_spares) {
                     _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                    if (is_test) test_arena_kept.store(es.arena.queryCapacity(), .release);
                     if (conn.spares.append(conn.allocator, es)) |_| return else |_| {}
                 }
                 es.destroy(conn.allocator);
@@ -1935,10 +1958,10 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 const es = try conn.allocator.create(EStream);
                 es.* = .{ .conn = conn, .arena = .init(conn.allocator) };
-                // The node every reset keeps, so the first reset does not
-                // reallocate it.
-                if (es.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                // The node every reset keeps, so the first reset of an
+                // ordinary exchange does not reallocate it.
+                if (es.arena.allocator().alloc(u8, arena_first_node)) |_| {
+                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_first_node });
                 } else |_| {}
                 return es;
             }
@@ -2730,7 +2753,11 @@ pub fn Engine(comptime Ctx: type) type {
             response.head = request.method == .head;
             request.url = es.path;
 
-            request.headers = http.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
+            // Room for an ordinary request's fields, grown up to the limit
+            // for one with more, as over HTTP/1.1: most of a spare stream's
+            // arena otherwise (M4, #179).
+            const max_headers = server.config.request.max_header_count;
+            request.headers = http.Headers.init(arena, @min(max_headers, initial_header_room)) catch return error.OutOfMemory;
             var too_many = false;
             // Repeated fields stay separate entries, as over HTTP/1.1,
             // except cookie crumbs, joined into one (RFC 9113 §8.2.3).
@@ -2741,7 +2768,7 @@ pub fn Engine(comptime Ctx: type) type {
                     hosts += 1;
                     host_field = f.value;
                 }
-                request.headers.addRequestField(arena, f.name, f.value) catch |err| switch (err) {
+                request.headers.addRequestFieldUpTo(arena, f.name, f.value, max_headers) catch |err| switch (err) {
                     error.TooManyHeaders => {
                         too_many = true;
                         break;
@@ -2760,7 +2787,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return .done;
             }
             if (!too_many and hosts == 0 and es.authority.len > 0) {
-                request.headers.add("Host", es.authority) catch {
+                request.headers.addUpTo(arena, "Host", es.authority, max_headers) catch {
                     too_many = true;
                 };
             }
