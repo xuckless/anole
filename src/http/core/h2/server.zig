@@ -441,6 +441,9 @@ pub fn Engine(comptime Ctx: type) type {
             drain_seen: u8 = 0,
             drain_notice: bool = false,
             goaway_sent: bool = false,
+            /// The peer's GOAWAY came: once nothing is open the connection
+            /// is over (`drained`), as nghttp2's want_read is 0 then.
+            peer_goaway: bool = false,
             /// A second count in the server's in-flight requests, from the
             /// drain's notice to the teardown, so the drain also waits for
             /// the final GOAWAY and the lingering close (#135).
@@ -684,7 +687,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             pub fn onGoaway(conn: *Conn, last_id: u31, code: conn_mod.ErrorCode) void {
-                _ = conn;
+                conn.peer_goaway = true;
                 // As a number: the peer may send any code (RFC 9113 §7),
                 // and a name only exists for the ones we know.
                 log.debug("HTTP/2: GOAWAY from the peer, last stream {d}, code {d}", .{ last_id, @backingInt(code) });
@@ -1033,10 +1036,13 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.proto.goaway(.no_error, "") catch {};
             }
 
-            /// The final GOAWAY is out and no stream is open: nothing more
-            /// is coming for this connection. Under the lock.
+            /// The final GOAWAY is out, or the peer's came in, and no
+            /// stream is open: nothing more is coming for this connection
+            /// (`nghttp2_session_want_read` is 0 for either, and the nghttp2
+            /// engine then closes; RFC 9113 §6.8: the peer opens no more
+            /// streams). Under the lock.
             fn drained(conn: *Conn) bool {
-                return conn.goaway_sent and conn.live.first == null;
+                return (conn.goaway_sent or conn.peer_goaway) and conn.live.first == null;
             }
 
             /// Idle past `timeout.keepalive`.
