@@ -1304,6 +1304,12 @@ pub const Response = struct {
             self._chunked = true;
         }
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
+        // A sink sizes its body writer once the head is recorded, on its
+        // first `body()` after it. Taken here, on the handler's task: the
+        // first write may come from a task on another executor (a
+        // WebSocket's `send`), and the buffer comes from the stream's
+        // arena, which is not thread-safe (#171).
+        if (self._sink) |sink| _ = sink.body();
         self.liftDeadline();
         return .init(self, buf, compressor);
     }
@@ -5804,6 +5810,8 @@ const TestSink = struct {
     content_type: []const u8 = "",
     interim: ?http.Status = null,
     heads: usize = 0,
+    /// `body()` calls after the head was recorded.
+    bodies_after_head: usize = 0,
     ends: usize = 0,
     trailer_grpc_status: []const u8 = "",
     body_buf: [4096]u8 = undefined,
@@ -5842,6 +5850,7 @@ const TestSink = struct {
     }
     fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
+        if (self.heads != 0) self.bodies_after_head += 1;
         return &self.body_writer;
     }
     fn end(ptr: *anyopaque, trailers: ?*const http.Headers) std.Io.Writer.Error!void {
@@ -5893,6 +5902,24 @@ test "Response sink: a streamed body is unframed, of unknown length, and ends on
 
     try std.testing.expectEqualStrings("hello streamed world", ts.body());
     try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: a streamed body's writer is taken before stream returns, on the handler's task" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var buf: [8]u8 = undefined;
+    var body = try response.stream(&buf);
+    // The sink has been asked for its writer with the head recorded, so it
+    // has sized its buffer (from the stream's arena, for HTTP/3) before
+    // any other task can write the first bytes (#171).
+    try std.testing.expectEqual(@as(usize, 1), ts.bodies_after_head);
+    try body.interface.writeAll("x");
+    try body.end();
+    try response.write();
 }
 
 test "Response sink: trailers reach the end of the message" {

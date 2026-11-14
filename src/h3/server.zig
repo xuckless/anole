@@ -3633,7 +3633,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // Sized once the head is recorded, as it names the length.
                 // Before that the writer only goes to `Response.sendHeader`
                 // (which a sink's head ignores), or takes a whole body in
-                // memory, which needs no buffer.
+                // memory, which needs no buffer. `Response.stream` asks
+                // again once the head is in, on the handler's task: the
+                // arena is not thread-safe, and a WebSocket's first frame
+                // may be written from a task on another executor.
                 if (self.writer.buffer.len == 0 and self.stream.response_nv.len != 0) {
                     // A known length needs no more; at least a little, so
                     // that a body written in pieces is not sent in pieces.
