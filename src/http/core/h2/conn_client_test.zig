@@ -615,6 +615,23 @@ test "h2 client conn: max_concurrent_streams: 100 until the server's SETTINGS, t
     try expectEqual(203, s.id);
 }
 
+test "h2 client conn: SETTINGS without MAX_CONCURRENT_STREAMS lift the limit, and a GOAWAY refuses every stream above its last-stream-id" {
+    // RFC 9113 §6.5.2: no entry, no limit (nghttp2 and Go lift the initial
+    // 100 at the server's first SETTINGS too).
+    const t = try ready(.{});
+    defer t.destroy();
+    for (0..300) |_| _ = try t.request(&get, false);
+    _ = try t.drain();
+    try expectEqual(300, t.c.table.size);
+    try expect(t.c.canOpen());
+    // One walk of the table, closing as it goes.
+    try t.feed(try t.srv.goaway(1, .no_error));
+    try expectEqual(1, t.c.table.size);
+    try expect(t.c.table.get(1) != null);
+    var id: u31 = 3;
+    while (id < 600) : (id += 2) try expectEqual(.refused_stream, t.rec.closeCode(id).?);
+}
+
 test "h2 client conn: the server's SETTINGS_INITIAL_WINDOW_SIZE moves open streams' send windows" {
     const t = try CT.create(testing.allocator, .{});
     defer t.destroy();

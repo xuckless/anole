@@ -63,8 +63,8 @@
 //! response body. One more callback, `onHeadRefused(h, s) void`: a response
 //! head or trailers past max_header_list_size, about to be reset with
 //! INTERNAL_ERROR. The client sends the preface and ENABLE_PUSH=0, takes
-//! the server's limit on its streams as 100 until its SETTINGS say
-//! otherwise, closes its streams above a GOAWAY's last-stream-id with
+//! the server's limit on its streams as 100 until its SETTINGS (no limit
+//! when they leave it out), closes its streams above a GOAWAY's last-stream-id with
 //! REFUSED_STREAM, and charges no reset or refused budget (those guard a
 //! server against its clients; CVE-2023-44487).
 
@@ -1016,6 +1016,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 c.settings_in_flight = false;
                 return c.applyLocalSettings();
             }
+            // A server's SETTINGS without MAX_CONCURRENT_STREAMS leaves it
+            // unlimited (RFC 9113 §6.5.2): the assumption ends with its
+            // first (nghttp2_session_on_settings_received, :4495, as
+            // NGHTTP2_DEFAULT_MAX_CONCURRENT_STREAMS).
+            if (role == .client and c.first_settings) c.remote.max_concurrent_streams = std.math.maxInt(u32);
             c.first_settings = false;
             // nghttp2's early flood check (:5897): with the budget spent,
             // the entries aren't applied.
@@ -1110,15 +1115,17 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         /// Closes our streams above `last` as REFUSED_STREAM, remembered as
         /// reset by us (what the server still sends on them is ignored).
-        /// The table can't change during a walk, so it walks again after
-        /// each close: at most the open streams' count of walks.
+        /// One walk: `closeStream` only removes the stream from the table,
+        /// and the removal's backward shift moves the rest of its run one
+        /// slot back, into the slot just read, so that slot is read again
+        /// (StreamTable.next). What wraps past the end lands in slots
+        /// already read, whose streams above `last` are gone.
         fn refuseAbove(c: *Self, last: u31) void {
-            while (true) {
-                var i: usize = 0;
-                const s = while (c.table.next(&i)) |x| {
-                    if (x.id > last) break x;
-                } else return;
+            var i: usize = 0;
+            while (c.table.next(&i)) |s| {
+                if (s.id <= last) continue;
                 c.closeStream(s, .refused_stream, .rst_sent);
+                i -= 1;
             }
         }
 

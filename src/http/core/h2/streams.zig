@@ -383,7 +383,9 @@ pub const StreamTable = struct {
 
     /// nghttp2_map_each as a cursor, so the caller's errors propagate:
     /// `var i: usize = 0; while (t.next(&i)) |s| ...`. The table must not
-    /// change during the walk.
+    /// change during the walk, except by `remove` of the stream just
+    /// returned followed by `i -= 1` (the backward shift fills that slot
+    /// from the rest of its run; what wraps lands in slots already read).
     pub fn next(t: *const StreamTable, i: *usize) ?*Stream {
         const n = t.slots();
         while (i.* < n) {

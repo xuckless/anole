@@ -523,7 +523,10 @@ pub const ClientConnection = struct {
         self.closing = true;
         self.dead = true;
         // What the core holds (a GOAWAY after a connection error) still
-        // goes out.
+        // goes out, but no more DATA is framed: `release` frees a stream
+        // of a dead connection at once, while its unframed body (lent to
+        // the core) is still queued.
+        self.proto.dead = true;
         self.shut = true;
         if (self.failure == null) self.failure = err;
         self.unlock();
@@ -536,15 +539,14 @@ pub const ClientConnection = struct {
         while (true) {
             const buffered = self.r.buffered();
             if (buffered.len > 0) {
-                const n = self.feed(buffered) catch |err| return err;
-                self.r.toss(n);
+                const fed = self.feed(buffered) catch |err| return err;
+                self.r.toss(fed.n);
                 // A GOAWAY's streams are all done: the connection is.
-                if (self.ended()) return error.ConnectionClosed;
+                if (fed.ended) return error.ConnectionClosed;
                 // The core took every whole frame: what is left is the
                 // start of the next one, so more must be read first.
-                if (n < buffered.len and buffered.len - n == self.r.buffer.len) {
-                    self.feedLarge() catch |err| return err;
-                    if (self.ended()) return error.ConnectionClosed;
+                if (fed.n < buffered.len and buffered.len - fed.n == self.r.buffer.len) {
+                    if (try self.feedLarge()) return error.ConnectionClosed;
                     continue;
                 }
             }
@@ -552,28 +554,32 @@ pub const ClientConnection = struct {
         }
     }
 
-    /// Hands `bytes` to the core; how many it took.
-    fn feed(self: *ClientConnection, bytes: []const u8) !usize {
-        const n = n: {
+    const Fed = struct { n: usize, ended: bool };
+
+    /// Hands `bytes` to the core: how many it took, and whether the
+    /// server's GOAWAY came and every stream it let finish has.
+    fn feed(self: *ClientConnection, bytes: []const u8) !Fed {
+        const fed: Fed = fed: {
             self.lock();
             defer self.unlock();
             const buf = try scratch(@max(self.max_header_list_size, hpack.table_capacity));
             const now = std.Io.Clock.awake.now(self.io);
-            break :n self.proto.recv(bytes, @intCast(@max(0, now.toSeconds())), buf) catch |err| switch (err) {
+            const n = self.proto.recv(bytes, @intCast(@max(0, now.toSeconds())), buf) catch |err| switch (err) {
                 error.ConnectionError, error.BadPreface => return error.Http2ProtocolError,
                 error.OutOfMemory => return error.OutOfMemory,
             };
+            break :fed .{ .n = n, .ended = self.proto.goaway_recv and self.proto.table.size == 0 };
         };
         self.kickWriter();
         self.progress.notify(self.io);
-        return n;
+        return fed;
     }
 
     /// A frame longer than the reader's buffer holds (a 16 KiB HEADERS
     /// behind a small TLS buffer): gathered whole in a buffer of its own,
     /// freed once fed. DATA never comes here: the core takes its payload
-    /// as it arrives.
-    fn feedLarge(self: *ClientConnection) !void {
+    /// as it arrives. Whether the connection has ended (`Fed.ended`).
+    fn feedLarge(self: *ClientConnection) !bool {
         const head = self.r.buffered();
         const need = 9 + @as(usize, std.mem.readInt(u24, head[0..3], .big));
         var frame_buf = try self.gpa.alloc(u8, need);
@@ -582,15 +588,9 @@ pub const ClientConnection = struct {
         self.r.toss(head.len);
         const got = self.r.readSliceShort(frame_buf[head.len..]) catch return error.ConnectionClosed;
         if (head.len + got < need) return error.ConnectionClosed;
-        const n = try self.feed(frame_buf);
-        if (n != need) return error.Http2ProtocolError;
-    }
-
-    /// The server's GOAWAY came and every stream it let finish has.
-    fn ended(self: *ClientConnection) bool {
-        self.lock();
-        defer self.unlock();
-        return self.proto.goaway_recv and self.proto.table.size == 0;
+        const fed = try self.feed(frame_buf);
+        if (fed.n != need) return error.Http2ProtocolError;
+        return fed.ended;
     }
 
     /// Ends every stream still waiting, as the connection is gone.
@@ -1213,6 +1213,12 @@ pub const Stream = struct {
                 conn.lock();
                 defer conn.unlock();
                 self.waiting_room = false;
+                // The stream or the connection is gone: the block may still
+                // be lent to `out`, so it is never handed back to write into.
+                if (self.ps == null or conn.dead) {
+                    self.write_err = self.cause orelse if (conn.dead) error.ConnectionClosed else error.StreamReset;
+                    return error.WriteFailed;
+                }
                 if (self.roomFree()) {
                     if (self.cause) |e| {
                         self.write_err = e;
@@ -1241,15 +1247,13 @@ pub const Stream = struct {
     /// Whether the block the writer wants next (`blocks[cur]`) is free:
     /// never submitted, or framed (the stream's queue no longer holds it:
     /// blocks go in order, the other one after it) and written
-    /// (`out.sent_total` past a mark taken once it was framed). True as
-    /// well when the stream or the connection is gone, for the waiter to
-    /// find out (the block then stays lent: `borrowed`). Under the lock.
+    /// (`out.sent_total` past a mark taken once it was framed). Only while
+    /// the stream is open (`waitRoom` checks). Under the lock.
     fn roomFree(self: *Stream) bool {
         const conn = self.conn;
         const b = &self.blocks[self.cur];
         if (!b.inflight) return true;
-        const ps = self.ps orelse return true;
-        if (conn.dead) return true;
+        const ps = self.ps.?;
         if (b.mark == null) {
             var queued: usize = 0;
             var it = ps.pending.first;

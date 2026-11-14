@@ -1510,3 +1510,108 @@ test "h2 client: a HEADERS frame longer than the reader's buffer is gathered who
     try std.testing.expectEqual(@as(u16, 200), s.status);
     try std.testing.expectEqual(@as(usize, 16370), s.header("x").?.len);
 }
+
+test "h2 client: once the connection is gone the writer frames no more of a released stream's body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    var closed = false;
+    defer if (!closed) conn.close();
+
+    // SETTINGS_INITIAL_WINDOW_SIZE 1024: the body goes out 1 KiB at first.
+    try peer.send(&frame(4, 0, 0, &.{ 0, 4, 0, 0, 4, 0 }));
+    try peer.waitTaken(conn);
+    try wait.waitUntil(io, "the client acknowledged the SETTINGS", peer, struct {
+        fn f(p: *Scripted) bool {
+            const bytes = p.sent[0..p.sent_len.load(.acquire)];
+            var at: usize = 24;
+            while (bytes.len >= at + 9) {
+                const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+                if (bytes[at + 3] == 0x4 and bytes[at + 4] & 0x1 != 0) return true;
+                at += 9 + len;
+            }
+            return false;
+        }
+    }.f);
+    peer.hold.store(true, .release);
+    const body: [100 * 1024]u8 = @splat('b');
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/up" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body_bytes = &body });
+    try peer.waitHeld();
+    // Credit for more of the body, then the connection ends: the stream is
+    // released while most of its body is still unframed.
+    try peer.send(&frame(8, 0, 1, &.{ 0, 1, 0, 0 }));
+    peer.end();
+    try std.testing.expectError(error.ConnectionClosed, s.waitHead());
+    s.release();
+    peer.openGate();
+    closed = true;
+    conn.close();
+    // Every DATA byte written came from the live body (freed memory would
+    // read as the debug allocator's 0xaa), and none after the end.
+    const bytes = peer.sent[0..peer.sent_len.load(.acquire)];
+    var at: usize = 24;
+    var data: usize = 0;
+    while (bytes.len >= at + 9) {
+        const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+        if (bytes.len < at + 9 + len) break;
+        if (bytes[at + 3] == 0x0) {
+            for (bytes[at + 9 ..][0..len]) |b| try std.testing.expectEqual(@as(u8, 'b'), b);
+            data += len;
+        }
+        at += 9 + len;
+    }
+    try std.testing.expectEqual(@as(usize, 1024), data);
+}
+
+test "h2 client: a body writer whose stream the server ended gets WriteFailed, not a block still being written from" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    try peer.waitTaken(conn);
+    try peer.waitFrameSent(0x4, 0);
+    // The writer stops on the request's HEADERS, so the body's blocks stay
+    // lent to the core.
+    peer.hold.store(true, .release);
+    const s = try request(conn, "/", .{ .body = true });
+    defer s.release();
+    try peer.waitHeld();
+    var next = try io.concurrent(struct {
+        fn f(st: *h2.Stream) anyerror!void {
+            // Block 0 goes, block 1 fills and goes, then the writer waits
+            // for block 0, which is still lent.
+            const body: [20 * 1024]u8 = @splat('b');
+            try st.writer().writeAll(&body);
+            try st.writer().flush();
+        }
+    }.f, .{s});
+    try wait.waitUntil(io, "the body writer waits for a block", s, struct {
+        fn f(st: *h2.Stream) bool {
+            st.conn.mutex.lockUncancelable(st.conn.io);
+            defer st.conn.mutex.unlock(st.conn.io);
+            return st.waiting_room;
+        }
+    }.f);
+    // The server answers in full, then ends the stream (grpc-go after an
+    // early status): no cause, the response is complete.
+    try peer.send(&frame(1, 0x5, 1, &.{0x88}));
+    try peer.send(&frame(3, 0, 1, &.{ 0, 0, 0, 0 }));
+    try std.testing.expectError(error.WriteFailed, next.await(io));
+    try std.testing.expectEqual(error.StreamReset, s.writeError().?);
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    peer.openGate();
+}
