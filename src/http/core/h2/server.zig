@@ -196,6 +196,11 @@ pub var test_keepalive_closes: if (is_test) std.atomic.Value(u32) else void = if
 /// join it any more; and the flushers asked for after that point.
 pub var test_after_join: if (is_test) ?*const fn () void else void = if (is_test) null else {};
 pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: called on the reader once a read ended in a connection
+/// error, with the lock let go and before the GOAWAY's flush, with the
+/// connection (`Engine.testWakeRooms` takes it): the moment a stream task
+/// on another thread may look at its stream before `closeRun`.
+pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void = if (is_test) null else {};
 /// Tests only: send-deadline waiters started (`waitSends`), and drained
 /// connections whose send side was shut (`shutDrained`).
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
@@ -1965,6 +1970,16 @@ pub fn Engine(comptime Ctx: type) type {
             }
         };
 
+        /// Tests only: what a write that completes does for the streams
+        /// waiting for room (`Conn.wakeRooms`), on `test_on_conn_error`'s
+        /// connection.
+        pub fn testWakeRooms(ptr: *anyopaque) void {
+            const conn: *Conn = @ptrCast(@alignCast(ptr));
+            conn.lock();
+            defer conn.unlock();
+            conn.wakeRooms();
+        }
+
         /// Whether the server registers this engine's connections for the
         /// drain (`Registry.field`).
         fn registered() bool {
@@ -2322,12 +2337,21 @@ pub fn Engine(comptime Ctx: type) type {
                         // Also after a connection error: those handlers
                         // see their streams reset.
                         if (conn.to_start.first != null) conn.startTasks();
+                        // A connection error frames no more DATA: every
+                        // stream is reset now, under the lock that saw it,
+                        // not at `closeRun`. Until then a stream task woken
+                        // by a write would find room (`roomFree` is true
+                        // for a dead connection), take a block `out` still
+                        // borrows, and write on as if its response could
+                        // finish.
+                        if (result) |_| {} else |_| conn.cancelStreams(true);
                         break :result result;
                     };
                     const taken = result catch |err| switch (err) {
                         // A GOAWAY is queued: out it goes, then the
                         // lingering close.
                         error.ConnectionError => {
+                            if (comptime is_test) if (test_on_conn_error) |hook| hook(conn);
                             try conn.flush(.all, timer);
                             return .dead;
                         },

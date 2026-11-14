@@ -415,6 +415,7 @@ const Handlers = struct {
 
     /// 1 MB streamed, far past the client's 64 KiB window.
     fn big(_: *Request, res: *Response) !void {
+        defer _ = big_done.fetchAdd(1, .release);
         var buf: [4096]u8 = undefined;
         var out = try res.stream(&buf);
         for (0..big_len / 1000) |i| out.interface.print("{d:0>999}\n", .{i}) catch |err| {
@@ -425,6 +426,7 @@ const Handlers = struct {
     }
     const big_len = 1000 * 1000;
     var big_failed: std.atomic.Value(u32) = .init(0);
+    var big_done: std.atomic.Value(u32) = .init(0);
 
     /// Answers once the test sets `held_gate`.
     fn held(req: *Request, res: *Response) !void {
@@ -775,6 +777,41 @@ test "h2 engine: a connection error mid-stream lets the streaming handler go and
     try wait.waitAtLeast(testing.io, "the streaming handler failed its write", &Handlers.big_failed, failed + 1);
     // `stop` then waits for `serve`, which returns only once the handler
     // is gone.
+}
+
+test "h2 engine: a stream woken between a connection error and the close fails its write, never reusing a block still borrowed" {
+    // CI (PR #226, ubuntu, 2-3 cores): a write completing between the
+    // read's connection error and `closeRun` woke the streaming handler;
+    // `roomFree` is true once the connection is dead, so the handler was
+    // handed a block `out` still borrowed and wrote on, all of its body,
+    // and ended without an error. Here the hook is that write.
+    const Hook = struct {
+        var done_before: u32 = 0;
+        fn onError(conn: *anyopaque) void {
+            E.testWakeRooms(conn);
+            // The handler, woken, runs to its end now (its stream reset)
+            // or to the end of its body (the bug), before the GOAWAY is
+            // flushed and `closeRun` resets the stream.
+            wait.waitAtLeast(testing.io, "the streaming handler returned", &Handlers.big_done, done_before + 1) catch {};
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    c.auto_window = false;
+    const failed = Handlers.big_failed.load(.acquire);
+    Hook.done_before = Handlers.big_done.load(.acquire);
+    engine.test_on_conn_error = Hook.onError;
+    defer engine.test_on_conn_error = null;
+    const id = try c.request("GET", "/big", null);
+    const r = c.get(id);
+    while (r.body.items.len < 65535) try c.readOne();
+    try c.frameOut(.ping, 0, id, "12345678");
+    try c.flush();
+    while (c.goaway == null) try c.readOne();
+    try wait.waitAtLeast(testing.io, "the streaming handler returned", &Handlers.big_done, Hook.done_before + 1);
+    try expectEqual(failed + 1, Handlers.big_failed.load(.acquire));
 }
 
 test "h2 engine: after the peer's GOAWAY the open stream is answered, then the connection ends with a FIN" {
