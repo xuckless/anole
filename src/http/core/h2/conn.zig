@@ -351,7 +351,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .recv_window = cw,
                 .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
                 .refused_budget = .init(opts.refused_stream_burst, opts.refused_stream_rate),
-                .empty_budget = .init(opts.limits.empty_frame_rate, opts.limits.empty_frame_rate),
+                .empty_budget = .init(opts.limits.empty_frame_burst, opts.limits.empty_frame_rate),
                 .glitch_budget = .init(opts.limits.glitch_burst, opts.limits.glitch_rate),
             };
             errdefer c.out.deinit();

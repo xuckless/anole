@@ -936,7 +936,7 @@ const profiles = [_]Profile{
         .stream_reset_rate = 0,
         .refused_stream_burst = 5,
         .refused_stream_rate = 0,
-        .limits = .{ .control_frame_budget = 20, .empty_frame_rate = 10, .glitch_burst = 10, .glitch_rate = 0 },
+        .limits = .{ .control_frame_budget = 20, .empty_frame_rate = 10, .empty_frame_burst = 10, .glitch_burst = 10, .glitch_rate = 0 },
     } },
 };
 

@@ -382,7 +382,7 @@ test "h2 limits: reset flood" {
 }
 
 test "h2 limits: empty frames" {
-    const opts: conn.Options = .{ .limits = .{ .empty_frame_rate = 5 } };
+    const opts: conn.Options = .{ .limits = .{ .empty_frame_rate = 5, .empty_frame_burst = 5 } };
     // Empty DATA without END_STREAM counts, with it not. A payload of only
     // padding isn't empty (nghttp2 :6930 charges payloadleft == 0 after the
     // Pad Length; padding is flow-controlled), the Pad Length alone is.
@@ -418,6 +418,25 @@ test "h2 limits: empty frames" {
         try expectError(error.ConnectionError, t.feed(try t.continuation(1, false, "")));
         try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
     }
+}
+
+test "h2 limits: every unknown frame type at once after the preface is ignored, and a PING answered" {
+    // grpc's tools/http2_interop TestSoonUnknownFrameType: types 11 to 255,
+    // empty, on stream 0, back to back, then a PING (RFC 9113 §4.1, §5.5).
+    // Without PRIORITY_UPDATE, which RFC 9218 made known (empty, it is a
+    // FRAME_SIZE_ERROR: "a malformed PRIORITY_UPDATE" below), as
+    // tests/grpc/interop/run-http2.sh has the tool skip it.
+    const t = try ready(.{});
+    defer t.destroy();
+    var ty: u8 = 11;
+    while (true) : (ty += 1) {
+        if (ty != 0x10) try t.feed(try t.raw(ty, 0, 0, ""));
+        if (ty == 255) break;
+    }
+    try t.feed(try t.ping(false, "01234567".*));
+    const out = try t.drain();
+    try expectEqual(0, count(out, .goaway));
+    try expectEqual(1, count(out, .ping));
 }
 
 test "h2 limits: refused-stream burst" {
@@ -599,7 +618,7 @@ test "h2: PRIORITY frames have no effect beyond validation" {
 }
 
 /// Budgets far below what a browser sends, so a charge would show.
-const tight: conn.Options = .{ .limits = .{ .glitch_burst = 10, .glitch_rate = 1, .empty_frame_rate = 10 } };
+const tight: conn.Options = .{ .limits = .{ .glitch_burst = 10, .glitch_rate = 1, .empty_frame_rate = 10, .empty_frame_burst = 10 } };
 
 fn priorityUpdate(t: *T, id: u31, target: u32, value: []const u8) ![]const u8 {
     const p = try t.arena().alloc(u8, 4 + value.len);

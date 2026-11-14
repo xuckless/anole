@@ -60,7 +60,9 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    ends** (PLAN §5.4). nghttp2 queues a graceful GOAWAY INTERNAL_ERROR
    (:4196) and goes on reading.
 3. **Empty frames and unknown or extension frames have their own budget**
-   (`Limits.empty_frame_rate`, 100 tokens refilled at 100/s; D15 point 2):
+   (`Limits.empty_frame_burst` and `empty_frame_rate`, 1000 tokens refilled
+   at 100/s; D15 point 2; the burst was 100 until grpc's HTTP/2 check sent
+   244 unknown types at once, research/s2/h2-m3/ci226.md):
    DATA with an empty payload and no END_STREAM, HEADERS with an empty
    fragment and no END_STREAM (END_HEADERS or not), an empty CONTINUATION
    without END_HEADERS, and every frame of an unknown type but

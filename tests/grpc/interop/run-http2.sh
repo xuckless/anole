@@ -29,6 +29,18 @@ dir=$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.std
 cp -R "$dir" "$work/suite"
 chmod -R u+w "$work/suite"
 
+# TestSoonUnknownFrameType sends every type from 11 to 255 with an empty
+# payload, skipping the extension it knew of (ALTSVC). It predates RFC
+# 9218, whose PRIORITY_UPDATE (0x10) is no longer unknown: shorter than 4
+# bytes it is a FRAME_SIZE_ERROR (RFC 9113 §4.2), in Anole, in Go's x/net
+# (parsePriorityUpdateFrame, which grpc-go's server reads through) and in
+# nghttp2 with the extension on. The loop skips it as it skips ALTSVC.
+loop='	for ft := ContinuationFrameType + 2; ft != 0; ft++ {'
+grep -qxF "$loop" "$work/suite/http2interop.go" || { echo "run-http2.sh: TestSoonUnknownFrameType's loop changed; recheck the PRIORITY_UPDATE skip"; exit 1; }
+sed -i.orig "s/^$loop\$/&\\
+		if ft == 0x10 { continue }/" "$work/suite/http2interop.go"
+grep -qxF '		if ft == 0x10 { continue }' "$work/suite/http2interop.go" || { echo "run-http2.sh: the PRIORITY_UPDATE skip did not apply"; exit 1; }
+
 "$here/cert.sh" "$work"
 # -use_test_ca reads the CA from this path, relative to the package.
 mkdir -p "$work/suite/src/core/tsi/test_creds"
