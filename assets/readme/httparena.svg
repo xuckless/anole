@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="236" viewBox="0 0 720 236" role="img" aria-label="HttpArena composite ranks for Anole v0.5.0: gRPC 3rd of 12, Gateway 3rd of 10, HTTP/3 4th of 22, HTTP/2 7th of 38, WebSocket 7th of 42, HTTP/1.1 9th of 102.">
+<title>HttpArena ranks, v0.5.0</title>
+<style>
+text { font-family: -apple-system, 'Segoe UI', Inter, Roboto, 'Helvetica Neue', Arial, sans-serif; }
+.cat { font-size: 13px; font-weight: 600; fill: #173b0d; }
+.rank { font-size: 13px; fill: #173b0d; }
+.track { fill: #e3edd0; }
+.bar { fill: #7ac02e; transform-box: fill-box; transform-origin: left; animation: grow 1.2s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes grow { from { transform: scaleX(0); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style>
+<rect x="0.5" y="0.5" width="719" height="235" rx="16" fill="#f3f7ea" stroke="#dbe8c4"/>
+<text x="24" y="34" font-size="15" font-weight="800" fill="#173b0d">HttpArena, v0.5.0</text>
+<text x="696" y="34" font-size="12" fill="#5d7449" text-anchor="end">bar = share of entries Anole beats</text>
+<!-- bar width = 440 * (N - rank) / (N - 1) -->
+<g transform="translate(0,52)">
+<text class="cat" x="24" y="13">gRPC</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="360" height="14" rx="7"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">3rd</tspan> of 12</text>
+</g>
+<g transform="translate(0,80)">
+<text class="cat" x="24" y="13">Gateway</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="342" height="14" rx="7" style="animation-delay:.08s"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">3rd</tspan> of 10</text>
+</g>
+<g transform="translate(0,108)">
+<text class="cat" x="24" y="13">HTTP/3</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="377" height="14" rx="7" style="animation-delay:.16s"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">4th</tspan> of 22</text>
+</g>
+<g transform="translate(0,136)">
+<text class="cat" x="24" y="13">HTTP/2</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="369" height="14" rx="7" style="animation-delay:.24s"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">7th</tspan> of 38</text>
+</g>
+<g transform="translate(0,164)">
+<text class="cat" x="24" y="13">WebSocket</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="376" height="14" rx="7" style="animation-delay:.32s"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">7th</tspan> of 42</text>
+</g>
+<g transform="translate(0,192)">
+<text class="cat" x="24" y="13">HTTP/1.1</text><rect class="track" x="130" y="2" width="440" height="14" rx="7"/><rect class="bar" x="130" y="2" width="405" height="14" rx="7" style="animation-delay:.4s"/><text class="rank" x="696" y="13" text-anchor="end"><tspan font-weight="800">9th</tspan> of 102</text>
+</g>
+</svg>

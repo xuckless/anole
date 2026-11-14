@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" viewBox="0 0 720 300" role="img" aria-label="Every protocol on the left goes through one Anole core, which reaches databases, messaging, storage and email on the right; auth, TLS and observability sit underneath.">
+<title>One core: protocols in, connectors out</title>
+<style>
+text { font-family: -apple-system, 'Segoe UI', Inter, Roboto, 'Helvetica Neue', Arial, sans-serif; }
+.mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.pill { fill: #ffffff; stroke: #c6ec7e; stroke-width: 1.5; }
+.lbl { font-size: 13px; fill: #173b0d; font-weight: 600; }
+.wire { stroke: #7ac02e; stroke-width: 1.6; fill: none; stroke-dasharray: 4 5; animation: flow 1.6s linear infinite; }
+.wire.out { stroke: #f5a623; }
+.pulse { animation: pulse 2.4s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+@keyframes flow { to { stroke-dashoffset: -18; } }
+@keyframes pulse { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style>
+<rect x="0.5" y="0.5" width="719" height="299" rx="16" fill="#f3f7ea" stroke="#dbe8c4"/>
+
+<!-- protocols -->
+<g>
+<rect class="pill" x="24" y="22" width="150" height="26" rx="13"/><text class="lbl" x="99" y="40" text-anchor="middle">HTTP/1.1 · h2 · h3</text>
+<rect class="pill" x="24" y="56" width="150" height="26" rx="13"/><text class="lbl" x="99" y="74" text-anchor="middle">WebSocket</text>
+<rect class="pill" x="24" y="90" width="150" height="26" rx="13"/><text class="lbl" x="99" y="108" text-anchor="middle">gRPC · Connect</text>
+<rect class="pill" x="24" y="124" width="150" height="26" rx="13"/><text class="lbl" x="99" y="142" text-anchor="middle">WebTransport</text>
+<rect class="pill" x="24" y="158" width="150" height="26" rx="13"/><text class="lbl" x="99" y="176" text-anchor="middle">Server-sent events</text>
+<rect class="pill" x="24" y="192" width="150" height="26" rx="13"/><text class="lbl" x="99" y="210" text-anchor="middle">Raw TCP · UDP</text>
+</g>
+<g>
+<path class="wire" d="M174 35 C230 35 230 120 270 120"/>
+<path class="wire" d="M174 69 C228 69 228 124 270 124"/>
+<path class="wire" d="M174 103 C226 103 226 128 270 128"/>
+<path class="wire" d="M174 137 C226 137 226 132 270 132"/>
+<path class="wire" d="M174 171 C228 171 228 136 270 136"/>
+<path class="wire" d="M174 205 C230 205 230 140 270 140"/>
+</g>
+
+<!-- core -->
+<rect x="270" y="72" width="180" height="116" rx="22" fill="#173b0d"/>
+<circle class="pulse" cx="360" cy="104" r="13" fill="#f5a623"/>
+<circle cx="360" cy="104" r="6" fill="#173b0d"/>
+<text x="360" y="141" text-anchor="middle" font-size="19" font-weight="800" fill="#f3f7ea">anole core</text>
+<text class="mono" x="360" y="161" text-anchor="middle" font-size="11" fill="#c6ec7e">one loop per core</text>
+<text class="mono" x="360" y="176" text-anchor="middle" font-size="11" fill="#c6ec7e">io_uring · epoll · kqueue</text>
+
+<!-- connectors -->
+<g>
+<path class="wire out" d="M450 120 C490 120 490 35 546 35"/>
+<path class="wire out" d="M450 125 C488 125 488 69 546 69"/>
+<path class="wire out" d="M450 130 C486 130 486 103 546 103"/>
+<path class="wire out" d="M450 135 C486 135 486 137 546 137"/>
+<path class="wire out" d="M450 140 C488 140 488 171 546 171"/>
+<path class="wire out" d="M450 145 C490 145 490 205 546 205"/>
+</g>
+<g>
+<rect class="pill" x="546" y="22" width="150" height="26" rx="13"/><text class="lbl" x="621" y="40" text-anchor="middle">PostgreSQL · SQLite</text>
+<rect class="pill" x="546" y="56" width="150" height="26" rx="13"/><text class="lbl" x="621" y="74" text-anchor="middle">MongoDB · Redis</text>
+<rect class="pill" x="546" y="90" width="150" height="26" rx="13"/><text class="lbl" x="621" y="108" text-anchor="middle">NATS · Kafka</text>
+<rect class="pill" x="546" y="124" width="150" height="26" rx="13"/><text class="lbl" x="621" y="142" text-anchor="middle">S3 · SMTP</text>
+<rect class="pill" x="546" y="158" width="150" height="26" rx="13"/><text class="lbl" x="621" y="176" text-anchor="middle">Jobs · cron</text>
+<rect class="pill" x="546" y="192" width="150" height="26" rx="13"/><text class="lbl" x="621" y="210" text-anchor="middle">HTTP clients</text>
+</g>
+
+<!-- foundation -->
+<rect x="24" y="238" width="672" height="40" rx="12" fill="#d84280"/>
+<text x="360" y="263" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">Auth · TLS (BoringSSL) · metrics, traces, logs · graceful drain and zero-downtime restarts</text>
+</svg>
