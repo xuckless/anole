@@ -494,11 +494,11 @@ pub fn borrowSizes(gpa: std.mem.Allocator, io: std.Io) !void {
         .{ .len = 1985, .borrows = 1, .one_record = true },
         .{ .len = 2 * 1024 + 1, .borrows = 1, .one_record = true },
         .{ .len = 8600, .borrows = 1, .one_record = true },
-        .{ .len = 16 * 1024, .borrows = 1, .one_record = true },
+        .{ .len = tls.record_len, .borrows = 1, .one_record = true },
         // Its first record is queued ahead of the last one.
-        .{ .len = 16 * 1024 + 1, .borrows = 0, .one_record = false },
+        .{ .len = tls.record_len + 1, .borrows = 0, .one_record = false },
         // The first six records leave at the gather sends, so nothing is
-        // queued ahead of the last one (4 KiB).
+        // queued ahead of the last one (4.75 KiB).
         .{ .len = 100 * 1024, .borrows = 1, .one_record = false },
     };
     for (cases) |case| {
@@ -714,7 +714,7 @@ fn sendSlicesTo(side: *Side, start: usize, prefix: usize, sizes: []const usize, 
 }
 
 /// Small slices (frame headers, HEADERS blocks) are gathered into records
-/// of 16 KiB, slices of a record or more pass through uncopied when
+/// (`record_len`, just under 16 KiB), slices of a record or more pass through uncopied when
 /// nothing is staged (and are copied when something is, as HTTP/2 DATA
 /// behind its frame header always is), and every byte arrives in order.
 pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
@@ -728,7 +728,7 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
     try exchange(io, &p.server, &p.client, start, 100);
     start += 100;
 
-    const record = 16 * 1024;
+    const record = tls.record_len;
     // 40 slices of 9 to 200 bytes and an 8 KiB body: less than a buffer.
     var small: [41]usize = undefined;
     for (small[0..40], 0..) |*s, i| s.* = 9 + (i * 37) % 192;
@@ -740,7 +740,7 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
 
     // Four DATA frames of 16 KiB, each header and payload a slice.
     var h2_data: [8]usize = undefined;
-    for (&h2_data, 0..) |*s, i| s.* = if (i % 2 == 0) 9 else record;
+    for (&h2_data, 0..) |*s, i| s.* = if (i % 2 == 0) 9 else 16 * 1024;
 
     const Case = struct { prefix: usize, sizes: []const usize, records: usize, staged: usize };
     const cases = [_]Case{
@@ -750,12 +750,13 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
         // A head ahead of a big body: the first record is topped up, the
         // rest passes through.
         .{ .prefix = 100, .sizes = &.{32 * 1024}, .records = 3, .staged = record - 100 },
-        // Slices of a record or more into an empty stage copy nothing.
-        .{ .prefix = 0, .sizes = &.{ 32 * 1024, 20 * 1024 }, .records = 4, .staged = 0 },
+        // Whole records into an empty stage copy nothing.
+        .{ .prefix = 0, .sizes = &.{ 2 * record, 20 * 1024 }, .records = 4, .staged = 0 },
         // The HTTP/2 shape: each 16 KiB DATA behind its 9-byte header finds
         // the stage non-empty and is copied: 5 records, not 8, and every
-        // byte staged but the final 36, which leave from the last slice.
-        .{ .prefix = 0, .sizes = &h2_data, .records = 5, .staged = 4 * (9 + record) - 36 },
+        // byte staged but the 548 past four records, which leave from the
+        // last slice.
+        .{ .prefix = 0, .sizes = &h2_data, .records = 5, .staged = 4 * record },
         // An HTTP/1 head of small writes, then a chunk size and a body.
         .{ .prefix = 300, .sizes = &.{ 2048, 9, 14 * 1024 }, .records = 2, .staged = record - 300 },
     };
@@ -780,5 +781,67 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
         try std.testing.expectEqual(case.records, d.seals);
         try std.testing.expectEqual(case.records + d.borrows, d.ssl_writes);
         try std.testing.expectEqual(case.staged, staged);
+    }
+}
+
+/// No write buffer BoringSSL allocates for a record lands in a bigger
+/// malloc class than a 16 KiB one. BoringSSL mallocs that buffer on every
+/// SSL_write and frees it once the BIO has taken the record (ssl_buffer.cc
+/// `SSLBuffer::EnsureCap`: the record, `SSL_max_seal_overhead` and
+/// `SSL3_ALIGN_PAYLOAD - 1` bytes of slack; `Clear` after the flush). Zig's
+/// libc malloc (SmpAllocator, in the musl builds) adds a 16-byte header and
+/// rounds up to a power of two: a full 16 KiB record's buffer is a 32 KiB
+/// slot, the class of an HTTP/2 stream's grown arena node, and writing it
+/// whole dirties pages of every such slot it cycles through, which the
+/// streams only partly use (the M4 RSS regression, h2 TLS json +20%,
+/// bench/results/20261114-h2-m4-ab). Gathered records, records passed
+/// through, and a drain's final record are all checked.
+pub fn recordBuffers(gpa: std.mem.Allocator, io: std.Io) !void {
+    // SAFETY: `open` sets every field.
+    var p: Pair = undefined;
+    try p.open(gpa, io);
+    defer p.close(gpa, io);
+
+    // The first response also carries the session tickets, a flight of
+    // their own ahead of the first record.
+    var start: usize = 0;
+    try exchange(io, &p.server, &p.client, start, 100);
+    start += 100;
+
+    // Five HTTP/2 frames of header, HEADERS block, header and 8 KiB DATA.
+    var frames: [20]usize = undefined;
+    for (&frames, 0..) |*s, i| s.* = ([_]usize{ 9, 150, 9, 8 * 1024 })[i % 4];
+    // Four 16 KiB DATA frames, each behind its header.
+    var h2_data: [8]usize = undefined;
+    for (&h2_data, 0..) |*s, i| s.* = if (i % 2 == 0) 9 else 16 * 1024;
+    const cases = [_]struct { prefix: usize, sizes: []const usize }{
+        .{ .prefix = 0, .sizes = &frames },
+        .{ .prefix = 0, .sizes = &h2_data },
+        .{ .prefix = 100, .sizes = &.{32 * 1024} },
+        .{ .prefix = 0, .sizes = &.{ 32 * 1024, 20 * 1024 } },
+        .{ .prefix = 0, .sizes = &.{64 * 1024} },
+    };
+    // Zig's libc malloc header (lib/c/malloc.zig, `alignment_bytes`) and
+    // BoringSSL's alignment slack.
+    const malloc_header = 16;
+    const align_slack = 7;
+    for (cases) |case| {
+        var len = case.prefix;
+        for (case.sizes) |s| len += s;
+        hooks.largest_seal.store(0, .monotonic);
+        var results: [2]anyerror!void = @splat({});
+        {
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            try group.concurrent(io, sendSlicesTo, .{ &p.server, start, case.prefix, case.sizes, &results[0] });
+            try group.concurrent(io, readRangeTo, .{ &p.client, start, len, &results[1] });
+            try group.await(io);
+        }
+        for (results) |r| try r;
+        start += len;
+        const largest = hooks.largest_seal.load(.monotonic);
+        errdefer std.log.err("{d} bytes in slices {any}: largest record {d}", .{ len, case.sizes, largest });
+        try std.testing.expect(largest > 8 * 1024);
+        try std.testing.expect(largest + align_slack + malloc_header <= 16 * 1024);
     }
 }

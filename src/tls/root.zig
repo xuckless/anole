@@ -76,10 +76,16 @@ test "TLS: a header ahead of a big payload and keyframe-sized writes arrive in o
     try testing.duplex.framed(std.testing.allocator, rt.io());
 }
 
-test "TLS: small slices are gathered into 16 KiB records, big ones into an empty stage pass uncopied" {
+test "TLS: small slices are gathered into records, big ones into an empty stage pass uncopied" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     try testing.duplex.gathered(std.testing.allocator, rt.io());
+}
+
+test "TLS: every record's BoringSSL write buffer fits a 16 KiB allocation, gathered or passed through" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.recordBuffers(std.testing.allocator, rt.io());
 }
 
 test "TLS: a queued flush takes the smallest pooled buffer that fits, then moves up" {

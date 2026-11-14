@@ -54,8 +54,20 @@ pub const input_buffer_len: usize = 0;
 /// response dirties.
 pub const output_buffer_len: usize = 0;
 
-/// Largest TLS record payload; SSL_write is called with at most this much.
-const max_plaintext_len = 16 * 1024;
+/// Plaintext per record written: SSL_write is called with at most this
+/// much, and `Writer.drain` gathers slices into records of it. 128 bytes
+/// under the protocol's 16 KiB, so that the write buffer BoringSSL mallocs
+/// for every record (ssl_buffer.cc `SSLBuffer::EnsureCap`: the record, at
+/// most 57 bytes of seal overhead and 27 of a KeyUpdate reply ahead of it,
+/// plus 7 of alignment slack), with the 16-byte header of Zig's libc malloc,
+/// is a 16 KiB allocation and not a 32 KiB one. That buffer is freed as
+/// soon as the BIO takes the record, and the next one takes the slot its
+/// class last freed: in the 32 KiB class those are HTTP/2 streams' arena
+/// nodes, which a stream only partly writes, and a full record written
+/// through each of them in turn kept about 20 KiB of every one resident
+/// (h2 TLS json +20% RSS, bench/results/20261114-h2-m4-ab). A record 0.8%
+/// smaller costs nothing measurable.
+pub const record_len = 16 * 1024 - 128;
 
 /// What the socket is read into while nothing is buffered: an ordinary
 /// request's records fit, so a connection serving small requests never
@@ -65,8 +77,9 @@ const stash_len = 1024;
 /// Socket reads a connection keeps its read block for after a big one.
 const busy_reads = 8;
 
-/// Queued ciphertext handed to the socket without waiting for `flush`.
-const gather_len = 48 * 1024;
+/// Queued ciphertext handed to the socket without waiting for `flush`:
+/// three full records.
+const gather_len = 3 * record_len;
 
 /// Room for a record's TLS overhead when the writing side sizes `pending`
 /// ahead of an SSL_write (`Shared.makeRoom`), so the BIO then appends
@@ -684,13 +697,13 @@ pub const Connection = struct {
     /// (`bioWrite`); `Shared.sendBorrowed` sends it with the lock released
     /// and repeats the SSL_write with the same arguments, as ssl.h
     /// `SSL_write` requires, and the BIO then takes it as written. A record
-    /// behind queued ones is copied: a response over 16 KiB borrows only a
+    /// behind queued ones is copied: a response over a record borrows only a
     /// last record that follows a gather send (`gather_len`).
     fn writeAll(self: *Connection, bytes: []const u8, last: bool) WriteError!void {
         const sh = self.shared.?;
         var rest = bytes;
         while (rest.len > 0) {
-            const n = @min(rest.len, max_plaintext_len);
+            const n = @min(rest.len, record_len);
             sh.lock();
             const borrow = last and rest.len == n and n > small_len - seal_slack and
                 sh.pending.len == 0 and sh.borrow == .off;
@@ -800,7 +813,7 @@ pub const Connection = struct {
         /// one `Connection.writeAll` may borrow.
         fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
-            const stage_len = @min(w.buffer.len, max_plaintext_len);
+            const stage_len = @min(w.buffer.len, record_len);
             // Bytes of `data` still to write, so the final non-empty write
             // knows it is last (`Connection.writeAll`). Saturating: a wrong
             // `last` costs a send, never correctness.
@@ -809,7 +822,7 @@ pub const Connection = struct {
                 for (data[0 .. data.len - 1]) |full| after +|= full.len;
                 after +|= data[data.len - 1].len *| splat;
             }
-            // More buffered than a record (a buffer over 16 KiB): it goes
+            // More buffered than a record (a buffer over `record_len`): it goes
             // first, so the buffer is a record's stage from here on.
             if (w.end >= stage_len and w.end > 0) {
                 try self.writeAll(w.buffered(), after == 0);
@@ -868,7 +881,7 @@ pub const Connection = struct {
                 } else {
                     // Whole records straight from `rest`; what is left over
                     // goes to the buffer.
-                    const whole = rest.len - rest.len % max_plaintext_len;
+                    const whole = rest.len - rest.len % record_len;
                     const k = if (whole > 0) whole else rest.len;
                     try self.writeAll(rest[0..k], false);
                     rest = rest[k..];
@@ -2123,6 +2136,9 @@ pub const test_hooks = if (builtin.is_test) struct {
     pub var staged_bytes: std.atomic.Value(usize) = .init(0);
     /// Records sent from BoringSSL's buffer.
     pub var borrows: std.atomic.Value(usize) = .init(0);
+    /// The most BoringSSL handed the BIO in one write: a record with
+    /// whatever it queued ahead of it, which is what its write buffer held.
+    pub var largest_seal: std.atomic.Value(usize) = .init(0);
     /// Growths of `pending` inside the BIO, so under the lock.
     pub var buf_grows: std.atomic.Value(usize) = .init(0);
     /// Called on the writing side with the lock released, right before a
@@ -2232,6 +2248,7 @@ fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
             if (builtin.is_test) {
                 _ = test_hooks.seals.fetchAdd(1, .monotonic);
                 _ = test_hooks.borrows.fetchAdd(1, .monotonic);
+                _ = test_hooks.largest_seal.fetchMax(bytes.len, .monotonic);
             }
             sh.borrowed = bytes;
             sh.borrow = .out;
@@ -2251,7 +2268,10 @@ fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
             return -1;
         },
     }
-    if (builtin.is_test) _ = test_hooks.seals.fetchAdd(1, .monotonic);
+    if (builtin.is_test) {
+        _ = test_hooks.seals.fetchAdd(1, .monotonic);
+        _ = test_hooks.largest_seal.fetchMax(bytes.len, .monotonic);
+    }
     sh.pending.append(bytes) catch return -1;
     return len;
 }
