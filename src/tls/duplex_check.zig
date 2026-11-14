@@ -682,3 +682,103 @@ pub fn borrowCancel(gpa: std.mem.Allocator, io: std.Io) !void {
     try std.testing.expectError(error.WriteFailed, future.cancel(io));
     try std.testing.expect(hooks.borrowOut(&p.server.conn));
 }
+
+// ---------------------------------------------------------------------------
+// Records cut by size, not at slice boundaries (dusty_tls `Writer.drain`).
+
+/// One message of `prefix` bytes written into a 16 KiB plaintext buffer,
+/// then slices of `sizes` as one vector, then a flush: one drain, as the
+/// HTTP/2 flusher writes a round of frames. From `start` in `side`'s
+/// stream.
+fn sendSlices(side: *Side, start: usize, prefix: usize, sizes: []const usize) !void {
+    var total = prefix;
+    for (sizes) |s| total += s;
+    const payload = try std.testing.allocator.alloc(u8, total);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = expectedByte(side.id, start + i);
+    var vecs: [64][]const u8 = undefined;
+    var off = prefix;
+    for (sizes, 0..) |s, i| {
+        vecs[i] = payload[off..][0..s];
+        off += s;
+    }
+    var plain_buf: [16 * 1024]u8 = undefined;
+    var w = side.conn.writer(&plain_buf);
+    w.interface.writeAll(payload[0..prefix]) catch return w.err.?;
+    w.interface.writeVecAll(vecs[0..sizes.len]) catch return w.err.?;
+    w.interface.flush() catch return w.err.?;
+}
+
+fn sendSlicesTo(side: *Side, start: usize, prefix: usize, sizes: []const usize, result: *anyerror!void) void {
+    result.* = sendSlices(side, start, prefix, sizes);
+}
+
+/// Small slices (frame headers, HEADERS blocks) are gathered into records
+/// of 16 KiB, slices of a record or more pass through uncopied when
+/// nothing is staged (and are copied when something is, as HTTP/2 DATA
+/// behind its frame header always is), and every byte arrives in order.
+pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
+    // SAFETY: `open` sets every field.
+    var p: Pair = undefined;
+    try p.open(gpa, io);
+    defer p.close(gpa, io);
+
+    // The first response also carries the session tickets.
+    var start: usize = 0;
+    try exchange(io, &p.server, &p.client, start, 100);
+    start += 100;
+
+    const record = 16 * 1024;
+    // 40 slices of 9 to 200 bytes and an 8 KiB body: less than a buffer.
+    var small: [41]usize = undefined;
+    for (small[0..40], 0..) |*s, i| s.* = 9 + (i * 37) % 192;
+    small[40] = 8 * 1024;
+    // Five frames of header, HEADERS block, header and 8 KiB DATA: 41,800
+    // bytes, all slices under a record.
+    var frames: [20]usize = undefined;
+    for (&frames, 0..) |*s, i| s.* = ([_]usize{ 9, 150, 9, 8 * 1024 })[i % 4];
+
+    // Four DATA frames of 16 KiB, each header and payload a slice.
+    var h2_data: [8]usize = undefined;
+    for (&h2_data, 0..) |*s, i| s.* = if (i % 2 == 0) 9 else record;
+
+    const Case = struct { prefix: usize, sizes: []const usize, records: usize, staged: usize };
+    const cases = [_]Case{
+        // Fits the buffer: std's writeSplat copies it, the flush seals it.
+        .{ .prefix = 0, .sizes = &small, .records = 1, .staged = 0 },
+        .{ .prefix = 0, .sizes = &frames, .records = 3, .staged = 41_800 },
+        // A head ahead of a big body: the first record is topped up, the
+        // rest passes through.
+        .{ .prefix = 100, .sizes = &.{32 * 1024}, .records = 3, .staged = record - 100 },
+        // Slices of a record or more into an empty stage copy nothing.
+        .{ .prefix = 0, .sizes = &.{ 32 * 1024, 20 * 1024 }, .records = 4, .staged = 0 },
+        // The HTTP/2 shape: each 16 KiB DATA behind its 9-byte header finds
+        // the stage non-empty and is copied: 5 records, not 8, and every
+        // byte staged but the final 36, which leave from the last slice.
+        .{ .prefix = 0, .sizes = &h2_data, .records = 5, .staged = 4 * (9 + record) - 36 },
+        // An HTTP/1 head of small writes, then a chunk size and a body.
+        .{ .prefix = 300, .sizes = &.{ 2048, 9, 14 * 1024 }, .records = 2, .staged = record - 300 },
+    };
+    for (cases) |case| {
+        var len = case.prefix;
+        for (case.sizes) |s| len += s;
+        const before: Counts = .now();
+        const staged_before = hooks.staged_bytes.load(.monotonic);
+        var results: [2]anyerror!void = @splat({});
+        {
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            try group.concurrent(io, sendSlicesTo, .{ &p.server, start, case.prefix, case.sizes, &results[0] });
+            try group.concurrent(io, readRangeTo, .{ &p.client, start, len, &results[1] });
+            try group.await(io);
+        }
+        for (results) |r| try r;
+        start += len;
+        const d = Counts.now().since(before);
+        const staged = hooks.staged_bytes.load(.monotonic) - staged_before;
+        errdefer std.log.err("{d} bytes: {any}, staged {d}", .{ len, d, staged });
+        try std.testing.expectEqual(case.records, d.seals);
+        try std.testing.expectEqual(case.records + d.borrows, d.ssl_writes);
+        try std.testing.expectEqual(case.staged, staged);
+    }
+}
