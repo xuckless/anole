@@ -893,7 +893,6 @@ test "h2 engine: after the peer's GOAWAY the open stream is answered, then the c
     const entered = Handlers.held_entered.load(.acquire);
     const id = try c.request("GET", "/held", null);
     try wait.waitAtLeast(testing.io, "the held handler started", &Handlers.held_entered, entered + 1);
-    const closes = engine.test_drain_closes.load(.acquire);
     // GOAWAY, last stream 0 (a client takes no pushes), NO_ERROR.
     const goaway: [8]u8 = @splat(0);
     try c.frameOut(.goaway, 0, 0, &goaway);
@@ -903,8 +902,11 @@ test "h2 engine: after the peer's GOAWAY the open stream is answered, then the c
     try expectEqual(200, r.status);
     try expectEqualStrings("held", r.body.items);
     // nghttp2's want_read is 0 once no stream is open: the send side is
-    // shut (h2/client_test.zig checks the lingering close after it).
-    try wait.waitAtLeast(testing.io, "the connection was shut after the peer's GOAWAY", &engine.test_drain_closes, closes + 1);
+    // shut, and the client reads its FIN (h2/client_test.zig checks the
+    // lingering close after it). Which side ends it depends on whether the
+    // GOAWAY is read before or after the stream finishes (the flusher's
+    // `shutDrained`, or the reader's `.drained` and `lingeringClose`), so
+    // the test waits for the FIN itself, not one path's counter.
     while (true) c.readOne() catch |err| switch (err) {
         error.EndOfStream => break,
         else => return err,
