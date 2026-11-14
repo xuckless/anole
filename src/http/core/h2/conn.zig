@@ -328,8 +328,19 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// (the server preface, as today's engine sends it, plus D15's
         /// SETTINGS_NO_RFC7540_PRIORITIES).
         pub fn init(gpa: Allocator, handler: *H, opts: Options) Allocator.Error!Self {
+            // SAFETY: `initAt` sets every field.
+            var c: Self = undefined;
+            try c.initAt(gpa, handler, opts);
+            return c;
+        }
+
+        /// `init` into `c` (the engine's heap connection): no copy of the
+        /// whole connection (about 7 KB, its HPACK tables) passes through
+        /// the caller's stack, whose pages a connection's task keeps
+        /// (#223).
+        pub fn initAt(c: *Self, gpa: Allocator, handler: *H, opts: Options) Allocator.Error!void {
             const cw: u31 = @max(default_window, opts.connection_window);
-            var c: Self = .{
+            c.* = .{
                 .gpa = gpa,
                 .handler = handler,
                 .opts = opts,
@@ -340,7 +351,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .recv_window = cw,
                 .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
                 .refused_budget = .init(opts.refused_stream_burst, opts.refused_stream_rate),
-                .empty_budget = .init(opts.limits.empty_frame_rate, opts.limits.empty_frame_rate),
+                .empty_budget = .init(opts.limits.empty_frame_burst, opts.limits.empty_frame_rate),
                 .glitch_budget = .init(opts.limits.glitch_burst, opts.limits.glitch_rate),
             };
             errdefer c.out.deinit();
@@ -367,7 +378,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const b = try c.out.writable(frame.header_len + n * frame.setting_len);
             c.out.commit(frame.writeSettings(b, false, entries[0..n]));
             if (cw > default_window) try c.queueWindowUpdate(0, cw - default_window);
-            return c;
         }
 
         /// Frees everything. No onStreamClose for the streams still open:
@@ -953,10 +963,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.out.commit(frame.writePing(b, true, p.data));
         }
 
-        /// nghttp2_session_on_goaway_received. A server opens no streams,
-        /// so none close.
+        /// nghttp2_session_on_goaway_received, but an id of the peer's own
+        /// parity is not an error (INTENTIONAL.md, the session 6). A server
+        /// opens no streams, so none close.
         fn onGoaway(c: *Self, g: frame.Goaway) RecvError!void {
-            if ((g.last_stream_id > 0 and g.last_stream_id & 1 == 1) or g.last_stream_id > c.remote_last)
+            if (g.last_stream_id > c.remote_last)
                 return c.terminate(.protocol_error, "GOAWAY: invalid last_stream_id");
             c.remote_last = g.last_stream_id;
             c.handler.onGoaway(g.last_stream_id, g.code);
@@ -1217,6 +1228,23 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             };
         }
 
+        /// Raises `s`'s receive window by `by`: a WINDOW_UPDATE for it now,
+        /// so the peer may send that much more before our next credit
+        /// (nghttp2_session_set_local_window_size on one stream, which
+        /// today's engine raises a body's window with as its handler keeps
+        /// reading; `Http2.stream_window_reading`). A stream whose peer half
+        /// ended, or a raise past 2^31-1, is left alone. The WINDOW_UPDATE
+        /// batching stays on the initial window (`due`): a raised stream is
+        /// credited at the same steps.
+        pub fn raiseWindow(c: *Self, s: *Stream, by: u31) Allocator.Error!void {
+            c.enter();
+            defer c.leave();
+            if (by == 0 or !s.canRecv()) return;
+            if (@as(i64, s.recv_window) + s.recv_unacked + by > frame.max_window_size) return;
+            try c.queueWindowUpdate(s.id, by);
+            s.recv_window += by;
+        }
+
         /// The response head: `:status` then `hdrs`, HEADERS split into
         /// CONTINUATIONs at the peer's SETTINGS_MAX_FRAME_SIZE, encoded now.
         /// With `end_stream` the stream may close (and `s` go) before this
@@ -1249,6 +1277,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             if (!s.canSend() or !s.flags.head_sent or s.flags.answered) return error.StreamClosed;
             var total: u64 = 0;
             for (parts) |p| total += p.len;
+            // An empty end behind queued DATA rides on its last frame (a
+            // body flushed, then ended), as `submitTrailers` does.
+            if (total == 0 and end_stream) if (s.pending.last) |node| {
+                const last: *Pending = @fieldParentPtr("node", node);
+                if (!last.end_stream and last.trailers == null) {
+                    last.end_stream = true;
+                    s.flags.answered = true;
+                    return;
+                }
+            };
             const p = try c.newPending();
             p.* = .{ .parts = parts, .left = total, .end_stream = end_stream };
             s.pending.append(&p.node);
@@ -1258,6 +1296,35 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 return err;
             };
             if (end_stream) s.flags.answered = true;
+        }
+
+        /// `n` more bytes for the stream's last queued DATA, when that is
+        /// `parts` (the same list, by identity) and does not end the
+        /// stream: the caller grows its last part in place by `n` once
+        /// this returns true, so sends queued faster than they are framed
+        /// go out as one DATA run (nghttp2's data provider reads whatever
+        /// its source holds when it frames). False, and nothing changed,
+        /// when the last queued DATA is another or none (`parts` framed
+        /// whole already).
+        pub fn growData(c: *Self, s: *Stream, parts: []const []const u8, n: usize) SubmitError!bool {
+            c.enter();
+            defer c.leave();
+            if (!s.canSend() or s.flags.answered) return error.StreamClosed;
+            const node = s.pending.last orelse return false;
+            const p: *Pending = @fieldParentPtr("node", node);
+            if (p.parts.ptr != parts.ptr or p.end_stream or p.trailers != null) return false;
+            if (s.send_window > 0) try c.makeReady(s);
+            p.left += n;
+            return true;
+        }
+
+        /// Whether `parts` (by identity) is the stream's first queued DATA,
+        /// not framed whole yet.
+        pub fn queuedFirst(c: *const Self, s: *const Stream, parts: []const []const u8) bool {
+            _ = c;
+            const node = s.pending.first orelse return false;
+            const p: *const Pending = @fieldParentPtr("node", node);
+            return p.parts.ptr == parts.ptr;
         }
 
         /// Trailers, by reference, sent with END_STREAM once the queued
@@ -1308,6 +1375,35 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         pub fn ping(c: *Self, data: [8]u8) Allocator.Error!void {
             const b = try c.out.writable(frame.header_len + 8);
             c.out.commit(frame.writePing(b, false, data));
+        }
+
+        /// Nothing of a frame is held between `recv` calls: no DATA payload
+        /// half in, no header block waiting for its CONTINUATIONs (and,
+        /// when the caller's buffer is empty, no partial frame there). An
+        /// idle connection parks only then, as nginx keeps a connection
+        /// whose `state.incomplete` is set out of its idle mode.
+        pub fn atFrameBoundary(c: *const Self) bool {
+            return c.data_in == null and c.block == null;
+        }
+
+        /// An idle connection's memory back (PLAN §3.4, M3): the output
+        /// blocks and ready queue, the stream slab's chunks, the stream
+        /// table and the spare Pending nodes, which the next stream
+        /// allocates again. Only with no stream in the table or closing
+        /// and nothing queued. Whether it could.
+        pub fn releaseIdle(c: *Self) bool {
+            if (c.depth != 0 or c.table.size != 0 or c.closing.first != null or c.pending_nodes != 0 or !c.out.idle() or c.out.peekReady() != null) return false;
+            c.out.release();
+            c.out.ready.clearAndFree(c.gpa);
+            c.out.ready_head = 0;
+            c.slab.deinit();
+            const max_live = c.table.max_live;
+            const seed = c.table.seed;
+            c.table.deinit();
+            c.table = .init(c.gpa, max_live, seed);
+            while (c.spare.popFirst()) |node| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", node)));
+            c.spare_len = 0;
+            return true;
         }
 
         /// What to write now: queued frames, plus DATA framed from the

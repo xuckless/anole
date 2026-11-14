@@ -1029,6 +1029,35 @@ test "h2 conn: consumed batches WINDOW_UPDATE" {
     for (try t.drain()) |f| try expect(f.id == 0);
 }
 
+test "h2 conn: raiseWindow sends the difference and moves recv_window" {
+    const t = try ready(.{});
+    defer t.destroy();
+    t.rec.consume = false;
+    t.rec.record = false;
+    try t.feed(try t.headers(1, &post, false));
+    const before = t.stream(1).recv_window;
+    try t.c.raiseWindow(t.stream(1), 1000);
+    const out = try t.drain();
+    try expectFrames(out, &.{.{ .type = .window_update, .id = 1 }});
+    try expectEqual(1000, out[0].inc);
+    try expectEqual(before + 1000, t.stream(1).recv_window);
+    // The peer may now send the old window and the raise, unconsumed,
+    // without a FLOW_CONTROL_ERROR.
+    const chunk: [16384]u8 = @splat(7);
+    var left: usize = @intCast(before + 1000);
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        try t.feed(try t.data(1, chunk[0..n], false));
+        left -= n;
+    }
+    try expectFrames(try t.drain(), &.{});
+    try expectEqual(0, t.stream(1).recv_window);
+    // Once the peer's half ends there is nothing to raise.
+    try t.feed(try t.data(1, "", true));
+    try t.c.raiseWindow(t.stream(1), 1000);
+    try expectFrames(try t.drain(), &.{});
+}
+
 test "h2 conn: DATA cut to windows and max_frame_size" {
     const t = try ready(.{});
     defer t.destroy();
@@ -1266,6 +1295,44 @@ test "h2 conn: out slices stay put while more is queued" {
         sent += n;
     }
     try expectEqual(80000, sent);
+}
+
+test "h2 conn: growData extends the last queued DATA, partly framed or not, and only that" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    const s = t.stream(1);
+    const body = try t.arena().alloc(u8, 70000);
+    for (body, 0..) |*b, i| b.* = @truncate(i);
+    try t.c.submitHead(s, 200, &.{}, false);
+    // The part a caller grows in place.
+    var part: [1][]const u8 = .{body[0..60000]};
+    try t.c.submitData(s, &part, false);
+    try expect(t.c.queuedFirst(s, &part));
+    // Framed up to the connection window (65535): queued still, partly.
+    var out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data }, .{ .type = .data }, .{ .type = .data }, .{ .type = .data } });
+    try expect(!t.c.queuedFirst(s, &part));
+    // Framed whole: not grown.
+    try expect(!try t.c.growData(s, &part, 1));
+    part[0] = body[60000..61000];
+    try t.c.submitData(s, &part, false);
+    try expect(try t.c.growData(s, &part, 9000));
+    part[0] = body[60000..70000];
+    // Another list is not the last queued.
+    const other: [1][]const u8 = .{"x"};
+    try expect(!try t.c.growData(s, &other, 1));
+    out = try t.drain();
+    try expectEqual(65535 - 60000, out[0].data.len);
+    try t.feed(try t.windowUpdate(0, 1 << 20));
+    try t.feed(try t.windowUpdate(1, 1 << 20));
+    out = try t.drain();
+    try expectFrames(out, &.{.{ .type = .data }});
+    try expectEqual(70000 - 65535, out[0].data.len);
+    try testing.expectEqualSlices(u8, body[65535..], out[0].data);
+    // Nor once the stream's end is queued.
+    try t.c.submitData(s, &part, true);
+    try expectError(error.StreamClosed, t.c.growData(s, &part, 1));
 }
 
 test "h2 conn: running out of memory while framing DATA queues nothing" {
@@ -1681,6 +1748,16 @@ test "h2 conn: on_goaway_received" {
     try expectEqualStrings("GOAWAY: invalid last_stream_id", out[0].data);
 }
 
+test "h2 conn: a GOAWAY's last_stream_id of the peer's own parity is accepted" {
+    // grpc-go's client closes with GOAWAY(NO_ERROR) naming its own highest stream (odd), not 0.
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    try t.feed(try t.goaway(1, .no_error));
+    try expectEqual(1, t.rec.count(.goaway));
+    try expectEqual(0, (try t.drain()).len);
+}
+
 test "h2 conn: on_window_update_received" {
     const t = try ready(.{});
     defer t.destroy();
@@ -1775,6 +1852,19 @@ test "h2 conn: submit_data" {
     try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data, .flags = F.end_stream } });
     try expectEqualStrings("hello", out[1].data);
     try expect(!t.c.borrowing());
+    try expectEqual(ErrorCode.no_error, t.rec.closeCode(1).?);
+}
+
+test "h2 conn: an empty end behind queued DATA ends on its last frame" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    try t.c.submitHead(t.stream(1), 200, &.{}, false);
+    try t.c.submitData(t.stream(1), &.{"hello"}, false);
+    try t.c.submitData(t.stream(1), &.{}, true);
+    const out = try t.drain();
+    try expectFrames(out, &.{ .{ .type = .headers }, .{ .type = .data, .flags = F.end_stream } });
+    try expectEqualStrings("hello", out[1].data);
     try expectEqual(ErrorCode.no_error, t.rec.closeCode(1).?);
 }
 

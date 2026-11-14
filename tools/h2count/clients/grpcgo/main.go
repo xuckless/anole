@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,4 +82,7 @@ func main() {
 	}
 	wg.Wait()
 	fmt.Printf("unary ok=%d failed=%d, cancelled=%d of %d\n", ok.Load(), failed.Load(), cut.Load(), *cancels)
+	if failed.Load() != 0 || cut.Load() != int64(*cancels) {
+		os.Exit(1)
+	}
 }

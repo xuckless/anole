@@ -5,6 +5,9 @@
 //!
 //!   zig build run-h2count-site -- 8080
 //!
+//!   zig build run-h2count-site -- 8080 8443 cert.pem key.pem   (also TLS, for clients that go straight at it)
+//!
+//!   GET  /done?s=X&ok=0|1&err=  logs "done s=X ok=1" (the result channel of /drive, read by scenarios/run.sh)
 //!   GET  /drive?s=X  a page that makes a browser reload, cancel, stream and upload (scenarios/run.sh)
 //!   GET  /           HTML with 60 images, 20 scripts and 20 stylesheets
 //!   GET  /r/:n       a few hundred bytes (the subresources)
@@ -35,6 +38,12 @@ const drive_html = @embedFile("drive.html");
 fn drive(_: *anole.Request, res: *anole.Response) !void {
     res.body = drive_html;
     res.content_type = .html;
+}
+
+fn done(req: *anole.Request, res: *anole.Response) !void {
+    const q = req.query;
+    std.debug.print("done s={s} ok={s} err={s}\n", .{ q.get("s") orelse "?", q.get("ok") orelse "?", q.get("err") orelse "" });
+    res.status = .no_content;
 }
 
 fn small(req: *anole.Request, res: *anole.Response) !void {
@@ -88,10 +97,13 @@ pub fn main(init: std.process.Init) !void {
     var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
+    const tls_port = if (args.next()) |p| try std.fmt.parseInt(u16, p, 10) else null;
+    const cert = args.next();
+    const key = args.next();
 
     var app = try anole.Server(void).init(init.gpa, .{
         .http = .{ .port = port, .h2c = true },
-        .https = null,
+        .https = if (tls_port) |p| .{ .address = "127.0.0.1", .port = p, .cert = .{ .files = .{ .cert_path = cert orelse return error.MissingCert, .key_path = key orelse return error.MissingKey } } } else null,
         // The upload sink streams its body, so allow a big one.
         .limits = .{ .body_max = 256 << 20 },
         .process = init.minimal,
@@ -99,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
     app.get("/", page);
     app.get("/drive", drive);
+    app.get("/done", done);
     app.get("/r/:n", small);
     app.get("/download", download);
     app.post("/upload", upload);

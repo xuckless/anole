@@ -77,6 +77,7 @@ test "h2 limits: defaults" {
     const l: limits.Limits = .{};
     try expectEqual(1000, l.control_frame_budget);
     try expectEqual(100, l.empty_frame_rate);
+    try expectEqual(1000, l.empty_frame_burst);
     try expectEqual(10000, l.glitch_burst);
     try expectEqual(330, l.glitch_rate);
     try expectEqual(32, l.max_settings);

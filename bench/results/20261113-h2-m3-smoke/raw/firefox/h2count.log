@@ -1,0 +1,19 @@
+h2count: tls on 127.0.0.1:19443 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19080 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19083 -> 127.0.0.1:18083
+scenario          conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+firefox-load      2      71       204    0       1     4        0      0          0      0       0       0       0    0         281     205   0
+firefox-reload    2      52       1515   0       1     4        8      8          8      0       0       0       0    0         283     1515  0
+firefox-abort     3      48       49     0       1     4        26     15         26     0       0       0       0    0         282     67    0
+firefox-sse       2      4        5      0       1     4        3      3          3      0       0       0       0    0         280     6     0
+firefox-upload    1      1        4      0       1     4        0      0          0      0       0       0       0    0         283     5     0
+firefox-download  1      1        4      0       1     4        0      0          0      0       0       0       0    0         284     222   0
+firefox-nav       2      1        5      0       1     4        0      0          0      0       0       0       0    0         281     221   0
+scenario          conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+firefox-load      2      71       204    0       1     4        0      0          0      0       0       0       0    0         281     205   0
+firefox-reload    2      52       1515   0       1     4        8      8          8      0       0       0       0    0         283     1515  0
+firefox-abort     3      48       49     0       1     4        26     15         26     0       0       0       0    0         282     67    0
+firefox-sse       2      4        5      0       1     4        3      3          3      0       0       0       0    0         280     6     0
+firefox-upload    1      1        4      0       1     4        0      0          0      0       0       0       0    0         283     5     0
+firefox-download  1      1        4      0       1     4        0      0          0      0       0       0       0    0         284     222   0
+firefox-nav       2      1        5      0       1     4        0      0          0      0       0       0       0    0         281     221   0

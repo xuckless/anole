@@ -324,8 +324,8 @@ pub const State = struct {
     }
 
     /// The smallest `task_cap` (`ServerConfig.max_tasks`): an HTTP/2
-    /// connection holds two tasks (its reader and its writer), and one more
-    /// is its first stream's.
+    /// connection may hold two tasks (its reader, and its flusher while
+    /// output is left over), and one more is its first stream's.
     pub const min_task_cap = 3;
 
     /// How a task takes its slot (`reserveTask`).
@@ -334,8 +334,9 @@ pub const State = struct {
         /// client may retry.
         stream,
         /// Counted, never refused: a task that has to run for work already
-        /// admitted (an HTTP/2 connection's writer, a parked connection
-        /// whose request has arrived). Bounded by the connections admitted.
+        /// admitted (an HTTP/2 connection's writer or flusher, a parked
+        /// connection whose request has arrived). Bounded by the
+        /// connections admitted.
         forced,
     };
 
@@ -362,8 +363,9 @@ pub const State = struct {
 
     /// Where an HTTP/1.x accept starts to wait: a quarter of `task_cap`
     /// below it, at least one slot, kept for the streams that can only be
-    /// refused. Connections alone (an idle HTTP/2 one holds two tasks)
-    /// never fill the cap, so a stream always has room once they stop.
+    /// refused. Connections alone (an idle HTTP/2 one holds its reader's
+    /// slot and its flusher's) never fill the cap, so a stream always has
+    /// room once they stop.
     pub fn acceptCap(s: *const State) u32 {
         if (s.task_cap == no_limit) return no_limit;
         return s.task_cap -| @max(1, s.task_cap / 4);

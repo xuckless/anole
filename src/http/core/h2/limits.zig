@@ -67,6 +67,13 @@ pub const Limits = struct {
     /// RFC 9218's PRIORITY_UPDATE. Kept at 100 by the D15 point 5
     /// calibration (legitimate clients sent none).
     empty_frame_rate: u32 = 100,
+    /// The empty-frame budget's burst: what may come at once before
+    /// `empty_frame_rate` bounds it. grpc's HTTP/2 conformance check
+    /// (tools/http2_interop TestSoonUnknownFrameType) sends every unknown
+    /// type, 11 to 255, back to back after the preface: 245 frames that
+    /// RFC 9113 §4.1/§5.5 says to ignore. nghttp2 takes them in its glitch
+    /// burst of 10000; this stays a tenth of that.
+    empty_frame_burst: u32 = 1000,
     /// nghttp2's glitch limiter (session_update_glitch_ratelim; burst and
     /// rate per second), which PLAN §5.4 doesn't name. conn.zig charges it
     /// for what the empty-frame budget doesn't take (header blocks decoded

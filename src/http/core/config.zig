@@ -313,7 +313,7 @@ pub const ServerConfig = struct {
     /// never take the room streams need; at the cap a stream is refused
     /// (REFUSED_STREAM, H3_REQUEST_REJECTED). A parked connection whose
     /// request arrived is counted, never refused. At least 3 (an HTTP/2
-    /// connection holds two tasks). Null: on Linux, what `vm.max_map_count`
+    /// connection may hold two tasks). Null: on Linux, what `vm.max_map_count`
     /// leaves after the mappings in use and an eighth of headroom, over the
     /// executors; elsewhere no cap.
     max_tasks: ?u32 = null,
@@ -419,8 +419,8 @@ pub const ServerConfig = struct {
         /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
         max_continuations: usize = 8,
         /// Streams the server may refuse before they reach a handler (a
-        /// header list past `max_header_list_size`, or one nghttp2's checks
-        /// reject) in a burst, refilled at `refused_stream_rate` per
+        /// header list past `max_header_list_size`, or one the request
+        /// field checks reject) in a burst, refilled at `refused_stream_rate` per
         /// second, before the connection is closed with
         /// GOAWAY(ENHANCE_YOUR_CALM).
         refused_stream_burst: u64 = 100,
