@@ -987,8 +987,9 @@ pub const Response = struct {
         return true;
     }
 
-    /// `headers.put`, the table grown first if it is full.
-    fn putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+    /// `headers.put`, the table grown first if it is full. Public for the
+    /// response cache, which replays headers it already checked.
+    pub fn _putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
         if (self.headers.get(name) == null and !self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.put(name, value);
     }
@@ -1230,7 +1231,7 @@ pub const Response = struct {
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
-        try self.putHeader(name, value);
+        try self._putHeader(name, value);
     }
 
     /// Adds a header even if the response has one by that name already:
@@ -1242,7 +1243,7 @@ pub const Response = struct {
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
-        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self.putHeader(name, value);
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self._putHeader(name, value);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add(name, value);
     }
@@ -1824,7 +1825,7 @@ pub const Response = struct {
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;
         try self.header("Upgrade", "websocket");
-        try self.putHeader("Connection", "Upgrade");
+        try self._putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self._streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
@@ -2374,7 +2375,7 @@ pub const Response = struct {
     fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
         if (self._send_date and self.headers.get("Date") == null) {
             const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
-            self.putHeader("Date", date) catch {};
+            self._putHeader("Date", date) catch {};
         }
     }
 

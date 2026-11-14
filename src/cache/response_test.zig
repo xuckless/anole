@@ -116,6 +116,13 @@ const Routes = struct {
         try res.print(.text, "user {s}", .{req.headers.get("X-Session-Token") orelse "anonymous"});
     }
 
+    /// More headers than a response's table starts with (16, a sink's 8).
+    fn many(_: *Request, res: *Response) !void {
+        count(15);
+        for (0..20) |i| try res.header(try std.fmt.allocPrint(res.arena, "X-H{d}", .{i}), "v");
+        res.body = "many";
+    }
+
     fn noTenant(req: *const Request) bool {
         return req.headers.get("X-Tenant") == null;
     }
@@ -387,6 +394,24 @@ test "ResponseCache: credential_headers and cacheable keep per-user answers out"
             try testing.expectEqualStrings("tenant a", (try c.get(.get, "/tenant", &.{.{ "X-Tenant", "a" }})).body);
             try testing.expectEqualStrings("tenant b", (try c.get(.get, "/tenant", &.{.{ "X-Tenant", "b" }})).body);
             try testing.expectEqualStrings("tenant none", (try c.get(.get, "/tenant", &.{})).body);
+        }
+    };
+    try serve(&app, Check.run, .{});
+}
+
+test "ResponseCache: a hit replays more headers than the table starts with" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.use(Routes.stamp);
+    app.get("/many", handlers.cached(ttl, Routes.many));
+    const Check = struct {
+        fn run(c: Ctx) !void {
+            const first = try c.get(.get, "/many", &.{});
+            const second = try c.get(.get, "/many", &.{});
+            try testing.expectEqual(http.Status.ok, first.status);
+            try testing.expectEqual(http.Status.ok, second.status);
+            try testing.expectEqualStrings("many", second.body);
+            try testing.expectEqual(@as(u32, 1), ran(15));
         }
     };
     try serve(&app, Check.run, .{});

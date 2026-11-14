@@ -1421,7 +1421,7 @@ test "h2 engine: a response ended before its request starts no send-deadline wai
     try expectEqual(waiters, engine.test_send_waiters.load(.acquire));
 }
 
-test "h2 engine: an ordinary exchange fits a new stream's first arena node; a bigger one grows the node once, to the limit" {
+test "h2 engine: an ordinary exchange takes under 2 KiB of its stream's arena; a spare keeps one node of the limit and allocates nothing again" {
     // The release behaviour: a spare stream keeps its arena's node.
     const safety = @import("anole_safety");
     safety.arena_poisoning.store(false, .monotonic);
@@ -1442,34 +1442,32 @@ test "h2 engine: an ordinary exchange fits a new stream's first arena node; a bi
         .{ .method = "POST", .path = "/nw/baseline?a=1&b=2", .body = "20", .want = "23" },
         .{ .method = "GET", .path = "/nw/hello", .body = null, .want = "hello" },
         .{ .method = "GET", .path = "/users/1", .body = null, .want = "user 1" },
+        .{ .method = "GET", .path = "/nw/json?n=1", .body = null, .want = "{\"items\":[{\"id\":0," },
     };
-    // One at a time: each runs on the one spare the first made.
+    // One at a time: each runs on the one spare the first made. The small
+    // header tables keep these under 2 KiB (2.4-2.9 KB with 32/16 entries).
     for (ordinary) |sh| {
         resetArenaProbes();
         const id = try c.requestWith(sh.method, sh.path, fields, sh.body);
-        try expectEqualStrings(sh.want, (try c.until(id)).body.items);
+        try expect(std.mem.startsWith(u8, (try c.until(id)).body.items, sh.want));
         try awaitArenaHigh();
-        try expect(engine.test_arena_high.load(.monotonic) <= engine.arena_first_node);
-        try expectEqual(engine.arena_first_node, engine.test_arena_kept.load(.monotonic));
+        try expect(engine.test_arena_high.load(.monotonic) <= 2 * 1024 - 4 * @sizeOf(usize));
+        try expectEqual(engine.arena_retain_limit, engine.test_arena_kept.load(.monotonic));
     }
-    resetArenaProbes();
-    const r1 = try c.requestWith("GET", "/nw/json?n=1", fields, null);
-    try expect(std.mem.startsWith(u8, (try c.until(r1)).body.items, "{\"items\":[{\"id\":0,"));
-    try awaitArenaHigh();
-    try expect(engine.test_arena_high.load(.monotonic) <= engine.arena_first_node);
-
-    // Past the first node: served, and the spare keeps the limit from then
-    // on, so the same request again allocates nothing.
-    for (0..2) |round| {
-        resetArenaProbes();
-        const before = counting.count.load(.monotonic);
-        const id = try c.requestWith("GET", "/nw/json?n=20", fields, null);
-        try expect(std.mem.endsWith(u8, (try c.until(id)).body.items, "],\"count\":20}"));
-        try awaitArenaHigh();
-        try expect(engine.test_arena_high.load(.monotonic) > engine.arena_first_node);
-        const kept = engine.test_arena_kept.load(.monotonic);
-        try expect(kept > engine.arena_first_node and kept <= engine.arena_retain_limit);
-        if (round == 1) try expectEqual(before, counting.count.load(.monotonic));
+    // Ordinary or within the node, a request on the spare allocates
+    // nothing; one past it spills and the spare is back to one node of the
+    // limit.
+    for ([_][]const u8{ "/nw/baseline?a=1&b=2", "/nw/json?n=20", "/nw/json?n=50" }) |path| {
+        for (0..2) |_| {
+            resetArenaProbes();
+            const before = counting.count.load(.monotonic);
+            const id = try c.requestWith("GET", path, fields, null);
+            try expectEqual(200, (try c.until(id)).status);
+            try awaitArenaHigh();
+            try expectEqual(engine.arena_retain_limit, engine.test_arena_kept.load(.monotonic));
+            if (engine.test_arena_high.load(.monotonic) <= engine.arena_retain_limit)
+                try expectEqual(before, counting.count.load(.monotonic));
+        }
     }
 }
 

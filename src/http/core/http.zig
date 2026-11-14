@@ -577,9 +577,12 @@ pub const Headers = struct {
     }
 
     /// `add`, a full table first growing in `allocator` (`grow`) up to
-    /// `max` entries. Without the memory for that it is full too.
-    pub fn addUpTo(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8, max: usize) error{TooManyHeaders}!void {
-        if (self.len >= self.keys.len and !self.grow(allocator, max)) return error.TooManyHeaders;
+    /// `max` entries.
+    pub fn addUpTo(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8, max: usize) error{ TooManyHeaders, OutOfMemory }!void {
+        if (self.len >= self.keys.len) {
+            if (self.keys.len >= max) return error.TooManyHeaders;
+            if (!self.grow(allocator, max)) return error.OutOfMemory;
+        }
         try self.add(name, value);
     }
 

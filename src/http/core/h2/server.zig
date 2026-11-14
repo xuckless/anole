@@ -129,16 +129,12 @@ const initial_header_room = 8;
 /// Spare streams a connection keeps for reuse (as the nghttp2 engine).
 const max_spare_streams = 128;
 const min_spare_streams = 16;
-/// The most a stream's arena keeps between requests (as the nghttp2
-/// engine: an 8 KiB malloc class with the arena's node header).
+/// What a stream's arena keeps between requests (as the nghttp2 engine:
+/// an 8 KiB malloc class with the arena's node header). Not a smaller
+/// first node grown on demand: SmpAllocator resizes only within a class,
+/// so every stream that grew would leave its old node on a free list that
+/// nothing in steady state reuses (M4, research/s2/h2-m4/heap.md).
 pub const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
-/// What a new stream's arena starts with: a 2 KiB malloc class, which
-/// holds an ordinary exchange (h2load's baseline, a small JSON answer:
-/// about 1.8 KiB). A stream that needs more grows its node once, at its
-/// reset, up to `arena_retain_limit`: every stream open at once and every
-/// spare keeps its node, so starting at the limit made each one a touched
-/// 4 KiB page (M4, #179).
-pub const arena_first_node = 2 * 1024 - 4 * @sizeOf(usize);
 /// A streamed response's block: the body writer's buffer, then borrowed by
 /// `out` until written. Two per stream on a task.
 const block_len = 16 * 1024;
@@ -217,8 +213,7 @@ pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void 
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: the most arena one stream's exchange used (bytes handed
-/// out over its nodes), read before its reset (`maybeFree`): what
-/// `arena_first_node` has to hold for an ordinary one.
+/// out over its nodes), read before its reset (`maybeFree`).
 pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
 /// Tests only: the arena the last stream put back to the spares kept.
 pub var test_arena_kept: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
@@ -1958,10 +1953,10 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 const es = try conn.allocator.create(EStream);
                 es.* = .{ .conn = conn, .arena = .init(conn.allocator) };
-                // The node every reset keeps, so the first reset of an
-                // ordinary exchange does not reallocate it.
-                if (es.arena.allocator().alloc(u8, arena_first_node)) |_| {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_first_node });
+                // The node every reset keeps, so the first reset does not
+                // reallocate it.
+                if (es.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
+                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
                 } else |_| {}
                 return es;
             }
@@ -2787,8 +2782,9 @@ pub fn Engine(comptime Ctx: type) type {
                 return .done;
             }
             if (!too_many and hosts == 0 and es.authority.len > 0) {
-                request.headers.addUpTo(arena, "Host", es.authority, max_headers) catch {
-                    too_many = true;
+                request.headers.addUpTo(arena, "Host", es.authority, max_headers) catch |err| switch (err) {
+                    error.TooManyHeaders => too_many = true,
+                    error.OutOfMemory => return error.OutOfMemory,
                 };
             }
             if (too_many) {
