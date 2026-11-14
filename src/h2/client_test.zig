@@ -1486,3 +1486,27 @@ test "h2 client: a request body the writer is still writing from outlives its re
         }
     }.f);
 }
+
+test "h2 client: a HEADERS frame longer than the reader's buffer is gathered whole" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try peer.waitHeadersSent(1);
+    // :status 200 and a 16370-byte literal: a 16386-byte frame, past the
+    // 16 KiB the scripted reader buffers.
+    const head = [_]u8{ 0x88, 0x00, 1, 'x', 0x7f, 0xf3, 0x7e } ++ @as([16370]u8, @splat('v'));
+    try std.testing.expect(9 + head.len > peer.read_buf.len);
+    try peer.send(&frame(1, 0x5, 1, &head));
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    try std.testing.expectEqual(@as(usize, 16370), s.header("x").?.len);
+}
