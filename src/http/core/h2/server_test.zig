@@ -521,7 +521,9 @@ const Det = struct {
         _ = n.fetchAdd(1, .acq_rel);
     }
 
-    /// The next detached response, once its handler has run.
+    /// The next detached response, once its handler has run. `seen` is the
+    /// count read before the request was sent: read after, a handler that
+    /// already detached would be waited for twice.
     fn take(seen: u32) !*Detached {
         try wait.waitAtLeast(testing.io, "the handler detached its response", &count, seen + 1);
         return slot.swap(null, .acq_rel).?;
@@ -1209,8 +1211,9 @@ test "h2 engine: a detached response finished later from another task; an attach
     defer fx.stop();
     const c = &fx.client;
     // Answered whole, with a trailer.
+    const seen1 = Det.count.load(.acquire);
     const id = try c.request("GET", "/nw/detach", null);
-    const d = try Det.take(Det.count.load(.acquire));
+    const d = try Det.take(seen1);
     var later = try testing.io.concurrent(Det.answer, .{ d, "answered later" });
     later.await(testing.io);
     const r = try c.until(id);
@@ -1223,8 +1226,9 @@ test "h2 engine: a detached response finished later from another task; an attach
     const want = try bigBody();
     defer testing.allocator.free(want);
     const done = Det.attached_done.load(.acquire);
+    const seen2 = Det.count.load(.acquire);
     const streamed = try c.request("GET", "/nw/detach", null);
-    const d2 = try Det.take(Det.count.load(.acquire));
+    const d2 = try Det.take(seen2);
     const group = d2.attach().?;
     try placement.concurrent(group, testing.io, .local, Det.attached, .{d2});
     const r2 = try c.until(streamed);
@@ -1238,9 +1242,10 @@ test "h2 engine: a detached response aborted by the client's RST_STREAM" {
     defer fx.stop();
     const c = &fx.client;
     const aborts = Det.aborts.load(.acquire);
+    const seen3 = Det.count.load(.acquire);
     const id = try c.request("GET", "/nw/detach", null);
     // Never finished: its owner hears of the reset instead, once.
-    _ = try Det.take(Det.count.load(.acquire));
+    _ = try Det.take(seen3);
     try c.rst(id, .cancel);
     try c.ping("detached".*);
     try c.flush();
@@ -1271,10 +1276,12 @@ test "h2 engine: a detached end never waits on the socket" {
     try a.client.settingsWindow(std.math.maxInt(u31));
     try a.client.windowUpdate(0, std.math.maxInt(u31) - 65535);
     try a.client.flush();
+    const seen4 = Det.count.load(.acquire);
     _ = try a.client.request("GET", "/nw/detach", null);
-    const da = try Det.take(Det.count.load(.acquire));
+    const da = try Det.take(seen4);
+    const seen5 = Det.count.load(.acquire);
     const id_b = try b.client.request("GET", "/nw/detach", null);
-    const db = try Det.take(Det.count.load(.acquire));
+    const db = try Det.take(seen5);
     const Both = struct {
         fn run(x: *Detached, y: *Detached, body: []const u8) void {
             Det.answer(x, body);
@@ -1292,8 +1299,9 @@ test "h2 engine: a parked response: bursts in order, the client's reset told onc
     defer fx.stop();
     const c = &fx.client;
     const gone = Park.gone.load(.acquire);
+    const seen6 = Park.count.load(.acquire);
     const id = try c.request("GET", "/park", null);
-    const p = try Park.take(Park.count.load(.acquire));
+    const p = try Park.take(seen6);
     const r = c.get(id);
     // The head went out at the park.
     while (r.status == 0) try c.readOne();
@@ -1313,8 +1321,9 @@ test "h2 engine: a parked response: bursts in order, the client's reset told onc
     p.release();
 
     // A reset during a burst: told at the burst's end.
+    const seen7 = Park.count.load(.acquire);
     const id2 = try c.request("GET", "/park", null);
-    const p2 = try Park.take(Park.count.load(.acquire));
+    const p2 = try Park.take(seen7);
     while (c.get(id2).status == 0) try c.readOne();
     try expect(p2.begin());
     try c.rst(id2, .cancel);
@@ -1337,8 +1346,9 @@ test "h2 engine: a parked response ended by its owner" {
     defer fx.stop();
     const c = &fx.client;
     const gone = Park.gone.load(.acquire);
+    const seen8 = Park.count.load(.acquire);
     const id = try c.request("GET", "/park", null);
-    const p = try Park.take(Park.count.load(.acquire));
+    const p = try Park.take(seen8);
     try Park.burst(p, "only");
     try expect(p.begin());
     p.end();
@@ -1444,14 +1454,17 @@ test "h2 engine: teardown with detached, parked and attached streams outstanding
     const gone = Park.gone.load(.acquire);
     const done = Det.attached_done.load(.acquire);
     // Never finished.
+    const seen9 = Det.count.load(.acquire);
     _ = try c.request("GET", "/nw/detach", null);
-    _ = try Det.take(Det.count.load(.acquire));
+    _ = try Det.take(seen9);
     // Parked, idle.
+    const seen10 = Park.count.load(.acquire);
     _ = try c.request("GET", "/park", null);
-    const p = try Park.take(Park.count.load(.acquire));
+    const p = try Park.take(seen10);
     // Attached, out of window mid-body.
+    const seen11 = Det.count.load(.acquire);
     const streamed = try c.request("GET", "/nw/detach", null);
-    const d = try Det.take(Det.count.load(.acquire));
+    const d = try Det.take(seen11);
     try placement.concurrent(d.attach().?, testing.io, .local, Det.attached, .{d});
     while (c.get(streamed).body.items.len < 65535) try c.readOne();
     // A connection error: every stream is over.
