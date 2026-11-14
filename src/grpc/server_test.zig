@@ -1242,10 +1242,9 @@ const CallerState = struct {
     fn blockedInSend(st: *CallerState) bool {
         if (!st.in_send.load(.acquire)) return false;
         const s = st.stream.load(.acquire) orelse return false;
-        const q = &s.out.type_erased;
-        q.mutex.lockUncancelable(st.io);
-        defer q.mutex.unlock(st.io);
-        return q.putters.first != null;
+        s.conn.mutex.lockUncancelable(st.io);
+        defer s.conn.mutex.unlock(st.io);
+        return s.waiting_room;
     }
 };
 

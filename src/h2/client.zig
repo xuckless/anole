@@ -1,8 +1,11 @@
-//! An HTTP/2 client connection on nghttp2: many concurrent streams over one
-//! TCP connection, cleartext (prior knowledge) or TLS with ALPN "h2". The
-//! shape follows the server engine in the the core fork: a reader task feeds
-//! the session, a writer task drains it, one mutex serializes every
-//! nghttp2 call, and nothing blocks while holding it.
+//! An HTTP/2 client connection on the HTTP core's protocol core
+//! (src/http/core/h2/conn.zig in its client role, M5 of
+//! research/h2h3-takeover/PLAN.md): many concurrent streams over one TCP
+//! connection, cleartext (prior knowledge) or TLS with ALPN "h2". A reader
+//! task feeds the core, a writer task drains it, and one mutex guards it
+//! and everything below: the caller's tasks may run on any executor, so
+//! the server engine's executor-local lock doesn't fit here. Nothing waits
+//! while holding the mutex.
 //!
 //!     var conn = try anole.h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = 8080 });
 //!     defer conn.close();
@@ -18,17 +21,30 @@
 //! `closeSend()`; its response body is read through `reader()`, and the
 //! trailers are in `trailers` once that reports the end.
 //!
+//! Request bodies go to the core by reference (`Conn.submitData`) and are
+//! written from where they lie: `body_bytes` from the stream's copy, a
+//! streamed body from two 16 KiB blocks it fills in turn (the server
+//! engine's sink pattern). Such memory is let go only once the writer has
+//! written past it (`Stream.retire_mark`), even after the stream closed.
+//!
 //! Its own module (`anole_h2_client`), because the core's client takes it as
 //! its `h2_client` import: when a server picks "h2" through ALPN, the core
 //! hands the TLS connection over (`adopt`), so `anole.http.Client` speaks
 //! HTTP/2 too.
 const std = @import("std");
-const c = @import("anole_nghttp2_c");
+const builtin = @import("builtin");
 const options = @import("anole_h2_options");
 const tls = if (options.tls) @import("anole_dusty_tls") else struct {};
 const dusty = @import("dusty");
 const placement = dusty.placement;
 const Deadline = dusty.Deadline;
+const Signal = dusty.Signal;
+const proto = dusty.h2_proto;
+const hpack = proto.hpack;
+const ErrorCode = proto.conn.ErrorCode;
+/// The core's stream (the protocol side of a `Stream`).
+const PStream = proto.conn.Stream;
+const Proto = proto.conn.Conn(.client, ClientConnection.Handler);
 
 /// A header field: request fields (pseudo-headers first, lower-case
 /// names) and the response's `headers` and `trailers`.
@@ -154,8 +170,9 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Shut down by the writer when the session ends, to end the reader's
-    /// wait. Closed by `close` only when `owned` (not after `adopt`).
+    /// Shut down by the writer when the connection ends, to end the
+    /// reader's wait. Closed by `close` only when `owned` (not after
+    /// `adopt`).
     socket: std.Io.net.Stream,
     /// The socket's and the TLS layer's state, when `connect` made them.
     owned: ?*Owned,
@@ -168,25 +185,43 @@ pub const ClientConnection = struct {
     /// The default for `RequestOptions.timeout`.
     timeout: std.Io.Timeout,
 
-    /// Serializes every nghttp2 call and guards what follows.
+    /// Guards `proto`, every stream's state and what follows.
     mutex: std.Io.Mutex = .init,
-    session: ?*c.nghttp2_session = null,
+    // SAFETY: set by `start` (`Proto.initAt`) before anything reads it.
+    proto: Proto = undefined,
+    // SAFETY: set by `start`, before `proto` can call it.
+    handler: Handler = undefined,
+    /// `proto` is freed (`close`).
+    proto_gone: bool = false,
     /// The connection is going or gone: no new streams. A GOAWAY sets it,
     /// and the streams it covers carry on.
     closing: bool = false,
     /// The last stream ID the server's GOAWAY says it may have processed;
     /// above it, a stream never ran (`Stream.unprocessed`).
     goaway_last_id: i32 = std.math.maxInt(i32),
-    /// The session is over: the reader has ended or a write failed. From
-    /// here nothing calls into nghttp2 but `close`, so no callback can
-    /// reach a stream any more.
+    /// The connection is over: the reader has ended or a write failed.
+    /// From here nothing calls into `proto` but the writer (draining it)
+    /// and `close`, so no callback can reach a stream any more.
     dead: bool = false,
+    /// The writer writes what `proto` holds, then shuts the socket down and
+    /// ends: `close`, or the reader is done.
+    shut: bool = false,
     /// Why it went, when it failed.
     failure: ?anyerror = null,
-    write_gen: std.atomic.Value(u32) = .init(0),
+    /// Wakes the writer: output was queued.
+    write_wake: Signal = .{},
+    /// Wakes the request and body-writer waits: a stream closed, the
+    /// writer wrote, the server's frames came in, or the connection ended.
+    progress: Signal = .{},
     group: std.Io.Group = .init,
-    /// Streams the caller still holds or nghttp2 still knows.
+    /// Streams the caller still holds or `proto` still knows.
     live: std.DoublyLinkedList = .{},
+    /// Freed streams whose request body `out` may still be writing from,
+    /// in `retire_mark` order.
+    retiring: std.DoublyLinkedList = .{},
+    /// Tests only: writes of the writer task (each a flush of whatever the
+    /// core held: concurrent requests share them).
+    test_writes: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
 
     const has_tls = options.tls;
 
@@ -317,38 +352,24 @@ pub const ClientConnection = struct {
             .max_header_list_size = max_header_list_size,
             .timeout = timeout,
         };
-        try self.initSession();
-        errdefer c.nghttp2_session_del(self.session);
+        self.handler = .{ .owner = self };
+        var seed: u64 = 0;
+        io.random(std.mem.asBytes(&seed));
+        // Window credit goes back as the reader takes bytes (`consumed`),
+        // so a stream's queue never overflows. Into the heap connection:
+        // no copy of the core's HPACK tables through this frame (#223).
+        try self.proto.initAt(gpa, &self.handler, .{
+            .initial_window = stream_window,
+            .connection_window = max_data,
+            .max_header_list_size = max_header_list_size,
+            .seed = seed,
+        });
+        errdefer self.proto.deinit();
         errdefer self.group.cancel(io);
         // On the caller's executor, as every task of a connection is.
         try placement.concurrent(&self.group, io, .local, readerLoop, .{self});
         try placement.concurrent(&self.group, io, .local, writerLoop, .{self});
         return self;
-    }
-
-    fn initSession(self: *ClientConnection) !void {
-        var cbs: ?*c.nghttp2_session_callbacks = null;
-        if (c.nghttp2_session_callbacks_new(&cbs) != 0) return error.OutOfMemory;
-        defer c.nghttp2_session_callbacks_del(cbs);
-        c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
-        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrameRecv);
-        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
-        c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onStreamClose);
-        var option: ?*c.nghttp2_option = null;
-        if (c.nghttp2_option_new(&option) != 0) return error.OutOfMemory;
-        defer c.nghttp2_option_del(option);
-        // Window credit goes back as the reader takes bytes, so a stream's
-        // queue never overflows.
-        c.nghttp2_option_set_no_auto_window_update(option, 1);
-        if (c.nghttp2_session_client_new2(&self.session, cbs, self, option) != 0) return error.OutOfMemory;
-        const iv = [_]c.nghttp2_settings_entry{
-            .{ .settings_id = c.NGHTTP2_SETTINGS_ENABLE_PUSH, .value = 0 },
-            .{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = self.stream_window },
-            .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = self.max_header_list_size },
-        };
-        if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, &iv, iv.len) != 0) return error.OutOfMemory;
-        // A connection window big enough for several busy streams.
-        _ = c.nghttp2_session_set_local_window_size(self.session, c.NGHTTP2_FLAG_NONE, 0, self.max_data);
     }
 
     /// Sends GOAWAY, waits for the reader and writer, and frees everything
@@ -360,8 +381,9 @@ pub const ClientConnection = struct {
             defer self.unlock();
             // Also after the server's GOAWAY, whose streams may still be
             // open.
-            if (!self.dead) _ = c.nghttp2_session_terminate_session(self.session, c.NGHTTP2_NO_ERROR);
+            if (!self.dead) self.proto.goaway(.no_error, "") catch {};
             self.closing = true;
+            self.shut = true;
         }
         self.kickWriter();
         // The tasks have ended either way; a cancel is the caller's to see.
@@ -369,10 +391,21 @@ pub const ClientConnection = struct {
         {
             self.lock();
             defer self.unlock();
-            c.nghttp2_session_del(self.session);
-            self.session = null;
-            // Streams released but never closed by the server.
             var it = self.live.first;
+            while (it) |node| : (it = node.next) {
+                const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+                if (stream.ps) |ps| ps.user = null;
+                stream.ps = null;
+            }
+            self.proto.deinit();
+            self.proto_gone = true;
+            // Nothing writes any more: what waited for the writer goes.
+            while (self.retiring.popFirst()) |node| {
+                const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node));
+                stream.free();
+            }
+            // Streams released but never closed by the server.
+            it = self.live.first;
             while (it) |node| {
                 it = node.next;
                 const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
@@ -406,8 +439,11 @@ pub const ClientConnection = struct {
     }
 
     fn kickWriter(self: *ClientConnection) void {
-        _ = self.write_gen.fetchAdd(1, .release);
-        self.io.futexWake(u32, &self.write_gen.raw, std.math.maxInt(u32));
+        self.write_wake.notify(self.io);
+    }
+
+    fn waitProgress(self: *ClientConnection, seen: u32) std.Io.Cancelable!void {
+        try self.progress.wait(self.io, seen);
     }
 
     /// Per request: a body (streamed or given whole) and the timeout.
@@ -429,29 +465,53 @@ pub const ClientConnection = struct {
     };
 
     /// Opens a stream. `headers` holds the pseudo-headers first, names in
-    /// lower case; they are copied.
+    /// lower case; they are encoded at once. With the server's limit on
+    /// concurrent streams reached, it waits for one to close, within the
+    /// request's timeout (`error.Timeout`), as Go's Transport waits.
     pub fn request(self: *ClientConnection, headers: []const Header, opts: RequestOptions) !*Stream {
-        const stream = try Stream.create(self, opts.body, opts.body_bytes, .init(self.io, opts.timeout orelse self.timeout));
+        const fixed = if (opts.body_bytes) |b| (if (b.len > 0) b else null) else null;
+        const stream = try Stream.create(self, opts.body, fixed, .init(self.io, opts.timeout orelse self.timeout));
         errdefer stream.destroy();
-        const nva = try self.gpa.alloc(c.nghttp2_nv, headers.len);
-        defer self.gpa.free(nva);
-        for (headers, nva) |h, *nv| nv.* = .{
-            .name = @constCast(h.name.ptr),
-            .namelen = h.name.len,
-            .value = @constCast(h.value.ptr),
-            .valuelen = h.value.len,
-            .flags = c.NGHTTP2_NV_FLAG_NONE,
-        };
-        {
-            self.lock();
-            defer self.unlock();
-            if (self.closing) return error.ConnectionClosed;
-            var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = stream }, .read_callback = provideData };
-            const has_body = opts.body or opts.body_bytes != null;
-            const id = c.nghttp2_submit_request2(self.session, null, nva.ptr, nva.len, if (has_body) &provider else null, stream);
-            if (id < 0) return error.Unexpected;
-            stream.id = id;
-            stream.submitted = true;
+        // SAFETY: the first headers.len are set below.
+        var stack: [32]hpack.Field = undefined;
+        const on_heap = headers.len > stack.len;
+        const fields = if (on_heap) try self.gpa.alloc(hpack.Field, headers.len) else stack[0..headers.len];
+        defer if (on_heap) self.gpa.free(fields);
+        for (headers, fields) |h, *f| f.* = .{ .name = h.name, .value = h.value };
+        const end_stream = !opts.body and fixed == null;
+        while (true) {
+            const seen = self.progress.epoch();
+            {
+                self.lock();
+                defer self.unlock();
+                if (self.closing or self.dead) return error.ConnectionClosed;
+                if (self.proto.submitRequest(fields, end_stream, stream)) |ps| {
+                    stream.ps = ps;
+                    stream.id = ps.id;
+                    stream.submitted = true;
+                    if (fixed != null) {
+                        stream.borrowed = true;
+                        self.proto.submitData(ps, &stream.fixed_part, true) catch |err| {
+                            self.proto.reset(ps, .internal_error) catch {};
+                            return err;
+                        };
+                    }
+                    break;
+                } else |err| switch (err) {
+                    error.StreamLimit => {},
+                    error.GoawayReceived => return error.ConnectionClosed,
+                    // A new connection is due (RFC 9113 §5.1.1).
+                    error.StreamIdsExhausted => {
+                        self.closing = true;
+                        return error.ConnectionClosed;
+                    },
+                    error.HeadersTooLarge, error.OutOfMemory => |e| return e,
+                }
+            }
+            stream.deadline.run(waitProgress, .{ self, seen }) catch |err| return switch (err) {
+                error.Timeout => error.Timeout,
+                else => error.Canceled,
+            };
         }
         self.kickWriter();
         return stream;
@@ -462,31 +522,75 @@ pub const ClientConnection = struct {
         self.lock();
         self.closing = true;
         self.dead = true;
+        // What the core holds (a GOAWAY after a connection error) still
+        // goes out.
+        self.shut = true;
         if (self.failure == null) self.failure = err;
         self.unlock();
         self.failAll();
         self.kickWriter();
+        self.progress.notify(self.io);
     }
 
     fn runReader(self: *ClientConnection) anyerror {
         while (true) {
             const buffered = self.r.buffered();
             if (buffered.len > 0) {
-                self.lock();
-                const rv = c.nghttp2_session_mem_recv2(self.session, buffered.ptr, buffered.len);
-                const done = c.nghttp2_session_want_read(self.session) == 0 and c.nghttp2_session_want_write(self.session) == 0;
-                self.unlock();
-                if (rv < 0) return error.Http2ProtocolError;
-                self.r.toss(@intCast(rv));
-                self.kickWriter();
-                if (done) return error.ConnectionClosed;
-                continue;
+                const n = self.feed(buffered) catch |err| return err;
+                self.r.toss(n);
+                // A GOAWAY's streams are all done: the connection is.
+                if (self.ended()) return error.ConnectionClosed;
+                // The core took every whole frame: what is left is the
+                // start of the next one, so more must be read first.
+                if (n < buffered.len and buffered.len - n == self.r.buffer.len) {
+                    self.feedLarge() catch |err| return err;
+                    if (self.ended()) return error.ConnectionClosed;
+                    continue;
+                }
             }
-            self.r.fillMore() catch |e| return switch (e) {
-                error.EndOfStream => error.ConnectionClosed,
-                error.ReadFailed => error.ConnectionClosed,
-            };
+            self.r.fillMore() catch return error.ConnectionClosed;
         }
+    }
+
+    /// Hands `bytes` to the core; how many it took.
+    fn feed(self: *ClientConnection, bytes: []const u8) !usize {
+        const n = n: {
+            self.lock();
+            defer self.unlock();
+            const buf = try scratch(@max(self.max_header_list_size, hpack.table_capacity));
+            const now = std.Io.Clock.awake.now(self.io);
+            break :n self.proto.recv(bytes, @intCast(@max(0, now.toSeconds())), buf) catch |err| switch (err) {
+                error.ConnectionError, error.BadPreface => return error.Http2ProtocolError,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        };
+        self.kickWriter();
+        self.progress.notify(self.io);
+        return n;
+    }
+
+    /// A frame longer than the reader's buffer holds (a 16 KiB HEADERS
+    /// behind a small TLS buffer): gathered whole in a buffer of its own,
+    /// freed once fed. DATA never comes here: the core takes its payload
+    /// as it arrives.
+    fn feedLarge(self: *ClientConnection) !void {
+        const head = self.r.buffered();
+        const need = 9 + @as(usize, std.mem.readInt(u24, head[0..3], .big));
+        var frame_buf = try self.gpa.alloc(u8, need);
+        defer self.gpa.free(frame_buf);
+        @memcpy(frame_buf[0..head.len], head);
+        self.r.toss(head.len);
+        const got = self.r.readSliceShort(frame_buf[head.len..]) catch return error.ConnectionClosed;
+        if (head.len + got < need) return error.ConnectionClosed;
+        const n = try self.feed(frame_buf);
+        if (n != need) return error.Http2ProtocolError;
+    }
+
+    /// The server's GOAWAY came and every stream it let finish has.
+    fn ended(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return self.proto.goaway_recv and self.proto.table.size == 0;
     }
 
     /// Ends every stream still waiting, as the connection is gone.
@@ -500,40 +604,48 @@ pub const ClientConnection = struct {
         }
     }
 
+    /// Writes what the core has queued, by reference (`pending` and
+    /// `advance`: the slices stay valid across the unlock, whatever is
+    /// queued meanwhile), then lets go of the request bodies written past.
     fn writerLoop(self: *ClientConnection) std.Io.Cancelable!void {
-        var staging: std.ArrayList(u8) = .empty;
-        defer staging.deinit(self.gpa);
+        var vecs: [64][]const u8 = undefined;
         while (true) {
-            const gen = self.write_gen.load(.acquire);
-            var closing = false;
-            var finished = false;
+            const seen = self.write_wake.epoch();
+            var len: usize = 0;
+            var shut = false;
             {
                 self.lock();
                 defer self.unlock();
-                // A GOAWAY only stops new streams: what is open finishes,
-                // and `finished` ends the loop after that.
-                closing = self.dead;
-                while (!closing and staging.items.len < 64 * 1024) {
-                    var data: [*c]const u8 = undefined;
-                    const n = c.nghttp2_session_mem_send2(self.session, &data);
-                    if (n <= 0) break;
-                    staging.appendSlice(self.gpa, data[0..@intCast(n)]) catch break;
-                }
-                finished = c.nghttp2_session_want_read(self.session) == 0 and c.nghttp2_session_want_write(self.session) == 0;
+                const got = self.proto.pending(&vecs) catch {
+                    self.failure = self.failure orelse error.OutOfMemory;
+                    self.dead = true;
+                    self.closing = true;
+                    shut = true;
+                    break;
+                };
+                len = got.len;
+                shut = self.shut;
             }
-            if (staging.items.len > 0) {
-                self.w.writeAll(staging.items) catch return self.writeFailed();
+            if (len > 0) {
+                var n: usize = 0;
+                for (vecs[0..len]) |v| n += v.len;
+                self.w.writeVecAll(vecs[0..len]) catch return self.writeFailed();
                 self.w.flush() catch return self.writeFailed();
-                staging.clearRetainingCapacity();
+                {
+                    self.lock();
+                    defer self.unlock();
+                    self.proto.advance(n);
+                    self.retire();
+                    if (builtin.is_test) self.test_writes += 1;
+                }
+                self.progress.notify(self.io);
                 continue;
             }
-            if (finished or closing) {
-                // Ends the reader's wait too.
-                self.socket.shutdown(self.io, .both) catch {};
-                return;
-            }
-            try self.io.futexWait(u32, &self.write_gen.raw, gen);
+            if (shut) break;
+            try self.write_wake.wait(self.io, seen);
         }
+        // Ends the reader's wait too.
+        self.socket.shutdown(self.io, .both) catch {};
     }
 
     fn writeFailed(self: *ClientConnection) void {
@@ -543,120 +655,144 @@ pub const ClientConnection = struct {
         if (self.failure == null) self.failure = error.ConnectionClosed;
         self.unlock();
         self.socket.shutdown(self.io, .both) catch {};
+        self.progress.notify(self.io);
     }
 
-    fn streamFrom(session: ?*c.nghttp2_session, id: i32) ?*Stream {
-        const p = c.nghttp2_session_get_stream_user_data(session, id) orelse return null;
-        return @ptrCast(@alignCast(p));
+    /// The freed streams whose marks `out` has passed are let go. Under
+    /// the lock.
+    fn retire(self: *ClientConnection) void {
+        const sent = self.proto.out.sent_total;
+        while (self.retiring.first) |node| {
+            const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node));
+            if (stream.retire_mark > sent) break;
+            _ = self.retiring.popFirst();
+            stream.free();
+        }
     }
 
-    /// Fails the stream with `cause` from a header callback: nghttp2
-    /// resets it and ignores the rest of its header block.
-    fn failHeaders(stream: *Stream, cause: StreamError) c_int {
-        if (stream.cause == null) stream.cause = cause;
-        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-    }
+    /// The core's handler (conn.zig's client role), called inside its
+    /// calls, under the connection's mutex.
+    const Handler = struct {
+        owner: *ClientConnection,
 
-    fn onHeader(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, _: ?*anyopaque) callconv(.c) c_int {
-        const stream = streamFrom(session, frame.*.hd.stream_id) orelse return 0;
-        if (frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
-        const n = name[0..namelen];
-        const v = value[0..valuelen];
-        // Every field of the stream's heads and trailers, counted as
-        // SETTINGS_MAX_HEADER_LIST_SIZE counts them, before any is kept.
-        stream.header_list_size +|= namelen + valuelen + 32;
-        if (stream.header_list_size > stream.conn.max_header_list_size) return failHeaders(stream, error.HeadersTooLarge);
-        const arena = stream.arena.allocator();
-        // After a 1xx the final response comes as HCAT_HEADERS, so what a
-        // block is goes by whether the head has come.
-        if (!stream.head_ready) {
-            if (std.mem.eql(u8, n, ":status")) {
-                stream.status = std.fmt.parseInt(u16, v, 10) catch 0;
-                if (stream.status >= 100 and stream.status < 200) {
-                    stream.interim += 1;
-                    if (stream.interim > max_interim_responses) return failHeaders(stream, error.TooManyInterimResponses);
+        /// Fails the stream with `cause` from a header callback: the core
+        /// resets it and skips the rest of its header block.
+        fn failHeaders(stream: *Stream, cause: StreamError) proto.conn.Error {
+            if (stream.cause == null) stream.cause = cause;
+            return error.ResetStream;
+        }
+
+        pub fn onField(h: *Handler, s: *PStream, name: []const u8, value: []const u8) proto.conn.Error!void {
+            _ = h;
+            const stream = Stream.of(s) orelse return;
+            // Every field of the stream's heads and trailers, counted as
+            // SETTINGS_MAX_HEADER_LIST_SIZE counts them, before any is kept.
+            stream.header_list_size +|= name.len + value.len + 32;
+            if (stream.header_list_size > stream.conn.max_header_list_size) return failHeaders(stream, error.HeadersTooLarge);
+            const arena = stream.arena.allocator();
+            const list = if (s.flags.in_trailers) &stream.trailers else list: {
+                if (std.mem.eql(u8, name, ":status")) {
+                    // The core checked it: three digits.
+                    stream.status = std.fmt.parseInt(u16, value, 10) catch 0;
+                    if (stream.status < 200) {
+                        stream.interim += 1;
+                        if (stream.interim > max_interim_responses) return failHeaders(stream, error.TooManyInterimResponses);
+                    }
+                    return;
                 }
-                return 0;
+                break :list &stream.headers;
+            };
+            list.append(arena, .{
+                .name = arena.dupe(u8, name) catch return failHeaders(stream, error.StreamReset),
+                .value = arena.dupe(u8, value) catch return failHeaders(stream, error.StreamReset),
+            }) catch return failHeaders(stream, error.StreamReset);
+        }
+
+        pub fn onHeadersEnd(h: *Handler, s: *PStream, end_stream: bool) proto.conn.Error!void {
+            const stream = Stream.of(s) orelse return;
+            const io = h.owner.io;
+            if (s.flags.in_trailers) {
+                stream.endBody();
+                return;
             }
-            stream.headers.append(arena, .{
-                .name = arena.dupe(u8, n) catch return failHeaders(stream, error.StreamReset),
-                .value = arena.dupe(u8, v) catch return failHeaders(stream, error.StreamReset),
-            }) catch return failHeaders(stream, error.StreamReset);
-        } else {
-            stream.trailers.append(arena, .{
-                .name = arena.dupe(u8, n) catch return failHeaders(stream, error.StreamReset),
-                .value = arena.dupe(u8, v) catch return failHeaders(stream, error.StreamReset),
-            }) catch return failHeaders(stream, error.StreamReset);
+            if (s.flags.expect_final) {
+                // 1xx: its fields are not the response's.
+                stream.headers.clearRetainingCapacity();
+                stream.status = 0;
+                return;
+            }
+            if (!end_stream) stream.allocBody() catch return failHeaders(stream, error.StreamReset);
+            stream.head_ready = true;
+            stream.head_event.set(io);
+            if (end_stream) stream.endBody();
         }
-        return 0;
-    }
 
-    fn onFrameRecv(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *ClientConnection = @ptrCast(@alignCast(user.?));
-        const hd = frame.*.hd;
-        if (hd.type == c.NGHTTP2_GOAWAY) {
-            // Streams above the last one taken never ran; nghttp2 closes
+        pub fn onData(h: *Handler, s: *PStream, bytes: []const u8, end_stream: bool) proto.conn.Error!void {
+            const c = h.owner;
+            const stream = Stream.of(s) orelse {
+                c.proto.consumed(s, bytes.len) catch {};
+                return;
+            };
+            // The window is the queue's size, so this fits; what doesn't
+            // (the queue closed) goes back at once.
+            const n = stream.body.putUncancelable(c.io, bytes, 0) catch 0;
+            if (n < bytes.len) c.proto.consumed(s, bytes.len - n) catch {};
+            if (end_stream) stream.endBody();
+        }
+
+        pub fn onStreamClose(h: *Handler, s: *PStream, code: ErrorCode) void {
+            const c = h.owner;
+            const stream = Stream.of(s) orelse return;
+            s.user = null;
+            stream.ps = null;
+            stream.error_code = @backingInt(code);
+            stream.finishLocked(if (code != .no_error) error.StreamReset else null);
+            stream.protocol_done = true;
+            // Room under the server's limit.
+            c.progress.notify(c.io);
+            stream.maybeFree();
+        }
+
+        pub fn onHeadRefused(h: *Handler, s: *PStream) void {
+            _ = h;
+            const stream = Stream.of(s) orelse return;
+            if (stream.cause == null) stream.cause = error.HeadersTooLarge;
+        }
+
+        pub fn onWindow(h: *Handler, s: ?*PStream) void {
+            // The reader kicks the writer after every read.
+            _ = h;
+            _ = s;
+        }
+
+        pub fn onGoaway(h: *Handler, last_id: u31, code: ErrorCode) void {
+            _ = code;
+            const c = h.owner;
+            // Streams above the last one taken never ran; the core closes
             // them. No new ones from here.
-            self.closing = true;
-            self.goaway_last_id = frame.*.goaway.last_stream_id;
-            return 0;
+            c.closing = true;
+            c.goaway_last_id = last_id;
         }
-        const stream = streamFrom(session, hd.stream_id) orelse return 0;
-        const end = hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
-        switch (hd.type) {
-            c.NGHTTP2_HEADERS => {
-                if (!stream.head_ready and stream.status >= 200) {
-                    if (!end) stream.allocBody() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                    stream.head_ready = true;
-                    stream.head_event.set(self.io);
-                } else if (!stream.head_ready) {
-                    // 1xx: its fields are not the response's.
-                    stream.headers.clearRetainingCapacity();
-                    stream.status = 0;
-                }
-                if (end) stream.endBody();
-            },
-            c.NGHTTP2_DATA => if (end) stream.endBody(),
-            else => {},
-        }
-        return 0;
-    }
 
-    fn onData(session: ?*c.nghttp2_session, _: u8, id: i32, data: [*c]const u8, len: usize, _: ?*anyopaque) callconv(.c) c_int {
-        const stream = streamFrom(session, id) orelse return 0;
-        // The window is the queue's size, so this fits.
-        const n = stream.body.putUncancelable(stream.conn.io, data[0..len], 0) catch 0;
-        if (n < len) _ = c.nghttp2_session_consume(session, id, len - n);
-        return 0;
-    }
-
-    fn onStreamClose(session: ?*c.nghttp2_session, id: i32, code: u32, _: ?*anyopaque) callconv(.c) c_int {
-        const stream = streamFrom(session, id) orelse return 0;
-        stream.error_code = code;
-        stream.finishLocked(if (code != c.NGHTTP2_NO_ERROR) error.StreamReset else null);
-        stream.protocol_done = true;
-        _ = c.nghttp2_session_set_stream_user_data(session, id, null);
-        stream.maybeFree();
-        return 0;
-    }
-
-    fn provideData(_: ?*c.nghttp2_session, _: i32, buf: [*c]u8, length: usize, flags: [*c]u32, source: [*c]c.nghttp2_data_source, _: ?*anyopaque) callconv(.c) c.nghttp2_ssize {
-        const stream: *Stream = @ptrCast(@alignCast(source.*.ptr.?));
-        if (stream.fixed_body) |b| {
-            const n = @min(length, b.len - stream.fixed_sent);
-            @memcpy(buf[0..n], b[stream.fixed_sent..][0..n]);
-            stream.fixed_sent += n;
-            if (stream.fixed_sent == b.len) flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-            return @intCast(n);
+        pub fn onPingAck(h: *Handler, data: [8]u8) void {
+            _ = h;
+            _ = data;
         }
-        const n = stream.out.getUncancelable(stream.conn.io, buf[0..length], 0) catch 0;
-        if (n == 0) {
-            if (!stream.send_closed) return c.NGHTTP2_ERR_DEFERRED;
-            flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-        }
-        return @intCast(n);
-    }
+    };
 };
+
+/// The HPACK scratch `recv` decodes into, one per thread (recv never
+/// yields, and runs under the connection's mutex), never given back, as the
+/// server engine's.
+threadlocal var scratch_buf: []u8 = &.{};
+
+fn scratch(need: usize) error{OutOfMemory}![]u8 {
+    if (scratch_buf.len >= need) return scratch_buf;
+    const buf = try std.heap.page_allocator.alloc(u8, need);
+    if (scratch_buf.len > 0) std.heap.page_allocator.free(scratch_buf);
+    scratch_buf = buf;
+    return buf;
+}
 
 /// One request and its response.
 pub const Stream = struct {
@@ -667,6 +803,8 @@ pub const Stream = struct {
     submitted: bool = false,
     /// The request's budget, shared by every wait on the stream.
     deadline: Deadline,
+    /// The core's side of the stream, until it closes.
+    ps: ?*PStream = null,
 
     status: u16 = 0,
     /// Informational responses so far.
@@ -690,18 +828,44 @@ pub const Stream = struct {
 
     body: std.Io.Queue(u8),
     body_reader: std.Io.Reader,
-    out: std.Io.Queue(u8),
     out_writer: std.Io.Writer,
     send_closed: bool = false,
     /// The request was opened with `.body = true`: the writer is its body.
     has_body: bool,
-    /// `RequestOptions.body_bytes`, copied, and how much of it nghttp2 took.
-    fixed_body: ?[]const u8 = null,
-    fixed_sent: usize = 0,
+    /// `RequestOptions.body_bytes`, copied: one part for `submitData`.
+    fixed_part: [1][]const u8 = .{""},
+    /// A streamed body's blocks: the writer fills `blocks[cur]` (its
+    /// buffer), and a full or flushed one goes to the core by reference.
+    blocks: [2]Block = .{ .{}, .{} },
+    cur: u1 = 0,
+    /// Some of the request body went to the core by reference: freeing
+    /// the stream waits for the writer to pass it (`retire_mark`).
+    borrowed: bool = false,
+    retire_node: std.DoublyLinkedList.Node = .{},
+    retire_mark: u64 = 0,
+    /// A write waits for a block to come free (the window is spent).
+    /// Under the connection's mutex; for tests.
+    waiting_room: bool = false,
 
-    /// Both the caller (`release`) and nghttp2 (stream close) are done.
+    /// Both the caller (`release`) and the core (stream close) are done.
     user_done: bool = false,
     protocol_done: bool = false,
+
+    const block_len = 16 * 1024;
+
+    const Block = struct {
+        mem: []u8 = &.{},
+        part: [1][]const u8 = .{""},
+        /// Submitted, and not yet known to be framed and written.
+        inflight: bool = false,
+        /// `out`'s position once the block was framed.
+        mark: ?u64 = null,
+    };
+
+    fn of(s: *PStream) ?*Stream {
+        // SAFETY: `user` is only ever a Stream (`request`).
+        return @ptrCast(@alignCast(s.user orelse return null));
+    }
 
     fn create(conn: *ClientConnection, has_body: bool, fixed_body: ?[]const u8, deadline: Deadline) !*Stream {
         const self = try conn.gpa.create(Stream);
@@ -712,7 +876,6 @@ pub const Stream = struct {
             .deadline = deadline,
             .body = undefined,
             .body_reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readBody } },
-            .out = undefined,
             .out_writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
             .send_closed = !has_body,
             .has_body = has_body,
@@ -724,12 +887,10 @@ pub const Stream = struct {
         self.body = .init(&.{});
         self.body_reader.buffer = try a.alloc(u8, 16 * 1024);
         if (has_body) {
-            self.out = .init(try a.alloc(u8, 32 * 1024));
-            self.out_writer.buffer = try a.alloc(u8, 16 * 1024);
-        } else {
-            self.out = .init(&.{});
+            for (&self.blocks) |*b| b.mem = try a.alloc(u8, block_len);
+            self.out_writer.buffer = self.blocks[0].mem;
         }
-        if (fixed_body) |b| self.fixed_body = try a.dupe(u8, b);
+        if (fixed_body) |b| self.fixed_part[0] = try a.dupe(u8, b);
         conn.lock();
         conn.live.append(&self.node);
         conn.unlock();
@@ -776,13 +937,27 @@ pub const Stream = struct {
             self.cause = e;
         };
         self.body.close(self.conn.io);
-        self.out.close(self.conn.io);
         self.head_event.set(self.conn.io);
     }
 
-    /// Under the connection's mutex: frees the stream when both sides let go.
+    /// Under the connection's mutex: frees the stream when both sides let
+    /// go, once the writer is past the request body it lent the core.
     fn maybeFree(self: *Stream) void {
         if (!(self.user_done and self.protocol_done)) return;
+        const conn = self.conn;
+        if (self.borrowed and !conn.proto_gone) {
+            const mark = conn.proto.out.mark();
+            if (conn.proto.out.sent_total < mark) {
+                self.retire_mark = mark;
+                conn.retiring.append(&self.retire_node);
+                return;
+            }
+        }
+        self.free();
+    }
+
+    /// Under the connection's mutex.
+    fn free(self: *Stream) void {
         const conn = self.conn;
         conn.live.remove(&self.node);
         self.arena.deinit();
@@ -794,7 +969,7 @@ pub const Stream = struct {
     /// is below this stream's. Such a request can be sent again on another
     /// connection whatever its method.
     pub fn unprocessed(self: *const Stream) bool {
-        if (self.error_code == c.NGHTTP2_REFUSED_STREAM) return true;
+        if (self.error_code == @backingInt(ErrorCode.refused_stream)) return true;
         return self.id > self.conn.goaway_last_id and !self.head_ready;
     }
 
@@ -884,7 +1059,8 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         self.send_closed = true;
-        if (self.submitted and self.cause == null) _ = c.nghttp2_session_resume_data(conn.session, self.id);
+        // An empty end rides on the last DATA still queued.
+        if (self.ps) |ps| if (self.cause == null and !conn.dead) conn.proto.submitData(ps, &.{}, true) catch {};
         conn.unlock();
         conn.kickWriter();
     }
@@ -903,31 +1079,31 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         defer conn.unlock();
-        if (!self.protocol_done and self.submitted and conn.session != null) {
-            _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, self.id, c.NGHTTP2_CANCEL);
-        }
+        // The cause first: the reset closes the stream inside the call.
         self.finishLocked(cause);
+        if (self.ps) |ps| if (!conn.dead) conn.proto.reset(ps, .cancel) catch {};
         conn.kickWriter();
     }
 
     /// Done with the stream: an unfinished one is canceled first, and
-    /// freed once nghttp2 has closed it.
+    /// freed once the core has closed it.
     pub fn release(self: *Stream) void {
         const conn = self.conn;
         conn.lock();
         // Also after a GOAWAY, which leaves the streams it covers open.
-        const open = !self.protocol_done and self.submitted and conn.session != null and !conn.dead;
+        const open = self.ps != null and !conn.dead;
         conn.unlock();
         if (open) self.cancel();
         conn.lock();
         defer conn.unlock();
         self.user_done = true;
         self.creditUnread();
-        // A stream nghttp2 never got, or one a dead session left behind,
-        // has no close to wait for. nghttp2 must not hand it out again.
-        if (!self.submitted or conn.session == null or conn.dead) {
-            if (self.submitted and !self.protocol_done and conn.session != null)
-                _ = c.nghttp2_session_set_stream_user_data(conn.session, self.id, null);
+        // A stream the core never got, or one a dead connection left
+        // behind, has no close to wait for; the core must not hand it out
+        // again.
+        if (!self.protocol_done and (self.ps == null or conn.dead)) {
+            if (self.ps) |ps| ps.user = null;
+            self.ps = null;
             self.protocol_done = true;
         }
         self.maybeFree();
@@ -940,15 +1116,15 @@ pub const Stream = struct {
     /// back by `onData`.
     fn creditUnread(self: *Stream) void {
         const conn = self.conn;
-        var scratch: [4096]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         var dropped: usize = 0;
         while (true) {
-            const n = self.body.getUncancelable(conn.io, &scratch, 0) catch break;
+            const n = self.body.getUncancelable(conn.io, &buf, 0) catch break;
             if (n == 0) break;
             dropped += n;
         }
-        if (dropped == 0 or conn.session == null) return;
-        _ = c.nghttp2_session_consume_connection(conn.session, dropped);
+        if (dropped == 0 or conn.dead or conn.proto_gone) return;
+        conn.proto.consumed(self.ps, dropped) catch {};
         conn.kickWriter();
     }
 
@@ -982,36 +1158,75 @@ pub const Stream = struct {
         w.advance(n);
         conn.lock();
         // The connection's window gets the bytes back even once the stream
-        // is closed (its whole response may have come before this read):
-        // else every response read late keeps its size of it, and the
-        // connection stops carrying DATA once that adds up (#149).
-        if (conn.session != null) {
-            if (self.protocol_done)
-                _ = c.nghttp2_session_consume_connection(conn.session, n)
-            else
-                _ = c.nghttp2_session_consume(conn.session, self.id, n);
-        }
+        // is closed (`ps` null: its whole response may have come before
+        // this read): else every response read late keeps its size of it,
+        // and the connection stops carrying DATA once that adds up (#149).
+        if (!conn.dead) conn.proto.consumed(self.ps, n) catch {};
         conn.unlock();
         conn.kickWriter();
         return n;
     }
 
-    fn putSome(self: *Stream, bytes: []const u8) (std.Io.QueueClosedError || std.Io.Cancelable)!usize {
-        return self.out.put(self.conn.io, bytes, 1);
+    /// Hands the writer's buffered bytes (`blocks[cur]`) to the core and
+    /// waits until the other block is free to fill.
+    fn sendBuffered(self: *Stream) std.Io.Writer.Error!void {
+        const w = &self.out_writer;
+        const bytes = w.buffered();
+        if (bytes.len == 0) return;
+        const conn = self.conn;
+        {
+            conn.lock();
+            defer conn.unlock();
+            const ps = self.ps orelse {
+                self.write_err = self.cause orelse error.StreamReset;
+                return error.WriteFailed;
+            };
+            if (self.cause != null or conn.dead) {
+                self.write_err = self.cause orelse error.ConnectionClosed;
+                return error.WriteFailed;
+            }
+            const b = &self.blocks[self.cur];
+            b.part[0] = bytes;
+            conn.proto.submitData(ps, &b.part, false) catch {
+                self.write_err = error.StreamReset;
+                return error.WriteFailed;
+            };
+            b.inflight = true;
+            b.mark = null;
+            self.borrowed = true;
+            self.cur ^= 1;
+            // Nothing to write into until the next block is free.
+            w.buffer = &.{};
+            w.end = 0;
+        }
+        conn.kickWriter();
+        try self.waitRoom();
+        w.buffer = self.blocks[self.cur].mem;
     }
 
-    fn put(self: *Stream, bytes: []const u8) std.Io.Writer.Error!void {
+    /// Waits until `blocks[cur]` is free, within the request's budget.
+    fn waitRoom(self: *Stream) std.Io.Writer.Error!void {
         const conn = self.conn;
-        if (!self.has_body and bytes.len > 0) return error.WriteFailed;
-        var rest = bytes;
-        while (rest.len > 0) {
-            const n = self.deadline.run(putSome, .{ self, rest }) catch |err| {
+        while (true) {
+            const seen = conn.progress.epoch();
+            {
+                conn.lock();
+                defer conn.unlock();
+                self.waiting_room = false;
+                if (self.roomFree()) {
+                    if (self.cause) |e| {
+                        self.write_err = e;
+                        return error.WriteFailed;
+                    }
+                    return;
+                }
+                self.waiting_room = true;
+            }
+            self.deadline.run(ClientConnection.waitProgress, .{ conn, seen }) catch |err| {
+                conn.lock();
+                self.waiting_room = false;
+                conn.unlock();
                 self.write_err = switch (err) {
-                    error.Closed => blk: {
-                        conn.lock();
-                        defer conn.unlock();
-                        break :blk self.cause orelse error.StreamReset;
-                    },
                     error.Timeout => blk: {
                         self.expire();
                         break :blk error.Timeout;
@@ -1020,31 +1235,73 @@ pub const Stream = struct {
                 };
                 return error.WriteFailed;
             };
-            rest = rest[n..];
-            conn.lock();
-            if (self.submitted and self.cause == null and !self.protocol_done) _ = c.nghttp2_session_resume_data(conn.session, self.id);
-            conn.unlock();
-            conn.kickWriter();
         }
+    }
+
+    /// Whether the block the writer wants next (`blocks[cur]`) is free:
+    /// never submitted, or framed (the stream's queue no longer holds it:
+    /// blocks go in order, the other one after it) and written
+    /// (`out.sent_total` past a mark taken once it was framed). True as
+    /// well when the stream or the connection is gone, for the waiter to
+    /// find out (the block then stays lent: `borrowed`). Under the lock.
+    fn roomFree(self: *Stream) bool {
+        const conn = self.conn;
+        const b = &self.blocks[self.cur];
+        if (!b.inflight) return true;
+        const ps = self.ps orelse return true;
+        if (conn.dead) return true;
+        if (b.mark == null) {
+            var queued: usize = 0;
+            var it = ps.pending.first;
+            while (it) |n| : (it = n.next) queued += 1;
+            const after: usize = if (self.blocks[self.cur ^ 1].inflight) 1 else 0;
+            if (queued > after) return false;
+            b.mark = conn.proto.out.mark();
+        }
+        if (conn.proto.out.sent_total < b.mark.?) return false;
+        b.inflight = false;
+        b.mark = null;
+        return true;
     }
 
     fn drainOut(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w));
-        try self.put(w.buffered());
-        w.end = 0;
+        try self.sendBuffered();
+        if (w.buffer.len == 0) {
+            // No body (`.body = false`), or a block never came free.
+            var any = false;
+            for (data) |d| any = any or d.len > 0;
+            if (!any) return 0;
+            if (self.write_err == null) self.write_err = error.StreamReset;
+            return error.WriteFailed;
+        }
+        // Into the free block, as far as it goes.
         var n: usize = 0;
         for (data[0 .. data.len - 1]) |bytes| {
-            try self.put(bytes);
-            n += bytes.len;
+            const k = @min(bytes.len, w.buffer.len - w.end);
+            @memcpy(w.buffer[w.end..][0..k], bytes[0..k]);
+            w.end += k;
+            n += k;
+            if (k < bytes.len) return n;
         }
-        for (0..splat) |_| try self.put(data[data.len - 1]);
-        return n + data[data.len - 1].len * splat;
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            const k = @min(pattern.len, w.buffer.len - w.end);
+            @memcpy(w.buffer[w.end..][0..k], pattern[0..k]);
+            w.end += k;
+            n += k;
+            if (k < pattern.len) return n;
+        }
+        return n;
     }
 
     fn flushOut(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w));
-        try self.put(w.buffered());
-        w.end = 0;
+        try self.sendBuffered();
+        if (w.buffer.len == 0 and self.has_body) {
+            if (self.write_err == null) self.write_err = error.StreamReset;
+            return error.WriteFailed;
+        }
     }
 };
 
