@@ -418,13 +418,6 @@ const Handlers = struct {
         res.body = "hello";
     }
 
-    /// HttpArena's baseline route: the sum of two query integers.
-    fn baseline(req: *Request, res: *Response) !void {
-        const a = std.fmt.parseInt(i64, req.queryParam("a") orelse "0", 10) catch 0;
-        const b = std.fmt.parseInt(i64, req.queryParam("b") orelse "0", 10) catch 0;
-        try res.print(.text, "{d}", .{a + b});
-    }
-
     fn user(req: *Request, res: *Response) !void {
         try res.print(.text, "user {s}", .{req.params.get("id").?});
     }
