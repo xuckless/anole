@@ -367,7 +367,9 @@ test "h2 hpack diff: our encoder through nghttp2's inflater" {
             };
             try lists.append(a, fields);
         }
-        for (lists.items) |fields| {
+        // Twice: the second pass encodes the memoized fields from the
+        // thread's memo.
+        for (0..2) |_| for (lists.items) |fields| {
             const out = try a.alloc(u8, hpack.Encoder.bound(fields));
             const n = try e.encode(out, fields);
             var got: std.ArrayList(Field) = .empty;
@@ -383,7 +385,7 @@ test "h2 hpack diff: our encoder through nghttp2's inflater" {
             }
             // Nothing was ever inserted.
             try testing.expectEqual(hpack.static_table.len, c.nghttp2_hd_inflate_get_num_table_entries(ng));
-        }
+        };
         try testing.expectEqual(0, c.nghttp2_hd_inflate_get_max_dynamic_table_size(ng));
     }
 }
