@@ -370,6 +370,7 @@ const Handlers = struct {
         s.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         s.router.addRouteWith(.post, "/nw/echo", echo, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/big", big, .{ .no_wait = true });
+        s.router.addRouteWith(.get, "/nw/kb", kb, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/detach", Det.handler, .{ .no_wait = true });
         s.router.get("/park", Park.handler);
         s.router.get("/tunnel", Tun.handler);
@@ -407,6 +408,12 @@ const Handlers = struct {
         };
         res.body = all.written();
     }
+
+    /// A body the response borrows (DATA sent from it, not copied).
+    fn kb(_: *Request, res: *Response) !void {
+        res.body = &kb_body;
+    }
+    const kb_body: [1536]u8 = @splat('k');
 
     fn trailers(_: *Request, res: *Response) !void {
         res.body = "with trailers";
@@ -732,6 +739,28 @@ test "h2 engine: a read's many small responses go out in one write" {
     // most (the reads that carry only WINDOW_UPDATEs write nothing).
     try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads);
     try expectEqual(flushers, engine.test_flushers.load(.acquire));
+}
+
+test "h2 engine: a round of 32 responses with borrowed bodies takes a few socket writes" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const reads = engine.test_reads.load(.acquire);
+    const writes = server_mod.Connection.TestSocketWrites.get();
+    var ids: [32]u31 = undefined;
+    for (&ids) |*id| id.* = try c.open("GET", "/nw/kb", &.{}, true);
+    try c.flush();
+    try c.untilAll();
+    for (ids) |id| try expectEqual(Handlers.kb_body.len, c.get(id).body.items.len);
+    // Each response is two segments (head and DATA header copied, the
+    // body borrowed). A round too big for the write buffer goes out as
+    // is, at most 8 iovecs per sendmsg, the buffered bytes among them
+    // (zio's `max_iovecs_len`, as std's): 7 writes for 32 responses in 3
+    // reads on Linux, 0.22 per response. A bound, not the count: how the
+    // requests split into reads varies.
+    const segments = 2 * ids.len;
+    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads + (segments + 6) / 7);
 }
 
 test "h2 engine: a response with no body on a stream the peer has ended is no reset" {
