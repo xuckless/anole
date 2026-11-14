@@ -81,6 +81,7 @@ const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const have_auto_cancel = @import("../deadline.zig").have_auto_cancel;
 const RequestBuffers = @import("../server/request_buffers.zig").RequestBuffers;
+const LocalArena = @import("../arena.zig").LocalArena;
 const park = @import("../server/park.zig");
 const placement = @import("../placement.zig");
 const admission = @import("../admission.zig");
@@ -1736,8 +1737,12 @@ pub fn Engine(comptime Ctx: type) type {
                 return blockFor(size) orelse size;
             }
 
+            /// The arena only when the connection's tasks share one
+            /// executor (`ConnLock.free`): the reader takes a body buffer
+            /// while the handler may be allocating from the same arena,
+            /// which is one owner's at a time (`LocalArena`).
             fn alloc(es: *EStream, size: usize) ?BodyBuf {
-                return if (size <= arena_body_max)
+                return if (size <= arena_body_max and es.conn.lock_.free)
                     .{ .mem = es.arena.allocator().alloc(u8, size) catch return null, .from = .arena }
                 else if (blockFor(size)) |class|
                     .{ .mem = block_cache.take(class) orelse return null, .from = .block }
@@ -1817,7 +1822,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// handler, and `out`'s borrowed bytes after the close.
         const EStream = struct {
             conn: *Conn,
-            arena: std.heap.ArenaAllocator,
+            arena: LocalArena,
             node: std.DoublyLinkedList.Node = .{},
             /// The protocol stream; null once it closed.
             cs: ?*PStream = null,
@@ -3561,6 +3566,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// `send` "from any task", websocket/root.zig): a task placed
             /// there, awaited (the pattern Rooms and SSE use to reach a
             /// socket's executor). `parts` are the caller's, alive till then.
+            /// The await also keeps the stream's arena to one user at a
+            /// time (`LocalArena`): `appendParts` allocates from it there.
             fn onOwner(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool) std.Io.Writer.Error!void {
                 const conn = self.es.conn;
                 if (comptime is_test) _ = test_hops.fetchAdd(1, .monotonic);

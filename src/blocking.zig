@@ -136,7 +136,9 @@ pub const Pool = struct {
     /// for it without holding its executor. `args` may point into the
     /// caller's memory: `run` returns only after the job has finished,
     /// even when canceled. `func` runs outside any coroutine, so whatever
-    /// it blocks on blocks only its own thread.
+    /// it blocks on blocks only its own thread. That wait is also what lets
+    /// `func` allocate from the caller's request arena, which has one user
+    /// at a time (`LocalArena`): keep it if this ever changes.
     pub fn run(self: *Pool, io: std.Io, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) (error{PoolClosed} || ErrorOf(Result(@TypeOf(func))))!PayloadOf(Result(@TypeOf(func))) {
         return self.runWith(io, .{}, func, args);
     }

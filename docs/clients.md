@@ -578,8 +578,10 @@ suspends that request only; the executor serves others meanwhile.
 - Keep HTTP/2 and HTTP/3 connections in your context too, rather than one per
   request: connecting costs a handshake. `examples/clients` opens one per
   request in `GET /relay` only to stay short.
-- The request's arena (`req.arena`) is not thread-safe. Give a task you start
-  with `io.concurrent` its own buffer or allocator.
+- The request's arena (`req.arena`) is not thread-safe: a call the handler
+  awaits may use it, but give a task you start with `io.concurrent` its own
+  buffer or allocator (Debug builds panic when two tasks allocate from the
+  arena at once).
 - Pass a thread-safe allocator to `connect` and `Client.init`; the
   connection's tasks may run on other executors.
 

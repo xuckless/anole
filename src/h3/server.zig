@@ -2512,7 +2512,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         const Stream = struct {
             conn: *Conn,
             id: i64,
-            arena: std.heap.ArenaAllocator,
+            arena: dusty.LocalArena,
             method: []const u8 = "",
             path: []const u8 = "",
             authority: []const u8 = "",
@@ -2719,14 +2719,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.conn.budget.unlink(&s.waiter);
                 s.out.deinit(&ep.blocks, &s.conn.budget);
                 s.body.deinit(&ep.blocks);
-                // One chunk within the limit, as usual: kept as it is.
-                const st = s.arena.state;
-                const single = st.free_list == null and (st.used_list == null or st.used_list.?.next == null);
-                if (single and s.arena.queryCapacity() <= arena_keep) {
-                    _ = safety.resetArena(&s.arena, .retain_capacity);
-                } else {
-                    _ = safety.resetArena(&s.arena, .{ .retain_with_limit = arena_keep });
-                }
+                // One chunk within the limit, as usual, is kept as it is.
+                _ = safety.resetArena(&s.arena, .{ .retain_with_limit = arena_keep });
                 if (!ep.keepStream(s)) s.destroy(gpa, &ep.blocks);
             }
 
