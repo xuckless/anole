@@ -1974,6 +1974,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// waiting for room (`Conn.wakeRooms`), on `test_on_conn_error`'s
         /// connection.
         pub fn testWakeRooms(ptr: *anyopaque) void {
+            // SAFETY: `test_on_conn_error` passes the Conn it was called for.
             const conn: *Conn = @ptrCast(@alignCast(ptr));
             conn.lock();
             defer conn.unlock();
