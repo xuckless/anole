@@ -790,11 +790,14 @@ pub const Connection = struct {
         /// no SSL_writev, so small slices (an HTTP/2 frame header, a
         /// HEADERS block, a chunk size) are gathered in the buffer up to a
         /// record before each SSL_write, as nginx's `ngx_ssl_send_chain`
-        /// copies a chain into its 16 KiB `ssl_buffer_size` buffer. Slices
-        /// of a record or more pass through uncopied, in whole records, and
-        /// the final one, once the buffer is empty, goes through whole as
-        /// it is: its last record is the one `Connection.writeAll` may
-        /// borrow.
+        /// copies a chain into its 16 KiB `ssl_buffer_size` buffer. A slice
+        /// that finds bytes staged tops the record up first, whatever its
+        /// size: on HTTP/2 every DATA payload follows its 9-byte frame
+        /// header, so DATA is copied too (nginx copies unless its buffer is
+        /// empty, the same rule). Only with nothing staged do slices of a
+        /// record or more pass through uncopied, in whole records, and the
+        /// final one goes through whole as it is: its last record is the
+        /// one `Connection.writeAll` may borrow.
         fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
             const stage_len = @min(w.buffer.len, max_plaintext_len);

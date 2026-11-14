@@ -714,8 +714,9 @@ fn sendSlicesTo(side: *Side, start: usize, prefix: usize, sizes: []const usize, 
 }
 
 /// Small slices (frame headers, HEADERS blocks) are gathered into records
-/// of 16 KiB, slices of a record or more pass through uncopied, and every
-/// byte arrives in order.
+/// of 16 KiB, slices of a record or more pass through uncopied when
+/// nothing is staged (and are copied when something is, as HTTP/2 DATA
+/// behind its frame header always is), and every byte arrives in order.
 pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
     // SAFETY: `open` sets every field.
     var p: Pair = undefined;
@@ -737,6 +738,10 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
     var frames: [20]usize = undefined;
     for (&frames, 0..) |*s, i| s.* = ([_]usize{ 9, 150, 9, 8 * 1024 })[i % 4];
 
+    // Four DATA frames of 16 KiB, each header and payload a slice.
+    var h2_data: [8]usize = undefined;
+    for (&h2_data, 0..) |*s, i| s.* = if (i % 2 == 0) 9 else record;
+
     const Case = struct { prefix: usize, sizes: []const usize, records: usize, staged: usize };
     const cases = [_]Case{
         // Fits the buffer: std's writeSplat copies it, the flush seals it.
@@ -745,8 +750,12 @@ pub fn gathered(gpa: std.mem.Allocator, io: std.Io) !void {
         // A head ahead of a big body: the first record is topped up, the
         // rest passes through.
         .{ .prefix = 100, .sizes = &.{32 * 1024}, .records = 3, .staged = record - 100 },
-        // Slices of a record or more copy nothing.
+        // Slices of a record or more into an empty stage copy nothing.
         .{ .prefix = 0, .sizes = &.{ 32 * 1024, 20 * 1024 }, .records = 4, .staged = 0 },
+        // The HTTP/2 shape: each 16 KiB DATA behind its 9-byte header finds
+        // the stage non-empty and is copied: 5 records, not 8, and every
+        // byte staged but the final 36, which leave from the last slice.
+        .{ .prefix = 0, .sizes = &h2_data, .records = 5, .staged = 4 * (9 + record) - 36 },
         // An HTTP/1 head of small writes, then a chunk size and a body.
         .{ .prefix = 300, .sizes = &.{ 2048, 9, 14 * 1024 }, .records = 2, .staged = record - 300 },
     };

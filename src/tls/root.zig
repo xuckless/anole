@@ -76,7 +76,7 @@ test "TLS: a header ahead of a big payload and keyframe-sized writes arrive in o
     try testing.duplex.framed(std.testing.allocator, rt.io());
 }
 
-test "TLS: small slices are gathered into 16 KiB records and big ones pass through uncopied" {
+test "TLS: small slices are gathered into 16 KiB records, big ones into an empty stage pass uncopied" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     try testing.duplex.gathered(std.testing.allocator, rt.io());
