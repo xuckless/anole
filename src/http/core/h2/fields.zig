@@ -4,8 +4,9 @@
 // lib/nghttp2_http.c and lib/nghttp2_helper.c. See LICENSE.nghttp2 and
 // THIRD_PARTY_NOTICES.
 
-//! A request's decoded header fields, checked one at a time against RFC
-//! 9113 §8.2-8.3 (and RFC 8441's `:protocol`), as nghttp2 checks them.
+//! A request's decoded header fields (`Request`) and a response's
+//! (`Response`, the client role), checked one at a time against RFC 9113
+//! §8.2-8.3 (and RFC 8441's `:protocol`), as nghttp2 checks them.
 //! Each field gets one of three verdicts, nghttp2's:
 //!
 //!   * `ok`: pass it on;
@@ -132,6 +133,8 @@ pub const Request = struct {
             },
             .connection, .keep_alive, .proxy_connection, .transfer_encoding, .upgrade => return .malformed,
             .te => if (!std.ascii.eqlIgnoreCase(value, "trailers")) return .malformed,
+            // A response's pseudo-header (nghttp2's default case).
+            .status => return .malformed,
             // RFC 9218. nghttp2 parses it for its scheduler; Anole
             // schedules nothing by it, so only its value is checked.
             .priority => if (!validValueRfc9113(value)) return .ignore,
@@ -166,9 +169,95 @@ pub const Request = struct {
     }
 };
 
+/// A response's fields (nghttp2's http_response_on_header, with
+/// nghttp2_http_on_header's common checks first), one header block at a
+/// time: an informational (1xx) head, the final head, or trailers. `end`
+/// checks a head as a whole; the caller (conn.zig) applies what follows
+/// from its status (nghttp2_http_on_response_headers).
+pub const Response = struct {
+    /// A regular field came: no more pseudo-headers.
+    pseudo_disallowed: bool = false,
+    /// The head's `:status`, once seen.
+    status: ?u16 = null,
+    /// The parsed content-length, once one was seen (0 for a 204's,
+    /// which is dropped).
+    content_length: ?u63 = null,
+
+    /// One field of a response head.
+    pub fn field(r: *Response, name: []const u8, value: []const u8) Verdict {
+        return r.onField(name, value, false);
+    }
+
+    /// One field of the response's trailers: pseudo-headers are
+    /// malformed, the rest is checked as in the head.
+    pub fn trailer(r: *Response, name: []const u8, value: []const u8) Verdict {
+        return r.onField(name, value, true);
+    }
+
+    fn onField(r: *Response, name: []const u8, value: []const u8, is_trailer: bool) Verdict {
+        // As in `Request.onField` (the empty name is the same divergence).
+        if (name.len == 0) return .malformed;
+        const tok = token(name);
+        if (name[0] == ':') {
+            if (tok == null or is_trailer or r.pseudo_disallowed) return .malformed;
+        } else {
+            r.pseudo_disallowed = true;
+            for (name) |ch| switch (name_chars[ch]) {
+                1 => {},
+                2 => return .malformed,
+                else => return .ignore,
+            };
+        }
+        const t = tok orelse return if (validValueRfc9113(value)) .ok else .ignore;
+        switch (t) {
+            .status => {
+                // check_pseudo_header, then parse_status_code; 101 has no
+                // place in HTTP/2 (RFC 9113 §8.6).
+                if (r.status != null) return .malformed;
+                const code = parseStatus(value) orelse return .malformed;
+                if (code == 101) return .malformed;
+                r.status = code;
+            },
+            .content_length => {
+                const status = r.status orelse 0;
+                if (status == 204) {
+                    // Prohibited (RFC 9110 §8.6), but widely sent as "0":
+                    // nghttp2 drops that one.
+                    if (r.content_length != null or !std.mem.eql(u8, value, "0")) return .malformed;
+                    r.content_length = 0;
+                    return .ignore;
+                }
+                if (status / 100 == 1) return .malformed;
+                if (r.content_length != null) return .malformed;
+                r.content_length = parseContentLength(value) orelse return .malformed;
+            },
+            .connection, .keep_alive, .proxy_connection, .transfer_encoding, .upgrade => return .malformed,
+            .te => if (!std.ascii.eqlIgnoreCase(value, "trailers")) return .malformed,
+            // The request's pseudo-headers.
+            .authority, .method, .path, .scheme, .protocol => return .malformed,
+            .host, .priority => if (!validValueRfc9113(value)) return .ignore,
+        }
+        return .ok;
+    }
+
+    /// The head is complete (nghttp2_http_on_response_headers' first
+    /// check): false means it is malformed.
+    pub fn end(r: *const Response) bool {
+        return r.status != null;
+    }
+};
+
+/// parse_status_code: three digits, the first not 0.
+fn parseStatus(s: []const u8) ?u16 {
+    if (s.len != 3 or s[0] < '1' or s[0] > '9') return null;
+    for (s[1..]) |ch| if (ch < '0' or ch > '9') return null;
+    return (@as(u16, s[0] - '0') * 100) + (s[1] - '0') * 10 + (s[2] - '0');
+}
+
 /// The names the checks care about (nghttp2's generated lookup_token, cut
 /// down to them).
 const Token = enum {
+    status,
     authority,
     method,
     path,
@@ -191,7 +280,7 @@ fn token(name: []const u8) ?Token {
         2 => if (eql(u8, name, "te")) .te else null,
         4 => if (eql(u8, name, "host")) .host else null,
         5 => if (eql(u8, name, ":path")) .path else null,
-        7 => if (eql(u8, name, ":method")) .method else if (eql(u8, name, ":scheme")) .scheme else if (eql(u8, name, "upgrade")) .upgrade else null,
+        7 => if (eql(u8, name, ":method")) .method else if (eql(u8, name, ":scheme")) .scheme else if (eql(u8, name, ":status")) .status else if (eql(u8, name, "upgrade")) .upgrade else null,
         8 => if (eql(u8, name, "priority")) .priority else null,
         9 => if (eql(u8, name, ":protocol")) .protocol else null,
         10 => if (eql(u8, name, ":authority")) .authority else if (eql(u8, name, "connection")) .connection else if (eql(u8, name, "keep-alive")) .keep_alive else null,
