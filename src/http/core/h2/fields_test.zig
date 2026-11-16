@@ -10,7 +10,6 @@
 //! and the other pure field checks).
 
 const std = @import("std");
-const build_options = @import("build_options");
 const fields = @import("fields.zig");
 const fuzz = @import("../fuzz.zig");
 
@@ -278,46 +277,73 @@ test "h2 fields: trailers" {
 }
 
 test "h2 fields: matches nghttp2's helpers" {
-    if (build_options.use_http2) try Ng.differential() else return error.SkipZigTest;
+    // nghttp2_check_header_name, _header_value, _header_value_rfc9113,
+    // _method, _path and _authority on every string of `enumerate`, as
+    // nghttp2 1.70.0 answered (testdata/vectors/README.md).
+    var replay: Replay = .{ .want = @embedFile("testdata/vectors/fields.bin") };
+    try enumerate(&replay);
+    try expectEqual(replay.want.len, replay.at);
 }
 
-/// nghttp2's six public checks, when it is linked.
-const Ng = struct {
-    const c = if (build_options.use_http2) @import("nghttp2") else struct {};
+const Replay = struct {
+    want: []const u8,
+    at: usize = 0,
 
-    fn differential() !void {
-        var buf: [3]u8 = undefined;
-        // Every string of up to two bytes, then seeded longer ones.
-        try same("");
-        for (0..256) |a| {
-            buf[0] = @intCast(a);
-            try same(buf[0..1]);
-            for (0..256) |b| {
-                buf[1] = @intCast(b);
-                try same(buf[0..2]);
-            }
-        }
-        var prng: std.Random.DefaultPrng = .init(0x6832666c64);
-        const r = prng.random();
-        const alphabet = " \t:@*/+-.!azAZ09\x00\x1f\x7f\x80\xff\r\n";
-        var s: [12]u8 = undefined;
-        for (0..20000) |_| {
-            const n = r.uintAtMost(usize, s.len);
-            for (s[0..n]) |*ch| ch.* = if (r.boolean()) alphabet[r.uintLessThan(usize, alphabet.len)] else r.int(u8);
-            try same(s[0..n]);
-        }
-    }
-
-    fn same(s: []const u8) !void {
+    fn visit(r: *Replay, s: []const u8) !void {
+        if (r.at == r.want.len) return error.RecordingExhausted;
+        const bits = r.want[r.at];
+        r.at += 1;
         errdefer std.debug.print("differs on \"{f}\"\n", .{std.zig.fmtString(s)});
-        try expectEqual(c.nghttp2_check_header_name(s.ptr, s.len) != 0, fields.validName(s));
-        try expectEqual(c.nghttp2_check_header_value(s.ptr, s.len) != 0, fields.validValue(s));
-        try expectEqual(c.nghttp2_check_header_value_rfc9113(s.ptr, s.len) != 0, fields.validValueRfc9113(s));
-        try expectEqual(c.nghttp2_check_method(s.ptr, s.len) != 0, fields.validMethod(s));
-        try expectEqual(c.nghttp2_check_path(s.ptr, s.len) != 0, fields.validPath(s));
-        try expectEqual(c.nghttp2_check_authority(s.ptr, s.len) != 0, fields.validAuthority(s));
+        try expectEqual(bits & 1 != 0, fields.validName(s));
+        try expectEqual(bits & 2 != 0, fields.validValue(s));
+        try expectEqual(bits & 4 != 0, fields.validValueRfc9113(s));
+        try expectEqual(bits & 8 != 0, fields.validMethod(s));
+        try expectEqual(bits & 16 != 0, fields.validPath(s));
+        try expectEqual(bits & 32 != 0, fields.validAuthority(s));
+        try expectEqual(0, bits >> 6);
     }
 };
+
+/// A fixed pseudo-random stream (xorshift64*), so that the strings of
+/// `enumerate` never depend on std's generator.
+const Xorshift = struct {
+    s: u64,
+
+    fn next(x: *Xorshift) u64 {
+        x.s ^= x.s >> 12;
+        x.s ^= x.s << 25;
+        x.s ^= x.s >> 27;
+        return x.s *% 0x2545f4914f6cdd1d;
+    }
+
+    fn below(x: *Xorshift, n: usize) usize {
+        return @intCast((x.next() >> 32) % n);
+    }
+};
+
+/// The strings the six checks are compared on, in a fixed order: every
+/// string of up to two bytes, then 20000 seeded longer ones. `v.visit(s)`
+/// for each.
+fn enumerate(v: anytype) !void {
+    var buf: [3]u8 = undefined;
+    try v.visit("");
+    for (0..256) |a| {
+        buf[0] = @intCast(a);
+        try v.visit(buf[0..1]);
+        for (0..256) |b| {
+            buf[1] = @intCast(b);
+            try v.visit(buf[0..2]);
+        }
+    }
+    var rng: Xorshift = .{ .s = 0x6832666c64 };
+    const alphabet = " \t:@*/+-.!azAZ09\x00\x1f\x7f\x80\xff\r\n";
+    var s: [12]u8 = undefined;
+    for (0..20000) |_| {
+        const n = rng.below(s.len + 1);
+        for (s[0..n]) |*ch| ch.* = if (rng.below(2) == 0) alphabet[rng.below(alphabet.len)] else @truncate(rng.next() >> 24);
+        try v.visit(s[0..n]);
+    }
+}
 
 test "fuzz: h2 fields" {
     try fuzz.bytes(struct {
@@ -335,10 +361,6 @@ test "fuzz: h2 fields" {
                     if (name.len == 0) return error.EmptyNameOk;
                     if (!fields.validName(name)) return error.BadNameOk;
                     if (name[0] != ':' and !fields.validValue(value)) return error.BadValueOk;
-                }
-                if (build_options.use_http2) {
-                    try Ng.same(name);
-                    try Ng.same(value);
                 }
             }
             _ = r.end();

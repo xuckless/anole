@@ -3,16 +3,16 @@
 //! connection's writer (57fdfa9's lost wake). The core's own HTTP/2 tests
 //! run on std.Io.Threaded, whose futex wake order is the OS's; zio's is
 //! FIFO per bucket, so here the order of the waiters is known and a wake of
-//! one goes to whoever waited first. Run on both engines: the nghttp2 one
-//! (a writer task, until M6) and the one that serves (no writer task; each
-//! stream waits on its own `room`, PLAN §3.3).
+//! one goes to whoever waited first. The engine has no writer task: each
+//! stream waits on its own `room` (PLAN §3.3), and a PING's ACK is the sync
+//! point.
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
-const c = @import("anole_nghttp2_c");
 const wait = @import("anole_test_wait");
 
-const h2_nghttp2 = dusty.h2_nghttp2_for_tests;
+const conn = dusty.h2_core_for_tests.conn;
+const tc = dusty.h2_core_for_tests.test_client;
 
 /// POST /body: says it is about to read, then reads the whole body and
 /// answers with its length. On one executor the flag is seen only once the
@@ -49,87 +49,82 @@ fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello";
 }
 
-/// The nghttp2 engine writer's waits (`h2_nghttp2.test_before_writer_wait`).
-var writer_waits: std.atomic.Value(u32) = .init(0);
-fn countWriterWait(_: std.Io) void {
-    _ = writer_waits.fetchAdd(1, .release);
-}
-
-/// A plain nghttp2 client over one connection with a few streams.
+/// A plain client over one connection with a few streams, on the core's
+/// client role (h2/test_client.zig); it is its own `Conn` handler.
 const Client = struct {
     io: std.Io,
+    gpa: std.mem.Allocator,
     stream: std.Io.net.Stream,
     reader: std.Io.net.Stream.Reader,
     writer: std.Io.net.Stream.Writer,
     read_buf: [16 * 1024]u8 = undefined,
     write_buf: [16 * 1024]u8 = undefined,
-    session: ?*c.nghttp2_session = null,
+    cn: CC = undefined,
+    scratch: []u8 = &.{},
+    rx: tc.Rx = .{},
+    arena: std.heap.ArenaAllocator,
     resps: [4]Resp = @splat(.{}),
     used: usize = 0,
     ping_acks: u32 = 0,
 
+    const CC = conn.Conn(.client, Client);
+
     const Resp = struct {
+        id: u31 = 0,
         status: u16 = 0,
         body: [256]u8 = undefined,
         body_len: usize = 0,
         closed: bool = false,
-        /// The request body, sent once `send_ready`; until then the
-        /// request side stays open with nothing sent.
-        send: []const u8 = "",
-        send_ready: bool = false,
+        /// The request body: nothing is sent until `sendBody`, and the
+        /// request side stays open until then.
+        src: tc.Source = .{ .keep_open = true },
+        has_body: bool = false,
 
         fn got(r: *const Resp) []const u8 {
             return r.body[0..r.body_len];
         }
     };
 
-    fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
-        self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
+    fn init(self: *Client, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !void {
+        self.* = .{ .io = io, .gpa = gpa, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined, .arena = .init(gpa) };
         self.reader = self.stream.reader(io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
-        var cbs: ?*c.nghttp2_session_callbacks = null;
-        _ = c.nghttp2_session_callbacks_new(&cbs);
-        defer c.nghttp2_session_callbacks_del(cbs);
-        c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
-        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
-        c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
-        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrame);
-        if (c.nghttp2_session_client_new(&self.session, cbs, self) != 0) return error.Http2Init;
-        if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.Http2Init;
+        self.scratch = try tc.scratch(gpa, tc.default_options);
+        try self.cn.initAt(gpa, self, tc.default_options);
     }
 
     fn deinit(self: *Client) void {
-        c.nghttp2_session_del(self.session);
+        self.cn.deinit();
+        self.rx.deinit(self.gpa);
+        self.arena.deinit();
+        self.gpa.free(self.scratch);
         self.stream.close(self.io);
     }
 
-    /// Submits a request; `body` keeps the request side open (with a
-    /// data provider that has nothing until `sendBody`).
+    /// Submits a request; `body` keeps the request side open (nothing is
+    /// sent until `sendBody`).
     fn request(self: *Client, method: []const u8, path: []const u8, body: bool) !*Resp {
-        const nva = [_]c.nghttp2_nv{ nv(":method", method), nv(":path", path), nv(":scheme", "http"), nv(":authority", "localhost") };
+        const hdrs = [_]tc.Field{ tc.nv(":method", method), tc.nv(":path", path), tc.nv(":scheme", "http"), tc.nv(":authority", "localhost") };
         const resp = &self.resps[self.used];
         self.used += 1;
-        var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = resp }, .read_callback = provide };
-        const id = c.nghttp2_submit_request2(self.session, null, &nva, nva.len, if (body) &provider else null, resp);
-        if (id < 0) return error.Http2Submit;
+        resp.has_body = body;
+        const s = try self.cn.submitRequest(&hdrs, !body, resp);
+        resp.id = s.id;
         return resp;
     }
 
     /// Sends `bytes` as the whole body of `resp`'s open request.
-    fn sendBody(self: *Client, resp: *Resp, id: i32, bytes: []const u8) void {
-        resp.send = bytes;
-        resp.send_ready = true;
-        _ = c.nghttp2_session_resume_data(self.session, id);
+    fn sendBody(_: *Client, resp: *Resp, bytes: []const u8) void {
+        resp.src.data = bytes;
+        resp.src.keep_open = false;
     }
 
     fn flushSession(self: *Client) !void {
-        while (true) {
-            var data: [*c]const u8 = undefined;
-            const n = c.nghttp2_session_mem_send2(self.session, &data);
-            if (n < 0) return error.Http2Send;
-            if (n == 0) break;
-            try self.writer.interface.writeAll(data[0..@intCast(n)]);
+        for (self.resps[0..self.used]) |*r| {
+            if (!r.has_body or r.closed) continue;
+            if (self.cn.table.get(r.id)) |s| try r.src.poll(self.arena.allocator(), &self.cn, s);
         }
+        try tc.writePending(&self.cn, &self.writer.interface);
         try self.writer.interface.flush();
     }
 
@@ -139,9 +134,8 @@ const Client = struct {
             if (done(self)) return;
             const r = &self.reader.interface;
             const bytes = try r.peekGreedy(1);
-            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
-            if (rv < 0) return error.Http2Recv;
-            r.toss(@intCast(rv));
+            try self.rx.feed(self.gpa, &self.cn, bytes, self.scratch);
+            r.toss(bytes.len);
         }
     }
 
@@ -163,61 +157,40 @@ const Client = struct {
         try task.await(self.io);
     }
 
-    fn nv(name: []const u8, value: []const u8) c.nghttp2_nv {
-        return .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
+    fn respOf(s: *conn.Stream) *Resp {
+        return @ptrCast(@alignCast(s.user.?));
     }
 
-    fn respOf(session: ?*c.nghttp2_session, id: i32) ?*Resp {
-        const ptr = c.nghttp2_session_get_stream_user_data(session, id) orelse return null;
-        return @ptrCast(@alignCast(ptr));
+    pub fn onHeadRefused(_: *Client, _: *conn.Stream) void {}
+
+    pub fn onField(_: *Client, s: *conn.Stream, name: []const u8, value: []const u8) conn.Error!void {
+        if (std.mem.eql(u8, name, ":status")) respOf(s).status = std.fmt.parseInt(u16, value, 10) catch 0;
     }
 
-    fn onHeader(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, _: ?*anyopaque) callconv(.c) c_int {
-        const resp = respOf(session, frame.*.hd.stream_id) orelse return 0;
-        if (std.mem.eql(u8, name[0..namelen], ":status")) resp.status = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
-        return 0;
-    }
+    pub fn onHeadersEnd(_: *Client, _: *conn.Stream, _: bool) conn.Error!void {}
 
-    fn onData(session: ?*c.nghttp2_session, _: u8, id: i32, data: [*c]const u8, len: usize, _: ?*anyopaque) callconv(.c) c_int {
-        const resp = respOf(session, id) orelse return 0;
-        const n = @min(len, resp.body.len - resp.body_len);
-        @memcpy(resp.body[resp.body_len..][0..n], data[0..n]);
+    pub fn onData(h: *Client, s: *conn.Stream, bytes: []const u8, _: bool) conn.Error!void {
+        const resp = respOf(s);
+        const n = @min(bytes.len, resp.body.len - resp.body_len);
+        @memcpy(resp.body[resp.body_len..][0..n], bytes[0..n]);
         resp.body_len += n;
-        return 0;
+        h.cn.consumed(s, bytes.len) catch @panic("OOM");
     }
 
-    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        if (frame.*.hd.type == c.NGHTTP2_PING and frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1;
-        return 0;
+    pub fn onStreamClose(_: *Client, s: *conn.Stream, _: conn.ErrorCode) void {
+        respOf(s).closed = true;
     }
 
-    fn onClose(session: ?*c.nghttp2_session, id: i32, _: u32, _: ?*anyopaque) callconv(.c) c_int {
-        const resp = respOf(session, id) orelse return 0;
-        resp.closed = true;
-        return 0;
-    }
+    pub fn onWindow(_: *Client, _: ?*conn.Stream) void {}
 
-    fn provide(_: ?*c.nghttp2_session, _: i32, buf: [*c]u8, length: usize, flags: [*c]u32, source: [*c]c.nghttp2_data_source, _: ?*anyopaque) callconv(.c) c.nghttp2_ssize {
-        const resp: *Resp = @ptrCast(@alignCast(source.*.ptr.?));
-        if (!resp.send_ready) return c.NGHTTP2_ERR_DEFERRED;
-        const n = @min(resp.send.len, length);
-        @memcpy(buf[0..n], resp.send[0..n]);
-        resp.send = resp.send[n..];
-        if (resp.send.len == 0) flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-        return @intCast(n);
+    pub fn onGoaway(_: *Client, _: u31, _: conn.ErrorCode) void {}
+
+    pub fn onPingAck(h: *Client, _: [8]u8) void {
+        h.ping_acks += 1;
     }
 };
 
 test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wake; a parked burst, a PING and a GET all go out first" {
-    try run(.anole);
-}
-
-test "HTTP/2 on zio: a handler waiting for its body never takes the writer's wake (nghttp2 engine)" {
-    try run(.nghttp2);
-}
-
-fn run(comptime engine: enum { anole, nghttp2 }) !void {
     // With one wake per kick, the waiters on the writer's word were the
     // writer and every handler waiting for its stream's first DATA frame,
     // in the order they went to sleep. The PING below makes the writer go
@@ -235,19 +208,11 @@ fn run(comptime engine: enum { anole, nghttp2 }) !void {
     body_waiting.store(false, .monotonic);
     parked = null;
     parked_opened = .unset;
-    if (engine == .nghttp2) h2_nghttp2.test_before_writer_wait = countWriterWait;
-    defer if (engine == .nghttp2) {
-        h2_nghttp2.test_before_writer_wait = null;
-    };
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
     }, {});
     defer server.deinit();
-    server.test_h2_engine = switch (engine) {
-        .anole => .anole,
-        .nghttp2 => .nghttp2,
-    };
     server.router.post("/body", readBody);
     server.router.get("/live", live);
     server.router.get("/hello", hello);
@@ -260,7 +225,7 @@ fn run(comptime engine: enum { anole, nghttp2 }) !void {
     try server.waitReady(io);
 
     var client: Client = undefined;
-    try client.init(io, server.address.ip);
+    try client.init(gpa, io, server.address.ip);
     defer client.deinit();
 
     // The parked stream, its head out: its data provider has deferred, so
@@ -290,14 +255,8 @@ fn run(comptime engine: enum { anole, nghttp2 }) !void {
 
     // A PING: the reader kicks once, and the writer answers, then sleeps
     // again (behind the waiting handler, in FIFO order).
-    const waits = writer_waits.load(.acquire);
-    _ = c.nghttp2_submit_ping(client.session, c.NGHTTP2_FLAG_NONE, null);
+    try client.cn.ping(@splat(0));
     try client.flushSession();
-    if (engine == .nghttp2) try wait.waitUntil(io, "the writer answered the PING and went back to sleep", waits, struct {
-        fn f(before: u32) bool {
-            return writer_waits.load(.acquire) > before;
-        }
-    }.f);
     try client.pump("the PING's ACK", struct {
         fn f(cl: *Client) bool {
             return cl.ping_acks >= 1;
@@ -326,7 +285,7 @@ fn run(comptime engine: enum { anole, nghttp2 }) !void {
     try std.testing.expect(!body_resp.closed);
 
     // Then the body: the waiting handler reads it and answers.
-    client.sendBody(body_resp, 3, "abcdefg");
+    client.sendBody(body_resp, "abcdefg");
     try client.pump("the body handler's answer", struct {
         fn f(cl: *Client) bool {
             return cl.resps[1].closed;

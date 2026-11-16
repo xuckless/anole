@@ -226,15 +226,15 @@ pub const ClientConnection = struct {
     const has_tls = options.tls;
 
     const Owned = struct {
-        read_buf: [32 * 1024]u8 = undefined,
-        write_buf: [32 * 1024]u8 = undefined,
-        tcp_reader: std.Io.net.Stream.Reader = undefined,
-        tcp_writer: std.Io.net.Stream.Writer = undefined,
+        read_buf: [32 * 1024]u8 = undefined, // SAFETY: a buffer, written before it is read
+        write_buf: [32 * 1024]u8 = undefined, // SAFETY: a buffer, written before it is read
+        tcp_reader: std.Io.net.Stream.Reader = undefined, // SAFETY: set by connect before any use
+        tcp_writer: std.Io.net.Stream.Writer = undefined, // SAFETY: set by connect before any use
         tls_conn: if (has_tls) ?tls.Connection else void = if (has_tls) null else {},
-        tls_reader: if (has_tls) tls.Connection.Reader else void = undefined,
-        tls_writer: if (has_tls) tls.Connection.Writer else void = undefined,
-        tls_read_buf: [16 * 1024]u8 = undefined,
-        tls_write_buf: [16 * 1024]u8 = undefined,
+        tls_reader: if (has_tls) tls.Connection.Reader else void = undefined, // SAFETY: set by connect before any use
+        tls_writer: if (has_tls) tls.Connection.Writer else void = undefined, // SAFETY: set by connect before any use
+        tls_read_buf: [16 * 1024]u8 = undefined, // SAFETY: a buffer, written before it is read
+        tls_write_buf: [16 * 1024]u8 = undefined, // SAFETY: a buffer, written before it is read
     };
 
     /// Connects (TCP, then TLS when `tls` is set) within `connect_timeout`
@@ -393,7 +393,7 @@ pub const ClientConnection = struct {
             defer self.unlock();
             var it = self.live.first;
             while (it) |node| : (it = node.next) {
-                const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+                const stream: *Stream = @alignCast(@fieldParentPtr("node", node)); // SAFETY: `node` is that field of a live container, so the parent is aligned
                 if (stream.ps) |ps| ps.user = null;
                 stream.ps = null;
             }
@@ -401,14 +401,14 @@ pub const ClientConnection = struct {
             self.proto_gone = true;
             // Nothing writes any more: what waited for the writer goes.
             while (self.retiring.popFirst()) |node| {
-                const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node));
+                const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node)); // SAFETY: `retire_node` is that field of a live container, so the parent is aligned
                 stream.free();
             }
             // Streams released but never closed by the server.
             it = self.live.first;
             while (it) |node| {
                 it = node.next;
-                const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+                const stream: *Stream = @alignCast(@fieldParentPtr("node", node)); // SAFETY: `node` is that field of a live container, so the parent is aligned
                 if (!stream.user_done) continue;
                 stream.protocol_done = true;
                 stream.maybeFree();
@@ -599,7 +599,7 @@ pub const ClientConnection = struct {
         defer self.unlock();
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
-            const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+            const stream: *Stream = @alignCast(@fieldParentPtr("node", node)); // SAFETY: `node` is that field of a live container, so the parent is aligned
             stream.finishLocked(error.ConnectionClosed);
         }
     }
@@ -663,7 +663,7 @@ pub const ClientConnection = struct {
     fn retire(self: *ClientConnection) void {
         const sent = self.proto.out.sent_total;
         while (self.retiring.first) |node| {
-            const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node));
+            const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node)); // SAFETY: `retire_node` is that field of a live container, so the parent is aligned
             if (stream.retire_mark > sent) break;
             _ = self.retiring.popFirst();
             stream.free();
@@ -874,7 +874,7 @@ pub const Stream = struct {
             .conn = conn,
             .arena = .init(conn.gpa),
             .deadline = deadline,
-            .body = undefined,
+            .body = undefined, // SAFETY: set to its own empty reader at 887, before use
             .body_reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readBody } },
             .out_writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
             .send_closed = !has_body,
@@ -1031,7 +1031,7 @@ pub const Stream = struct {
 
     /// The stream whose `reader` this is.
     pub fn ofReader(r: *std.Io.Reader) *Stream {
-        return @alignCast(@fieldParentPtr("body_reader", r));
+        return @alignCast(@fieldParentPtr("body_reader", r)); // SAFETY: `body_reader` is that field of a live container, so the parent is aligned
     }
 
     /// What the last `ReadFailed` from `reader` was.
@@ -1133,7 +1133,7 @@ pub const Stream = struct {
     }
 
     fn readBody(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Stream = @alignCast(@fieldParentPtr("body_reader", r));
+        const self: *Stream = @alignCast(@fieldParentPtr("body_reader", r)); // SAFETY: `body_reader` is that field of a live container, so the parent is aligned
         const conn = self.conn;
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
@@ -1269,7 +1269,7 @@ pub const Stream = struct {
     }
 
     fn drainOut(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w));
+        const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w)); // SAFETY: `out_writer` is that field of a live container, so the parent is aligned
         try self.sendBuffered();
         if (w.buffer.len == 0) {
             // No body (`.body = false`), or a block never came free.
@@ -1300,7 +1300,7 @@ pub const Stream = struct {
     }
 
     fn flushOut(w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w));
+        const self: *Stream = @alignCast(@fieldParentPtr("out_writer", w)); // SAFETY: `out_writer` is that field of a live container, so the parent is aligned
         try self.sendBuffered();
         if (w.buffer.len == 0 and self.has_body) {
             if (self.write_err == null) self.write_err = error.StreamReset;

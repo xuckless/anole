@@ -74,7 +74,7 @@ pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned, .fast_ac
 zio reads it at compile time, as std reads `std_options`. Pinned scheduling
 runs many executors (OS threads), and a task never leaves the executor that
 started it. Anole relies on that: a connection and every task it spawns stay
-on one thread, so nghttp2 sessions, BoringSSL's per-thread error queue and
+on one thread, so BoringSSL's per-thread error queue and
 zig-protobuf's thread-locals need no locking. Anole builds zio with pinned
 scheduling as the default, so the declaration can be left out; a root file
 that declares work stealing fails to compile, with a message that says what

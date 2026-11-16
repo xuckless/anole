@@ -13,6 +13,13 @@ pub const std_options = std.Options{
         .{ .scope = .websocket, .level = .warn },
     },
     .logFn = customLogFn,
+    // Windows: std.Io.Threaded has no mapping for LOCAL_DISCONNECT and
+    // PIPE_DISCONNECTED (a read after our own shutdown, a write after the
+    // peer is gone) and traces each one; the tests that provoke them expect
+    // the error, so the traces are noise there. This also hides a new
+    // unmapped status: turn it back on to diagnose an error.Unexpected on
+    // Windows.
+    .unexpected_error_tracing = if (builtin.os.tag == .windows) false else (std.Options{}).unexpected_error_tracing,
 };
 
 const std = @import("std");

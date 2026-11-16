@@ -12,7 +12,7 @@ attribution header and are listed in part B; that includes the HTTP core
 
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
-`-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
+`-Dtls=boringssl` adds BoringSSL; `-Dhttp3` adds
 ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dlibdeflate` adds libdeflate; `-Dkafka` adds lz4; `-Dpostgres` adds pg.zig and
 buffer.zig; `-Dsqlite` adds SQLite and zig-sqlite.
 
@@ -35,21 +35,12 @@ zio (async runtime)
   Pinned:   commit 806b5e4fa82592564f4e788ab4797370e43a99a5 of the fork
   Linked:   always
 
-nghttp2 1.70.0 (HTTP/2)
-  Licence:  MIT. Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa;
-            Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
-  Source:   https://github.com/nghttp2/nghttp2, used through Anole's fork
-            https://github.com/xuckless/nghttp2 (branch anole: tag v1.70.0,
-            its generated nghttp2ver.h, and Anole's RFC 9113 strictness patch)
-  Pinned:   commit 0f8bc1c4271f4380409071eade31830e6e436bd6 of the fork
-  Linked:   -Dhttp2=true
-
-sfparse (Structured Field Values parser, shipped inside nghttp2 and nghttp3)
+sfparse (Structured Field Values parser, shipped inside nghttp3)
   Licence:  MIT. Copyright (c) 2023 sfparse contributors;
             Copyright (c) 2019 nghttp3 contributors;
             Copyright (c) 2015 nghttp2 contributors
   Source:   https://github.com/ngtcp2/sfparse
-  Linked:   -Dhttp2=true or -Dhttp3=true
+  Linked:   -Dhttp3=true
 
 BoringSSL (TLS and cryptography)
   Licence:  Apache License 2.0 (see LICENSE in the BoringSSL tree)
@@ -249,7 +240,7 @@ B. Code adapted into this repository
 src/http/core/ (the HTTP core: HTTP/1.1 server, router, middleware,
 client, WebSocket, the HTTP/2 server engine, static files, assets)
   Adapted from dusty, through Anole's fork, whose changes (the HTTP/2
-  engine, TLS and nghttp2 seams, h2c, the PROXY protocol, inherited
+  engine, TLS seam, h2c, the PROXY protocol, inherited
   listeners, task placement and the rest) are Anole's own. Every Zig file
   carries an attribution header; dusty's licence is kept as
   src/http/core/LICENSE.dusty.
@@ -259,8 +250,8 @@ client, WebSocket, the HTTP/2 server engine, static files, assets)
             86d152f353c8ec029185e75ce5d2caf8d5756e59 (branch anole)
   Linked:   always
 
-src/http/core/h2/ (the HTTP/2 codecs and protocol core; so far the HPACK
-Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
+src/http/core/h2/ (the HTTP/2 codecs, protocol core and server engine; the
+HPACK Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
 from nghttp2's lib/nghttp2_hd_huffman_data.c, and the HPACK codec from
 lib/nghttp2_hd.c; testdata/hpack_blocks.bin holds header blocks that
 tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus, and
@@ -270,8 +261,11 @@ stream table from lib/nghttp2_map.c, its window and content-length checks from
 lib/nghttp2_stream.c and lib/nghttp2_http.c, and its closed-stream memory from
 the fork patch in lib/nghttp2_session.c; conn.zig's inbound state machine from
 lib/nghttp2_session.c and lib/nghttp2_http.c, with its tests from
-tests/nghttp2_session_test.c)
-  Translated from nghttp2's lib/. Every translated Zig file carries an
+tests/nghttp2_session_test.c; testdata/vectors/ holds what nghttp2 1.70.0
+answered to the differential tests' inputs, recorded once while it was
+still linked, so the tests compare against it without the library)
+  Translated from nghttp2's lib/. nghttp2 itself is no longer a dependency
+  (removed at M6). Every translated Zig file carries an
   attribution header; nghttp2's licence is kept as
   src/http/core/h2/LICENSE.nghttp2.
   Licence:  MIT. Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa;
@@ -280,7 +274,7 @@ tests/nghttp2_session_test.c)
   Source:   https://github.com/nghttp2/nghttp2, tag v1.70.0, through
             https://github.com/xuckless/nghttp2, commit
             0f8bc1c4271f4380409071eade31830e6e436bd6 (branch anole)
-  Linked:   tests only (until the engine uses it, M3)
+  Linked:   always with -Dhttp2=true (translated code; no C)
 
 src/http/core/arena.zig (the request and stream arenas' allocator)
   Derived from Zig's std.heap.ArenaAllocator with its atomics and free
@@ -329,12 +323,6 @@ build/boringssl.zig
   Adapted from allyourcodebase/boringssl's build.zig.
   Licence:  Zlib. Copyright (c) Lukas Kastern
   Source:   https://github.com/allyourcodebase/boringssl
-
-build/nghttp2.zig
-  Per-OS compile flags from dusty's build.zig (MIT, Lukas Lalinsky and
-  contributors, https://github.com/lalinsky/dusty, commit d3cb485); source
-  list from etcd-zig's build.zig (MIT, Copyright (c) 2026 Matt Robenolt,
-  https://github.com/mattrobenolt/etcd-zig, commit 4becbee).
 
 build/ngtcp2.zig, build/nghttp3.zig
   Source lists and macro sets adapted from server_native's

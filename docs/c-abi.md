@@ -27,7 +27,7 @@ cc -O2 app.c -Izig-out/include zig-out/lib/libanole.a -lpthread -o app
 ```
 
 `libanole.a` is one object holding Anole, every C library it uses (BoringSSL,
-nghttp2, ngtcp2, nghttp3, zlib-ng, libdeflate, zstd, Brotli, ...) and compiler-rt; it
+ngtcp2, nghttp3, zlib-ng, libdeflate, zstd, Brotli, ...) and compiler-rt; it
 needs only libc (and `-lpthread` on older glibc). It is packed with Zig alone
 (no system linker, `objcopy` or `strip`), and every symbol but `anole_*` is
 hidden (ELF `STV_HIDDEN`, Mach-O private extern), so a Node addon or a Python

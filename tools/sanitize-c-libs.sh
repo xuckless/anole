@@ -3,9 +3,8 @@
 # build.zig.zon pins, with clang's AddressSanitizer and
 # UndefinedBehaviorSanitizer. Zig 0.17 has no ASan, so this is where memory
 # errors in the C code would show. (Zig's Debug builds already run all the C
-# with UBSan; nghttp2's suite runs under ASan in the xuckless/nghttp2 fork's
-# CI, since its tests need a git submodule the tarball lacks. BoringSSL tests
-# itself under sanitizers upstream at every commit.)
+# with UBSan. BoringSSL tests itself under sanitizers upstream at every
+# commit.)
 #
 #   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4 libdeflate]
 #

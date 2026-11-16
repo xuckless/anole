@@ -4,7 +4,6 @@ name: Sanitizers
 # build.zig.zon pins, under AddressSanitizer and UndefinedBehaviorSanitizer
 # (tools/sanitize-c-libs.sh). The pinned code changes only with a pin, so
 # this runs then, weekly (a newer compiler can find more), and on demand.
-# nghttp2 runs under the same sanitizers in the xuckless/nghttp2 fork's CI.
 on:
   schedule:
     - cron: "41 6 * * 1"

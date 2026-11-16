@@ -1,40 +1,44 @@
-//! The session differential (PLAN §5.3): the same client byte stream into
-//! an nghttp2 server session set up as today's engine sets it up
-//! (server/h2_nghttp2.zig `initSession`: no automatic WINDOW_UPDATE, credit
-//! given back as DATA arrives, the header-list limit in the header
-//! callback) and into Conn(.server), each with a handler that answers
-//! every complete request with 200 and "ok"; the output compared after
-//! normalization, batch by batch. Intentional divergences: INTENTIONAL.md,
-//! each matched by one named rule here and counted. Only with -Dhttp2 (the
-//! bindings are the engine's).
+//! The session differential (PLAN §5.3): a client byte stream into
+//! Conn(.server), with a handler that answers every complete request with
+//! 200 and "ok", against what nghttp2 1.70.0 answered to the same bytes in
+//! a server session set up as the nghttp2 engine set it up (removed at
+//! M6; its `initSession`: no automatic WINDOW_UPDATE, credit given back as DATA
+//! arrives, the header-list limit in the header callback, answers 200 and
+//! "ok"). nghttp2's side was recorded while the library was still linked
+//! (testdata/vectors/README.md; the recorder is `Ng` and `Rec` in commit
+//! 1012aa39) and is replayed here, so the library is gone from the build.
+//! The output is compared after normalization, batch by batch.
+//! Intentional divergences: INTENTIONAL.md, each matched by one named rule
+//! here and counted.
 //!
 //! What a batch compares (each side's output for one chunk of input, parsed
-//! with frame.zig, header blocks decoded by one nghttp2 inflater per side,
-//! so HPACK bytes and frame sizes never matter): the connection's frames in
-//! order
-//! (SETTINGS entries sorted, GOAWAY's debug data left out), each stream's
-//! frames in order (decoded HEADERS, DATA concatenated with END_STREAM's
-//! place, RST_STREAM's code), and the order of the responses. Not
-//! compared: DATA interleaving across streams, the place of DATA among the
-//! control frames, and WINDOW_UPDATE amounts, which are a bound instead
+//! with frame.zig, header blocks decoded by our decoder on either side, so
+//! HPACK bytes and frame sizes never matter): the connection's frames in
+//! order (SETTINGS entries sorted, GOAWAY's debug data left out), each
+//! stream's frames in order (decoded HEADERS, DATA concatenated with
+//! END_STREAM's place, RST_STREAM's code), and the order of the responses.
+//! Not compared: DATA interleaving across streams, the place of DATA among
+//! the control frames, and WINDOW_UPDATE amounts, which are a bound instead
 //! (INTENTIONAL.md, session 2).
 //!
 //! Inputs: nghttp2's fuzz corpus (client streams recorded against nghttpd,
 //! packed by tools/pack_h2_sessions.py), the 'fuzz: h2 conn recv' seeds,
-//! and 5000 generated sessions. Each runs in lockstep whole (one chunk)
-//! and on random cuts: Conn gets what it left over plus the next piece,
-//! nghttp2 exactly the bytes Conn took, both drained after every frame
-//! (`lockstep`), compared after every chunk. Then through Conn alone, whole
-//! and on the same cuts with no drain until the end: the same bytes
-//! (WINDOW_UPDATEs aside), however the input was cut.
+//! and 400 of 5000 generated sessions (kept for covering every rule and
+//! outcome). Each ran in lockstep whole (one chunk) and on random cuts,
+//! the cuts recorded with nghttp2's answers: Conn gets what it left over
+//! plus the next piece, nghttp2 exactly the bytes Conn took, both drained
+//! after every frame (`lockstep`), compared after every chunk. Then
+//! through Conn alone, whole and on the same cuts with no drain until the
+//! end: the same bytes (WINDOW_UPDATEs aside), however the input was cut.
+//! The generator also runs live, against Conn alone only.
 
 const std = @import("std");
-const c = @import("nghttp2");
 const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const conn_test = @import("conn_test.zig");
 const streams = @import("streams.zig");
+const vectors = @import("vectors.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -88,199 +92,34 @@ const Handler = struct {
 
 const C = conn.Conn(.server, Handler);
 
-/// nghttp2's side, configured from the same Options.
+/// nghttp2's side, replayed from the vectors: each `feed` takes the next
+/// recorded `Feed` of the run, whose input must be what Conn consumed (so
+/// nghttp2 saw the same bytes).
 const Ng = struct {
-    session: *c.nghttp2_session,
-    opts: conn.Options,
-    heads: std.AutoHashMapUnmanaged(i32, Head) = .empty,
-    gpa: Allocator,
+    run: *const vectors.Run,
+    fed: usize = 0,
     /// mem_recv2's error, if it returned one (no GOAWAY is queued).
-    fatal: ?c_int = null,
+    fatal: ?i32 = null,
+    /// nghttp2_session_want_read: it wants no more input once the peer has
+    /// sent GOAWAY with no stream open.
+    want_read: bool = true,
+    last_proc: u32 = 0,
 
-    /// production's `onHeader` limit, extended to Conn's answer
-    /// (INTENTIONAL.md, limits 6): a request head past the list size or the
-    /// field count is answered 431, trailers are reset.
-    const Head = struct {
-        size: u64 = 0,
-        count: usize = 0,
-        cookie: bool = false,
-        over: bool = false,
-        /// RST_STREAM(NO_ERROR) once the 431 is sent (queued before it,
-        /// it would drop the HEADERS).
-        rst_after: bool = false,
-        /// "ok" bytes sent.
-        body_off: u8 = 0,
-    };
+    /// nghttp2.h's NGHTTP2_ERR_BAD_CLIENT_MAGIC and
+    /// NGHTTP2_ERR_TOO_MANY_CONTINUATIONS.
+    const bad_client_magic = -903;
+    const too_many_continuations = -905;
 
-    fn init(ng: *Ng, gpa: Allocator, opts: conn.Options) !void {
-        ng.* = .{ .session = undefined, .opts = opts, .gpa = gpa };
-        var cbs: ?*c.nghttp2_session_callbacks = null;
-        if (c.nghttp2_session_callbacks_new(&cbs) != 0) return error.OutOfMemory;
-        defer c.nghttp2_session_callbacks_del(cbs);
-        c.nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, onBeginHeaders);
-        c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
-        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrameRecv);
-        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onDataChunk);
-        c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onStreamClose);
-        c.nghttp2_session_callbacks_set_on_frame_send_callback(cbs, onFrameSend);
-        var opt: ?*c.nghttp2_option = null;
-        if (c.nghttp2_option_new(&opt) != 0) return error.OutOfMemory;
-        defer c.nghttp2_option_del(opt);
-        c.nghttp2_option_set_no_auto_window_update(opt, 1);
-        c.nghttp2_option_set_stream_reset_rate_limit(opt, opts.stream_reset_burst, opts.stream_reset_rate);
-        c.nghttp2_option_set_max_continuations(opt, opts.max_continuations);
-        c.nghttp2_option_set_max_outbound_ack(opt, opts.limits.control_frame_budget);
-        c.nghttp2_option_set_max_settings(opt, opts.limits.max_settings);
-        c.nghttp2_option_set_glitch_rate_limit(opt, opts.limits.glitch_burst, opts.limits.glitch_rate);
-        var s: ?*c.nghttp2_session = null;
-        if (c.nghttp2_session_server_new2(&s, cbs, ng, opt) != 0) return error.OutOfMemory;
-        ng.session = s.?;
-        // The entries Conn.init sends, NO_RFC7540_PRIORITIES included
-        // (D15 point 3; production nghttp2 doesn't send it yet).
-        var iv: [6]c.nghttp2_settings_entry = undefined;
-        var n: usize = 0;
-        const entries = [_][2]u32{
-            .{ c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, opts.max_concurrent_streams },
-            .{ c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, opts.initial_window },
-            .{ c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, opts.max_header_list_size },
-            .{ c.NGHTTP2_SETTINGS_MAX_FRAME_SIZE, opts.max_frame_size },
-            .{ c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1 },
-            .{ c.NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES, 1 },
-        };
-        for (entries) |e| {
-            if (e[0] == c.NGHTTP2_SETTINGS_MAX_FRAME_SIZE and opts.max_frame_size == frame.min_max_frame_size) continue;
-            if (e[0] == c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL and !opts.enable_connect_protocol) continue;
-            iv[n] = .{ .settings_id = @intCast(e[0]), .value = e[1] };
-            n += 1;
-        }
-        if (c.nghttp2_submit_settings(ng.session, c.NGHTTP2_FLAG_NONE, &iv, n) != 0) return error.OutOfMemory;
-        if (opts.connection_window > conn.default_window)
-            _ = c.nghttp2_session_set_local_window_size(ng.session, c.NGHTTP2_FLAG_NONE, 0, opts.connection_window);
-    }
-
-    fn deinit(ng: *Ng) void {
-        c.nghttp2_session_del(ng.session);
-        ng.heads.deinit(ng.gpa);
-    }
-
-    fn from(user: ?*anyopaque) *Ng {
-        return @ptrCast(@alignCast(user.?));
-    }
-
-    fn onBeginHeaders(_: ?*c.nghttp2_session, fr: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const ng = from(user);
-        const g = ng.heads.getOrPut(ng.gpa, fr.*.hd.stream_id) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-        const off: u8 = if (g.found_existing) g.value_ptr.body_off else 0;
-        g.value_ptr.* = .{ .body_off = off };
-        return 0;
-    }
-
-    fn onHeader(
-        _: ?*c.nghttp2_session,
-        fr: [*c]const c.nghttp2_frame,
-        name_ptr: [*c]const u8,
-        name_len: usize,
-        _: [*c]const u8,
-        value_len: usize,
-        _: u8,
-        user: ?*anyopaque,
-    ) callconv(.c) c_int {
-        const ng = from(user);
-        const h = ng.heads.getPtr(fr.*.hd.stream_id) orelse return 0;
-        if (h.over) return 0;
-        const request = fr.*.headers.cat == c.NGHTTP2_HCAT_REQUEST;
-        h.size += name_len + value_len + 32;
-        var over = h.size > ng.opts.max_header_list_size;
-        const name = name_ptr[0..name_len];
-        if (!over and name.len > 0 and name[0] != ':') {
-            const crumb = std.mem.eql(u8, name, "cookie");
-            if (!crumb or !h.cookie) h.count += 1;
-            h.cookie = h.cookie or crumb;
-            over = h.count > ng.opts.max_header_count;
-        }
-        if (!over) return 0;
-        if (!request) return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-        h.over = true;
-        return 0;
-    }
-
-    fn onFrameRecv(session: ?*c.nghttp2_session, fr: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const ng = from(user);
-        const hd = fr.*.hd;
-        if (c.nghttp2_session_find_stream(session, hd.stream_id) == null) return 0;
-        const es = hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
-        switch (hd.type) {
-            c.NGHTTP2_HEADERS => {
-                const over = if (ng.heads.get(hd.stream_id)) |h| h.over else false;
-                if (fr.*.headers.cat == c.NGHTTP2_HCAT_REQUEST and over) {
-                    ng.respond(hd.stream_id, "431", false);
-                    if (!es) ng.heads.getPtr(hd.stream_id).?.rst_after = true;
-                } else if (es) ng.respond(hd.stream_id, "200", true);
-            },
-            c.NGHTTP2_DATA => if (es) ng.respond(hd.stream_id, "200", true),
-            else => {},
-        }
-        return 0;
-    }
-
-    fn respond(ng: *Ng, id: i32, status: *const [3]u8, body: bool) void {
-        var nv = [_]c.nghttp2_nv{.{
-            .name = @constCast(":status".ptr),
-            .namelen = 7,
-            .value = @constCast(status),
-            .valuelen = 3,
-            .flags = c.NGHTTP2_NV_FLAG_NONE,
-        }};
-        var prov: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = null }, .read_callback = provide };
-        _ = c.nghttp2_submit_response2(ng.session, id, &nv, nv.len, if (body) &prov else null);
-    }
-
-    fn provide(_: ?*c.nghttp2_session, id: i32, buf: [*c]u8, len: usize, flags: [*c]u32, _: [*c]c.nghttp2_data_source, user: ?*anyopaque) callconv(.c) c.nghttp2_ssize {
-        const ng = from(user);
-        const h = ng.heads.getPtr(id) orelse return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-        const body = "ok";
-        const n = @min(len, body.len - h.body_off);
-        @memcpy(buf[0..n], body[h.body_off..][0..n]);
-        h.body_off += @intCast(n);
-        if (h.body_off == body.len) flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-        return @intCast(n);
-    }
-
-    fn onFrameSend(session: ?*c.nghttp2_session, fr: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const ng = from(user);
-        if (fr.*.hd.type != c.NGHTTP2_HEADERS) return 0;
-        const h = ng.heads.getPtr(fr.*.hd.stream_id) orelse return 0;
-        if (h.rst_after) _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, fr.*.hd.stream_id, c.NGHTTP2_NO_ERROR);
-        h.rst_after = false;
-        return 0;
-    }
-
-    fn onDataChunk(session: ?*c.nghttp2_session, _: u8, id: i32, _: [*c]const u8, len: usize, _: ?*anyopaque) callconv(.c) c_int {
-        _ = c.nghttp2_session_consume(session, id, len);
-        return 0;
-    }
-
-    fn onStreamClose(_: ?*c.nghttp2_session, id: i32, _: u32, user: ?*anyopaque) callconv(.c) c_int {
-        _ = from(user).heads.remove(id);
-        return 0;
-    }
-
-    fn recv(ng: *Ng, bytes: []const u8) void {
-        if (ng.fatal != null or bytes.len == 0) return;
-        const rv = c.nghttp2_session_mem_recv2(ng.session, bytes.ptr, bytes.len);
-        if (rv < 0) ng.fatal = @intCast(rv) else std.debug.assert(@as(usize, @intCast(rv)) == bytes.len);
-    }
-
-    fn drain(ng: *Ng, a: Allocator) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        while (true) {
-            var data: [*c]const u8 = undefined;
-            const n = c.nghttp2_session_mem_send2(ng.session, &data);
-            if (n < 0) return error.NgSendFailed;
-            if (n == 0) break;
-            try out.appendSlice(a, data[0..@intCast(n)]);
-        }
-        return out.items;
+    /// nghttp2's output for the next chunk.
+    fn feed(ng: *Ng, ng_in: usize) ![]const u8 {
+        if (ng.fed == ng.run.feeds.len) return error.RecordingExhausted;
+        const f = ng.run.feeds[ng.fed];
+        ng.fed += 1;
+        try testing.expectEqual(f.ng_in, ng_in);
+        ng.fatal = if (f.fatal == 0) null else f.fatal;
+        ng.want_read = f.want_read;
+        ng.last_proc = f.last_proc;
+        return f.out;
     }
 };
 
@@ -363,20 +202,29 @@ const Excused = std.AutoHashMapUnmanaged(u31, void);
 
 /// One side's output, batch after batch.
 const Tracer = struct {
-    inflater: *c.nghttp2_hd_inflater,
+    gpa: Allocator,
+    /// Our HPACK decoder, one per side: the answers' blocks are decoded
+    /// the same way for both (the decoder is checked against nghttp2's by
+    /// hpack_diff_test.zig).
+    decoder: *hpack.Decoder,
+    scratch: []u8,
     /// WINDOW_UPDATE increments so far, per stream (0 the connection).
     granted: std.AutoHashMapUnmanaged(u31, u64) = .empty,
     /// The last GOAWAY sent.
     goaway: ?Goaway = null,
 
-    fn init() !Tracer {
-        var inf: ?*c.nghttp2_hd_inflater = null;
-        if (c.nghttp2_hd_inflate_new(&inf) != 0) return error.OutOfMemory;
-        return .{ .inflater = inf.? };
+    const list_limit = 1 << 16;
+
+    fn init(gpa: Allocator) !Tracer {
+        const d = try gpa.create(hpack.Decoder);
+        errdefer gpa.destroy(d);
+        d.* = .init(.{});
+        return .{ .gpa = gpa, .decoder = d, .scratch = try gpa.alloc(u8, list_limit) };
     }
 
     fn deinit(t: *Tracer) void {
-        c.nghttp2_hd_inflate_del(t.inflater);
+        t.gpa.destroy(t.decoder);
+        t.gpa.free(t.scratch);
     }
 
     fn batch(t: *Tracer, a: Allocator, bytes: []const u8) !Batch {
@@ -477,23 +325,12 @@ const Tracer = struct {
     }
 
     fn decode(t: *Tracer, a: Allocator, block: []const u8, out: *std.ArrayList(u8)) !void {
-        var in = block;
+        var b = t.decoder.block(block, t.scratch, list_limit);
         var first = true;
-        while (true) {
-            var nv: c.nghttp2_nv = undefined;
-            var flags: c_int = 0;
-            const rv = c.nghttp2_hd_inflate_hd3(t.inflater, &nv, &flags, in.ptr, in.len, 1);
-            if (rv < 0) return error.BadOutputBlock;
-            in = in[@intCast(rv)..];
-            if (flags & c.NGHTTP2_HD_INFLATE_EMIT != 0) {
-                if (!first) try out.append(a, ',');
-                first = false;
-                try out.print(a, "{s}={s}", .{ nv.name[0..nv.namelen], nv.value[0..nv.valuelen] });
-            }
-            if (flags & c.NGHTTP2_HD_INFLATE_FINAL != 0) {
-                _ = c.nghttp2_hd_inflate_end_headers(t.inflater);
-                return;
-            }
+        while (b.next() catch return error.BadOutputBlock) |f| {
+            if (!first) try out.append(a, ',');
+            first = false;
+            try out.print(a, "{s}={s}", .{ f.name, f.value });
         }
     }
 };
@@ -561,7 +398,7 @@ fn classify(p: *Pair, a: Allocator, ours: *const Batch, theirs: *const Batch) !?
     // only on its glitch budget (above); its output after it is the rest of
     // the input, fed at once once we stop.
     if (og != null and std.mem.startsWith(u8, og.?.debug, "PRIORITY_UPDATE: ")) return .{ .priority_update, true };
-    if (reasonIs(og, "too many CONTINUATION frames") or p.ng.fatal == c.NGHTTP2_ERR_TOO_MANY_CONTINUATIONS) return .{ .continuations, true };
+    if (reasonIs(og, "too many CONTINUATION frames") or p.ng.fatal == Ng.too_many_continuations) return .{ .continuations, true };
     // A frame past a window that nghttp2, charging chunk by chunk, took
     // because credit given back for its first chunks made room (only when
     // the input was cut).
@@ -663,21 +500,19 @@ const Pair = struct {
     ours_out: std.ArrayList(u8) = .empty,
     ng_out: std.ArrayList(u8) = .empty,
 
-    fn create(gpa: Allocator, opts: conn.Options, plant: Plant) !*Pair {
+    fn create(gpa: Allocator, opts: conn.Options, plant: Plant, run: *const vectors.Run) !*Pair {
         const p = try gpa.create(Pair);
         errdefer gpa.destroy(p);
-        p.* = .{ .gpa = gpa, .cn = undefined, .ng = undefined, .ours = try .init(), .theirs = try .init(), .scratch = undefined, .opts = opts };
+        p.* = .{ .gpa = gpa, .cn = undefined, .ng = .{ .run = run }, .ours = try .init(gpa), .theirs = try .init(gpa), .scratch = undefined, .opts = opts };
         p.h.plant = plant;
         p.scratch = try gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
         p.cn = try C.init(gpa, &p.h, opts);
         p.h.c = &p.cn;
-        try p.ng.init(gpa, opts);
         return p;
     }
 
     fn destroy(p: *Pair) void {
         p.cn.deinit();
-        p.ng.deinit();
         p.ours.deinit();
         p.theirs.deinit();
         p.tail.deinit(p.gpa);
@@ -694,12 +529,11 @@ const Pair = struct {
     /// nghttp2 exactly those bytes (all of them once Conn has failed); then
     /// both are drained into the batch.
     fn feed(p: *Pair, a: Allocator, piece: []const u8) !void {
-        if (p.dead != null) {
-            p.ng.recv(piece);
-        } else {
+        var ng_in: usize = piece.len;
+        if (p.dead == null) {
             try p.tail.appendSlice(p.gpa, piece);
             if (p.cn.recv(p.tail.items, 0, p.scratch)) |n| {
-                p.ng.recv(p.tail.items[0..n]);
+                ng_in = n;
                 const rest = p.tail.items.len - n;
                 std.mem.copyForwards(u8, p.tail.items[0..rest], p.tail.items[n..]);
                 p.tail.items.len = rest;
@@ -707,19 +541,19 @@ const Pair = struct {
                 error.OutOfMemory => return err,
                 else => {
                     p.dead = err;
-                    p.ng.recv(p.tail.items);
+                    ng_in = p.tail.items.len;
                     p.tail.clearRetainingCapacity();
                 },
             }
         }
         try p.ours_out.appendSlice(a, try drainConn(&p.cn, a));
-        try p.ng_out.appendSlice(a, try p.ng.drain(a));
+        try p.ng_out.appendSlice(a, try p.ng.feed(ng_in));
     }
 
     /// After the peer's GOAWAY with no stream active nghttp2 wants to read
     /// no more, and the engine closes the connection.
     fn ngDone(p: *const Pair) bool {
-        return p.ng.fatal == null and p.theirs.goaway == null and c.nghttp2_session_want_read(p.ng.session) == 0;
+        return p.ng.fatal == null and p.theirs.goaway == null and !p.ng.want_read;
     }
 
     /// Drains both and compares the batch; a rule that stops returns it.
@@ -810,8 +644,8 @@ const Pair = struct {
 };
 
 /// Both sides in lockstep on `cuts` (one chunk: the whole input).
-fn lockstep(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8, cuts: []const usize, plant: Plant) !Result {
-    const p = try Pair.create(gpa, opts, plant);
+fn lockstep(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8, cuts: []const usize, plant: Plant, run: *const vectors.Run) !Result {
+    const p = try Pair.create(gpa, opts, plant, run);
     defer p.destroy();
     p.cut = cuts.len > 1;
     var res: Result = .{};
@@ -832,14 +666,20 @@ fn lockstep(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8,
             at = next;
             if (p.ngDone()) break;
         }
-        if (try p.compare(a, &res) or p.ngDone()) return res;
+        if (try p.compare(a, &res) or p.ngDone()) {
+            // The recording stopped here too.
+            try testing.expectEqual(run.feeds.len, p.ng.fed);
+            return res;
+        }
     }
     // The final state: open, GOAWAY (in the trace) or a fatal error, and
     // the last stream processed.
-    errdefer std.debug.print("h2 conn diff: final state: ours {?t} last {d}, nghttp2 {?d} last {d}\n", .{ p.dead, p.cn.last_proc, p.ng.fatal, c.nghttp2_session_get_last_proc_stream_id(p.ng.session) });
-    try testing.expectEqual(p.badPreface(), p.ng.fatal == c.NGHTTP2_ERR_BAD_CLIENT_MAGIC);
-    if (p.ng.fatal) |f| try testing.expectEqual(c.NGHTTP2_ERR_BAD_CLIENT_MAGIC, f);
-    if (p.ours.goaway == null) try testing.expectEqual(c.nghttp2_session_get_last_proc_stream_id(p.ng.session), p.cn.last_proc);
+    errdefer std.debug.print("h2 conn diff: final state: ours {?t} last {d}, nghttp2 {?d} last {d}\n", .{ p.dead, p.cn.last_proc, p.ng.fatal, p.ng.last_proc });
+    try testing.expectEqual(p.badPreface(), p.ng.fatal == Ng.bad_client_magic);
+    if (p.ng.fatal) |f| try testing.expectEqual(Ng.bad_client_magic, f);
+    if (p.ours.goaway == null) try testing.expectEqual(p.ng.last_proc, p.cn.last_proc);
+    // The recording ended where this run does.
+    try testing.expectEqual(run.feeds.len, p.ng.fed);
     res.outcome = if (p.badPreface()) .fatal else if (p.ours.goaway != null) .goaway else .open;
     return res;
 }
@@ -972,24 +812,52 @@ fn randomCuts(a: Allocator, r: std.Random, len: usize) ![]usize {
     return cuts.items;
 }
 
-/// One input: lockstep whole and on `lockstep_runs` random cuts, then Conn
-/// alone whole and on the last cuts.
-fn runInput(gpa: Allocator, r: std.Random, opts: conn.Options, input: []const u8, lockstep_runs: usize, stats: *Stats) !void {
+/// One recorded input: lockstep on each run of `g` (the whole input first,
+/// then the cuts it was run on), then Conn alone whole and on the last cuts.
+fn runInput(gpa: Allocator, opts: conn.Options, input: []const u8, g: vectors.Group, stats: *Stats) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     errdefer std.debug.print("h2 conn diff: input ({d} bytes): \"{f}\"\n", .{ input.len, std.zig.fmtString(input) });
     stats.inputs += 1;
+    try testing.expect(g.runs.len >= 2);
     const whole = [_]usize{input.len};
-    const one = try lockstep(gpa, a, opts, input, if (input.len == 0) &.{} else &whole, .none);
+    const first = try runCuts(a, g.runs[0], input.len);
+    try testing.expectEqualSlices(usize, if (input.len == 0) &.{} else &whole, first);
+    const one = try lockstep(gpa, a, opts, input, first, .none, &g.runs[0]);
     try count(stats, one);
     stats.outcomes[@backingInt(one.outcome)] += 1;
-    var cuts: []usize = &.{};
-    for (0..lockstep_runs) |_| {
-        cuts = try randomCuts(a, r, input.len);
+    var cuts: []const usize = &.{};
+    for (g.runs[1..]) |*run| {
+        cuts = try runCuts(a, run.*, input.len);
         errdefer std.debug.print("h2 conn diff: cuts {any}\n", .{cuts});
-        try count(stats, try lockstep(gpa, a, opts, input, cuts, .none));
+        try count(stats, try lockstep(gpa, a, opts, input, cuts, .none, run));
     }
+    errdefer std.debug.print("h2 conn diff: Conn alone on cuts {any}\n", .{cuts});
+    try expectSameOutput(a, opts, try alone(gpa, a, opts, input, &whole), try alone(gpa, a, opts, input, cuts));
+}
+
+/// A recorded run's chunk sizes, which must add up to the input.
+fn runCuts(a: Allocator, run: vectors.Run, input_len: usize) ![]usize {
+    const cuts = try a.alloc(usize, run.cuts.len);
+    var sum: usize = 0;
+    for (cuts, run.cuts) |*d, n| {
+        d.* = n;
+        sum += n;
+    }
+    try testing.expectEqual(input_len, sum);
+    return cuts;
+}
+
+/// Split invariance on a generated input that was never recorded: Conn
+/// alone, whole and on random cuts.
+fn splitInvariance(gpa: Allocator, r: std.Random, opts: conn.Options, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    errdefer std.debug.print("h2 conn diff: input ({d} bytes): \"{f}\"\n", .{ input.len, std.zig.fmtString(input) });
+    const whole = [_]usize{input.len};
+    const cuts = try randomCuts(a, r, input.len);
     errdefer std.debug.print("h2 conn diff: Conn alone on cuts {any}\n", .{cuts});
     try expectSameOutput(a, opts, try alone(gpa, a, opts, input, &whole), try alone(gpa, a, opts, input, cuts));
 }
@@ -1009,15 +877,21 @@ fn readU32(data: []const u8, pos: *usize) u32 {
 }
 
 test "h2 conn diff: nghttp2's fuzz corpus" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
     // tools/pack_h2_sessions.py: u32 count, then u32 length + bytes each.
     const data = @embedFile("testdata/h2_sessions.bin");
-    var prng: std.Random.DefaultPrng = .init(0x68326466);
-    for (profiles) |pf| {
+    const groups = try vectors.readConn(arena.allocator(), @embedFile("testdata/vectors/conn_corpus.bin"));
+    var gi: usize = 0;
+    for (profiles, 0..) |pf, pi| {
         var stats: Stats = .{};
         var pos: usize = 0;
         for (0..readU32(data, &pos)) |_| {
             const n = readU32(data, &pos);
-            try runInput(testing.allocator, prng.random(), pf.opts, data[pos..][0..n], 2, &stats);
+            const g = groups[gi];
+            gi += 1;
+            try testing.expectEqual(pi, g.profile);
+            try runInput(testing.allocator, pf.opts, try g.input.resolve(data[pos..][0..n]), g, &stats);
             pos += n;
         }
         try testing.expectEqual(data.len, pos);
@@ -1025,16 +899,20 @@ test "h2 conn diff: nghttp2's fuzz corpus" {
         try testing.expectEqual(136, stats.inputs);
         try testing.expect(stats.identical >= 130 * 3 / 2);
     }
+    try testing.expectEqual(groups.len, gi);
 }
 
 test "h2 conn diff: the conn recv fuzz seeds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const groups = try vectors.readConn(arena.allocator(), @embedFile("testdata/vectors/conn_seeds.bin"));
     const seeds = try conn_test.fuzzSeeds(testing.allocator);
     defer {
         for (seeds) |s| testing.allocator.free(s);
         testing.allocator.free(seeds);
     }
-    var prng: std.Random.DefaultPrng = .init(0x73656564);
-    for (profiles) |pf| {
+    var gi: usize = 0;
+    for (profiles, 0..) |pf, pi| {
         var stats: Stats = .{};
         for (seeds) |seed| {
             // fuzzOne's handshake, then the frames (the split byte dropped).
@@ -1042,32 +920,40 @@ test "h2 conn diff: the conn recv fuzz seeds" {
             defer input.deinit(testing.allocator);
             try input.appendSlice(testing.allocator, conn.client_magic ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++ "\x00\x00\x00\x04\x01\x00\x00\x00\x00");
             try input.appendSlice(testing.allocator, seed[1..]);
-            try runInput(testing.allocator, prng.random(), pf.opts, input.items, 2, &stats);
+            const g = groups[gi];
+            gi += 1;
+            try testing.expectEqual(pi, g.profile);
+            try runInput(testing.allocator, pf.opts, try g.input.resolve(input.items), g, &stats);
         }
         stats.print("conn recv seeds", pf.name);
         try testing.expectEqual(seeds.len, stats.inputs);
     }
+    try testing.expectEqual(groups.len, gi);
 }
 
 test "h2 conn diff: the harness catches a planted divergence" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    // The unplanted runs of the three inputs below, as nghttp2 answered them.
+    const groups = try vectors.readConn(a, @embedFile("testdata/vectors/conn_plant.bin"));
+    try testing.expectEqual(3, groups.len);
     const t = try conn_test.T.create(testing.allocator, .{});
     defer t.destroy();
     var input: std.ArrayList(u8) = .empty;
     try input.appendSlice(a, conn.client_magic);
     for ([_][]const u8{ try t.settings(&.{}), try t.settingsAck(), try t.headers(1, &conn_test.get, true), try t.headers(3, &conn_test.post, false), try t.data(3, "abc", true) }) |f|
         try input.appendSlice(a, f);
+    _ = try groups[0].input.resolve(input.items);
     const whole = [_]usize{input.items.len};
     // Two DATA frames for one: normalized away.
-    const split = try lockstep(testing.allocator, a, .{}, input.items, &whole, .split);
+    const split = try lockstep(testing.allocator, a, .{}, input.items, &whole, .split, &groups[0].runs[0]);
     try testing.expectEqual(null, split.rule);
     try testing.expectEqual(Outcome.open, split.outcome);
     // 201 for 200, and a 431 to requests under the limits: caught.
     std.debug.print("h2 conn diff: planted divergences follow\n", .{});
-    try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status));
-    try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status431));
+    try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status, &groups[0].runs[0]));
+    try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, input.items, &whole, .status431, &groups[0].runs[0]));
     // A PING of ours after the peer's GOAWAY, while a stream is open and
     // once nghttp2 is done: neither peer_goaway nor its stop excuses a
     // frame nghttp2 never drops.
@@ -1075,14 +961,15 @@ test "h2 conn diff: the harness catches a planted divergence" {
     for ([_][]const []const u8{
         &.{ try t.headers(1, &conn_test.post, false), try t.goaway(0, .no_error), try t.data(1, "abc", true) },
         &.{ try t.headers(1, &conn_test.get, true), try t.goaway(0, .no_error), try t.ping(false, @splat(1)) },
-    }) |frames| {
+    }, groups[1..]) |frames, g| {
         var in: std.ArrayList(u8) = .empty;
         for (head) |f| try in.appendSlice(a, f);
         for (frames) |f| try in.appendSlice(a, f);
+        _ = try g.input.resolve(in.items);
         const one = [_]usize{in.items.len};
-        const clean = try lockstep(testing.allocator, a, .{}, in.items, &one, .none);
+        const clean = try lockstep(testing.allocator, a, .{}, in.items, &one, .none, &g.runs[0]);
         try testing.expectEqual(Outcome.open, clean.outcome);
-        try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, in.items, &one, .goaway_ping));
+        try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, in.items, &one, .goaway_ping, &g.runs[0]));
     }
 }
 
@@ -1105,8 +992,8 @@ const Gen = struct {
     bounded: bool,
     types: *Types,
     out: std.ArrayList(u8) = .empty,
-    /// The client's HPACK: nghttp2's deflater (indexing) or our encoder.
-    deflater: ?*c.nghttp2_hd_deflater = null,
+    /// The client's HPACK: our encoder, which never indexes (the recorded
+    /// sessions were half made by nghttp2's deflater, with indexing).
     enc: hpack.Encoder = .{},
     next_id: u31 = 1,
     streams: std.ArrayList(GStream) = .empty,
@@ -1137,14 +1024,6 @@ const Gen = struct {
     }
 
     fn block(g: *Gen, fs: []const Field) ![]const u8 {
-        if (g.deflater) |d| {
-            const nva = try g.a.alloc(c.nghttp2_nv, fs.len);
-            for (fs, nva) |f, *nv| nv.* = .{ .name = @constCast(f.name.ptr), .namelen = f.name.len, .value = @constCast(f.value.ptr), .valuelen = f.value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
-            const buf = try g.a.alloc(u8, c.nghttp2_hd_deflate_bound(d, nva.ptr, nva.len));
-            const rv = c.nghttp2_hd_deflate_hd(d, buf.ptr, buf.len, nva.ptr, nva.len);
-            if (rv < 0) return error.DeflateFailed;
-            return buf[0..@intCast(rv)];
-        }
         const buf = try g.a.alloc(u8, hpack.Encoder.bound(fs));
         return buf[0..try g.enc.encode(buf, fs)];
     }
@@ -1452,12 +1331,6 @@ const Gen = struct {
 
 fn generate(a: Allocator, r: std.Random, opts: conn.Options, bounded: bool, types: *Types) ![]const u8 {
     var g: Gen = .{ .a = a, .r = r, .opts = opts, .bounded = bounded, .types = types };
-    if (r.boolean()) {
-        var d: ?*c.nghttp2_hd_deflater = null;
-        if (c.nghttp2_hd_deflate_new(&d, 4096) != 0) return error.OutOfMemory;
-        g.deflater = d;
-    }
-    defer if (g.deflater) |d| c.nghttp2_hd_deflate_del(d);
     try g.out.appendSlice(a, conn.client_magic);
     if (g.chance(100)) g.out.items[r.uintLessThan(usize, conn.client_magic.len)] ^= 0x20;
     if (g.chance(40)) try g.ping(false) else try g.settings(true);
@@ -1467,26 +1340,39 @@ fn generate(a: Allocator, r: std.Random, opts: conn.Options, bounded: bool, type
     return g.out.items;
 }
 
-test "h2 conn diff: 5000 generated sessions" {
+test "h2 conn diff: generated sessions, recorded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // The 400 sessions kept of 2 x 2500: each rule the comparison excuses
+    // and each outcome is in them (the tight profile needs every rule).
+    const groups = try vectors.readConn(arena.allocator(), @embedFile("testdata/vectors/conn_generated.bin"));
+    var gi: usize = 0;
+    for (profiles, 0..) |pf, pi| {
+        var stats: Stats = .{};
+        while (gi < groups.len and groups[gi].profile == pi) : (gi += 1) {
+            try runInput(testing.allocator, pf.opts, try groups[gi].input.resolve(null), groups[gi], &stats);
+        }
+        stats.print("generated sessions, recorded", pf.name);
+        try testing.expectEqual(200, stats.inputs);
+        try testing.expectEqual(400, stats.runs);
+        try testing.expect(stats.identical >= 150);
+        try testing.expect(stats.outcomes[0] >= 40 and stats.outcomes[1] >= 30 and stats.outcomes[2] >= 10);
+        if (pi == 1) for (stats.rules) |n| try testing.expect(n > 0);
+    }
+    try testing.expectEqual(groups.len, gi);
+}
+
+test "h2 conn diff: 5000 generated sessions, split invariance" {
     var prng: std.Random.DefaultPrng = .init(0x68326d32);
     const r = prng.random();
     var types: Types = @splat(0);
     for (profiles, 0..) |pf, i| {
-        var stats: Stats = .{};
         for (0..2500) |_| {
             var arena: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena.deinit();
             const input = try generate(arena.allocator(), r, pf.opts, i == 0, &types);
-            try runInput(testing.allocator, r, pf.opts, input, 1, &stats);
+            try splitInvariance(testing.allocator, r, pf.opts, input);
         }
-        stats.print("generated sessions", pf.name);
-        // Every session ran, most compared to the end, ending in each way;
-        // in the tight profile every rule was needed at least once (one
-        // that never fires shows here).
-        try testing.expectEqual(2500, stats.inputs);
-        try testing.expect(stats.identical >= 2000);
-        try testing.expect(stats.outcomes[0] >= 1000 and stats.outcomes[1] >= 400 and stats.outcomes[2] >= 10);
-        if (i == 1) for (stats.rules) |n| try testing.expect(n > 0);
     }
     std.debug.print("h2 conn diff: generated frames by type {any}\n", .{types});
     for (types) |n| try testing.expect(n >= 100);

@@ -4,7 +4,7 @@
 
 //! Stub `h2_client` module: no HTTP/2 client is injected, so the client
 //! never offers "h2" through ALPN and speaks HTTP/1.1 only. An application
-//! with an HTTP/2 client (Anole's, on nghttp2) overrides this import:
+//! with an HTTP/2 client (Anole's, on the h2 core) overrides this import:
 //!
 //!     dusty_mod.addImport("h2_client", its_h2_client_module);
 //!
