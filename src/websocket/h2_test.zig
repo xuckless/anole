@@ -1,13 +1,14 @@
 //! WebSocket over HTTP/2 (RFC 8441), end to end: the core's HTTP/2 engine with
-//! an `anole.websocket` echo handler, and a minimal nghttp2 client that opens
-//! an extended CONNECT and speaks masked frames through websocket-zig's
-//! client codec. Autobahn has no RFC 8441 mode, so this is the HTTP/2 path's
+//! an `anole.websocket` echo handler, and a minimal client on the core's own
+//! client role that opens an extended CONNECT and speaks masked frames
+//! through websocket-zig's client codec. Autobahn has no RFC 8441 mode, so this is the HTTP/2 path's
 //! conformance check alongside the codec's own tests.
 const std = @import("std");
 const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
-const c = @import("anole_nghttp2_c");
+const h2c = dusty.h2_core_for_tests;
+const tc = h2c.test_client;
 const wsc = @import("anole_websocket_codec").client;
 const websocket = @import("root.zig");
 const observe = @import("../observe/root.zig");
@@ -66,17 +67,16 @@ const Client = struct {
     writer: std.Io.net.Stream.Writer,
     read_buf: [16 * 1024]u8 = undefined,
     write_buf: [16 * 1024]u8 = undefined,
-    session: ?*c.nghttp2_session = null,
-    stream_id: i32 = -1,
+    gpa: std.mem.Allocator,
+    cn: CC = undefined,
+    scratch: []u8 = &.{},
+    rx: tc.Rx = .{},
+    /// What the core refers to until it is framed (the queued frames).
+    arena: std.heap.ArenaAllocator,
+    stream_id: u31 = 0,
     status: u16 = 0,
     closed: bool = false,
     close_code: u32 = 0,
-    /// WebSocket bytes to send, and what has gone.
-    outgoing: [4096]u8 = undefined,
-    out_len: usize = 0,
-    out_sent: usize = 0,
-    /// End the stream once what is queued has gone.
-    finished: bool = false,
     /// WebSocket bytes received.
     incoming: [8192]u8 = undefined,
     in_len: usize = 0,
@@ -102,34 +102,27 @@ const Client = struct {
     /// The answer's `retry-after`, in seconds; 0 for none.
     retry_after: u16 = 0,
 
+    const CC = h2c.conn.Conn(.client, Client);
+
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
-        self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
+        const gpa = std.testing.allocator;
+        self.* = .{ .io = io, .gpa = gpa, .arena = .init(gpa), .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
         self.reader = self.stream.reader(io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
-        var cbs: ?*c.nghttp2_session_callbacks = null;
-        _ = c.nghttp2_session_callbacks_new(&cbs);
-        defer c.nghttp2_session_callbacks_del(cbs);
-        c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
-        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
-        c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
-        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrame);
-        if (c.nghttp2_session_client_new(&self.session, cbs, self) != 0) return error.Http2Init;
-        if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.Http2Init;
+        self.scratch = try tc.scratch(gpa, tc.default_options);
+        try self.cn.initAt(gpa, self, tc.default_options);
     }
 
     fn deinit(self: *Client) void {
-        c.nghttp2_session_del(self.session);
+        self.cn.deinit();
+        self.rx.deinit(self.gpa);
+        self.arena.deinit();
+        self.gpa.free(self.scratch);
         self.stream.close(self.io);
     }
 
     fn flushSession(self: *Client) !void {
-        while (true) {
-            var data: [*c]const u8 = undefined;
-            const n = c.nghttp2_session_mem_send2(self.session, &data);
-            if (n < 0) return error.Http2Send;
-            if (n == 0) break;
-            try self.writer.interface.writeAll(data[0..@intCast(n)]);
-        }
+        try tc.writePending(&self.cn, &self.writer.interface);
         try self.writer.interface.flush();
     }
 
@@ -140,9 +133,8 @@ const Client = struct {
             if (done(self)) return;
             const r = &self.reader.interface;
             const bytes = try r.peekGreedy(1);
-            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
-            if (rv < 0) return error.Http2Recv;
-            r.toss(@intCast(rv));
+            try self.rx.feed(self.gpa, &self.cn, bytes, self.scratch);
+            r.toss(bytes.len);
         }
     }
 
@@ -165,14 +157,14 @@ const Client = struct {
     }
 
     fn open(self: *Client) !void {
-        // nghttp2 lets :protocol out only once the server's SETTINGS allow it.
+        // :protocol goes out only once the server's SETTINGS allow it.
         try self.pumpUntil(struct {
             fn f(cl: *Client) bool {
-                return c.nghttp2_session_get_remote_settings(cl.session, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL) == 1;
+                return cl.cn.remote.enable_connect_protocol;
             }
         }.f);
-        var nva_buf: [8]c.nghttp2_nv = undefined;
-        const base = [_]c.nghttp2_nv{
+        var nva_buf: [8]tc.Field = undefined;
+        const base = [_]tc.Field{
             nv(":method", "CONNECT"),
             nv(":protocol", "websocket"),
             nv(":scheme", "http"),
@@ -194,10 +186,7 @@ const Client = struct {
             nva_buf[n] = nv("sec-websocket-extensions", e);
             n += 1;
         }
-        const nva = nva_buf;
-        var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = self }, .read_callback = provide };
-        self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, n, &provider, self);
-        if (self.stream_id < 0) return error.Http2Submit;
+        self.stream_id = (try self.cn.submitRequest(nva_buf[0..n], false, null)).id;
         try self.pumpUntil(struct {
             fn f(cl: *Client) bool {
                 return cl.status != 0 or cl.closed;
@@ -211,37 +200,50 @@ const Client = struct {
 
     /// Queues one masked frame on the stream.
     fn sendFrame(self: *Client, opcode: wsc.Opcode, payload: []const u8) !void {
-        var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
+        var buf: [4096 + 16]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
         var copy: [4096]u8 = undefined;
         @memcpy(copy[0..payload.len], payload);
         try wsc.writeFrame(&w, copy[0..payload.len], .{ .opcode = opcode });
-        self.out_len += w.buffered().len;
-        _ = c.nghttp2_session_resume_data(self.session, self.stream_id);
+        try self.queue(w.buffered(), false);
     }
 
     /// Queues a masked frame of `len` (126..65535) bytes of 'x' under a zero
     /// key, `first` its FIN bit and opcode: a fragment, which `sendFrame`
     /// can't write.
     fn sendRawFrame(self: *Client, first: u8, len: u16) !void {
-        // All sent: start over at the front.
-        if (self.out_sent == self.out_len) {
-            self.out_sent = 0;
-            self.out_len = 0;
-        }
-        var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
-        try w.writeAll(&.{ first, 0x80 | 126 });
-        try w.writeInt(u16, len, .big);
-        try w.writeAll(&.{ 0, 0, 0, 0 });
-        try w.splatByteAll('x', len);
-        self.out_len += w.buffered().len;
-        _ = c.nghttp2_session_resume_data(self.session, self.stream_id);
+        var w: std.Io.Writer.Allocating = .init(self.gpa);
+        defer w.deinit();
+        try w.writer.writeAll(&.{ first, 0x80 | 126 });
+        try w.writer.writeInt(u16, len, .big);
+        try w.writer.writeAll(&.{ 0, 0, 0, 0 });
+        try w.writer.splatByteAll('x', len);
+        try self.queue(w.written(), false);
+    }
+
+    /// Ends the request side, once what is queued has gone.
+    fn finish(self: *Client) !void {
+        try self.queue("", true);
+    }
+
+    /// A stream the peer has closed takes nothing (as a resumed nghttp2
+    /// stream that is gone did not).
+    fn queue(self: *Client, bytes: []const u8, end: bool) !void {
+        const s = self.cn.table.get(self.stream_id) orelse return;
+        try tc.queue(self.arena.allocator(), &self.cn, s, bytes, end);
+    }
+
+    /// Whether the core has framed everything queued on the stream.
+    fn allFramed(self: *Client) bool {
+        const s = self.cn.table.get(self.stream_id) orelse return true;
+        return self.cn.unframed(s) == 0;
     }
 
     /// Sends what is queued on the stream.
     fn sendQueued(self: *Client) !void {
         try self.pumpUntilBounded("the queued frames sent", struct {
             fn f(cl: *Client) bool {
-                return cl.out_sent == cl.out_len or cl.closed;
+                return cl.allFramed() or cl.closed;
             }
         }.f);
     }
@@ -283,63 +285,48 @@ const Client = struct {
 
     var grow_mark: usize = 0;
 
-    fn nv(name: []const u8, value: []const u8) c.nghttp2_nv {
-        return .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
+    fn nv(name: []const u8, value: []const u8) tc.Field {
+        return tc.nv(name, value);
     }
 
-    fn onHeader(_: ?*c.nghttp2_session, _: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        if (std.mem.eql(u8, name[0..namelen], ":status")) self.status = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
-        if (std.mem.eql(u8, name[0..namelen], "retry-after")) self.retry_after = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
-        if (std.mem.eql(u8, name[0..namelen], "sec-websocket-protocol") and valuelen <= self.answered_protocol.len) {
-            @memcpy(self.answered_protocol[0..valuelen], value[0..valuelen]);
-            self.answered_protocol_len = valuelen;
+    pub fn onHeadRefused(_: *Client, _: *h2c.conn.Stream) void {}
+
+    pub fn onField(self: *Client, _: *h2c.conn.Stream, name: []const u8, value: []const u8) h2c.conn.Error!void {
+        if (std.mem.eql(u8, name, ":status")) self.status = std.fmt.parseInt(u16, value, 10) catch 0;
+        if (std.mem.eql(u8, name, "retry-after")) self.retry_after = std.fmt.parseInt(u16, value, 10) catch 0;
+        if (std.mem.eql(u8, name, "sec-websocket-protocol") and value.len <= self.answered_protocol.len) {
+            @memcpy(self.answered_protocol[0..value.len], value);
+            self.answered_protocol_len = value.len;
         }
-        if (std.mem.eql(u8, name[0..namelen], "x-user") and valuelen <= self.answered_user.len) {
-            @memcpy(self.answered_user[0..valuelen], value[0..valuelen]);
-            self.answered_user_len = valuelen;
+        if (std.mem.eql(u8, name, "x-user") and value.len <= self.answered_user.len) {
+            @memcpy(self.answered_user[0..value.len], value);
+            self.answered_user_len = value.len;
         }
-        return 0;
     }
 
-    fn onData(_: ?*c.nghttp2_session, _: u8, _: i32, data: [*c]const u8, len: usize, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        if (self.discard) return 0;
-        @memcpy(self.incoming[self.in_len..][0..len], data[0..len]);
-        self.in_len += len;
+    pub fn onHeadersEnd(self: *Client, s: *h2c.conn.Stream, end_stream: bool) h2c.conn.Error!void {
+        if (s.id == self.stream_id and end_stream) self.remote_ended = true;
+    }
+
+    pub fn onData(self: *Client, s: *h2c.conn.Stream, bytes: []const u8, end_stream: bool) h2c.conn.Error!void {
+        self.cn.consumed(s, bytes.len) catch @panic("OOM");
+        if (s.id == self.stream_id and end_stream) self.remote_ended = true;
+        if (self.discard or bytes.len == 0) return;
+        @memcpy(self.incoming[self.in_len..][0..bytes.len], bytes);
+        self.in_len += bytes.len;
         self.data_frames += 1;
-        return 0;
     }
 
-    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        if (frame.*.hd.stream_id == self.stream_id and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.remote_ended = true;
-        return 0;
-    }
-
-    fn onClose(_: ?*c.nghttp2_session, _: i32, code: u32, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
+    pub fn onStreamClose(self: *Client, _: *h2c.conn.Stream, code: h2c.conn.ErrorCode) void {
         self.closed = true;
-        self.close_code = code;
-        return 0;
+        self.close_code = @backingInt(code);
     }
 
-    fn provide(_: ?*c.nghttp2_session, _: i32, buf: [*c]u8, length: usize, flags: [*c]u32, source: [*c]c.nghttp2_data_source, _: ?*anyopaque) callconv(.c) c.nghttp2_ssize {
-        const self: *Client = @ptrCast(@alignCast(source.*.ptr.?));
-        const rest = self.outgoing[self.out_sent..self.out_len];
-        if (rest.len == 0) {
-            // All sent: reuse the buffer from the start.
-            self.out_sent = 0;
-            self.out_len = 0;
-            if (!self.finished) return c.NGHTTP2_ERR_DEFERRED;
-            flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-            return 0;
-        }
-        const n = @min(rest.len, length);
-        @memcpy(buf[0..n], rest[0..n]);
-        self.out_sent += n;
-        return @intCast(n);
-    }
+    pub fn onWindow(_: *Client, _: ?*h2c.conn.Stream) void {}
+
+    pub fn onGoaway(_: *Client, _: u31, _: h2c.conn.ErrorCode) void {}
+
+    pub fn onPingAck(_: *Client, _: [8]u8) void {}
 };
 
 test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close; the metrics record the socket as a 101" {
@@ -393,8 +380,7 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close; the metrics record th
     try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xe8 }, closing);
     // The closing handshake is done: end our side of the stream (RFC 8441
     // §5 maps the end of the connection to END_STREAM).
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.finish();
     try client.pumpUntil(struct {
         fn f(cl: *Client) bool {
             return cl.closed;
@@ -462,8 +448,7 @@ test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total
     try client.sendFrame(.close, &.{ 0x03, 0xe8 });
     _ = try client.nextFrame(&op, &back);
     try std.testing.expectEqual(wsc.Opcode.close, op);
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.finish();
     try client.pumpUntil(struct {
         fn f(cl: *Client) bool {
             return cl.closed;
@@ -515,8 +500,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
     try std.testing.expectEqualStrings("server shutting down", closing[2..]);
     // Answer the close and end the stream; the server ends its side.
     try client.sendFrame(.close, &.{ 0x03, 0xe9 });
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.finish();
     try client.pumpUntil(struct {
         fn f(cl: *Client) bool {
             return cl.closed;
@@ -581,8 +565,7 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
     try client.sendFrame(.close, &.{ 0x03, 0xe9 });
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.finish();
     try client.pumpUntil(struct {
         fn f(cl: *Client) bool {
             return cl.closed;
@@ -790,13 +773,13 @@ test "WebSocket over HTTP/2: under an admission freeze the extended CONNECT gets
     // The connection is still good for other streams.
     client.status = 0;
     client.closed = false;
-    const nva = [_]c.nghttp2_nv{
+    const nva = [_]tc.Field{
         Client.nv(":method", "GET"),
         Client.nv(":scheme", "http"),
         Client.nv(":path", "/plain"),
         Client.nv(":authority", "localhost"),
     };
-    if (c.nghttp2_submit_request2(client.session, null, &nva, nva.len, null, null) < 0) return error.Http2Submit;
+    _ = try client.cn.submitRequest(&nva, true, null);
     try client.pumpUntilBounded("the GET's answer", struct {
         fn f(cl: *Client) bool {
             return cl.status != 0;
@@ -1132,8 +1115,7 @@ test "WebSocket over HTTP/2 on the new engine: echo, ping, close" {
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xe8 }, closing);
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.finish();
     try client.pumpUntil(struct {
         fn f(cl: *Client) bool {
             return cl.closed;

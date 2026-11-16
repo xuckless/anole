@@ -19,6 +19,8 @@ pub const conn = @import("conn.zig");
 pub const server = @import("server.zig");
 /// Tests only: connections served by `server` without `Server.run`.
 pub const test_server = if (@import("builtin").is_test) @import("test_server.zig") else struct {};
+/// Tests only: the helpers of the suites' HTTP/2 clients, which run on `conn.Conn(.client, H)`.
+pub const test_client = if (@import("builtin").is_test) @import("test_client.zig") else struct {};
 
 test {
     std.testing.refAllDecls(@This());
