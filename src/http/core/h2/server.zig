@@ -208,10 +208,10 @@ pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (i
 /// connection (`Engine.testWakeRooms` takes it): the moment a stream task
 /// on another thread may look at its stream before `closeRun`.
 pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void = if (is_test) null else {};
-/// Tests only: send-deadline waiters started (`waitSends`), and drained
-/// connections whose send side was shut (`shutDrained`).
+/// Tests only: send-deadline waiters started (`waitSends`), and send
+/// sides shut at a connection's end (`shutDrained`, `lingeringClose`).
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+pub var test_send_shuts: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: the most arena one stream's exchange used (bytes handed
 /// out over its nodes), read before its reset (`maybeFree`).
 pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
@@ -1419,7 +1419,6 @@ pub fn Engine(comptime Ctx: type) type {
             /// elsewhere at the peer's hang-up or the keep-alive.
             noinline fn shutDrained(conn: *Conn) std.Io.Cancelable!void {
                 defer conn.wakeReader();
-                if (comptime is_test) _ = test_drain_closes.fetchAdd(1, .monotonic);
                 {
                     var t: Timer = .init(null);
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
@@ -1433,6 +1432,7 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
+                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
             }
 
             /// Ends the reader's wait for input, as its deadline would, if
@@ -2532,15 +2532,18 @@ pub fn Engine(comptime Ctx: type) type {
         /// is over, so it still gets the last frames (the nghttp2 engine's
         /// `lingeringClose`): close_notify under TLS and the send side
         /// shut, then what the peer sends is thrown away until it hangs up,
-        /// `linger_timeout` passes, or `linger_limit` bytes. The tasks have
-        /// ended: this is the only reader and writer. Out of line (cold).
+        /// `linger_timeout` passes, or `linger_limit` bytes. Where the timer
+        /// cannot bound the reads only the send side is shut, as HTTP/1.x's
+        /// `lingeringClose` does: the peer still reads the end now, not at
+        /// the socket's close, which the caller may hold (`Engine.serve`).
+        /// The tasks have ended: this is the only reader and writer. Out of
+        /// line (cold).
         noinline fn lingeringClose(conn: *Conn) std.Io.Cancelable!void {
             var timer: Timer = .init(null);
-            if (!timer.canBound()) return;
             if (!conn.send_shut) {
                 {
                     var t: Timer = .init(null);
-                    t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
+                    if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
                         conn.connection.stream.shutdown(conn.io, .both) catch {};
@@ -2552,7 +2555,9 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
+                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
             }
+            if (!timer.canBound()) return;
             timer.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
             defer timer.clear(conn.io);
             _ = conn.connection.reader.discardShort(server_mod.linger_limit) catch {
