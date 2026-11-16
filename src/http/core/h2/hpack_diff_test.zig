@@ -12,6 +12,73 @@ const vectors = @import("hpack_vectors.zig");
 const testing = std.testing;
 const Field = hpack.Field;
 const Buf = vectors.Buf;
+const golden = @import("vectors.zig");
+const Allocator = std.mem.Allocator;
+
+// ---------------------------------------------------------------------------
+// Recording (temporary: see conn_diff_test.zig)
+
+/// Collects nghttp2's answers while H2_RECORD is set.
+const Rec = struct {
+    arena: Allocator,
+    conns: std.ArrayList(golden.HpackConn) = .empty,
+    blocks: std.ArrayList(golden.BlockRec) = .empty,
+    /// Per pair: whether its blocks are kept in the file.
+    keep_bytes: bool = true,
+
+    fn begin(arena: Allocator) ?*Rec {
+        if (!golden.recording()) return null;
+        const r = arena.create(Rec) catch @panic("OOM");
+        r.* = .{ .arena = arena };
+        return r;
+    }
+
+    fn block(r: *Rec, p: *Pair, block_bytes: []const u8, ok: bool, theirs: []const Field) !void {
+        var table: golden.Table = .{ .entries = 0, .size = 0, .max_size = 0, .crc = 0 };
+        if (ok) {
+            const n = c.nghttp2_hd_inflate_get_num_table_entries(p.ng) - hpack.static_table.len;
+            var h: std.hash.Crc32 = .init();
+            // Oldest entry first: the table entries are newest first.
+            var i: usize = n;
+            while (i > 0) {
+                i -= 1;
+                const nv: *const c.nghttp2_nv = c.nghttp2_hd_inflate_get_table_entry(p.ng, hpack.static_table.len + 1 + i);
+                golden.tableCrc(&h, nvSlice(nv.name, nv.namelen), nvSlice(nv.value, nv.valuelen));
+            }
+            table = .{
+                .entries = @intCast(n),
+                .size = @intCast(c.nghttp2_hd_inflate_get_dynamic_table_size(p.ng)),
+                .max_size = @intCast(c.nghttp2_hd_inflate_get_max_dynamic_table_size(p.ng)),
+                .crc = h.final(),
+            };
+        }
+        const crcs = try r.arena.alloc(u32, theirs.len);
+        var fc: golden.FieldCrc = .{};
+        var size: u32 = 0;
+        for (crcs, theirs) |*d, t| {
+            d.* = fc.add(t.name, t.value, t.never_index);
+            size += @intCast(t.name.len + t.value.len + 32);
+        }
+        try r.blocks.append(r.arena, .{
+            .block = .make(if (r.keep_bytes) try r.arena.dupe(u8, block_bytes) else block_bytes, r.keep_bytes),
+            .ok = ok,
+            .list_size = size,
+            .crcs = crcs,
+            .table = table,
+        });
+    }
+
+    fn endConn(r: *Rec, limit: u32) !void {
+        try r.conns.append(r.arena, .{ .limit = limit, .blocks = try r.blocks.toOwnedSlice(r.arena) });
+    }
+
+    fn write(r: *Rec, conns: []const golden.HpackConn, name: []const u8) !void {
+        _ = r;
+        const bytes = try golden.writeHpack(testing.allocator, conns);
+        defer testing.allocator.free(bytes);
+        try golden.recordFile(name, bytes);
+    }
+};
 
 /// Large enough that the list limit never fires on these inputs: every
 /// field is emitted, as nghttp2 does. The second limit is a realistic one,
@@ -30,6 +97,7 @@ const Pair = struct {
     /// Both failed, or ours ended the connection (INTENTIONAL.md 2, 3).
     done: bool = false,
     blocks: usize = 0,
+    rec: ?*Rec = null,
     /// Blocks our limit refused, and those whose `skipRest` completed
     /// (the tables then compared).
     refused: usize = 0,
@@ -58,6 +126,7 @@ const Pair = struct {
         const a = arena.allocator();
         var theirs: std.ArrayList(Field) = .empty;
         const ng_ok = try p.ngDecode(a, block, &theirs);
+        if (p.rec) |r| try r.block(p, block, ng_ok, theirs.items);
         var mine: std.ArrayList(Field) = .empty;
         var b = p.ours.block(block, p.scratch, p.limit);
         const our_err: ?hpack.Error = while (true) {
@@ -156,9 +225,12 @@ test "h2 hpack diff: RFC 7541 vectors and nghttp2's test blocks" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const rec = Rec.begin(a);
     for (vectors.rfc_groups) |g| {
         var p: Pair = try .init(testing.allocator, scratch_len);
         defer p.deinit();
+        p.rec = rec;
+        defer if (rec) |x| x.endConn(scratch_len) catch @panic("record");
         for (g.vectors, 0..) |v, i| {
             var b: Buf = .init(a);
             // Both decoders start at 4096: C.5/C.6's 256 comes as an update.
@@ -171,14 +243,21 @@ test "h2 hpack diff: RFC 7541 vectors and nghttp2's test blocks" {
     for (try vectors.portedCases(a)) |case| {
         var p: Pair = try .init(testing.allocator, scratch_len);
         defer p.deinit();
+        p.rec = rec;
+        defer if (rec) |x| x.endConn(scratch_len) catch @panic("record");
         for (case.blocks) |blk| try p.feed(blk);
     }
+    if (rec) |x| try x.write(x.conns.items, "hpack_vectors.bin");
 }
 
 test "h2 hpack diff: real header blocks from nghttp2's fuzz corpus" {
     // tools/extract_hpack_blocks.py: u32 connections; per connection a
     // u32 block count, then u32 length + bytes per block.
     const data = @embedFile("testdata/hpack_blocks.bin");
+    var rec_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer rec_arena.deinit();
+    const rec = Rec.begin(rec_arena.allocator());
+    if (rec) |x| x.keep_bytes = false;
     for (limits) |limit| {
         var pos: usize = 0;
         const conns = readU32(data, &pos);
@@ -186,16 +265,19 @@ test "h2 hpack diff: real header blocks from nghttp2's fuzz corpus" {
         for (0..conns) |_| {
             var p: Pair = try .init(testing.allocator, limit);
             defer p.deinit();
+            p.rec = rec;
             for (0..readU32(data, &pos)) |_| {
                 const n = readU32(data, &pos);
                 try p.feed(data[pos..][0..n]);
                 pos += n;
                 blocks += 1;
             }
+            if (rec) |x| try x.endConn(limit);
         }
         try testing.expectEqual(data.len, pos);
         try testing.expect(blocks >= 300);
     }
+    if (rec) |x| try x.write(x.conns.items, "hpack_corpus.bin");
 }
 
 fn readU32(data: []const u8, pos: *usize) u32 {
@@ -272,11 +354,18 @@ fn mutate(r: std.Random, block: []u8) []u8 {
     return block;
 }
 
+/// Slots of the 50 recorded, at the first limit only: nghttp2's answers don't
+/// depend on ours (temporary).
+const frozen_slots = 3;
+
 test "h2 hpack diff: 5000 generated blocks with table churn, and nghttp2's deflater" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var prng: std.Random.DefaultPrng = .init(0x6870616b);
     const r = prng.random();
+    var rec_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer rec_arena.deinit();
+    const rec = Rec.begin(rec_arena.allocator());
     for (limits) |limit| {
         // Per kind (0 nghttp2's deflater, 1 the generator): blocks fed,
         // connections that ended, and those that ran 20 blocks or more.
@@ -292,6 +381,8 @@ test "h2 hpack diff: 5000 generated blocks with table churn, and nghttp2's defla
             while (left > 0) {
                 var p: Pair = try .init(testing.allocator, limit);
                 defer p.deinit();
+                if (slot < frozen_slots and limit == scratch_len) p.rec = rec;
+                defer if (p.rec) |x| x.endConn(limit) catch @panic("record");
                 var deflater: ?*c.nghttp2_hd_deflater = null;
                 try testing.expectEqual(0, c.nghttp2_hd_deflate_new(&deflater, 4096));
                 defer c.nghttp2_hd_deflate_del(deflater);
@@ -339,6 +430,13 @@ test "h2 hpack diff: 5000 generated blocks with table churn, and nghttp2's defla
             for (long) |l| try testing.expect(l >= 30);
         } else try testing.expect(refused >= 1000 and skipped >= 500);
     }
+    if (rec) |x| try x.write(x.conns.items, "hpack_generated.bin");
+}
+
+fn listBytes(fields: []const Field) usize {
+    var n: usize = 0;
+    for (fields) |f| n += f.name.len + f.value.len;
+    return n;
 }
 
 test "h2 hpack diff: our encoder through nghttp2's inflater" {
@@ -346,6 +444,8 @@ test "h2 hpack diff: our encoder through nghttp2's inflater" {
     defer arena.deinit();
     var prng: std.Random.DefaultPrng = .init(0x656e63);
     const r = prng.random();
+    var cases: std.ArrayList(golden.EncCase) = .empty;
+    const record = golden.recording();
     // A peer at the default, one that lowered SETTINGS_HEADER_TABLE_SIZE
     // to 0 and one at 1024: nghttp2 then requires a size update first.
     for ([_]?usize{ null, 0, 1024 }) |settings| {
@@ -367,13 +467,23 @@ test "h2 hpack diff: our encoder through nghttp2's inflater" {
             };
             try lists.append(a, fields);
         }
+        var rec_blocks: std.ArrayList([]const u8) = .empty;
+        var rec_never: std.ArrayList(u32) = .empty;
+        var rec_lists: std.ArrayList([]const Field) = .empty;
         // Twice: the second pass encodes the memoized fields from the
         // thread's memo.
-        for (0..2) |_| for (lists.items) |fields| {
+        for (0..2) |pass| for (lists.items) |fields| {
             const out = try a.alloc(u8, hpack.Encoder.bound(fields));
             const n = try e.encode(out, fields);
             var got: std.ArrayList(Field) = .empty;
             try testing.expect(try p.ngDecode(a, out[0..n], &got));
+            if (record and pass == 0 and rec_lists.items.len < 40 and listBytes(fields) <= 1200) {
+                try rec_lists.append(a, fields);
+                try rec_blocks.append(a, try a.dupe(u8, out[0..n]));
+                var mask: u32 = 0;
+                for (got.items, 0..) |g, i| mask |= @as(u32, @intFromBool(g.never_index)) << @intCast(i);
+                try rec_never.append(a, mask);
+            }
             try testing.expectEqual(fields.len, got.items.len);
             for (fields, got.items) |w, g| {
                 try testing.expectEqualStrings(w.name, g.name);
@@ -387,5 +497,16 @@ test "h2 hpack diff: our encoder through nghttp2's inflater" {
             try testing.expectEqual(hpack.static_table.len, c.nghttp2_hd_inflate_get_num_table_entries(ng));
         };
         try testing.expectEqual(0, c.nghttp2_hd_inflate_get_max_dynamic_table_size(ng));
+        if (record) try cases.append(a, .{
+            .setting = if (settings) |s| @intCast(s) else -1,
+            .lists = rec_lists.items,
+            .blocks = rec_blocks.items,
+            .never = rec_never.items,
+        });
+    }
+    if (record) {
+        const bytes = try golden.writeEncoder(testing.allocator, cases.items);
+        defer testing.allocator.free(bytes);
+        try golden.recordFile("encoder.bin", bytes);
     }
 }

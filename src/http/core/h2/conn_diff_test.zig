@@ -35,12 +35,67 @@ const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const conn_test = @import("conn_test.zig");
 const streams = @import("streams.zig");
+const vectors = @import("vectors.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ErrorCode = frame.ErrorCode;
 const Stream = conn.Stream;
 const Field = hpack.Field;
+
+// ---------------------------------------------------------------------------
+// Recording (temporary: the commit that adds testdata/vectors/ is the last
+// one in which nghttp2 can be asked again; the next one replays them)
+
+/// Collects nghttp2's side of the runs of the current input while
+/// H2_RECORD is set (see `Rec.begin`).
+const Rec = struct {
+    arena: Allocator,
+    feeds: std.ArrayList(vectors.Feed) = .empty,
+    runs: std.ArrayList(vectors.Run) = .empty,
+    groups: std.ArrayList(vectors.Group) = .empty,
+
+    fn begin(arena: Allocator) ?*Rec {
+        if (!vectors.recording()) return null;
+        const r = arena.create(Rec) catch @panic("OOM");
+        r.* = .{ .arena = arena };
+        return r;
+    }
+
+    fn feed(r: *Rec, p: *Pair, ng_in: usize, out: []const u8) !void {
+        try r.feeds.append(r.arena, .{
+            .ng_in = @intCast(ng_in),
+            .out = try r.arena.dupe(u8, out),
+            .fatal = p.ng.fatal orelse 0,
+            .want_read = c.nghttp2_session_want_read(p.ng.session) != 0,
+            .last_proc = @intCast(c.nghttp2_session_get_last_proc_stream_id(p.ng.session)),
+        });
+    }
+
+    fn endRun(r: *Rec, cuts: []const usize) !void {
+        const cs = try r.arena.alloc(u32, cuts.len);
+        for (cs, cuts) |*d, n| d.* = @intCast(n);
+        try r.runs.append(r.arena, .{ .cuts = cs, .feeds = try r.feeds.toOwnedSlice(r.arena) });
+    }
+
+    /// The runs since the last group are `input`'s under profile `profile`.
+    fn endGroup(r: *Rec, profile: usize, input: []const u8, keep: bool) !void {
+        try r.groups.append(r.arena, .{
+            .profile = @intCast(profile),
+            .input = .make(if (keep) try r.arena.dupe(u8, input) else input, keep),
+            .runs = try r.runs.toOwnedSlice(r.arena),
+        });
+    }
+
+    fn write(r: *Rec, groups: []const vectors.Group, name: []const u8) !void {
+        const bytes = try vectors.writeConn(testing.allocator, groups);
+        defer testing.allocator.free(bytes);
+        try vectors.recordFile(name, bytes);
+        _ = r;
+    }
+};
+
+var recorder: ?*Rec = null;
 
 // ---------------------------------------------------------------------------
 // The two servers
@@ -694,11 +749,13 @@ const Pair = struct {
     /// nghttp2 exactly those bytes (all of them once Conn has failed); then
     /// both are drained into the batch.
     fn feed(p: *Pair, a: Allocator, piece: []const u8) !void {
+        var ng_in: usize = piece.len;
         if (p.dead != null) {
             p.ng.recv(piece);
         } else {
             try p.tail.appendSlice(p.gpa, piece);
             if (p.cn.recv(p.tail.items, 0, p.scratch)) |n| {
+                ng_in = n;
                 p.ng.recv(p.tail.items[0..n]);
                 const rest = p.tail.items.len - n;
                 std.mem.copyForwards(u8, p.tail.items[0..rest], p.tail.items[n..]);
@@ -707,13 +764,16 @@ const Pair = struct {
                 error.OutOfMemory => return err,
                 else => {
                     p.dead = err;
+                    ng_in = p.tail.items.len;
                     p.ng.recv(p.tail.items);
                     p.tail.clearRetainingCapacity();
                 },
             }
         }
         try p.ours_out.appendSlice(a, try drainConn(&p.cn, a));
-        try p.ng_out.appendSlice(a, try p.ng.drain(a));
+        const ng_drained = try p.ng.drain(a);
+        try p.ng_out.appendSlice(a, ng_drained);
+        if (recorder) |r| try r.feed(p, ng_in, ng_drained);
     }
 
     /// After the peer's GOAWAY with no stream active nghttp2 wants to read
@@ -811,6 +871,12 @@ const Pair = struct {
 
 /// Both sides in lockstep on `cuts` (one chunk: the whole input).
 fn lockstep(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8, cuts: []const usize, plant: Plant) !Result {
+    const res = try lockstepRun(gpa, a, opts, input, cuts, plant);
+    if (recorder) |r| try r.endRun(cuts);
+    return res;
+}
+
+fn lockstepRun(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8, cuts: []const usize, plant: Plant) !Result {
     const p = try Pair.create(gpa, opts, plant);
     defer p.destroy();
     p.cut = cuts.len > 1;
@@ -1012,12 +1078,18 @@ test "h2 conn diff: nghttp2's fuzz corpus" {
     // tools/pack_h2_sessions.py: u32 count, then u32 length + bytes each.
     const data = @embedFile("testdata/h2_sessions.bin");
     var prng: std.Random.DefaultPrng = .init(0x68326466);
-    for (profiles) |pf| {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const rec = Rec.begin(arena.allocator());
+    recorder = rec;
+    defer recorder = null;
+    for (profiles, 0..) |pf, pi| {
         var stats: Stats = .{};
         var pos: usize = 0;
         for (0..readU32(data, &pos)) |_| {
             const n = readU32(data, &pos);
             try runInput(testing.allocator, prng.random(), pf.opts, data[pos..][0..n], 2, &stats);
+            if (rec) |x| try x.endGroup(pi, data[pos..][0..n], false);
             pos += n;
         }
         try testing.expectEqual(data.len, pos);
@@ -1025,6 +1097,7 @@ test "h2 conn diff: nghttp2's fuzz corpus" {
         try testing.expectEqual(136, stats.inputs);
         try testing.expect(stats.identical >= 130 * 3 / 2);
     }
+    if (rec) |x| try x.write(x.groups.items, "conn_corpus.bin");
 }
 
 test "h2 conn diff: the conn recv fuzz seeds" {
@@ -1034,7 +1107,12 @@ test "h2 conn diff: the conn recv fuzz seeds" {
         testing.allocator.free(seeds);
     }
     var prng: std.Random.DefaultPrng = .init(0x73656564);
-    for (profiles) |pf| {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const rec = Rec.begin(arena.allocator());
+    recorder = rec;
+    defer recorder = null;
+    for (profiles, 0..) |pf, pi| {
         var stats: Stats = .{};
         for (seeds) |seed| {
             // fuzzOne's handshake, then the frames (the split byte dropped).
@@ -1043,16 +1121,19 @@ test "h2 conn diff: the conn recv fuzz seeds" {
             try input.appendSlice(testing.allocator, conn.client_magic ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++ "\x00\x00\x00\x04\x01\x00\x00\x00\x00");
             try input.appendSlice(testing.allocator, seed[1..]);
             try runInput(testing.allocator, prng.random(), pf.opts, input.items, 2, &stats);
+            if (rec) |x| try x.endGroup(pi, input.items, false);
         }
         stats.print("conn recv seeds", pf.name);
         try testing.expectEqual(seeds.len, stats.inputs);
     }
+    if (rec) |x| try x.write(x.groups.items, "conn_seeds.bin");
 }
 
 test "h2 conn diff: the harness catches a planted divergence" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const rec = Rec.begin(a);
     const t = try conn_test.T.create(testing.allocator, .{});
     defer t.destroy();
     var input: std.ArrayList(u8) = .empty;
@@ -1060,6 +1141,7 @@ test "h2 conn diff: the harness catches a planted divergence" {
     for ([_][]const u8{ try t.settings(&.{}), try t.settingsAck(), try t.headers(1, &conn_test.get, true), try t.headers(3, &conn_test.post, false), try t.data(3, "abc", true) }) |f|
         try input.appendSlice(a, f);
     const whole = [_]usize{input.items.len};
+    if (rec) |x| try recordPlant(x, a, input.items);
     // Two DATA frames for one: normalized away.
     const split = try lockstep(testing.allocator, a, .{}, input.items, &whole, .split);
     try testing.expectEqual(null, split.rule);
@@ -1080,10 +1162,21 @@ test "h2 conn diff: the harness catches a planted divergence" {
         for (head) |f| try in.appendSlice(a, f);
         for (frames) |f| try in.appendSlice(a, f);
         const one = [_]usize{in.items.len};
+        if (rec) |x| try recordPlant(x, a, in.items);
         const clean = try lockstep(testing.allocator, a, .{}, in.items, &one, .none);
         try testing.expectEqual(Outcome.open, clean.outcome);
         try testing.expectError(error.Divergence, lockstep(testing.allocator, a, .{}, in.items, &one, .goaway_ping));
     }
+    if (rec) |x| try x.write(x.groups.items, "conn_plant.bin");
+}
+
+/// The unplanted run of a planted test's input, recorded.
+fn recordPlant(rec: *Rec, a: Allocator, input: []const u8) !void {
+    recorder = rec;
+    defer recorder = null;
+    const whole = [_]usize{input.len};
+    _ = try lockstep(testing.allocator, a, .{}, input, &whole, .none);
+    try rec.endGroup(0, input, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,13 +1564,29 @@ test "h2 conn diff: 5000 generated sessions" {
     var prng: std.Random.DefaultPrng = .init(0x68326d32);
     const r = prng.random();
     var types: Types = @splat(0);
+    var rec_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer rec_arena.deinit();
+    const rec = Rec.begin(rec_arena.allocator());
+    recorder = rec;
+    defer recorder = null;
+    // Recording: every session is a candidate (what it needed in `local`);
+    // `freeze` keeps about 200 per profile.
+    var cands: std.ArrayList(Cand) = .empty;
     for (profiles, 0..) |pf, i| {
         var stats: Stats = .{};
         for (0..2500) |_| {
             var arena: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena.deinit();
             const input = try generate(arena.allocator(), r, pf.opts, i == 0, &types);
-            try runInput(testing.allocator, r, pf.opts, input, 1, &stats);
+            if (rec) |x| {
+                var local: Stats = .{};
+                try runInput(testing.allocator, r, pf.opts, input, 1, &local);
+                inline for (.{ "inputs", "runs", "identical" }) |f| @field(stats, f) += @field(local, f);
+                for (0..n_rules) |k| stats.rules[k] += local.rules[k];
+                for (0..3) |k| stats.outcomes[k] += local.outcomes[k];
+                try x.endGroup(i, input, true);
+                try cands.append(rec_arena.allocator(), .{ .group = x.groups.items[x.groups.items.len - 1], .stats = local });
+            } else try runInput(testing.allocator, r, pf.opts, input, 1, &stats);
         }
         stats.print("generated sessions", pf.name);
         // Every session ran, most compared to the end, ending in each way;
@@ -1490,4 +1599,44 @@ test "h2 conn diff: 5000 generated sessions" {
     }
     std.debug.print("h2 conn diff: generated frames by type {any}\n", .{types});
     for (types) |n| try testing.expect(n >= 100);
+    if (rec) |x| try freeze(x, cands.items);
+}
+
+const Cand = struct { group: vectors.Group, stats: Stats };
+
+/// The sessions kept: for each profile, up to 8 that needed each rule, up
+/// to 30 of each outcome, then the first ones in order up to 200.
+fn freeze(rec: *Rec, cands: []const Cand) !void {
+    const keep = try rec.arena.alloc(bool, cands.len);
+    @memset(keep, false);
+    for (0..profiles.len) |pi| {
+        var kept: usize = 0;
+        for (0..n_rules) |k| {
+            var n: usize = 0;
+            for (cands, 0..) |cd, i| {
+                if (cd.group.profile != pi or keep[i] or cd.stats.rules[k] == 0 or n >= 8) continue;
+                keep[i] = true;
+                n += 1;
+                kept += 1;
+            }
+        }
+        for (0..3) |k| {
+            var n: usize = 0;
+            for (cands, 0..) |cd, i| {
+                if (cd.group.profile != pi or keep[i] or cd.stats.outcomes[k] == 0 or n >= 30) continue;
+                keep[i] = true;
+                n += 1;
+                kept += 1;
+            }
+        }
+        for (cands, 0..) |cd, i| {
+            if (kept >= 200) break;
+            if (cd.group.profile != pi or keep[i]) continue;
+            keep[i] = true;
+            kept += 1;
+        }
+    }
+    var out: std.ArrayList(vectors.Group) = .empty;
+    for (cands, keep) |cd, k| if (k) try out.append(rec.arena, cd.group);
+    try rec.write(out.items, "conn_generated.bin");
 }

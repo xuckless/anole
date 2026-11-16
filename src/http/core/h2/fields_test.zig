@@ -13,6 +13,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const fields = @import("fields.zig");
 const fuzz = @import("../fuzz.zig");
+const vectors = @import("vectors.zig");
 
 const Request = fields.Request;
 const Verdict = fields.Verdict;
@@ -281,31 +282,80 @@ test "h2 fields: matches nghttp2's helpers" {
     if (build_options.use_http2) try Ng.differential() else return error.SkipZigTest;
 }
 
+/// A fixed pseudo-random stream (xorshift64*), so that the strings of
+/// `enumerate` never depend on std's generator.
+const Xorshift = struct {
+    s: u64,
+
+    fn next(x: *Xorshift) u64 {
+        x.s ^= x.s >> 12;
+        x.s ^= x.s << 25;
+        x.s ^= x.s >> 27;
+        return x.s *% 0x2545f4914f6cdd1d;
+    }
+
+    fn below(x: *Xorshift, n: usize) usize {
+        return @intCast((x.next() >> 32) % n);
+    }
+};
+
+/// The strings the six checks are compared on, in a fixed order: every
+/// string of up to two bytes, then 20000 seeded longer ones. `v.visit(s)`
+/// for each.
+fn enumerate(v: anytype) !void {
+    var buf: [3]u8 = undefined;
+    try v.visit("");
+    for (0..256) |a| {
+        buf[0] = @intCast(a);
+        try v.visit(buf[0..1]);
+        for (0..256) |b| {
+            buf[1] = @intCast(b);
+            try v.visit(buf[0..2]);
+        }
+    }
+    var rng: Xorshift = .{ .s = 0x6832666c64 };
+    const alphabet = " \t:@*/+-.!azAZ09\x00\x1f\x7f\x80\xff\r\n";
+    var s: [12]u8 = undefined;
+    for (0..20000) |_| {
+        const n = rng.below(s.len + 1);
+        for (s[0..n]) |*ch| ch.* = if (rng.below(2) == 0) alphabet[rng.below(alphabet.len)] else @truncate(rng.next() >> 24);
+        try v.visit(s[0..n]);
+    }
+}
+
 /// nghttp2's six public checks, when it is linked.
 const Ng = struct {
     const c = if (build_options.use_http2) @import("nghttp2") else struct {};
 
     fn differential() !void {
-        var buf: [3]u8 = undefined;
-        // Every string of up to two bytes, then seeded longer ones.
-        try same("");
-        for (0..256) |a| {
-            buf[0] = @intCast(a);
-            try same(buf[0..1]);
-            for (0..256) |b| {
-                buf[1] = @intCast(b);
-                try same(buf[0..2]);
-            }
+        var rec: Record = .{};
+        defer rec.list.deinit(std.testing.allocator);
+        try enumerate(&rec);
+        if (vectors.recording()) {
+            try vectors.recordFile("fields.bin", rec.list.items);
         }
-        var prng: std.Random.DefaultPrng = .init(0x6832666c64);
-        const r = prng.random();
-        const alphabet = " \t:@*/+-.!azAZ09\x00\x1f\x7f\x80\xff\r\n";
-        var s: [12]u8 = undefined;
-        for (0..20000) |_| {
-            const n = r.uintAtMost(usize, s.len);
-            for (s[0..n]) |*ch| ch.* = if (r.boolean()) alphabet[r.uintLessThan(usize, alphabet.len)] else r.int(u8);
-            try same(s[0..n]);
+    }
+
+    /// Compares each string with ours, and keeps nghttp2's six answers as
+    /// bits (name, value, value 9113, method, path, authority).
+    const Record = struct {
+        list: std.ArrayList(u8) = .empty,
+
+        fn visit(r: *Record, s: []const u8) !void {
+            try same(s);
+            try r.list.append(std.testing.allocator, bits(s));
         }
+    };
+
+    fn bits(s: []const u8) u8 {
+        var b: u8 = 0;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_header_name(s.ptr, s.len) != 0)) << 0;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_header_value(s.ptr, s.len) != 0)) << 1;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_header_value_rfc9113(s.ptr, s.len) != 0)) << 2;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_method(s.ptr, s.len) != 0)) << 3;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_path(s.ptr, s.len) != 0)) << 4;
+        b |= @as(u8, @intFromBool(c.nghttp2_check_authority(s.ptr, s.len) != 0)) << 5;
+        return b;
     }
 
     fn same(s: []const u8) !void {
