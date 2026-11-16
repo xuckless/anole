@@ -280,6 +280,15 @@ the nghttp2 engine it replaces.
    run (a send-deadline waiter takes one more of its own); a parked
    connection holds no task and no slot. h2_test.zig's task-cap test runs
    on the engine with the same count the old one had. Not wire behaviour.
+8. **A peer that keeps sending past the refusal budget may lose the
+   GOAWAY(ENHANCE_YOUR_CALM) to a reset.** The server sends the GOAWAY, then
+   the lingering close reads and discards up to `linger_limit` (64 KiB) before
+   it hangs up. A flooding peer that has queued more than that (about 105 KiB
+   of refused heads) leaves unread input at the close, the kernel answers with
+   an RST, and the peer may throw away the GOAWAY unread. A peer that stops
+   at the GOAWAY, as the nghttp2 test client did, sees it. Not wire behaviour
+   RFC 9113 constrains; h2_test.zig's ENHANCE_YOUR_CALM test sends 44 refused
+   requests so that it stays under the limit.
 
 The nghttp2-only tests that measured that engine's internals (its `test_*`
 hooks: writer rounds and wakes, the body queue and its windows,

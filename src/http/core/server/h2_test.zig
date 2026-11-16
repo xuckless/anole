@@ -653,6 +653,58 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             try std.testing.expectEqualStrings("hello", client.get(again).body.items);
         }
 
+        /// `count` held requests at once on `client`, all in their handlers
+        /// before any answers: the connection needs that many streams.
+        fn heldBurst(client: *TestClient, io: std.Io, count: u32) !void {
+            Handlers.held_gate = .unset;
+            const entered = Handlers.held_entered.load(.acquire);
+            var ids: [128]i32 = undefined;
+            for (ids[0..count]) |*id| id.* = try client.request("GET", "/held", null);
+            try client.sendPending();
+            // The test client reads nothing meanwhile: the server's frames wait in
+            // the socket, and none of the requests can finish before the gate.
+            try wait.waitAtLeast(io, "every held request is in its handler", &Handlers.held_entered, entered + count);
+            Handlers.held_gate.set(io);
+            try client.run();
+            for (ids[0..count]) |id| try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
+        }
+
+        test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to 16" {
+            const io = std.testing.io;
+            var fx: Fixture = undefined;
+            try fx.start(io);
+            defer fx.stop(io);
+
+            var client: TestClient = undefined;
+            try client.init(std.testing.allocator, io, fx.server.address.ip);
+            defer client.deinit();
+            try heldBurst(&client, io, 40);
+            try awaitStreamsFreed(&fx.server, io);
+            try std.testing.expectEqual(@as(usize, 40), @field(fx.server, E.registry).sparesForTest());
+            // Each round: a trim interval passes, and one request makes the
+            // reader look (its idle check). The first trim sets the low-water
+            // mark; the next frees what sat unused since. Three rounds hold two
+            // trims after the burst, whichever idle check the first one lands on.
+            for (0..3) |_| {
+                _ = E.mod.test_trim_epoch.fetchAdd(1, .monotonic);
+                const id = try client.request("GET", "/hello", null);
+                try client.run();
+                try std.testing.expectEqualStrings("hello", client.get(id).body.items);
+                // One reader takes the connection's input in order, so the
+                // ACK of a second PING, sent once the first one's is in, means
+                // the reader went through its idle check after the request.
+                for (0..2) |_| {
+                    try client.ping();
+                    try client.runUntilPingAck();
+                }
+                try awaitStreamsFreed(&fx.server, io);
+            }
+            // The floor, plus the one stream a round's request may have held
+            // while the trim ran.
+            const left = @field(fx.server, E.registry).sparesForTest();
+            try std.testing.expect(left >= 16 and left <= 17);
+        }
+
         /// Sets `gate` once `client` has taken both of the drain's GOAWAYs: a
         /// response held until then is in flight through the whole drain, however
         /// slow the machine. Not on the first: the test is over when the stream
@@ -1229,6 +1281,8 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             // the wire; the little left unread when the server hangs up stays
             // under its linger limit (64 KiB), and the GOAWAY is read before
             // the close.
+            // A peer that sends past the limit may lose the GOAWAY to the
+            // reset (INTENTIONAL.md, server engine 8).
             sendRefusedHeads(&client, 44) catch {};
             try client.runUntilClosed();
             try std.testing.expect(client.goaway_count >= 1);
