@@ -593,6 +593,11 @@ fn panicWithLog(msg: []const u8, first_trace_addr: ?usize) noreturn {
 
 pub const std_options: std.Options = .{
     .logFn = log,
+    // Windows: std.Io.Threaded traces its unmapped LOCAL_DISCONNECT and
+    // PIPE_DISCONNECTED statuses, which the tests provoke on purpose; noise.
+    // This also hides a new unmapped status: turn it back on to diagnose an
+    // error.Unexpected on Windows.
+    .unexpected_error_tracing = if (builtin.os.tag == .windows) false else (std.Options{}).unexpected_error_tracing,
 };
 
 /// ANOLE: zio reads its options from the root, the runner in a test binary:

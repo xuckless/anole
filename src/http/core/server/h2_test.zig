@@ -1828,6 +1828,18 @@ pub fn Behaviour(comptime e: harness.Engine) type {
         }
 
         test "HTTP/2: a peer whose streams keep being refused is sent GOAWAY(ENHANCE_YOUR_CALM)" {
+            // Windows: skipped, not pending (#229). core-test runs on the zio
+            // stub (no timer, so no lingering close, h2/server.zig
+            // lingeringClose), so the engine closes with a few KB of the
+            // peer's heads unread and the OS resets the connection on every
+            // platform. On Linux the client reads the GOAWAY first, the reset
+            // is reported once and swallowed by `sendRefusedHeads(..) catch {}`;
+            // on Windows the read in runUntilClosed fails instead (GOAWAY
+            // discarded or the reset reported on every read: not yet told
+            // apart). Under zio the lingering close runs (h2.client_test's
+            // GOAWAY test, anole-test), and the refusal budget itself is tested
+            // without sockets in h2/conn_limits_test.zig.
+            if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
             const io = std.testing.io;
             var server = E.Server(void).init(std.testing.allocator, io, .{
                 .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
