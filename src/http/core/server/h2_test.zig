@@ -210,6 +210,48 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
         }
 
+        test "HTTP/2: the window a handler's read raises is sent even when the handler writes nothing" {
+            const io = std.testing.io;
+            var fx: Fixture = undefined;
+            try fx.start(io);
+            defer fx.stop(io);
+            Handlers.raise_gate = .unset;
+            Handlers.raise_rest_gate = .unset;
+            // Last in, first out: a failed wait below lets the handler go
+            // before the server stops.
+            defer Handlers.raise_gate.set(io);
+            defer Handlers.raise_rest_gate.set(io);
+
+            const body = try std.testing.allocator.alloc(u8, 256 * 1024 + 3);
+            defer std.testing.allocator.free(body);
+            for (body, 0..) |*b, i| b.* = @truncate(i *% 31 +% (i >> 11));
+
+            var client: TestClient = undefined;
+            try client.init(std.testing.allocator, io, fx.server.address.ip);
+            defer client.deinit();
+            const id = try client.request("POST", "/raise", body);
+            // The default window of the body, and a PING answered after the
+            // server's SETTINGS (whose stream window is one byte more).
+            try client.ping();
+            try client.runUntilPingAck();
+            // That byte, then a PING behind it: its answer means the server
+            // has read the whole window, so the handler's first read raises it.
+            try client.sendPending();
+            try std.testing.expectEqual(@as(usize, 65536), client.get(id).src.sent);
+            try client.ping();
+            try client.runUntilPingAck();
+            try std.testing.expectEqual(@as(usize, 0), client.stream_window_updates);
+            // The handler reads one byte and waits: no write of its own, no
+            // credit due for one byte, and nothing more from the client,
+            // whose window is spent. Only the raise can move it.
+            Handlers.raise_gate.set(io);
+            try client.recvUntilStreamWindowUpdate();
+            Handlers.raise_rest_gate.set(io);
+            try client.run();
+            var expect: [64]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+        }
+
         test "HTTP/2: a handler waiting for its body gets a DATA frame's first bytes before the rest of the frame" {
             const io = std.testing.io;
             var fx: Fixture = undefined;

@@ -602,6 +602,26 @@ pub const Handlers = struct {
     }
     pub const stall_credit = 512 * 1024;
     pub var stall_gate: std.Io.Event = .unset;
+    /// `sum`, as a handler that writes nothing while it reads: once the
+    /// test opens `raise_gate` (a whole window of the body in), one byte,
+    /// whose read raises the stream's window; then nothing more until the
+    /// test opens `raise_rest_gate` (the client has that raise's
+    /// WINDOW_UPDATE), then the rest. Nothing it does writes, so the raise
+    /// goes out only if the read hands it to the flusher.
+    pub fn raiseOnly(req: *dusty.Request, res: *dusty.Response) !void {
+        try wait.waitEvent(req.io, "the test opened the raising handler's gate", &raise_gate);
+        const raw = req._body_source.?.reader;
+        var hash: std.hash.Wyhash = .init(0);
+        var n = try takeBody(raw, &hash, 1);
+        try wait.waitEvent(req.io, "the test opened the raising handler's second gate", &raise_rest_gate);
+        while (true) n += takeBody(raw, &hash, 4096) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        try res.print(.text, "{d} {x}", .{ n, hash.final() });
+    }
+    pub var raise_gate: std.Io.Event = .unset;
+    pub var raise_rest_gate: std.Io.Event = .unset;
     /// `sum`, reading one byte each time the server has seen the peer send
     /// a whole window since the last raise (the engine's window-full counter past
     /// `stepper_base`), twice, then the rest: each of those reads raises
@@ -735,6 +755,7 @@ pub fn Fixture(comptime E: type) type {
             self.server.router.get("/held", Handlers.held);
             self.server.router.post("/late", Handlers.late);
             self.server.router.post("/stall", Handlers.stall);
+            self.server.router.post("/raise", Handlers.raiseOnly);
             self.server.router.post("/stepper", Handlers.stepper);
             self.server.router.post("/reader", Handlers.reader);
             // The same handlers on routes that promise not to wait, which run

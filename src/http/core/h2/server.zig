@@ -3179,19 +3179,23 @@ pub fn Engine(comptime Ctx: type) type {
                 while (true) {
                     const seen = es.wake.epoch();
                     conn.lock();
+                    // Before the raise: its WINDOW_UPDATE is credit too, and
+                    // may be the only thing the peer waits for (a handler
+                    // that reads without writing, or waits for room behind
+                    // it, as an echo over TLS on a slow machine did).
+                    const before = conn.proto.out.mark();
                     if (es.raise_due) conn.raiseWindow(es);
                     if (es.reset) {
                         conn.unlock();
                         return self.fail(error.ConnectionResetByPeer);
                     }
                     const n = es.body.take(dest);
+                    if (n > 0) conn.proto.consumed(es.cs, n) catch {};
+                    // Credit that queued a WINDOW_UPDATE (a raise, or about
+                    // once a half window) is written; on the reader it goes
+                    // with the read's output.
+                    const queued = conn.proto.out.mark() != before and !es.inline_mode;
                     if (n > 0) {
-                        const before = conn.proto.out.mark();
-                        conn.proto.consumed(es.cs, n) catch {};
-                        // Credit that queued a WINDOW_UPDATE (about once a
-                        // half window) is written; on the reader it goes
-                        // with the read's output.
-                        const queued = conn.proto.out.mark() != before and !es.inline_mode;
                         conn.unlock();
                         if (queued) conn.kickFlush();
                         w.advance(n);
@@ -3202,6 +3206,7 @@ pub fn Engine(comptime Ctx: type) type {
                         return error.EndOfStream;
                     }
                     conn.unlock();
+                    if (queued) conn.kickFlush();
                     es.wake.wait(conn.io, seen) catch return self.fail(error.Canceled);
                 }
             }
