@@ -2532,15 +2532,18 @@ pub fn Engine(comptime Ctx: type) type {
         /// is over, so it still gets the last frames (the nghttp2 engine's
         /// `lingeringClose`): close_notify under TLS and the send side
         /// shut, then what the peer sends is thrown away until it hangs up,
-        /// `linger_timeout` passes, or `linger_limit` bytes. The tasks have
-        /// ended: this is the only reader and writer. Out of line (cold).
+        /// `linger_timeout` passes, or `linger_limit` bytes. Where the timer
+        /// cannot bound the reads only the send side is shut, as HTTP/1.x's
+        /// `lingeringClose` does: the peer still reads the end now, not at
+        /// the socket's close, which the caller may hold (`Engine.serve`).
+        /// The tasks have ended: this is the only reader and writer. Out of
+        /// line (cold).
         noinline fn lingeringClose(conn: *Conn) std.Io.Cancelable!void {
             var timer: Timer = .init(null);
-            if (!timer.canBound()) return;
             if (!conn.send_shut) {
                 {
                     var t: Timer = .init(null);
-                    t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
+                    if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
                         conn.connection.stream.shutdown(conn.io, .both) catch {};
@@ -2553,6 +2556,7 @@ pub fn Engine(comptime Ctx: type) type {
                     else => {},
                 };
             }
+            if (!timer.canBound()) return;
             timer.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
             defer timer.clear(conn.io);
             _ = conn.connection.reader.discardShort(server_mod.linger_limit) catch {
