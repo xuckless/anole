@@ -349,12 +349,34 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
         }
 
         fn deadline(c: Ctx) !void {
-            const status, _, const s = try get(c.conn, c.arena, "GET", "/short", null);
-            defer s.release();
-            try std.testing.expectEqual(@as(u16, 504), status);
-            // The consumer may take the request after its deadline
-            // answered (a busy machine): wait for it.
-            const h = try waitHeld(c.io, &c.a.held);
+            const expired0 = c.a.e.stats().expired;
+            {
+                const status, _, const s = try get(c.conn, c.arena, "GET", "/short", null);
+                defer s.release();
+                try std.testing.expectEqual(@as(u16, 504), status);
+            }
+            try std.testing.expect(c.a.e.stats().expired >= expired0 + 1);
+            // Whether the consumer took the request depends on whether it
+            // polled before the 100 ms deadline: a request still queued at
+            // its deadline is expired and skipped by anole_poll, never
+            // delivered (a busy CI runner, as on Windows). A barrier tells
+            // the two apart: a connection's requests share one executor's
+            // ring, which the consumer drains and handles in order, so once
+            // a later request is answered, the consumer has handled
+            // /short's record if it ever will.
+            {
+                const status, const out, const s = try get(c.conn, c.arena, "GET", "/hello/after", null);
+                defer s.release();
+                try std.testing.expectEqual(@as(u16, 200), status);
+                try std.testing.expectEqualStrings(try std.fmt.allocPrint(c.arena, "hello /hello/after {d}", .{version}), out);
+            }
+            const h = c.a.held.load(.acquire);
+            if (h == 0) {
+                // Expired while queued: the consumer never heard of it, so
+                // it is told nothing.
+                try std.testing.expectEqual(@as(u32, 0), c.a.aborts.load(.acquire));
+                return;
+            }
             try std.testing.expectError(error.Gone, engine.respond(c.a.e, h, 200, &.{}, "", false));
             // The consumer hears why: the deadline, with the 504 sent.
             try wait.waitEqual(c.io, "the consumer heard the held request's ABORT", &c.a.last_abort, h);
