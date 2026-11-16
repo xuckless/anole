@@ -3,7 +3,31 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.6.0 (2026-11-16)
+
+The HTTP/2 takeover: the HTTP/2 server and client now run on Anole's own protocol core instead of nghttp2 (milestones M3 to M6). With it come the M4 performance work, a request arena without atomics, and the first green Windows CI job.
+
+### Performance
+
+On my box (i7-14700F), instructions per request, 1 executor, fixed count; the rested A/B used 5 executors. The load generator caps most HTTP/2 cells at about 300k req/s on this box, so CPU per request is the signal there.
+
+| Cell | 0.5.4 (nghttp2) | 0.6.0 |
+|---|---|---|
+| h2c baseline: instructions per request | 16,535 | 11,924 (−28%) |
+| Unary gRPC (h2c): instructions per request | 28,872 | 20,849 (−28%) |
+| h2 TLS json: instructions per request | M3's engine 151,390, which was 4.8% above nghttp2 | 136,033 (−10% against M3, about −6% against nghttp2); TLS records per request 5.9 → 0.6 |
+| gRPC client, per call | 31,400 | 22,248 (−29%) |
+| HTTP/1.1 `/json/50`: instructions per request | 116,691 | 116,437 (no change) |
+
+Against the last HttpArena entry (v0.5.0), on the box: static-h2 +33% req/s with RSS about halved; CPU per request −16 to −49% across the h2, h2c, json-h2c and gRPC cells. Results: bench/results/20261113-h2-m3-gate, 20261114-h2-m4-ab, 20261114-h2-arena-vs-050.
+
+### Changed
+
+- **The HTTP/2 server runs on Anole's own engine** (src/http/core/h2/server.zig; M3): one reader task per connection, no writer task, output under a flush token, per-stream back-pressure, timeouts on the per-executor sweep, the two-phase GOAWAY drain, and idle connections giving back their buffers (#97). Behaviour that differs from nghttp2 on purpose is listed in src/http/core/h2/INTENTIONAL.md. h2spec passes 147/147 on h2c and TLS.
+- **The HTTP/2 client runs on the same core** (M5). `anole.h2.ClientConnection` and the gRPC client keep their API.
+- **HPACK field memo, gathered TLS records, window batching and burst pools** (M4): response header fields are encoded once per thread and reused (never secrets); TLS output is packed into records of 16 KiB minus 128 bytes; a burst of up to `max_concurrent_streams` responses no longer allocates on a warm connection.
+- **Smaller HTTP/2 streams** (#179 groundwork): a stream's first arena node is 2 KiB, and request header tables start at 8 entries and grow.
+- **`max_tasks` counts an HTTP/2 connection as two tasks** (reader and its flusher), as before; a parked connection counts none.
 
 ### Performance
 
@@ -27,8 +51,16 @@ breaking changes are listed anyway.
   where they needed a peer. The test-only `test_h2_engine` switch went with
   the old engine; no user-facing option disappears.
 
+### Windows
+
+- The Windows CI job is green for the first time: a test that depended on a 100 ms poll was rewritten, #229's flood test stays under the linger limit, and the test runners no longer print thousands of NTSTATUS disconnect traces. Windows stays a development target, not a supported one.
+
 ### Fixed
 
+- **HTTP/2: a request body could stall.** A window raised by a handler's read was queued but not sent until the next write, so a client that had spent its stream window waited for an update that never left (a deadlock; found on CI).
+- **HTTP/2: the lingering close sent no FIN** on std.Io.Threaded, where its timer can't bound the reads.
+- **Idle park: a deadline ended by the sweep in the same pass as the park delay** left a cancel unclaimed, which later read as the server stopping.
+- **HTTP/2 detached and parked responses, tunnels, gRPC** on the new engine: a file body over an extended CONNECT, a connection error waking a handler onto a borrowed block, grpc-go's closing GOAWAY, unknown frame types in a burst, and the peer's GOAWAY now ending the connection once no stream is open.
 - WebSocket permessage-deflate over HTTP/2 and HTTP/3 keeps its buffers out
   of the stream's arena: tasks on other executors (`Rooms`) compress what
   they send, which the non-atomic arena does not allow.
