@@ -53,10 +53,10 @@ with Anole. That includes:
   `build/`;
 - the HTTP core in `src/http/core` (adapted from lalinsky/dusty) and the
   other modules copied in with attribution (listed in THIRD_PARTY_NOTICES);
-- the patches Anole carries on its forks (xuckless/zio, nghttp2, ngtcp2,
+- the patches Anole carries on its forks (xuckless/zio, ngtcp2,
   nghttp3, pg.zig, zig-sqlite and the others pinned in `build.zig.zon`).
 
-Bundled C libraries (BoringSSL, nghttp2, ngtcp2, nghttp3, zlib-ng, zstd,
+Bundled C libraries (BoringSSL, ngtcp2, nghttp3, zlib-ng, zstd,
 Brotli, yyjson, hiredis, SQLite, llhttp): a flaw in the library itself
 belongs with its upstream project, which runs its own disclosure process.
 Tell us as well when it affects Anole, so we can bump the pin as soon as a

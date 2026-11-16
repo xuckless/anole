@@ -185,10 +185,6 @@ pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 /// Tests only: the HTTP/2 engine, for its test counters and hooks
 /// (`test_sink_bodies`, src/grpc/server_test.zig).
 pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("h2/server.zig") else struct {};
-/// Tests only, until M6: the nghttp2 engine, which a server picks with
-/// `test_h2_engine = .nghttp2`, for its hooks (`test_before_*`,
-/// src/http/h2_wake_test.zig).
-pub const h2_nghttp2_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
 /// The HTTP/2 protocol core and its codecs, for Anole's HTTP/2 client
 /// (src/h2/client.zig, on `conn.Conn(.client, H)`). Nothing here is analysed
 /// unless that client uses it.

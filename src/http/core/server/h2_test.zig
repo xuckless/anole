@@ -475,7 +475,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                     .alpn_protocols = &.{ "h2", "http/1.1" },
                 } }},
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/hello", Handlers.hello);
             server.router.post("/echo", Handlers.echo);
@@ -525,7 +524,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
                 .buffer_budget = 1024,
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/hello", Handlers.hello);
             server.router.post("/len", struct {
@@ -614,7 +612,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 // its run holds for a flusher.
                 .max_tasks = 3,
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/hello", Handlers.hello);
             server.router.get("/wait", Waiter.handle);
@@ -810,7 +807,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                     .alpn_protocols = &.{ "h2", "http/1.1" },
                 } }},
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/who", Handlers.who);
             var future = try io.concurrent(Fixture.run, .{&server});
@@ -1191,7 +1187,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 // The refusal budget is the next test's.
                 .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 1000 },
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/hello", Handlers.hello);
             var future = try io.concurrent(Fixture.run, .{&server});
@@ -1219,7 +1214,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
                 .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 20, .refused_stream_rate = 1 },
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/hello", Handlers.hello);
             var future = try io.concurrent(Fixture.run, .{&server});
@@ -1247,7 +1241,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
                 .timeout = .{ .request = .fromMilliseconds(300) },
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/whole", struct {
                 const body: [100 * 1024]u8 = @splat('z');
@@ -1280,7 +1273,6 @@ pub fn Behaviour(comptime e: harness.Engine) type {
                 .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
                 .timeout = .{ .request = .fromMilliseconds(100), .write = .fromSeconds(5) },
             }, {});
-            E.select(&server);
             defer server.deinit();
             server.router.get("/slow", struct {
                 // Time passing on purpose (TESTING.md D1, margin >= 5x): sleeps are
@@ -1549,12 +1541,11 @@ pub fn Behaviour(comptime e: harness.Engine) type {
     };
 }
 
-test "HTTP/2: a server serves h2 on the new engine by default" {
+test "HTTP/2: a server serves h2 by default" {
     const io = std.testing.io;
     var fx: harness.Fixture(harness.Desc(.anole)) = undefined;
     try fx.start(io);
     defer fx.stop(io);
-    try std.testing.expect(fx.server.test_h2_engine == .anole);
     const reads = anole_h2.test_reads.load(.monotonic);
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);

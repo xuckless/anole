@@ -233,7 +233,7 @@ test "h2 client: 20 concurrent streams share one connection" {
     try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
 }
 
-/// nghttp2 has closed the stream: its whole response is in.
+/// The core has closed the stream: its whole response is in.
 fn streamClosed(s: *h2.Stream) bool {
     s.conn.mutex.lockUncancelable(s.conn.io);
     defer s.conn.mutex.unlock(s.conn.io);

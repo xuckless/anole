@@ -114,13 +114,13 @@ jobs:
         run: zig build test -Dprofile=minimal --test-timeout 120s --summary all
       # These three catch a configure-path error, which compiling catches;
       # the suites they would run are run by the steps above and by flags.
-      - name: Profile web compiles (BoringSSL + nghttp2, no HTTP/3)
+      - name: Profile web compiles (BoringSSL, no HTTP/3)
         timeout-minutes: 23
         run: zig build compile-tests -Dprofile=web --summary all
       - name: Full profile without TLS compiles (turns HTTP/3 off)
         timeout-minutes: 20
         run: zig build compile-tests -Dtls=none --summary all
-      - name: HTTP/3 without HTTP/2 compiles (nghttp3 without nghttp2)
+      - name: HTTP/3 without HTTP/2 compiles (nghttp3 alone)
         timeout-minutes: 31
         run: zig build compile-tests -Dhttp2=false -Dhttp3=true --summary all
       # The core's tests on the core without TLS, HTTP/2 or compression:

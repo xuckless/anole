@@ -41,10 +41,6 @@ pub fn Desc(comptime e: Engine) type {
             }
             /// The server's registry of this engine's connections.
             pub const registry = "h2_conns";
-            /// Picks this engine for the server's next connections.
-            pub fn select(s: anytype) void {
-                if (@TypeOf(s.test_h2_engine) != void) s.test_h2_engine = .anole;
-            }
         },
     };
 }
@@ -728,7 +724,6 @@ pub fn Fixture(comptime E: type) type {
                 // Off by default; the extended CONNECT tests need it.
                 .http2 = .{ .enable_connect_protocol = true },
             }, {});
-            E.select(&self.server);
             self.server.router.get("/hello", Handlers.hello);
             self.server.router.get("/file", sendFileHandler);
             self.server.router.get("/fields", Handlers.fields);

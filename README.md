@@ -94,7 +94,7 @@ Every bundled library sits behind a flag, all on by default; what you switch off
 | Flag | minimal | web | full (default) | Adds |
 | --- | --- | --- | --- | --- |
 | `-Dtls=boringssl\|none` | none | boringssl | boringssl | BoringSSL |
-| `-Dhttp2=bool` | false | true | true | nghttp2 |
+| `-Dhttp2=bool` | false | true | true | HTTP/2 server and client (Zig, no C library) |
 | `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3, WebTransport |
 | `-Dcompression=bool` | false | true | true | zlib-ng, zstd |
 | `-Dbrotli=bool` | false | true | true | Brotli responses (google/brotli); needs `-Dcompression` |
@@ -137,7 +137,7 @@ Examples run with `zig build run-<name>`: `hello`, `rest`, `websocket`, `grpc`, 
 
 Pre-1.0; the latest release is [0.5.4](CHANGELOG.md), and the API may still change. Next: hardening for 1.0, then the anole-node and anole-py bindings.
 
-Anole stands on [zio](https://github.com/lalinsky/zio), [dusty](https://github.com/lalinsky/dusty) (adapted as its HTTP core), nghttp2, ngtcp2, nghttp3 and BoringSSL. Bugs and ideas: [Issues](https://github.com/xuckless/anole/issues/new/choose); questions: [Discussions](https://github.com/xuckless/anole/discussions); security: [SECURITY.md](SECURITY.md).
+Anole stands on [zio](https://github.com/lalinsky/zio), [dusty](https://github.com/lalinsky/dusty) (adapted as its HTTP core), nghttp2 (its HTTP/2 rules, translated to Zig), ngtcp2, nghttp3 and BoringSSL. Bugs and ideas: [Issues](https://github.com/xuckless/anole/issues/new/choose); questions: [Discussions](https://github.com/xuckless/anole/discussions); security: [SECURITY.md](SECURITY.md).
 
 ## License
 

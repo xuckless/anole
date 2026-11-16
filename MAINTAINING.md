@@ -11,7 +11,7 @@ that happens promptly.
 | --- | --- | --- |
 | zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` (for now `anole-diag`, see below) |
 | HTTP core (from dusty) | src/http/core | Anole code since 2026-10-20; see "The HTTP core" below |
-| nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
+| HTTP/2 (codecs, core, server engine, client) | src/http/core/h2 | Anole code, translated from nghttp2 1.70.0; no nghttp2 dependency since M6 (the xuckless/nghttp2 fork stays up, not archived; its last pin was 0f8bc1c) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (git URL) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
@@ -49,7 +49,7 @@ should see. If libmsquic's newest version stops working with the pinned
 ## Advisories
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
-whenever build.zig.zon changes. It checks nghttp2, ngtcp2, nghttp3, zlib-ng,
+whenever build.zig.zon changes. It checks ngtcp2, nghttp3, zlib-ng,
 zstd, Brotli, yyjson, hiredis and lz4 against their GitHub security advisories, the
 BoringSSL commit against OSV, and SQLite against NVD's CVE list (SQLite
 publishes no GitHub advisories; `NVD_IGNORE` lists CVEs NVD matches to every
@@ -69,7 +69,7 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
    THIRD_PARTY_NOTICES. For zlib-ng, zstd, Brotli, yyjson, lz4 and
    libdeflate, add the new tarball's SHA-256 (and Brotli's `testdata.txz`'s) to `sha256_of` in
    `tools/sanitize-c-libs.sh`, which refuses a download it has no hash for. Re-read the "Includes:" lines there (sfparse in
-   nghttp2 and nghttp3, PCG in ngtcp2, fiat in BoringSSL), and re-copy
+   nghttp3, PCG in ngtcp2, fiat in BoringSSL), and re-copy
    BoringSSL's licence text into part E if it changed.
 3. Library-specific steps:
    - **BoringSSL and ngtcp2 move together.** ngtcp2's BoringSSL helper is
@@ -86,10 +86,12 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      `do_send_new_session_ticket`'s deferral to the first write. The
      SAFETY.md L5 exception for BoringSSL's record buffers rests on
      `SSLBuffer::EnsureCap` and `Clear`.
-   - **nghttp2** comes from the fork, which carries an RFC 9113 strictness
-     patch. Rebase the patch onto the new tag on a new branch, run nghttp2's
-     unit tests and h2spec in strict mode (147/147 over h2c and TLS), merge
-     into `anole`, and pin the merge commit.
+   - **HTTP/2 is Anole's own code** (`src/http/core/h2`), translated from
+     nghttp2 1.70.0 (attribution in THIRD_PARTY_NOTICES, licence in
+     `LICENSE.nghttp2`). There is no pin to bump: read nghttp2's release
+     notes and advisories for logic bugs the translation could share, and run
+     h2spec (147/147 over h2c and TLS). The differential tests replay what
+     nghttp2 answered (`h2/testdata/vectors`, README there).
    - **ngtcp2** comes from the fork too: the tag, the release's generated
      `lib/includes/ngtcp2/version.h`, and a patch that keeps a server's
      fallback connection ID across a migration right after a NAT rebinding
@@ -165,10 +167,6 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      reached the library. Bump the version it expects, and the zig-sqlite
      fork's own lazy amalgamation (used only when it builds alone) with it.
      Then run `zig build test` with `-Dsqlite` on Linux and macOS.
-   - **nghttp2 and nghttp3 both ship sfparse** with the same exported
-     symbols, and the linker keeps one copy. `build/nghttp3.zig`
-     (`checkSharedSfparse`) stops the build when the two copies differ; then
-     rename one copy's symbols with `-D` macros or build one shared sfparse.
 4. Run everything CI runs: `zig build test`, `zig build test-flags`,
    the profile builds, h2spec, Autobahn, the gRPC
    interop, `tests/grpc/h3/run.sh`, `tests/h3/run.sh`, `tests/interop/run.sh`
@@ -302,7 +300,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   `serviceKick`, `TcpListener.driverFor`'s rollback) touch the connection
   or driver after a refused spawn; a spawn that could yield and then fail
   (or be canceled in its yield) would make them use-after-free.
-- **nghttp2**, **ngtcp2**, **nghttp3**: see above.
+- **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed. websocket-zig also
   carries a security patch (RSV1 refused on control frames and
@@ -382,7 +380,7 @@ Anole code since 2026-10-20: changes land here directly. Keep the
 attribution header on every file and THIRD_PARTY_NOTICES part B current.
 
 - Its own tests run in `zig build test` (and alone as `zig build core-test`)
-  with its test runner and its zio stub, on Anole's TLS, nghttp2, zlib-ng,
+  with its test runner and its zio stub, on Anole's TLS, zlib-ng,
   zstd and Brotli. Their certificate is made at build time by
   `tests/test_cert.zig`; no key is committed.
 - Its "fuzz:" targets run a second time under Zig's own test runner, so

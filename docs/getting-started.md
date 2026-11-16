@@ -25,7 +25,7 @@ Or build the same thing by hand:
 
 You need Zig 0.17 (`zig version` prints `0.17.0`) on macOS or Linux, and
 nothing else: Anole's build fetches and compiles its C libraries (BoringSSL,
-nghttp2 and the rest) itself.
+ngtcp2 and the rest) itself.
 
 ```sh
 mkdir api && cd api

@@ -11,8 +11,8 @@ const tls = @import("tls");
 const has_trust_store = build_options.use_tls and @hasDecl(tls, "TrustStore");
 const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
-/// An HTTP/2 client, injected as the `h2_client` import like `tls` and
-/// `nghttp2` (src/h2_client_stub.zig lists what it must provide). With one,
+/// An HTTP/2 client, injected as the `h2_client` import like `tls`
+/// (src/h2_client_stub.zig lists what it must provide). With one,
 /// `ClientOptions.http2` offers "h2" through ALPN, and a connection on which
 /// the server picks it is handed to it after the handshake.
 const h2_client = @import("h2_client");
@@ -466,7 +466,7 @@ pub const ConnectionPool = struct {
         // And the carriers of origins still in use (their requests must
         // be done by now).
         if (comptime has_h2_client) while (self.origins.popFirst()) |node| {
-            const origin: *H2Origin = @alignCast(@fieldParentPtr("node", node));
+            const origin: *H2Origin = @alignCast(@fieldParentPtr("node", node)); // SAFETY: `node` is that field of a live container, so the parent is aligned
             origin.listed = false;
             destroy(self, origin.carrier);
         };
@@ -478,7 +478,7 @@ pub const ConnectionPool = struct {
     }
 
     fn fromNode(node: *std.DoublyLinkedList.Node) *Connection {
-        return @alignCast(@fieldParentPtr("pool_node", node));
+        return @alignCast(@fieldParentPtr("pool_node", node)); // SAFETY: `pool_node` is that field of a live container, so the parent is aligned
     }
 
     fn destroy(self: *ConnectionPool, conn: *Connection) void {
@@ -553,7 +553,7 @@ pub const ConnectionPool = struct {
             defer self.mutex.unlock(self.io);
             var node = self.origins.first;
             while (node) |n| : (node = n.next) {
-                const o: *H2Origin = @alignCast(@fieldParentPtr("node", n));
+                const o: *H2Origin = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
                 if (!o.carrier.matches(remote_host, remote_port, protocol, null)) continue;
                 if (!o.carrier.h2.?.isOpen()) continue;
                 o.refs += 1;
@@ -695,7 +695,7 @@ pub const ConnectionPool = struct {
         defer self.mutex.unlock(self.io);
         var node = self.dialing.first;
         while (node) |n| : (node = n.next) {
-            const other: *DialTicket = @alignCast(@fieldParentPtr("node", n));
+            const other: *DialTicket = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
             if (other.key == ticket.key) return self.dial_gen.load(.acquire);
         }
         self.dialing.append(&ticket.node);
@@ -925,12 +925,12 @@ pub const Connection = struct {
 
     // Connection pool metadata
     pool_node: std.DoublyLinkedList.Node = .{},
-    host_buffer: [255]u8 = undefined,
+    host_buffer: [255]u8 = undefined, // SAFETY: a buffer, written before it is read
     host_len: u8 = 0,
     port: u16 = 0,
     closing: bool = false,
     // Unix socket path (empty means TCP connection)
-    unix_path_buffer: [unix_path_max]u8 = undefined,
+    unix_path_buffer: [unix_path_max]u8 = undefined, // SAFETY: a buffer, written before it is read
     unix_path_len: u8 = 0,
 
     // Keep-Alive tracking
@@ -1131,14 +1131,14 @@ pub const Connection = struct {
         self.max_response_headers = carrier.max_response_headers;
         self.protocol = carrier.protocol;
         self.http_version = .http_2;
-        self.tcp_reader = undefined;
-        self.tcp_writer = undefined;
+        self.tcp_reader = undefined; // SAFETY: not read once the connection is the HTTP/2 client's
+        self.tcp_writer = undefined; // SAFETY: not read once the connection is the HTTP/2 client's
         self.tls_tcp_read_buffer = &.{};
         self.tls_tcp_write_buffer = &.{};
         self.tls_conn = null;
-        self.tls_reader = undefined;
-        self.tls_writer = undefined;
-        self.tls_rng = undefined;
+        self.tls_reader = undefined; // SAFETY: not read once the connection is the HTTP/2 client's
+        self.tls_writer = undefined; // SAFETY: not read once the connection is the HTTP/2 client's
+        self.tls_rng = undefined; // SAFETY: not read once the connection is the HTTP/2 client's
         self.read_buffer = &.{};
         self.write_buffer = &.{};
         self.reader = carrier.reader;
@@ -1572,12 +1572,12 @@ const UploadImpl = struct {
     timeout: std.Io.Timeout,
     write_err: ?Connection.WriteError = null,
     w: std.Io.Writer,
-    buffer: [4096]u8 = undefined,
+    buffer: [4096]u8 = undefined, // SAFETY: a buffer, written before it is read
 
     const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w));
+        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w)); // SAFETY: `w` is that field of a live container, so the parent is aligned
         const buffered = w.buffered();
         var from_data: usize = 0;
         for (data[0 .. data.len - 1]) |d| from_data += d.len;
@@ -1596,7 +1596,7 @@ const UploadImpl = struct {
     }
 
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w));
+        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w)); // SAFETY: `w` is that field of a live container, so the parent is aligned
         try std.Io.Writer.defaultFlush(w);
         self.conn.flush() catch |err| {
             self.conn.closing = true;
@@ -2241,7 +2241,7 @@ pub const Client = struct {
             return error.WebSocketUpgradeFailed;
         }
 
-        var seed: u64 = undefined;
+        var seed: u64 = undefined; // SAFETY: filled by io.random on the next line
         self.io.random(std.mem.asBytes(&seed));
         var ws = WebSocket.init(self.io, conn.transport(), conn.allocator, seed);
         ws.is_client = true;
@@ -3386,7 +3386,7 @@ fn bodyCounts(raw: []const u8, head_request: bool, max: usize, expected: anyerro
 
     var reader = try fixedMessageReader(arena.allocator(), raw);
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
-    var parser: ResponseParser = undefined;
+    var parser: ResponseParser = undefined; // SAFETY: set by `init` on the next line
     try parser.init(&parsed, 64);
     parser.head_request = head_request;
     try parseResponseHeaders(&reader, &parser);
@@ -3394,7 +3394,7 @@ fn bodyCounts(raw: []const u8, head_request: bool, max: usize, expected: anyerro
     var response = ClientResponse{
         .arena = counter.allocator(),
         .parser = &parser,
-        .transport = .{ .reader = &reader, .writer = undefined },
+        .transport = .{ .reader = &reader, .writer = undefined }, // SAFETY: a fixed-message response never writes
         .parsed = &parsed,
         .max_response_size = max,
     };

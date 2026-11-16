@@ -143,33 +143,3 @@ pub fn configureC(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void
     }
     if (target.result.cpu.arch.endian() == .big) mod.addCMacro("WORDS_BIGENDIAN", "1");
 }
-
-/// nghttp2 (lib/sfparse.c) and nghttp3 (lib/sfparse/sfparse.c) each vendor sfparse and
-/// export the same global `sfparse_*` symbols. When both libraries are linked, the
-/// linker keeps one archive member and both libraries run that copy. That is safe only
-/// while the two copies are identical, so the build stops when a pin bump makes them
-/// differ. The fix then is to rename one copy's symbols or to build one shared sfparse.
-pub fn checkSharedSfparse(b: *std.Build, nghttp2_up: *std.Build.Dependency, nghttp3_up: *std.Build.Dependency) void {
-    const pairs = [_][2][]const u8{
-        .{ "lib/sfparse.c", "lib/sfparse/sfparse.c" },
-        .{ "lib/sfparse.h", "lib/sfparse/sfparse.h" },
-    };
-    for (pairs) |pair| {
-        const a = readPkgFile(b, nghttp2_up, pair[0]);
-        const c = readPkgFile(b, nghttp3_up, pair[1]);
-        if (!std.mem.eql(u8, a, c)) {
-            std.debug.print(
-                "error: nghttp2's {s} and nghttp3's {s} differ; both export the same sfparse_* symbols, " ++
-                    "so linking both would run one library against the other's sfparse. Bump the pins together " ++
-                    "or give one copy its own symbol prefix.\n",
-                .{ pair[0], pair[1] },
-            );
-            std.process.exit(1);
-        }
-    }
-}
-
-fn readPkgFile(b: *std.Build, up: *std.Build.Dependency, path: []const u8) []const u8 {
-    return up.builder.root.root_dir.handle.readFileAlloc(b.graph.io, path, b.allocator, .unlimited) catch |err|
-        std.debug.panic("cannot read {s} from a C dependency: {t}", .{ path, err });
-}

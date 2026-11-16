@@ -1,8 +1,8 @@
 //! The session differential (PLAN §5.3): a client byte stream into
 //! Conn(.server), with a handler that answers every complete request with
 //! 200 and "ok", against what nghttp2 1.70.0 answered to the same bytes in
-//! a server session set up as the engine set it up (server/h2_nghttp2.zig
-//! `initSession`: no automatic WINDOW_UPDATE, credit given back as DATA
+//! a server session set up as the nghttp2 engine set it up (removed at
+//! M6; its `initSession`: no automatic WINDOW_UPDATE, credit given back as DATA
 //! arrives, the header-list limit in the header callback, answers 200 and
 //! "ok"). nghttp2's side was recorded while the library was still linked
 //! (testdata/vectors/README.md; the recorder is `Ng` and `Rec` in commit

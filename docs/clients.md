@@ -208,7 +208,7 @@ HTTP/1.1 fails its requests.
 
 ## HTTP/2
 
-`anole.h2.ClientConnection` is one connection on nghttp2. `connect` opens it
+`anole.h2.ClientConnection` is one connection on Anole's own HTTP/2 core. `connect` opens it
 and starts its reader and writer tasks; every request is a stream on it.
 
 ```zig
@@ -305,7 +305,8 @@ after `close`, and `s.resetCode()` is the application error code of the
 server's RESET_STREAM. `anole.h3` exports the names `anole.h2` does:
 `ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
 `StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
-`anole.h2.version()`'s "nghttp2/1.70.0").
+`anole.h2.version()`'s "anole-h2": the HTTP/2 client and server run on
+Anole's own protocol core, with no C library under them).
 
 The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
 Connect to it when you know the server speaks it, or read the header with
@@ -562,7 +563,7 @@ try group.await(io);
 ```
 
 When the server's concurrent-stream limit is reached, HTTP/3's `request` waits
-for a slot, and nghttp2 holds an HTTP/2 request until one frees. After the
+for a slot, and an HTTP/2 request is held until one frees. After the
 server's GOAWAY, or after `close` has begun, `request` fails with
 `error.ConnectionClosed`; open a new connection then. Do not call `close` while
 other tasks still use the connection.

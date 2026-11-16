@@ -27,7 +27,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const nghttp2_build = @import("build/nghttp2.zig");
 const boringssl_build = @import("build/boringssl.zig");
 const ngtcp2_build = @import("build/ngtcp2.zig");
 const nghttp3_build = @import("build/nghttp3.zig");
@@ -145,11 +144,11 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite or f.grpc;
+        return f.tls != .none or f.http3 or f.compression or f.json or f.redis or f.sqlite or f.grpc;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
-        return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
+        return (!f.needsTls() or have.needsTls()) and (!f.http3 or have.http3) and
             (!f.compression or have.compression) and (!f.brotli or have.brotli) and (!f.libdeflate or have.libdeflate) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
             (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
             (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb) and
@@ -1104,7 +1103,7 @@ pub fn build(b: *std.Build) void {
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
-    // nghttp2, zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.
+    // zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.
     if (core.dusty_by[1][1][1][@intFromBool(features.brotli)][@intFromBool(features.libdeflate)] != null and target.query.isNative()) {
         const core_full = core.dusty_by[1][1][1][@intFromBool(features.brotli)][@intFromBool(features.libdeflate)].?;
         // A second instance of the same sources and imports, but with the
@@ -1159,7 +1158,7 @@ pub fn build(b: *std.Build) void {
             }),
         }));
         const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
-        const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli");
+        const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, zlib-ng, zstd and Brotli");
         for (core_runs) |run_core_tests| {
             run_core_tests.setCwd(certs_dir);
             if (core_test_filter) |f| run_core_tests.setEnvironmentVariable("TEST_FILTER", f);
@@ -2061,7 +2060,7 @@ pub fn build(b: *std.Build) void {
 fn resolveFeatures(b: *std.Build) Features {
     const profile = b.option(Profile, "profile", "Feature preset: minimal (HTTP/1.1 only), web, full (default)") orelse .full;
     const tls = b.option(Tls, "tls", "TLS backend: boringssl or none (overrides the profile)");
-    const http2 = b.option(bool, "http2", "HTTP/2: the server engine in Zig, the client via nghttp2 (overrides the profile)");
+    const http2 = b.option(bool, "http2", "HTTP/2: the server engine and the client, in Zig (overrides the profile)");
     const http3 = b.option(bool, "http3", "HTTP/3 via ngtcp2 + nghttp3; needs -Dtls=boringssl (overrides the profile)");
     const grpc = b.option(bool, "grpc", "gRPC; needs -Dhttp2=true (overrides the profile)");
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");
@@ -2229,7 +2228,7 @@ const Core = struct {
     llhttp: LlHttp,
     /// dusty instances by [tls][http2][compression][brotli][libdeflate]. One
     /// exists for each combination this build can satisfy: TLS needs
-    /// BoringSSL in the build, HTTP/2 nghttp2, compression zlib-ng, Brotli
+    /// BoringSSL in the build, compression zlib-ng, Brotli
     /// google/brotli and compression, libdeflate ebiggers/libdeflate and
     /// compression. Different arguments give separate dusty instances, so
     /// test-flags can build every combination side by side.
@@ -2293,7 +2292,6 @@ const Core = struct {
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
-                if (http2 and c_mods.nghttp2 == null) continue;
                 for ([_]bool{ false, true }) |compression| {
                     if (compression and c_mods.zlib == null) continue;
                     for ([_]bool{ false, true }) |brotli| {
@@ -2305,7 +2303,7 @@ const Core = struct {
                                 zio_mod,
                                 core.llhttp,
                                 if (tls) seam else null,
-                                if (http2) c_mods.nghttp2 else null,
+                                http2,
                                 if (compression) c_mods.zlib else null,
                                 if (compression) c_mods.zstd else null,
                                 if (brotli) c_mods.brotli else null,
@@ -2346,7 +2344,7 @@ const Core = struct {
     /// The HTTP/2 client, as its own module so dusty's client can take it
     /// (`h2_client`): a TLS connection on which ALPN picks "h2" is handed
     /// to it. The two modules import each other. It runs on dusty's HTTP/2
-    /// protocol core (`dusty.h2_proto`), not nghttp2 (M5).
+    /// protocol core (`dusty.h2_proto`).
     fn h2ClientModule(
         b: *std.Build,
         dusty_mod: *std.Build.Module,
@@ -2401,7 +2399,7 @@ const Core = struct {
         zio_mod: *std.Build.Module,
         llhttp: LlHttp,
         tls: ?*std.Build.Module,
-        nghttp2: ?*std.Build.Module,
+        http2: bool,
         zlib: ?*std.Build.Module,
         zstd: ?*std.Build.Module,
         brotli: ?*std.Build.Module,
@@ -2418,7 +2416,7 @@ const Core = struct {
         const opts = b.addOptions();
         opts.addOption([]const u8, "version", @import("build.zig.zon").version);
         opts.addOption(bool, "use_tls", tls != null);
-        opts.addOption(bool, "use_http2", nghttp2 != null);
+        opts.addOption(bool, "use_http2", http2);
         opts.addOption(bool, "use_zlib", zlib != null);
         opts.addOption(bool, "use_zstd", zstd != null);
         opts.addOption(bool, "use_brotli", brotli != null);
@@ -2430,7 +2428,6 @@ const Core = struct {
         // Replaced by src/h2/client.zig in the HTTP/2 instances (h2ClientModule).
         mod.addAnonymousImport("h2_client", .{ .root_source_file = b.path("src/http/core/h2_client_stub.zig") });
         if (tls) |m| mod.addImport("tls", m) else mod.addAnonymousImport("tls", .{ .root_source_file = b.path("src/http/core/tls_stub.zig") });
-        if (nghttp2) |m| mod.addImport("nghttp2", m);
         if (zlib) |m| mod.addImport("zlib", m) else mod.addAnonymousImport("zlib", .{ .root_source_file = b.path("src/http/core/zlib_stub.zig") });
         if (zstd) |m| mod.addImport("zstd", m);
         if (brotli) |m| mod.addImport("brotli", m);
@@ -2448,8 +2445,6 @@ const Core = struct {
 /// Zig binding modules of the C libraries. Each one links its static library,
 /// so importing the module is enough.
 const CModules = struct {
-    /// nghttp2.h (http2)
-    nghttp2: ?*std.Build.Module = null,
     /// BoringSSL headers listed in src/tls/bssl.h (tls=boringssl)
     boringssl: ?*std.Build.Module = null,
     /// ngtcp2.h + ngtcp2_crypto_boringssl.h (http3)
@@ -2500,7 +2495,6 @@ const CModules = struct {
         // Request every needed lazy dependency before giving up, so one fetch
         // round gets them all.
         const tc_dep = if (f.needsTranslateC()) b.lazyDependency("translate_c", .{}) else null;
-        const nghttp2_dep = if (f.http2) b.lazyDependency("nghttp2", .{}) else null;
         const boringssl_dep = if (f.needsTls()) b.lazyDependency("boringssl", .{}) else null;
         const ngtcp2_dep = if (f.http3) b.lazyDependency("ngtcp2", .{}) else null;
         const nghttp3_dep = if (f.http3) b.lazyDependency("nghttp3", .{}) else null;
@@ -2528,7 +2522,6 @@ const CModules = struct {
         const zig_sqlite_dep = if (sqlite_dep) |up| b.lazyDependency("zig_sqlite", sqlite_build.zigSqliteArgs(up, sqlite_config.?, target, optimize)) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
-        if (f.http2 and nghttp2_dep == null) return null;
         if (f.needsTls() and boringssl_dep == null) return null;
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
@@ -2543,9 +2536,6 @@ const CModules = struct {
         if (f.auth and jwt_dep == null) return null;
         if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
         if (f.sqlite and (sqlite_dep == null or zig_sqlite_dep == null)) return null;
-
-        // Both vendor sfparse and export the same symbols; stop if they differ.
-        if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
 
         var m: CModules = .{};
         if (websocket_dep) |dep| m.websocket = dep.module("websocket");
@@ -2603,11 +2593,6 @@ const CModules = struct {
         if (lz4_dep) |up| {
             const lib = lz4_build.library(b, up, target, optimize);
             m.lz4 = lz4_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
-        }
-
-        if (nghttp2_dep) |up| {
-            const lib = nghttp2_build.library(b, up, target, optimize);
-            m.nghttp2 = nghttp2_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
 
         var bssl_lib: ?*std.Build.Step.Compile = null;
@@ -2736,7 +2721,6 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("anole_banner", o.core.banner);
     mod.addImport("anole_test_wait", o.core.test_wait);
     if (f.http2) {
-        mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));
     }
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
