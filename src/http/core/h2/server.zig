@@ -208,8 +208,10 @@ pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (i
 /// connection (`Engine.testWakeRooms` takes it): the moment a stream task
 /// on another thread may look at its stream before `closeRun`.
 pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void = if (is_test) null else {};
-/// Tests only: send-deadline waiters started (`waitSends`).
+/// Tests only: send-deadline waiters started (`waitSends`), and send
+/// sides shut at a connection's end (`shutDrained`, `lingeringClose`).
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+pub var test_send_shuts: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: the most arena one stream's exchange used (bytes handed
 /// out over its nodes), read before its reset (`maybeFree`).
 pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
@@ -1430,6 +1432,7 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
+                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
             }
 
             /// Ends the reader's wait for input, as its deadline would, if
@@ -2552,6 +2555,7 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
+                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
             }
             if (!timer.canBound()) return;
             timer.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });

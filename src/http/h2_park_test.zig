@@ -572,13 +572,14 @@ test "h2 lifecycle: the drain's close lets the peer's late frames in, and it rea
     const entered = held_entered.load(.acquire);
     const id = try c.get("/held");
     try wait.waitAtLeast(f.io, "the held request's handler runs", &held_entered, entered + 1);
+    const shuts = engine.test_send_shuts.load(.acquire);
     var stopper = try f.io.concurrent(Fixture.stopper, .{&f});
     defer stopper.await(f.io);
     while (c.goaway_count < 2) try c.readOne();
     held_gate.set(f.io);
-    // The send side's FIN, not a counter: the flusher (`shutDrained`) or
-    // the reader (`.drained`, then the lingering close) may shut it.
-    try std.testing.expectEqual(error.EndOfStream, c.closeCause());
+    // Either close path counts: the flusher's `shutDrained`, or the
+    // reader's `.drained` and then the lingering close.
+    try wait.waitAtLeast(f.io, "the drained connection's send side shut", &engine.test_send_shuts, shuts + 1);
     // The peer still talks after the server's last frame (credit, a PING),
     // as a client reading a large response does: the server reads and
     // drops it rather than answer it with a reset.
@@ -588,6 +589,7 @@ test "h2 lifecycle: the drain's close lets the peer's late frames in, and it rea
     const rs = try c.until(id);
     try std.testing.expectEqual(200, rs.status);
     try std.testing.expectEqual("held but whole".len, rs.body_len);
+    try std.testing.expectEqual(error.EndOfStream, c.closeCause());
 }
 
 test "h2 lifecycle: keepalive closes a connection with a TLS record half read" {

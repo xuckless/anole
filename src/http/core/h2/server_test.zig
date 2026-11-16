@@ -901,8 +901,8 @@ test "h2 engine: after the peer's GOAWAY the open stream is answered, then the c
     const r = try c.until(id);
     try expectEqual(200, r.status);
     try expectEqualStrings("held", r.body.items);
-    // nghttp2's want_read is 0 once no stream is open: the send side is
-    // shut, and the client reads its FIN (h2/client_test.zig checks the
+    // After the peer's GOAWAY no stream is open, so the connection is
+    // drained: the send side is shut, and the client reads its FIN (h2/client_test.zig checks the
     // lingering close after it). Which side ends it depends on whether the
     // GOAWAY is read before or after the stream finishes (the flusher's
     // `shutDrained`, or the reader's `.drained` and `lingeringClose`), so
