@@ -208,10 +208,8 @@ pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (i
 /// connection (`Engine.testWakeRooms` takes it): the moment a stream task
 /// on another thread may look at its stream before `closeRun`.
 pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void = if (is_test) null else {};
-/// Tests only: send-deadline waiters started (`waitSends`), and drained
-/// connections whose send side was shut (`shutDrained`).
+/// Tests only: send-deadline waiters started (`waitSends`).
 pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_drain_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: the most arena one stream's exchange used (bytes handed
 /// out over its nodes), read before its reset (`maybeFree`).
 pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
@@ -1419,7 +1417,6 @@ pub fn Engine(comptime Ctx: type) type {
             /// elsewhere at the peer's hang-up or the keep-alive.
             noinline fn shutDrained(conn: *Conn) std.Io.Cancelable!void {
                 defer conn.wakeReader();
-                if (comptime is_test) _ = test_drain_closes.fetchAdd(1, .monotonic);
                 {
                     var t: Timer = .init(null);
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
