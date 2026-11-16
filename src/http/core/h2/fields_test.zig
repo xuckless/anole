@@ -10,10 +10,8 @@
 //! and the other pure field checks).
 
 const std = @import("std");
-const build_options = @import("build_options");
 const fields = @import("fields.zig");
 const fuzz = @import("../fuzz.zig");
-const vectors = @import("vectors.zig");
 
 const Request = fields.Request;
 const Verdict = fields.Verdict;
@@ -279,8 +277,32 @@ test "h2 fields: trailers" {
 }
 
 test "h2 fields: matches nghttp2's helpers" {
-    if (build_options.use_http2) try Ng.differential() else return error.SkipZigTest;
+    // nghttp2_check_header_name, _header_value, _header_value_rfc9113,
+    // _method, _path and _authority on every string of `enumerate`, as
+    // nghttp2 1.70.0 answered (testdata/vectors/README.md).
+    var replay: Replay = .{ .want = @embedFile("testdata/vectors/fields.bin") };
+    try enumerate(&replay);
+    try expectEqual(replay.want.len, replay.at);
 }
+
+const Replay = struct {
+    want: []const u8,
+    at: usize = 0,
+
+    fn visit(r: *Replay, s: []const u8) !void {
+        if (r.at == r.want.len) return error.RecordingExhausted;
+        const bits = r.want[r.at];
+        r.at += 1;
+        errdefer std.debug.print("differs on \"{f}\"\n", .{std.zig.fmtString(s)});
+        try expectEqual(bits & 1 != 0, fields.validName(s));
+        try expectEqual(bits & 2 != 0, fields.validValue(s));
+        try expectEqual(bits & 4 != 0, fields.validValueRfc9113(s));
+        try expectEqual(bits & 8 != 0, fields.validMethod(s));
+        try expectEqual(bits & 16 != 0, fields.validPath(s));
+        try expectEqual(bits & 32 != 0, fields.validAuthority(s));
+        try expectEqual(0, bits >> 6);
+    }
+};
 
 /// A fixed pseudo-random stream (xorshift64*), so that the strings of
 /// `enumerate` never depend on std's generator.
@@ -323,52 +345,6 @@ fn enumerate(v: anytype) !void {
     }
 }
 
-/// nghttp2's six public checks, when it is linked.
-const Ng = struct {
-    const c = if (build_options.use_http2) @import("nghttp2") else struct {};
-
-    fn differential() !void {
-        var rec: Record = .{};
-        defer rec.list.deinit(std.testing.allocator);
-        try enumerate(&rec);
-        if (vectors.recording()) {
-            try vectors.recordFile("fields.bin", rec.list.items);
-        }
-    }
-
-    /// Compares each string with ours, and keeps nghttp2's six answers as
-    /// bits (name, value, value 9113, method, path, authority).
-    const Record = struct {
-        list: std.ArrayList(u8) = .empty,
-
-        fn visit(r: *Record, s: []const u8) !void {
-            try same(s);
-            try r.list.append(std.testing.allocator, bits(s));
-        }
-    };
-
-    fn bits(s: []const u8) u8 {
-        var b: u8 = 0;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_header_name(s.ptr, s.len) != 0)) << 0;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_header_value(s.ptr, s.len) != 0)) << 1;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_header_value_rfc9113(s.ptr, s.len) != 0)) << 2;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_method(s.ptr, s.len) != 0)) << 3;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_path(s.ptr, s.len) != 0)) << 4;
-        b |= @as(u8, @intFromBool(c.nghttp2_check_authority(s.ptr, s.len) != 0)) << 5;
-        return b;
-    }
-
-    fn same(s: []const u8) !void {
-        errdefer std.debug.print("differs on \"{f}\"\n", .{std.zig.fmtString(s)});
-        try expectEqual(c.nghttp2_check_header_name(s.ptr, s.len) != 0, fields.validName(s));
-        try expectEqual(c.nghttp2_check_header_value(s.ptr, s.len) != 0, fields.validValue(s));
-        try expectEqual(c.nghttp2_check_header_value_rfc9113(s.ptr, s.len) != 0, fields.validValueRfc9113(s));
-        try expectEqual(c.nghttp2_check_method(s.ptr, s.len) != 0, fields.validMethod(s));
-        try expectEqual(c.nghttp2_check_path(s.ptr, s.len) != 0, fields.validPath(s));
-        try expectEqual(c.nghttp2_check_authority(s.ptr, s.len) != 0, fields.validAuthority(s));
-    }
-};
-
 test "fuzz: h2 fields" {
     try fuzz.bytes(struct {
         fn check(input: []const u8) anyerror!void {
@@ -385,10 +361,6 @@ test "fuzz: h2 fields" {
                     if (name.len == 0) return error.EmptyNameOk;
                     if (!fields.validName(name)) return error.BadNameOk;
                     if (name[0] != ':' and !fields.validValue(value)) return error.BadValueOk;
-                }
-                if (build_options.use_http2) {
-                    try Ng.same(name);
-                    try Ng.same(value);
                 }
             }
             _ = r.end();

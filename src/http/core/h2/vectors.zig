@@ -23,24 +23,6 @@ const hpack = @import("hpack.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Temporary (recording commit): where to write the vectors, from the
-/// environment's H2_RECORD (an absolute directory; the tests run in
-/// .zig-cache).
-pub fn recordDir() ?[]const u8 {
-    return std.mem.span(std.c.getenv("H2_RECORD") orelse return null);
-}
-
-pub fn recording() bool {
-    return recordDir() != null;
-}
-
-pub fn recordFile(name: []const u8, data: []const u8) !void {
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ recordDir().?, name });
-    defer std.testing.allocator.free(path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = data });
-    std.debug.print("h2 vectors: wrote {s}: {d} bytes\n", .{ path, data.len });
-}
-
 pub const Error = error{ Truncated, BadMagic, OutOfMemory };
 
 pub const Reader = struct {
@@ -169,11 +151,12 @@ pub const Blob = struct {
         return .{ .len = @intCast(bytes.len), .crc = crc(bytes), .inline_bytes = if (keep) bytes else null };
     }
 
-    /// The bytes: the file's own, or `supplied` if they are the ones the
-    /// vector was recorded for.
+    /// The bytes: the file's own or `supplied`. If both exist they must be
+    /// equal, and either must be the ones the vector was recorded for.
     pub fn resolve(b: Blob, supplied: ?[]const u8) error{WrongInput}![]const u8 {
         const bytes = b.inline_bytes orelse supplied orelse return error.WrongInput;
         if (bytes.len != b.len or crc(bytes) != b.crc) return error.WrongInput;
+        if (b.inline_bytes != null) if (supplied) |x| if (!std.mem.eql(u8, bytes, x)) return error.WrongInput;
         return bytes;
     }
 
@@ -481,6 +464,9 @@ test "h2 vectors: reader and writer round-trip" {
     try testing.expectError(error.WrongInput, back[1].input.resolve("by reference!"));
     try testing.expectError(error.WrongInput, back[1].input.resolve("by referencd"));
     try testing.expectError(error.WrongInput, back[1].input.resolve(null));
+    // And a supplied input that is not the recorded inline one.
+    try testing.expectEqualStrings("hello", try back[0].input.resolve("hello"));
+    try testing.expectError(error.WrongInput, back[0].input.resolve("hellp"));
 }
 
 test "h2 vectors: hpack and encoder files round-trip" {

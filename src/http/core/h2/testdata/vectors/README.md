@@ -39,9 +39,13 @@ with the same rules and counts them, and an unexplained one fails.
 
 ## Re-recording
 
-Only possible with nghttp2 linked: the commit that added this directory
-("h2 tests: record nghttp2's outputs as golden vectors") is the last one in
-which `H2_RECORD=<absolute directory> core-test` rewrites these files (the
-test runs in `.zig-cache`; run the built binary directly if `zig build`
-does not pass the variable on). After that commit the vectors can only be
-extended by checking out that commit.
+Only possible with nghttp2 linked: commit 1012aa39 ("h2 tests: record
+nghttp2's outputs as golden vectors") is the last one in which the diff
+tests still ran live and `H2_RECORD=<absolute directory>` made them write
+these files (the test binary runs in `.zig-cache`, so the directory must be
+absolute; run the built `core-test` directly if `zig build` does not pass
+the variable on). The nghttp2 server session the sessions were run against
+(`Ng` there: no automatic WINDOW_UPDATE, credit given back as DATA arrives,
+the header-list limit in the header callback, 200 and "ok" for every
+request) and the generators of the blocks and sessions are in that commit
+too. To extend the vectors, check it out.

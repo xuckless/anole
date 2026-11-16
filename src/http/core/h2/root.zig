@@ -31,11 +31,9 @@ test {
     _ = @import("conn_client_test.zig");
     _ = @import("conn_limits_test.zig");
     _ = @import("vectors.zig");
-    // Against nghttp2's own inflater; compiled out with -Dhttp2=false.
-    if (@import("build_options").use_http2) {
-        _ = @import("hpack_diff_test.zig");
-        _ = @import("conn_diff_test.zig");
-        // `Server(Ctx)` has its HTTP/2 fields only then.
-        _ = @import("server_test.zig");
-    }
+    // Replays of what nghttp2 answered (testdata/vectors/README.md).
+    _ = @import("hpack_diff_test.zig");
+    _ = @import("conn_diff_test.zig");
+    // `Server(Ctx)` has its HTTP/2 fields only with -Dhttp2.
+    if (@import("build_options").use_http2) _ = @import("server_test.zig");
 }
