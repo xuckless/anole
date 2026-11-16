@@ -30,24 +30,13 @@ pub const RequestOptions = client.ClientConnection.RequestOptions;
 /// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
 pub const StreamError = client.StreamError;
 
-/// The translated nghttp2.h, for this file's tests.
-const c = @import("anole_nghttp2_c");
-
-/// The library under HTTP/2 in this build, as "nghttp2/1.70.0".
-/// `anole.h3.version()` has the same shape. nghttp2 is still linked (the
-/// test engines and differentials) until M6 removes it, and this with it.
+/// The HTTP/2 implementation in this build: Anole's own core (the codecs
+/// and `Conn` translate nghttp2 1.70.0's rules; nothing of nghttp2 is
+/// linked). `anole.h3.version()` has the same shape.
 pub fn version() []const u8 {
-    return "nghttp2/" ++ c.NGHTTP2_VERSION;
+    return "anole-h2";
 }
 
 test {
     _ = @import("client_test.zig");
-}
-
-test "nghttp2 version" {
-    const info = c.nghttp2_version(0);
-    try std.testing.expect(info != null);
-    // The library linked is the one the header describes.
-    try std.testing.expectEqualStrings(c.NGHTTP2_VERSION, std.mem.span(info.*.version_str));
-    try std.testing.expectEqualStrings("nghttp2/1.70.0", version());
 }

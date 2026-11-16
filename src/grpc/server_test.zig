@@ -1,10 +1,12 @@
 //! gRPC end to end: the four call modes, status in trailers, deadlines and
-//! gzip, against the core's HTTP/2 engine with a minimal nghttp2 client.
+//! gzip, against the core's HTTP/2 engine with a minimal client on the
+//! core's own client role.
 const std = @import("std");
 const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
-const c = @import("anole_nghttp2_c");
+const h2c = dusty.h2_core_for_tests;
+const tc = h2c.test_client;
 const pb = @import("anole_test_pb");
 const grpc = @import("root.zig");
 const frame = @import("frame.zig");
@@ -126,7 +128,8 @@ fn bidi(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest), out: *std.Io.Queue(
     }
 }
 
-/// One gRPC call over a fresh HTTP/2 connection.
+/// One gRPC call over a fresh HTTP/2 connection, on the core's client role
+/// (h2/test_client.zig); it is its own `Conn` handler.
 const Client = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -134,9 +137,12 @@ const Client = struct {
     writer: std.Io.net.Stream.Writer = undefined,
     read_buf: [16 * 1024]u8 = undefined,
     write_buf: [16 * 1024]u8 = undefined,
-    session: ?*c.nghttp2_session = null,
+    cn: CC = undefined,
+    scratch: []u8 = &.{},
+    rx: tc.Rx = .{},
     body: []const u8 = "",
-    sent: usize = 0,
+    /// `body` as the one part the core refers to until it is framed.
+    parts: [1][]const u8 = undefined,
     data: std.ArrayList(u8) = .empty,
     gpa: std.mem.Allocator,
     status: u16 = 0,
@@ -148,13 +154,15 @@ const Client = struct {
     late_header: bool = false,
     closed: bool = false,
 
-    fn call(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const c.nghttp2_nv) !*Client {
+    const CC = h2c.conn.Conn(.client, Client);
+
+    fn call(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const tc.Field) !*Client {
         return callCompressed(gpa, io, addr, path, messages, extra, .identity);
     }
 
     /// `call` with the request messages in `compression` (the caller sends
     /// the matching grpc-encoding in `extra`).
-    fn callCompressed(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const c.nghttp2_nv, compression: grpc.Compression) !*Client {
+    fn callCompressed(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const tc.Field, compression: grpc.Compression) !*Client {
         const self = try gpa.create(Client);
         self.* = .{ .io = io, .gpa = gpa, .stream = try addr.connect(io, .{ .mode = .stream }) };
         self.reader = self.stream.reader(io, &self.read_buf);
@@ -170,25 +178,20 @@ const Client = struct {
             try body.writer.writeAll(framed);
         }
         self.body = try gpa.dupe(u8, body.written());
+        self.parts = .{self.body};
 
-        var cbs: ?*c.nghttp2_session_callbacks = null;
-        _ = c.nghttp2_session_callbacks_new(&cbs);
-        defer c.nghttp2_session_callbacks_del(cbs);
-        c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
-        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
-        c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
-        _ = c.nghttp2_session_client_new(&self.session, cbs, self);
-        _ = c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0);
-        var nva: std.ArrayList(c.nghttp2_nv) = .empty;
-        defer nva.deinit(gpa);
-        try nva.appendSlice(gpa, &.{
+        self.scratch = try tc.scratch(gpa, tc.default_options);
+        try self.cn.initAt(gpa, self, tc.default_options);
+        var hdrs: std.ArrayList(tc.Field) = .empty;
+        defer hdrs.deinit(gpa);
+        try hdrs.appendSlice(gpa, &.{
             nv(":method", "POST"),                  nv(":path", path),
             nv(":scheme", "http"),                  nv(":authority", "localhost"),
             nv("content-type", "application/grpc"), nv("te", "trailers"),
         });
-        try nva.appendSlice(gpa, extra);
-        var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = self }, .read_callback = provide };
-        if (c.nghttp2_submit_request2(self.session, null, nva.items.ptr, nva.items.len, &provider, self) < 0) return error.Submit;
+        try hdrs.appendSlice(gpa, extra);
+        const s = try self.cn.submitRequest(hdrs.items, false, self);
+        try self.cn.submitData(s, &self.parts, true);
         // A hang fails with error.Timeout after the wait helper's deadline.
         const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = wait.deadline(), .clock = .awake } });
         try bound.run(exchange, .{self});
@@ -198,23 +201,19 @@ const Client = struct {
     /// Sends the request and reads until the stream closes.
     fn exchange(self: *Client) !void {
         while (!self.closed) {
-            while (true) {
-                var out: [*c]const u8 = undefined;
-                const n = c.nghttp2_session_mem_send2(self.session, &out);
-                if (n <= 0) break;
-                try self.writer.interface.writeAll(out[0..@intCast(n)]);
-            }
+            try tc.writePending(&self.cn, &self.writer.interface);
             try self.writer.interface.flush();
             if (self.closed) break;
             const bytes = try self.reader.interface.peekGreedy(1);
-            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
-            if (rv < 0) return error.Recv;
-            self.reader.interface.toss(@intCast(rv));
+            try self.rx.feed(self.gpa, &self.cn, bytes, self.scratch);
+            self.reader.interface.toss(bytes.len);
         }
     }
 
     fn deinit(self: *Client) void {
-        c.nghttp2_session_del(self.session);
+        self.cn.deinit();
+        self.rx.deinit(self.gpa);
+        self.gpa.free(self.scratch);
         self.stream.close(self.io);
         self.gpa.free(self.body);
         self.data.deinit(self.gpa);
@@ -236,14 +235,13 @@ const Client = struct {
         return self.grpc_message[0..self.grpc_message_len];
     }
 
-    fn nv(name: []const u8, value: []const u8) c.nghttp2_nv {
-        return .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
+    fn nv(name: []const u8, value: []const u8) tc.Field {
+        return tc.nv(name, value);
     }
 
-    fn onHeader(_: ?*c.nghttp2_session, _: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        const n = name[0..namelen];
-        const v = value[0..valuelen];
+    pub fn onHeadRefused(_: *Client, _: *h2c.conn.Stream) void {}
+
+    pub fn onField(self: *Client, _: *h2c.conn.Stream, n: []const u8, v: []const u8) h2c.conn.Error!void {
         if (std.mem.eql(u8, n, ":status")) self.status = std.fmt.parseInt(u16, v, 10) catch 0;
         if (std.mem.eql(u8, n, "grpc-status")) self.grpc_status = std.fmt.parseInt(u32, v, 10) catch null;
         if (std.mem.eql(u8, n, "grpc-message")) {
@@ -253,30 +251,24 @@ const Client = struct {
         if (std.mem.eql(u8, n, "x-echoed")) self.echoed_trailer = true;
         if (std.mem.eql(u8, n, "x-early")) self.early_header = true;
         if (std.mem.eql(u8, n, "x-late")) self.late_header = true;
-        return 0;
     }
 
-    fn onData(_: ?*c.nghttp2_session, _: u8, _: i32, data: [*c]const u8, len: usize, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
-        self.data.appendSlice(self.gpa, data[0..len]) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-        return 0;
+    pub fn onHeadersEnd(_: *Client, _: *h2c.conn.Stream, _: bool) h2c.conn.Error!void {}
+
+    pub fn onData(self: *Client, s: *h2c.conn.Stream, bytes: []const u8, _: bool) h2c.conn.Error!void {
+        self.data.appendSlice(self.gpa, bytes) catch @panic("OOM");
+        self.cn.consumed(s, bytes.len) catch @panic("OOM");
     }
 
-    fn onClose(_: ?*c.nghttp2_session, _: i32, _: u32, user: ?*anyopaque) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(user.?));
+    pub fn onStreamClose(self: *Client, _: *h2c.conn.Stream, _: h2c.conn.ErrorCode) void {
         self.closed = true;
-        return 0;
     }
 
-    fn provide(_: ?*c.nghttp2_session, _: i32, buf: [*c]u8, length: usize, flags: [*c]u32, source: [*c]c.nghttp2_data_source, _: ?*anyopaque) callconv(.c) c.nghttp2_ssize {
-        const self: *Client = @ptrCast(@alignCast(source.*.ptr.?));
-        const rest = self.body[self.sent..];
-        const n = @min(rest.len, length);
-        @memcpy(buf[0..n], rest[0..n]);
-        self.sent += n;
-        if (self.sent == self.body.len) flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
-        return @intCast(n);
-    }
+    pub fn onWindow(_: *Client, _: ?*h2c.conn.Stream) void {}
+
+    pub fn onGoaway(_: *Client, _: u31, _: h2c.conn.ErrorCode) void {}
+
+    pub fn onPingAck(_: *Client, _: [8]u8) void {}
 };
 
 /// A server on a fresh runtime for `body`: Echo (with `echo_options`),
@@ -384,7 +376,7 @@ test "gRPC on the new HTTP/2 engine: unary answered whole (no streaming body wri
     }.run);
 }
 
-test "gRPC: the four call modes and trailing metadata over h2 (raw nghttp2 client)" {
+test "gRPC: the four call modes and trailing metadata over h2 (raw core client)" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
             const gpa = env.gpa;

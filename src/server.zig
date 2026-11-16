@@ -147,7 +147,7 @@ const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
 /// The zio configuration Anole is built for. An executable declares it in
 /// its root file: `pub const zio_options = anole.zio_options;`. Pinned: a
 /// connection and everything it spawns stay on one OS thread, which the
-/// nghttp2 sessions, BoringSSL's error queue and zig-protobuf rely on.
+/// BoringSSL's error queue and zig-protobuf rely on.
 /// `fast_accept`: an accept loop takes the connections waiting in its
 /// backlog directly, and the accept and spawn budgets grow with the run
 /// queue, so new connections, parked ones waking and new HTTP/2 streams are

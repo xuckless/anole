@@ -12,7 +12,7 @@ these and nothing else.
    it; `skipRest()` then decodes the rest of the block for its table effects
    (RFC 9113 §4.3, §10.5.1: the block must be processed to keep the
    connection state). nghttp2's inflater has no limit; Anole's nghttp2
-   callback (`onHeader` in server/h2_nghttp2.zig) had the same rule. The diff
+   callback (`onHeader` in the old server/h2_nghttp2.zig) had the same rule. The diff
    harness accepts it only when nghttp2's list is over the limit, our fields
    are a prefix of nghttp2's, and the tables agree after the block.
 2. **The skip-mode cost cap.** While skipping, the literals (which copy their
@@ -96,7 +96,7 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    rest of the block is decoded for the table. Trailers past a limit reset
    the stream with INTERNAL_ERROR. nghttp2 has no field count or list limit
    of its own; today's engine resets the stream with INTERNAL_ERROR for the
-   list size (h2_nghttp2.zig `onHeader`) and answers 431 for the count from
+   list size (the old h2_nghttp2.zig `onHeader`) and answers 431 for the count from
    the request layer. The diff harness's nghttp2 callback has to apply the
    same limits.
 7. **A request past `max_concurrent_streams` is REFUSED_STREAM, also once our
@@ -187,7 +187,7 @@ side's answers would depend on when its writer ran.
    once its queue is empty): it answers no PING or SETTINGS
    (`nghttp2_session_on_ping_received`, `..._on_settings_received`), drops
    the last frame it pops, and the engine closes the connection
-   (server/h2_nghttp2.zig, when neither wants to read or write). Conn
+   (the old server/h2_nghttp2.zig, when neither wants to read or write). Conn
    leaves the close to the transport (M3) and goes on answering. The
    harness feeds nothing after the frame that leaves nghttp2 done (the
    engine reads no more), and accepts the batch when Conn sent no GOAWAY,
@@ -215,7 +215,7 @@ side's answers would depend on when its writer ran.
    grows is kept. conn_test.zig "a GOAWAY's last_stream_id of the peer's
    own parity is accepted"; the differential only sends 0.
 
-## The server engine (server.zig against server/h2_nghttp2.zig)
+## The server engine (server.zig against the nghttp2 engine it replaced)
 
 Not part of the differential tests: what the engine does differently from
 the nghttp2 engine it replaces.
@@ -279,13 +279,20 @@ the nghttp2 engine it replaces.
    engine's writer held one, so the cap still bounds the tasks that may
    run (a send-deadline waiter takes one more of its own); a parked
    connection holds no task and no slot. h2_test.zig's task-cap test runs
-   on both engines with the same count. Not wire behaviour.
+   on the engine with the same count the old one had. Not wire behaviour.
+8. **A peer that keeps sending past the refusal budget may lose the
+   GOAWAY(ENHANCE_YOUR_CALM) to a reset.** The server sends the GOAWAY, then
+   the lingering close reads and discards up to `linger_limit` (64 KiB) before
+   it hangs up. A flooding peer that has queued more than that (about 105 KiB
+   of refused heads) leaves unread input at the close, the kernel answers with
+   an RST, and the peer may throw away the GOAWAY unread. A peer that stops
+   at the GOAWAY, as the nghttp2 test client did, sees it. Not wire behaviour
+   RFC 9113 constrains; h2_test.zig's ENHANCE_YOUR_CALM test sends 44 refused
+   requests so that it stays under the limit.
 
-The nghttp2-only tests in server/h2_test.zig (`startWith(io, .nghttp2)` or
-`test_h2_engine = .nghttp2`) are those of that engine's internals: its
-`test_*` hooks (writer rounds and wakes, the body queue and its windows,
-`test_before_fill`/`flush`, `test_after_peer_end`) and its spare streams:
-on this engine their hooks never fire, so they would wait or measure
-nothing. The protocol behaviour under them (windows, drains, half-closes)
-is this engine's in server_test.zig, src/http/h2_park_test.zig and
-conn_test.zig. They go with h2_nghttp2.zig at M6.
+The nghttp2-only tests that measured that engine's internals (its `test_*`
+hooks: writer rounds and wakes, the body queue and its windows,
+`test_before_fill`/`flush`, `test_after_peer_end`, and its spare streams) went
+with the engine at M6. The protocol behaviour under them (windows, drains,
+half-closes) is this engine's in server_test.zig, src/http/h2_park_test.zig
+and conn_test.zig.

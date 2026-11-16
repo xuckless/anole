@@ -78,15 +78,6 @@
             .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
             .lazy = true,
         },
-        // -Dhttp2: nghttp2 1.70.0 from Anole's fork xuckless/nghttp2, branch
-        // `anole`: the v1.70.0 tag plus its generated nghttp2ver.h and a patch
-        // that answers frames on closed streams, PRIORITY errors and stream
-        // window overflow as RFC 9113 says (h2spec 146/146).
-        .nghttp2 = .{
-            .url = "https://github.com/xuckless/nghttp2/archive/0f8bc1c4271f4380409071eade31830e6e436bd6.tar.gz",
-            .hash = "N-V-__8AAP98WQBOcqCV-jYjCmw19Aw3aCtmPAMilcMGfLOK",
-            .lazy = true,
-        },
         // -Dtls=boringssl: google/boringssl at 22a0079b, the commit ngtcp2 1.25.0
         // is tested against, built by build/boringssl.zig.
         .boringssl = .{

@@ -1549,6 +1549,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return p.parts.ptr == parts.ptr;
         }
 
+        /// Bytes of `s`'s queued DATA not framed yet: what the peer's
+        /// windows have held back (tests: test_client.zig `Source.framed`).
+        pub fn unframed(c: *const Self, s: *const Stream) u64 {
+            _ = c;
+            var n: u64 = 0;
+            var it = s.pending.first;
+            while (it) |node| : (it = node.next) n += @as(*const Pending, @fieldParentPtr("node", node)).left;
+            return n;
+        }
+
         /// Trailers, by reference, sent with END_STREAM once the queued
         /// DATA has gone (now, if none is queued).
         pub fn submitTrailers(c: *Self, s: *Stream, hdrs: []const hpack.Field) SubmitError!void {

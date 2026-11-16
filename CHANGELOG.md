@@ -14,6 +14,19 @@ breaking changes are listed anyway.
   that is unchanged, but Debug builds now panic when two tasks allocate
   from it at once, where the old arena hid it.
 
+### Removed
+
+- **nghttp2** (HTTP/2 takeover, M6): the HTTP/2 server and client run on
+  Anole's own protocol core, and `-Dhttp2` pulls in no C code (the fork,
+  its build file, the `nghttp2` entry in build.zig.zon and the sfparse
+  duplicate check are gone). The rules still come from nghttp2 1.70.0,
+  translated to Zig (LICENSE.nghttp2 and THIRD_PARTY_NOTICES stay).
+  `anole.h2.version()` now returns "anole-h2" instead of "nghttp2/1.70.0".
+  The tests that ran against a live nghttp2 now replay what it answered
+  (src/http/core/h2/testdata/vectors) and use Anole's own HTTP/2 client
+  where they needed a peer. The test-only `test_h2_engine` switch went with
+  the old engine; no user-facing option disappears.
+
 ### Fixed
 
 - WebSocket permessage-deflate over HTTP/2 and HTTP/3 keeps its buffers out

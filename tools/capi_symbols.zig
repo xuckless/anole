@@ -4,7 +4,7 @@
 //!       Every defined global symbol of a relocatable object whose name does
 //!       not start with `anole_` becomes hidden (ELF STV_HIDDEN, Mach-O
 //!       private extern): the linker of a shared library or a Node/Python
-//!       extension never exports it, so libanole's BoringSSL, nghttp2, zstd
+//!       extension never exports it, so libanole's BoringSSL, nghttp3, zstd
 //!       or zlib never bind to (or interpose on) the copies a host process
 //!       carries. They stay global inside one link, so two static libraries
 //!       defining the same name still clash there; hiding is what the

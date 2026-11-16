@@ -1,6 +1,6 @@
 //! The HTTP/2 server engine on Anole's own protocol core (conn.zig;
 //! research/h2h3-takeover/PLAN.md §3.3-§3.5, M3), in place of the nghttp2
-//! engine (src/http/core/server/h2_nghttp2.zig, kept for tests until M6).
+//! engine (removed at M6).
 //! A connection runs as
 //!
 //!   * the reader (the connection's own task, which entered `serve`): reads,

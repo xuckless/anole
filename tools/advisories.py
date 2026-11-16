@@ -16,11 +16,12 @@ import sys
 import urllib.request
 
 # name: (advisory repo, version, pattern that must match the pin in
-# build.zig.zon). nghttp2 comes from the xuckless fork: v1.70.0 plus the
-# RFC 9113 strictness patch; ngtcp2 too: v1.25.0 plus its patches (pinned
+# build.zig.zon). nghttp2 is not here any more (removed at M6; the HTTP/2
+# codecs and core are Anole's own, translated from 1.70.0): its advisories
+# are still worth reading for logic bugs the translation could share.
+# ngtcp2 comes from the xuckless fork: v1.25.0 plus its patches (pinned
 # by git URL); nghttp3 too: v1.18.0 plus nghttp3_conn_add_extra_setting.
 VERSIONED = {
-    "nghttp2": ("nghttp2/nghttp2", "1.70.0", r"xuckless/nghttp2/archive/0f8bc1c4271f4380409071eade31830e6e436bd6"),
     "ngtcp2": ("ngtcp2/ngtcp2", "1.25.0", r"xuckless/ngtcp2#b70d6d98d90be1af793af704bdf66b97df8dd7f1"),
     "nghttp3": ("ngtcp2/nghttp3", "1.18.0", r"xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d"),
     "zlib-ng": ("zlib-ng/zlib-ng", "2.3.3", r"zlib-ng/archive/refs/tags/2\.3\.3\.tar"),
