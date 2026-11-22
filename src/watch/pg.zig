@@ -55,7 +55,7 @@ const Transport = struct {
     }
 
     pub fn stop(l: *Conn) void {
-        l.stop() catch {};
+        l.interrupt();
     }
 
     pub fn close(l: *Conn, gpa: Allocator) void {

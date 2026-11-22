@@ -369,7 +369,10 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   generic, merged into `anole`): a call that skips the statement cache
   takes one round trip after its first run (Parse with the cached types,
   Bind, Describe, Execute and Sync in one write, as pgx's
-  `QueryExecModeCacheDescribe`; the fork's `tests/run.sh` covers it). The first four are
+  `QueryExecModeCacheDescribe`; the fork's `tests/run.sh` covers it).
+  `Listener.interrupt`: shutdown without Terminate, so the watch hub can
+  stop a connection another task is writing to (#221); `deinit` sends
+  Terminate only after no interrupt or stop. The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig
@@ -378,7 +381,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   run the fork's `tests/run.sh` (a throwaway postgres:17, on std's
   Threaded Io and on zio, with and without TLS), re-pin, and run Anole's
   `tests/postgres/run.sh` (plain and verify-full TLS). After a merge, check
-  that `src/listener.zig` still has the four non-blocking calls: `src/pg`
+  that `src/listener.zig` still has `interrupt` and the four non-blocking calls: `src/pg`
   and `src/watch/pg.zig` call them, and `zig build test
   -Dpostgres-test-url=... -Dtest-filter="watch live"` runs the LISTEN
   hub against a live server (a killed backend, two channels on one

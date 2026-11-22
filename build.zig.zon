@@ -195,9 +195,8 @@
         // may run again), and a describe cache for calls that skip the
         // statement cache (describe_cache_size, #132).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#06ccba16b9f5fea10e735f2ad78dd93e641694cd",
-            .hash = "pg-0.0.0-Wp_7gYHzCQDpK_fIvPmBk04P2kdjEekmW-Pk1TpQqMM9",
-            .lazy = true,
+            // WIP pin (#221): the lead replaces it with the pushed fork commit + hash.
+            .path = "../pg-b1",
         },
         // Tests only, fetched only when Anole is the root build: the BSON
         // corpus (source/bson-corpus/tests) of mongodb/specifications. The
