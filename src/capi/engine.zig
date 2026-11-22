@@ -235,6 +235,162 @@ pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, v
 
 const Reply = enum { respond, fail, abort, fd, ws_accept, sse_accept };
 
+/// What the capi task does with an in-flight slot (`finish`): the consumer's
+/// answer came off the done list, the slot's deadline passed (the sweepers),
+/// or `destroy` abandons the consumer (`abandonAll`).
+pub const Event = enum { answered, deadline, abandon };
+
+/// Who ends an in-flight request slot (`Slot.owner`; not `Detached.owner`,
+/// which is the detached response's abort callback). Executor-local: set and
+/// read on the request's executor only, so the moves are plain stores; the
+/// word (`SlotState`) stays the only cross-thread state of the slot.
+///
+/// Moves (all here, each asserting where it comes from):
+///   `of`        set-up: `task`, or `detached` when the response detached
+///   `take`      detached -> task (the capi task or the attached task now
+///               writes the answer, or the sweeper ends it)
+///   `orphaned`  detached -> orphan (`detachedAborted` met a consumer call)
+///   `timeout`   task -> timed_out (the sweeper, at the deadline)
+///   `abandon`   task | timed_out | abandoned -> abandoned (`destroy`)
+///   release     any -> task (`Exec.release`)
+///
+/// `finish` is the owner x event table; every cell is decided there, and a
+/// new owner or event is a new row or column here and an arm there.
+/// `answered` meets the word `done` or `streaming`; `deadline` and `abandon`
+/// meet `queued` or `out` (other words are looked at again later, whoever
+/// owns the slot). A cell that ends the request first moves the word to
+/// `expired`; when that CAS loses (the consumer is in a call), nothing
+/// changes and the sweeper or the next round tries again.
+///
+/// | owner     | answered               | deadline                    | abandon                       |
+/// |-----------|------------------------|-----------------------------|-------------------------------|
+/// | task      | wake the task          | unlink, timeout, wake       | unlink, abandon, stop (*)     |
+/// | timed_out | wake the task          | unreachable: unlinked       | as task: 503, no abort        |
+/// | abandoned | wake the task          | unreachable: unlinked       | nothing (already told)        |
+/// | detached  | finishDetached (kind)  | endDetached: 504, ABORT     | endDetached: 503, nothing     |
+/// |           |                        | DEADLINE when `out`         | posted                        |
+/// | orphan    | ABORT CLIENT when      | expired, ABORT CLIENT when  | expired, release, nothing     |
+/// |           | `streaming`, release   | `out`, release (**)         | posted                        |
+///
+/// (*) stop: wake the task (a request), or end the call UNAVAILABLE
+/// (`grpc.stop`). (**) gRPC calls are swept by `grpc.sweep`, which only
+/// unwatches an orphan at its deadline. A `streaming` slot under `destroy`
+/// is cut whoever owns it (`abandonAll`), except an orphaned gRPC call,
+/// whose call memory went with its stream; a gRPC call's task is told once
+/// (task | timed_out -> abandoned).
+pub const Owner = union(enum) {
+    /// A task waits for the answer (HTTP/1.1), or writes it (a detached
+    /// answer after `take`).
+    task,
+    /// The sweeper told the waiting task: the deadline passed.
+    timed_out,
+    /// `destroy` told the waiting task: the server is stopping (answered
+    /// 503, the consumer hears nothing more).
+    abandoned,
+    /// HTTP/2, HTTP/3: no task waits; the capi task finishes it.
+    detached: *Detached,
+    /// The detached request went away while a consumer call held the slot:
+    /// its request memory is gone; the capi task (or the sweeper) frees the
+    /// slot once it can.
+    orphan,
+
+    pub fn of(d: ?*Detached) Owner {
+        return if (d) |p| .{ .detached = p } else .task;
+    }
+
+    pub fn take(o: *Owner) *Detached {
+        const d = o.detached;
+        o.* = .task;
+        return d;
+    }
+
+    pub fn orphaned(o: *Owner) void {
+        std.debug.assert(o.* == .detached);
+        o.* = .orphan;
+    }
+
+    pub fn timeout(o: *Owner) void {
+        std.debug.assert(o.* == .task);
+        o.* = .timed_out;
+    }
+
+    pub fn abandon(o: *Owner) void {
+        std.debug.assert(o.* == .task or o.* == .timed_out or o.* == .abandoned);
+        o.* = .abandoned;
+    }
+
+    /// The waiting task is told to stop (it answers 504, or 503 when
+    /// abandoned).
+    pub fn over(o: Owner) bool {
+        return o == .timed_out or o == .abandoned;
+    }
+};
+
+test "capi engine: Owner transitions" {
+    // SAFETY: only its address is used.
+    var d: Detached = undefined;
+    const Tag = std.meta.Tag(Owner);
+    const Move = enum { take, orphaned, timeout, abandon };
+    const rows = [_]struct { name: []const u8, from: Owner, move: Move, to: Tag }{
+        .{ .name = "detached, taken", .from = .of(&d), .move = .take, .to = .task },
+        .{ .name = "detached, orphaned", .from = .of(&d), .move = .orphaned, .to = .orphan },
+        .{ .name = "task, timed out", .from = .of(null), .move = .timeout, .to = .timed_out },
+        .{ .name = "task, abandoned", .from = .task, .move = .abandon, .to = .abandoned },
+        .{ .name = "timed out, abandoned", .from = .timed_out, .move = .abandon, .to = .abandoned },
+        .{ .name = "abandoned, abandoned again", .from = .abandoned, .move = .abandon, .to = .abandoned },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        var o = r.from;
+        switch (r.move) {
+            .take => try std.testing.expectEqual(&d, o.take()),
+            .orphaned => o.orphaned(),
+            .timeout => o.timeout(),
+            .abandon => o.abandon(),
+        }
+        try std.testing.expectEqual(r.to, std.meta.activeTag(o));
+    }
+    try std.testing.expectEqual(Tag.task, std.meta.activeTag(Owner.of(null)));
+    try std.testing.expectEqual(Tag.detached, std.meta.activeTag(Owner.of(&d)));
+    // The waiting task's verdict: only the sweeper's and destroy's.
+    const over = [_]struct { Owner, bool }{ .{ .task, false }, .{ .timed_out, true }, .{ .abandoned, true }, .{ .of(&d), false }, .{ .orphan, false } };
+    for (over) |row| try std.testing.expectEqual(row[1], row[0].over());
+}
+
+pub inline fn isGrpc(s: *const Slot) bool {
+    return features.grpc and s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call);
+}
+
+/// A slot's state crosses threads only through four atomics; everything
+/// else is the executor's, or the consumer's while the word says so.
+///
+/// `word` (`SlotState`, generation + state): the executor fills a slot and
+/// stores `queued` (release). The consumer moves it by CAS: `queued` ->
+/// `polling` (`poll`, acquire, while it copies the head) -> `out`; `out` ->
+/// `polling` (`requestTrace`'s pin, `claimOut`, seq_cst) -> `out`; `out` ->
+/// `responding` (an answer call, `claimOut`) -> `done` | `streaming`
+/// (`handBack`, release) or back to `out` (a failed or partial answer).
+/// The executor ends `queued` | `out` by CAS to `expired` (acq_rel) and
+/// stores `free` (release) in `release`. `polling` and `responding` are
+/// short windows on a consumer thread: the executor spins them out
+/// (`detachedAborted`) or looks again shortly (`waitForAnswer`, sweeps).
+///
+/// `gone` (Dekker with `polling`): `detachedAborted` stores true (seq_cst)
+/// and then loads `word` (seq_cst), spinning while it is `polling`;
+/// `requestTrace` CASes `out` -> `polling` (seq_cst) and then loads `gone`
+/// (seq_cst). Either the executor sees the pin and waits it out, or the pin
+/// sees `gone` and reads nothing of `req`. Reset by `release` (monotonic,
+/// before the word's `free` release store).
+///
+/// `drained`: `handBack` stores false (monotonic, before the word's release
+/// store) as the slot goes onto the done list; the capi task stores true
+/// (release) once it took the slot off. `waitForAnswer` and `grpc.wait`,
+/// woken some other way just as the answer came, spin on it (acquire)
+/// before they release the slot. Set true at set-up.
+///
+/// `answered`: `handBack` stores true (release, before the word);
+/// `Exec.release` loads it (acquire) to tell `db.endTied` whether to cut the
+/// queries tied to the request, and resets it (monotonic).
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// What its handles are (`Handle.Kind`): a request, or a gRPC call.
@@ -301,22 +457,12 @@ pub const Slot = struct {
     /// thread's call on it and orphaned the slot): `requestTrace` must not
     /// read `req` any more, though the slot may be `out` again once that
     /// call hands it back. Set by the executor, read by a consumer under
-    /// its pin, both `.seq_cst` (a Dekker handshake with the word: either
-    /// the executor sees the pin and waits it out, or the pin sees this).
-    /// Reset with `orphan` when the slot is released.
+    /// its pin, both `.seq_cst` (the handshake block above `Slot`).
+    /// Reset when the slot is released.
     gone: std.atomic.Value(bool) = .init(false),
 
     // Executor-local from here.
-    /// The request's response is detached (HTTP/2, HTTP/3): no task waits.
-    detached: ?*Detached = null,
-    /// The detached request went away while the consumer was in a call on
-    /// it: the capi task (or the sweeper) frees the slot once it can.
-    orphan: bool = false,
-    /// The sweeper's verdict for a waiting task.
-    timed_out: bool = false,
-    /// `destroy` on a server not drained: this request is answered 503 and
-    /// the consumer hears nothing more.
-    abandoned: bool = false,
+    owner: Owner = .task,
     /// The request body failed (too large, cut short): the answer.
     body_error: ?http.Status = null,
     deadline: i96 = 0,
@@ -578,7 +724,6 @@ pub const Exec = struct {
         const s = &x.slots[i];
         s.deadline = deadline;
         s.list = list;
-        s.timed_out = false;
         s.linked = true;
         s.next = no_slot;
         const l = &x.lists[list];
@@ -630,10 +775,8 @@ pub const Exec = struct {
             s.trailer_bytes.clearAndFree(gpa);
             s.trailers.clearAndFree(gpa);
         }
-        s.detached = null;
-        s.orphan = false;
+        s.owner = .task;
         s.gone.store(false, .monotonic);
-        s.abandoned = false;
         s.body_error = null;
         s.claims = "";
         s.ws_upgrade = false;
@@ -641,7 +784,7 @@ pub const Exec = struct {
         s.ws_slot = no_slot;
         s.subprotocol_off = 0;
         s.subprotocol_len = 0;
-        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
+        if (isGrpc(s)) grpc.onRelease(x, i);
         s.kind.store(@backingInt(Handle.Kind.request), .monotonic);
         _ = x.engine.inflight.fetchSub(1, .monotonic);
         // 0 is skipped so that no handle is ever 0.
@@ -2527,7 +2670,7 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
         @atomicStore(usize, &s.route_ptr, @intFromPtr(path.ptr), .monotonic);
         @atomicStore(usize, &s.route_len, path.len, .monotonic);
     }
-    s.detached = d;
+    s.owner = .of(d);
     s.body = "";
     s.ws_upgrade = up != null and !up.?.sse;
     s.sse_subscribe = up != null and up.?.sse;
@@ -2568,10 +2711,11 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        // `destroy` (`abandonAll` may have marked the slot already): the
-        // consumer will never make room.
-        const stopping = s.abandoned or e.abandon.load(.acquire);
-        if (stopping or s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
+        // `destroy` (`abandonAll` may have marked the slot already, which
+        // it does only once `abandon` is set): the consumer will never
+        // make room.
+        const stopping = e.abandon.load(.acquire);
+        if (stopping or s.owner.over() or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
             x.unlink(si);
             x.release(si);
             if (stopping) {
@@ -2634,21 +2778,21 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
                 continue;
             },
             .queued, .out => {
-                if (canceled or s.timed_out or s.body_error != null) {
+                if (canceled or s.owner.over() or s.body_error != null) {
                     // Why it is over, for the consumer that saw it.
                     var reason: u16 = abi.ABORT_BODY;
                     var status: u16 = if (s.body_error) |b| @intCast(@backingInt(b)) else 0;
                     if (canceled) {
                         reason = e.clientReason();
                         status = 0;
-                    } else if (s.timed_out) {
+                    } else if (s.owner.over()) {
                         reason = abi.ABORT_DEADLINE;
                         status = 504;
                     }
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
                         // The consumer saw it: it hears that it is over
                         // (not when the server is going away under it).
-                        if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
+                        if (stateOf(w) == .out and s.owner != .abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
                     }
                     continue;
@@ -2667,7 +2811,7 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
     switch (outcome) {
         .expired => {
             const body_error = s.body_error;
-            const abandoned = s.abandoned;
+            const abandoned = s.owner == .abandoned;
             x.release(si);
             if (abandoned and !canceled) {
                 res.fail(.service_unavailable, "the server is stopping");
@@ -3006,7 +3150,6 @@ pub fn detachedAborted(ctx: *anyopaque) void {
     const e = global.?;
     const x = execOfSlot(e, s);
     const si: u32 = @intCast(s - x.slots.ptr);
-    s.detached = null;
     _ = e.aborted_count.fetchAdd(1, .monotonic);
     while (true) {
         const w = s.word.load(.acquire);
@@ -3030,7 +3173,7 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             // memory went, and a pin taken before this saw it is waited
             // out (never a freed pointer).
             .responding, .done, .streaming => {
-                s.orphan = true;
+                s.owner.orphaned();
                 s.gone.store(true, .seq_cst);
                 while (true) {
                     const now_w = s.word.load(.seq_cst);
@@ -3057,7 +3200,8 @@ fn execOfSlot(e: *Engine, s: *Slot) *Exec {
 /// one (a stream, a file).
 fn finishDetached(x: *Exec, si: u32) void {
     const s = &x.slots[si];
-    const d = s.detached.?;
+    // Kept `detached` while the task starts: `attachedTask` takes it.
+    const d = s.owner.detached;
     const w = s.word.load(.acquire);
     const gen = genOf(w);
     x.unlink(si);
@@ -3072,7 +3216,7 @@ fn finishDetached(x: *Exec, si: u32) void {
         };
         return;
     }
-    s.detached = null;
+    _ = s.owner.take();
     const result = applyAnswer(x, si, d.request, d.response);
     // `finish` lets the request's memory go, which a streamed request body
     // may still be read from: the reads end first.
@@ -3084,8 +3228,7 @@ fn finishDetached(x: *Exec, si: u32) void {
 /// A detached answer that needs a task: a streamed body or a file.
 fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
     const s = &x.slots[si];
-    const d = s.detached.?;
-    s.detached = null;
+    const d = s.owner.take();
     d.enter();
     const result: anyerror!void = if (stateOf(s.word.load(.acquire)) == .streaming)
         streamAnswer(x, si, gen, d.request, d.response)
@@ -3097,15 +3240,9 @@ fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
 }
 
-/// A detached request past its deadline: 504 now. The consumer, if it saw
-/// it, hears it is over.
-fn expireDetached(x: *Exec, si: u32, w: u64) void {
-    endDetached(x, si, w, false);
-}
-
-/// A detached request ended by the sweeper: 504 at its deadline, or 503
-/// when the server is being destroyed (`abandon`: the consumer hears
-/// nothing more).
+/// A detached request ended by the sweeper: 504 at its deadline (the
+/// consumer, if it saw it, hears it is over), or 503 when the server is
+/// being destroyed (`abandon`: the consumer hears nothing more).
 fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
@@ -3114,16 +3251,59 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
         if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, 504);
         _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     }
-    if (s.detached) |d| {
-        s.detached = null;
-        x.closePipe(&s.in, gen, si);
-        if (abandoning)
-            d.response.fail(.service_unavailable, "the server is stopping")
-        else
-            d.response.fail(.gateway_timeout, "the application did not answer in time");
-        d.finish({});
-    }
+    const d = s.owner.take();
+    x.closePipe(&s.in, gen, si);
+    if (abandoning)
+        d.response.fail(.service_unavailable, "the server is stopping")
+    else
+        d.response.fail(.gateway_timeout, "the application did not answer in time");
+    d.finish({});
     x.release(si);
+}
+
+/// The capi task's move for slot `si` (its word `w`) at `ev`, by owner: the
+/// table above `Owner`, one arm per cell. Inline with a comptime event, so
+/// each caller is one switch on the owner's tag.
+pub inline fn finish(x: *Exec, si: u32, w: u64, comptime ev: Event) void {
+    const s = &x.slots[si];
+    const io = x.engine.io;
+    switch (s.owner) {
+        .task, .timed_out => switch (ev) {
+            .answered => s.event.set(io),
+            // A timed-out task was unlinked: the sweeper never meets it.
+            .deadline => {
+                x.unlink(si);
+                s.owner.timeout();
+                s.event.set(io);
+            },
+            .abandon => {
+                x.unlink(si);
+                s.owner.abandon();
+                if (isGrpc(s)) grpc.stop(x, s) else s.event.set(io);
+            },
+        },
+        .abandoned => switch (ev) {
+            .answered => s.event.set(io),
+            .deadline => unreachable, // unlinked when abandoned
+            .abandon => {},
+        },
+        .detached => switch (ev) {
+            .answered => if (isGrpc(s)) grpc.finishDetached(x, si) else finishDetached(x, si),
+            .deadline, .abandon => if (isGrpc(s)) grpc.endDetached(x, si, w, ev == .abandon) else endDetached(x, si, w, ev == .abandon),
+        },
+        .orphan => {
+            const gen = genOf(w);
+            // `answered` meets `done` or `streaming`: the executor's already.
+            if (ev != .answered) if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
+            const tell = switch (ev) {
+                .answered => stateOf(w) == .streaming,
+                .deadline => stateOf(w) == .out,
+                .abandon => false,
+            };
+            if (tell) x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);
+            x.release(si);
+        },
+    }
 }
 
 /// Run by the capi task while `abandon` is set (`destroy` on a server not
@@ -3135,25 +3315,21 @@ fn abandonAll(x: *Exec) void {
     for (x.slots, 0..) |*s, i| {
         const si: u32 = @intCast(i);
         const w = s.word.load(.acquire);
-        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
-            grpc.abandon(x, si, w);
-            continue;
-        };
         switch (stateOf(w)) {
-            .queued, .out => {
-                if (s.orphan) {
-                    if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
-                    x.release(si);
-                } else if (s.detached != null) {
-                    endDetached(x, si, w, true);
-                } else if (!s.abandoned) {
-                    x.unlink(si);
-                    s.abandoned = true;
-                    s.timed_out = true;
-                    s.event.set(io);
-                }
-            },
-            .streaming => {
+            .queued, .out => finish(x, si, w, .abandon),
+            // A stream is cut whoever owns it. A call's task is told once
+            // (`stop` rewrites the call's status); one still held by its
+            // Detached is told each round until its task takes it; an
+            // orphaned call's memory went with its stream (its done-list
+            // entry releases it).
+            .streaming => if (isGrpc(s)) switch (s.owner) {
+                .task, .timed_out => {
+                    s.owner.abandon();
+                    grpc.stop(x, s);
+                },
+                .detached => grpc.stop(x, s),
+                .abandoned, .orphan => {},
+            } else {
                 s.out.acquire();
                 s.out.failed = true;
                 s.out.exec_waiting = false;
@@ -3192,17 +3368,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
             const s = &x.slots[si];
             rev = s.next_done;
             s.drained.store(true, .release);
-            if (s.orphan) {
-                const w = s.word.load(.acquire);
-                if (stateOf(w) == .streaming) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
-                x.release(si);
-            } else if (s.detached != null) {
-                if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
-                    grpc.finishDetached(x, si);
-                    continue;
-                };
-                finishDetached(x, si);
-            } else s.event.set(io);
+            finish(x, si, s.word.load(.acquire), .answered);
         }
         // Commands.
         var cmds = x.inbox.swap(null, .acquire);
@@ -3228,19 +3394,9 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                 if (s.deadline > now) break;
                 const w = s.word.load(.acquire);
                 switch (stateOf(w)) {
-                    .queued, .out => {
-                        if (s.orphan) {
-                            if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
-                            if (stateOf(w) == .out) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
-                            x.release(si);
-                        } else if (s.detached != null) {
-                            expireDetached(x, si, w);
-                        } else {
-                            x.unlink(si);
-                            s.timed_out = true;
-                            s.event.set(io);
-                        }
-                    },
+                    // Each move unlinks it, or (a lost CAS) leaves it for
+                    // the next look.
+                    .queued, .out => finish(x, si, w, .deadline),
                     // The consumer is in a call on it: look again shortly.
                     else => {
                         until = @min(until, now + std.time.ns_per_ms);

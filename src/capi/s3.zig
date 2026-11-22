@@ -1463,7 +1463,7 @@ const BodyReader = struct {
             // Orphaned: the stream went while a consumer call held the
             // slot, and with it what the pipe held (executor-local, read
             // on the executor).
-            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and !s.orphan;
+            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and s.owner != .orphan;
             if (!mine or s.in.failed) {
                 s.in.release();
                 self.failed = true;

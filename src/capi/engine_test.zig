@@ -145,6 +145,7 @@ const routes =
     \\  {"method": "GET", "path": "/hold", "handler": 5},
     \\  {"method": "GET", "path": "/borrow", "handler": 6},
     \\  {"method": "GET", "path": "/short", "handler": 5, "timeout_ms": 100},
+    \\  {"method": "GET", "path": "/orphan", "handler": 5, "timeout_ms": 500},
     \\  {"method": "GET", "path": "/abort", "handler": 8},
     \\  {"method": "POST", "path": "/late", "handler": 7}
     \\]
@@ -411,11 +412,98 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             try std.testing.expectError(error.Gone, engine.respond(c.a.e, held, 200, &.{}, "", false));
             try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), c.a.last_abort_reason.load(.acquire));
         }
+
+        /// A request on `path` the client resets while a consumer answer
+        /// call holds it: the engine orphans it (its memory goes), and the
+        /// call fails and hands it back to `out`. Null when the route's
+        /// deadline ended it before the call could claim it (a slow
+        /// runner): there is nothing to orphan.
+        fn orphan(c: Ctx, path: []const u8) !?u64 {
+            c.a.held.store(0, .release);
+            const s = try open(c.conn, "GET", path, null);
+            defer s.release();
+            const held = try wait.waitNonZero(c.io, "the consumer holds the request", &c.a.held);
+            const aborted = c.a.e.aborted_count.load(.monotonic);
+            var hold: engine.TestPin = .{};
+            engine.test_answer_hold = &hold;
+            defer engine.test_answer_hold = null;
+            var fa: FailedAccept = .{ .e = c.a.e, .req = held, .hold = &hold };
+            const t = try std.Thread.spawn(.{}, FailedAccept.run, .{&fa});
+            var joined = false;
+            defer if (!joined) {
+                hold.release.store(true, .release);
+                t.join();
+            };
+            try wait.waitUntil(c.io, "the answer call holds the request, or failed", &fa, FailedAccept.heldOrDone);
+            if (!hold.held.load(.acquire)) {
+                t.join();
+                joined = true;
+                try std.testing.expectEqual(@as(?anyerror, error.Gone), fa.result);
+                return null;
+            }
+            s.cancel();
+            try wait.waitAtLeast(c.io, "the engine lets the reset request go", &c.a.e.aborted_count, aborted + 1);
+            hold.release.store(true, .release);
+            t.join();
+            joined = true;
+            try std.testing.expectEqual(@as(?anyerror, error.State), fa.result);
+            return held;
+        }
+
+        /// An orphan past its deadline (the sweeper, `out`): the consumer
+        /// hears ABORT CLIENT once, the handle is GONE, and it is not
+        /// counted as expired.
+        fn orphanDeadline(c: Ctx) !void {
+            const aborts = c.a.aborts.load(.acquire);
+            const expired = c.a.e.stats().expired;
+            const held = try orphan(c, "/orphan") orelse return;
+            try wait.waitEqual(c.io, "the consumer heard the orphan's ABORT", &c.a.last_abort, held);
+            try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), c.a.last_abort_reason.load(.acquire));
+            try std.testing.expectEqual(aborts + 1, c.a.aborts.load(.acquire));
+            try std.testing.expectError(error.Gone, engine.respond(c.a.e, held, 200, &.{}, "", false));
+            try std.testing.expectEqual(expired, c.a.e.stats().expired);
+        }
+
+        /// `destroy`'s first step on an orphan (`abandon`, the capi tasks'
+        /// `abandonAll`): released, the handle is GONE, the consumer hears
+        /// nothing.
+        fn orphanAbandon(c: Ctx) !void {
+            const e = c.a.e;
+            const aborts = c.a.aborts.load(.acquire);
+            const held = try orphan(c, "/hold") orelse return error.TestUnexpectedResult;
+            e.abandon.store(true, .release);
+            for (e.execs) |*x| x.setEvent(&x.kick);
+            try wait.waitEqual(c.io, "the orphaned request is released", &e.inflight, 0);
+            try std.testing.expectError(error.Gone, engine.respond(e, held, 200, &.{}, "", false));
+            try std.testing.expectEqual(aborts, c.a.aborts.load(.acquire));
+        }
     };
 }
 
 const H2 = Harness(.h2);
 const H3 = Harness(.h3);
+
+/// `engine.sseAccept` on a plain request, on a thread of its own: it claims
+/// the request (where `test_answer_hold` holds it in `responding`), then
+/// fails (`error.State`) and hands the slot back to `out`.
+const FailedAccept = struct {
+    e: *engine.Engine,
+    req: u64,
+    hold: *engine.TestPin,
+    result: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(fa: *FailedAccept) void {
+        _ = engine.sseAccept(fa.e, fa.req, &.{}, &.{}, 0) catch |err| {
+            fa.result = err;
+        };
+        fa.done.store(true, .release);
+    }
+
+    fn heldOrDone(fa: *FailedAccept) bool {
+        return fa.hold.held.load(.acquire) or fa.done.load(.acquire);
+    }
+};
 
 test "capi engine over HTTP/2: 24 concurrent requests on one connection are answered from the consumer thread, detached" {
     if (comptime !features.http2) return error.SkipZigTest;
@@ -507,6 +595,16 @@ test "capi engine over HTTP/2: a client reset is ABORT CLIENT and the handle is 
 test "capi engine over HTTP/3: a client reset is ABORT CLIENT and the handle is GONE" {
     if (comptime !features.http3) return error.SkipZigTest;
     try H3.run(H3.clientReset);
+}
+
+test "capi engine over HTTP/2: an orphaned request past its deadline is ABORT CLIENT and released" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try H2.run(H2.orphanDeadline);
+}
+
+test "capi engine over HTTP/2: destroy releases an orphaned request and the consumer hears nothing" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try H2.run(H2.orphanAbandon);
 }
 
 test "capi engine: made-up handles are refused, never followed, and so is a file range past the file's end" {

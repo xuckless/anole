@@ -567,7 +567,7 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     s.flags = 0;
     s.remote_len = engine.remoteText(r, &s.remote);
     s.claims = engine.claimsOf(r);
-    s.detached = d;
+    s.owner = .of(d);
     s.body = "";
     s.borrowed = null;
     s.event.reset();
@@ -711,7 +711,7 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
                         } else reason = e.clientReason();
                     } else status = @intCast(@backingInt(call.status));
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
-                        if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
+                        if (stateOf(w) == .out and s.owner != .abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
                     }
                     continue;
@@ -1021,7 +1021,8 @@ fn streamGone(x: *Exec, si: u32, gen: u32) void {
 /// A detached call answered (from the capi task's done list).
 pub fn finishDetached(x: *Exec, si: u32) void {
     const s = &x.slots[si];
-    const d = s.detached.?;
+    // Kept `detached` while the task starts: `attachedTask` takes it.
+    const d = s.owner.detached;
     const w = s.word.load(.acquire);
     const gen = genOf(w);
     const call = s.grpc.call;
@@ -1035,7 +1036,7 @@ pub fn finishDetached(x: *Exec, si: u32) void {
         return;
     }
     heapRemove(x, si);
-    s.detached = null;
+    _ = s.owner.take();
     const result = answerWhole(call, s);
     d.finish(result);
     x.release(si);
@@ -1043,8 +1044,7 @@ pub fn finishDetached(x: *Exec, si: u32) void {
 
 fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
     const s = &x.slots[si];
-    const d = s.detached.?;
-    s.detached = null;
+    const d = s.owner.take();
     d.enter();
     const result = stream(x, si, gen, s.grpc.call);
     heapRemove(x, si);
@@ -1063,12 +1063,13 @@ pub fn sweep(x: *Exec, now: i96) ?i96 {
         if (s.grpc.deadline.? > now) return s.grpc.deadline.?;
         const w = s.word.load(.acquire);
         switch (stateOf(w)) {
-            .queued, .out => {
-                if (s.orphan) {
-                    heapRemove(x, si);
-                    continue;
-                }
-                expire(x, si, w);
+            .queued, .out => switch (s.owner) {
+                .detached => endDetached(x, si, w, false),
+                // Only unwatched (the engine's sweeper expires its own).
+                .orphan => heapRemove(x, si),
+                // Only detached calls are in the heap, and a call taken
+                // from its Detached is `streaming`.
+                .task, .timed_out, .abandoned => unreachable,
             },
             .streaming => {
                 // The task writing it ends it.
@@ -1084,14 +1085,10 @@ pub fn sweep(x: *Exec, now: i96) ?i96 {
     return null;
 }
 
-fn expire(x: *Exec, si: u32, w: u64) void {
-    endDetached(x, si, w, false);
-}
-
 /// A detached call ended by the sweeper: DEADLINE_EXCEEDED at its deadline
 /// (the consumer hears ABORT), or UNAVAILABLE when the server is being
 /// destroyed (it hears nothing more).
-fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
+pub fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
@@ -1101,49 +1098,26 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     }
     heapRemove(x, si);
     const call = s.grpc.call;
-    if (s.detached) |d| {
-        s.detached = null;
-        var buf: std.ArrayList(u8) = .empty;
-        call.impl.buffer = &buf;
-        const result = if (abandoning)
-            serving.finish(call, call.fail(.unavailable, "the server is stopping"))
-        else
-            serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
-        call.impl.buffer = null;
-        d.finish(result);
-    }
+    const d = s.owner.take();
+    var buf: std.ArrayList(u8) = .empty;
+    call.impl.buffer = &buf;
+    const result = if (abandoning)
+        serving.finish(call, call.fail(.unavailable, "the server is stopping"))
+    else
+        serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
+    call.impl.buffer = null;
+    d.finish(result);
     x.release(si);
 }
 
-/// `destroy` on a server not drained: this call is ended with UNAVAILABLE
-/// (from the capi task); the consumer hears nothing more.
-pub fn abandon(x: *Exec, si: u32, w: u64) void {
-    const s = &x.slots[si];
-    switch (stateOf(w)) {
-        .queued, .out => {
-            if (s.orphan) {
-                if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) return;
-                heapRemove(x, si);
-                x.release(si);
-            } else if (s.detached != null) {
-                endDetached(x, si, w, true);
-            } else if (!s.abandoned) {
-                s.abandoned = true;
-                s.grpc.call.status = .unavailable;
-                s.grpc.call.status_message = "the server is stopping";
-                s.grpc.read_error = error.GrpcStatus;
-                x.setEvent(&s.event);
-            }
-        },
-        .streaming => if (!s.abandoned) {
-            s.abandoned = true;
-            s.grpc.call.status = .unavailable;
-            s.grpc.call.status_message = "the server is stopping";
-            s.grpc.read_error = error.GrpcStatus;
-            x.setEvent(&s.event);
-        },
-        else => {},
-    }
+/// `destroy` on a server not drained: a call a task serves is ended with
+/// UNAVAILABLE (from the capi task: `engine.finish` and `abandonAll`); the
+/// consumer hears nothing more.
+pub fn stop(x: *Exec, s: *Slot) void {
+    s.grpc.call.status = .unavailable;
+    s.grpc.call.status_message = "the server is stopping";
+    s.grpc.read_error = error.GrpcStatus;
+    x.setEvent(&s.event);
 }
 
 // ---------------------------------------------------------------------------
