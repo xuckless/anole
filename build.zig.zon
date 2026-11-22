@@ -193,10 +193,11 @@
         // slice of tagged unions and text results (the C ABI), and the
         // bytes the socket accepted (Conn.bytesSent: when a failed call
         // may run again), and a describe cache for calls that skip the
-        // statement cache (describe_cache_size, #132).
+        // statement cache (describe_cache_size, #132), and Listener.interrupt
+        // (a shutdown without Terminate, #221).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#06ccba16b9f5fea10e735f2ad78dd93e641694cd",
-            .hash = "pg-0.0.0-Wp_7gYHzCQDpK_fIvPmBk04P2kdjEekmW-Pk1TpQqMM9",
+            .url = "git+https://github.com/xuckless/pg.zig#8595bef48e6f1335bc0fa04398cbd5e617664bec",
+            .hash = "pg-0.0.0-Wp_7gSsACgD9yH_V-eB0cODS88Qk7TFA3IsebNxAdESg",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

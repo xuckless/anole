@@ -4,12 +4,14 @@
 # routes, run inline), many streams at once, a drain that lets a download in
 # flight finish, Retry, resumption and 0-RTT, WebTransport and WebSocket
 # over HTTP/3. Then
-# anole.h3's client against aioquic's server.
-#   tests/h3/run.sh [path-to-h3-test-server] [path-to-h3-test-client]
+# anole.h3's client against aioquic's server, and hq-interop (HTTP/0.9)
+# against aioquic's H0 ALPN.
+#   tests/h3/run.sh [path-to-h3-test-server] [path-to-h3-test-client] [path-to-h3-interop-server]
 # Needs python3; aioquic is installed into a throwaway venv.
 set -eu
 server=${1:-zig-out/bin/h3-test-server}
 client=${2:-zig-out/bin/h3-test-client}
+interop=${3:-zig-out/bin/h3-interop-server}
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/../lib/wait.sh"
 work=$(mktemp -d)
@@ -161,8 +163,41 @@ for host in $hosts; do
 done
 kill -9 $pid
 pid=""
-# anole.h3's client against aioquic's server.
 "$client" cert "$work"
+# hq-interop (HTTP/0.9 over QUIC): the interop server's files, on raw QUIC
+# streams, all on one connection.
+hqport=$((port + 1))
+mkdir "$work/www"
+head -c 100 /dev/urandom >"$work/www/small"
+head -c 1048576 /dev/urandom >"$work/www/big"
+: >"$work/www/empty"
+sum() { python3 -I -c "import sys; d=open(sys.argv[1],'rb').read(); print('bytes', len(d), 'sum', sum(d) & 0xffffffff)" "$1"; }
+"$interop" "$work/cert.pem" "$work/key.pem" "$work/www" $hqport >"$work/hq.log" 2>&1 &
+pid=$!
+wait_until 30 "the interop server to start" log_has "$work/hq.log" "interop server on port" || fail "hq: the interop server did not start"
+big5000=$(python3 -I -c "print('A' * 5000)")
+out=$("$work/venv/bin/python" -I "$here/hq_client.py" 127.0.0.1 $hqport 'GET /small\r\n' 'GET /big\r\n' 'GET /empty\r\n' \
+  'GET /nope\r\n' 'POST /small\r\n' 'GET /../small\r\n' 'GET /small' "nofin:$big5000" 'GET /small\r\n') || fail "hq client: $out"
+want="$(sum "$work/www/small")
+$(sum "$work/www/big")
+bytes 0 sum 0
+bytes 0 sum 0
+bytes 0 sum 0
+bytes 0 sum 0
+$(sum "$work/www/small")
+reset
+$(sum "$work/www/small")"
+[ "$out" = "$want" ] || fail "hq-interop: got
+$out
+want
+$want"
+kill -TERM $pid
+stopped "hq: server still running after a TERM"
+grep -qiE "leaked|panic" "$work/hq.log" && fail "leak or panic in the hq-interop server log"
+pid=""
+echo "PASS hq-interop: small, 1 MiB, empty, refused paths, FIN-ended line, oversize line, 9 streams on one connection"
+
+# anole.h3's client against aioquic's server.
 "$work/venv/bin/python" -I "$here/peer_server.py" $port "$work/cert.pem" "$work/key.pem" >"$work/peer.log" 2>&1 &
 peer=$!
 ca="$work/cert.pem"

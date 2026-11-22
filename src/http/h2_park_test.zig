@@ -351,19 +351,19 @@ fn parkAndResume(secure: bool) !void {
     var c: Client = undefined;
     try c.open(f.io, f.addr(), secure, .{});
     defer c.close();
-    const parks = engine.test_parks.load(.acquire);
+    const parks = engine.probe.at(.parks).load(.acquire);
     try std.testing.expectEqual(200, try c.status("/"));
     try f.waitParked(1);
-    try wait.waitAtLeast(f.io, "the engine parked it", &engine.test_parks, parks + 1);
+    try wait.waitAtLeast(f.io, "the engine parked it", engine.probe.at(.parks), parks + 1);
     // Parked idle: no task, no read buffer, not in flight for the drain.
-    try std.testing.expectEqual(0, engine.test_read_buffers.load(.acquire));
+    try std.testing.expectEqual(0, engine.probe.at(.read_buffers).load(.acquire));
     try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
     // The next request wakes it, on the same connection.
     try std.testing.expectEqual(200, try c.status("/"));
     try f.waitParked(1);
     try std.testing.expectEqual(204, try c.status("/empty"));
     try f.waitParked(1);
-    try std.testing.expect(engine.test_parks.load(.acquire) >= parks + 3);
+    try std.testing.expect(engine.probe.at(.parks).load(.acquire) >= parks + 3);
 }
 
 test "h2 lifecycle: an idle connection parks and resumes on the next request" {
@@ -392,7 +392,7 @@ test "h2 lifecycle: many idle connections release their buffers" {
     try f.waitParked(n);
     // No read buffer held, no count in flight: what a parked connection
     // keeps is its heap state (the protocol core with its HPACK tables).
-    try std.testing.expectEqual(0, engine.test_read_buffers.load(.acquire));
+    try std.testing.expectEqual(0, engine.probe.at(.read_buffers).load(.acquire));
     try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
     for (clients) |*c| try std.testing.expectEqual(200, try c.status("/"));
     try f.waitParked(n);
@@ -419,10 +419,10 @@ test "h2 lifecycle: a partial frame keeps the connection on its task until the f
     const id = c.next_id;
     c.next_id += 2;
     _ = frame.writeHeader(&h, .{ .length = @intCast(len), .type = .headers, .flags = F.end_headers | F.end_stream, .stream_id = id });
-    const refused = engine.test_park_refused_partial.load(.acquire);
+    const refused = engine.probe.at(.park_refused_partial).load(.acquire);
     try c.writer().writeAll(h[0..5]);
     try c.flush();
-    try wait.waitAtLeast(f.io, "a wait kept on the task for the partial frame", &engine.test_park_refused_partial, refused + 1);
+    try wait.waitAtLeast(f.io, "a wait kept on the task for the partial frame", engine.probe.at(.park_refused_partial), refused + 1);
     try std.testing.expectEqual(0, f.server.parkedConnections());
     try c.writer().writeAll(h[5..]);
     try c.writer().writeAll(block[0..len]);
@@ -443,14 +443,14 @@ fn keepAlive(idle_park: ?std.Io.Duration) !void {
     var c: Client = undefined;
     try c.open(f.io, f.addr(), false, .{});
     defer c.close();
-    const closes = engine.test_keepalive_closes.load(.acquire);
+    const closes = engine.probe.at(.keepalive_closes).load(.acquire);
     try std.testing.expectEqual(200, try c.status("/"));
     if (idle_park != null) try f.waitParked(1);
     c.untilClosed();
     if (idle_park == null) {
         // Closed by its own task: a GOAWAY(NO_ERROR) first.
         try std.testing.expectEqual(1, c.goaway_count);
-        try std.testing.expect(engine.test_keepalive_closes.load(.acquire) > closes);
+        try std.testing.expect(engine.probe.at(.keepalive_closes).load(.acquire) > closes);
     }
     try f.waitClosed();
 }
@@ -476,10 +476,10 @@ test "h2 lifecycle: a peer that stops reading is cut at timeouts.write" {
     // Windows wide open: only the socket holds the server back.
     try c.open(f.io, f.addr(), false, .{ .initial_window = std.math.maxInt(u31), .conn_window_raise = std.math.maxInt(u31) - 65535 });
     defer c.close();
-    const timeouts = engine.test_write_timeouts.load(.acquire);
+    const timeouts = engine.probe.at(.write_timeouts).load(.acquire);
     _ = try c.get("/big");
     // Never read again.
-    try wait.waitAtLeast(f.io, "the write cut at timeouts.write", &engine.test_write_timeouts, timeouts + 1);
+    try wait.waitAtLeast(f.io, "the write cut at timeouts.write", engine.probe.at(.write_timeouts), timeouts + 1);
     try f.waitClosed();
 }
 
@@ -496,12 +496,12 @@ test "h2 lifecycle: a finished response the peer never takes is reset at its sen
     // A stream window of zero: the head may go, never the body.
     try c.open(f.io, f.addr(), false, .{ .initial_window = 0 });
     defer c.close();
-    const resets = engine.test_send_resets.load(.acquire);
+    const resets = engine.probe.at(.send_resets).load(.acquire);
     const id = try c.get("/whole");
     const rs = try c.until(id);
     try std.testing.expectEqual(200, rs.status);
     try std.testing.expectEqual(@backingInt(frame.ErrorCode.cancel), rs.rst.?);
-    try std.testing.expect(engine.test_send_resets.load(.acquire) > resets);
+    try std.testing.expect(engine.probe.at(.send_resets).load(.acquire) > resets);
     // Only that stream: the connection serves on.
     try std.testing.expectEqual(204, try c.status("/empty"));
 }
@@ -542,6 +542,12 @@ fn drainInFlight(secure: bool, answer_pings: bool) !void {
     try std.testing.expectEqual(200, rs.status);
     try std.testing.expectEqual("held but whole".len, rs.body_len);
     c.untilClosed();
+    // The stream's count and the drain's are both given back.
+    try wait.waitUntil(f.io, "the server's in-flight count is back to 0", &f, struct {
+        fn zero(fx: *Fixture) bool {
+            return fx.server.busy.load(.acquire).count == 0;
+        }
+    }.zero);
 }
 
 test "h2 lifecycle: the drain sends the notice GOAWAY and a PING, then the final GOAWAY, and the stream in flight finishes" {
@@ -572,14 +578,14 @@ test "h2 lifecycle: the drain's close lets the peer's late frames in, and it rea
     const entered = held_entered.load(.acquire);
     const id = try c.get("/held");
     try wait.waitAtLeast(f.io, "the held request's handler runs", &held_entered, entered + 1);
-    const shuts = engine.test_send_shuts.load(.acquire);
+    const shuts = engine.probe.at(.send_shuts).load(.acquire);
     var stopper = try f.io.concurrent(Fixture.stopper, .{&f});
     defer stopper.await(f.io);
     while (c.goaway_count < 2) try c.readOne();
     held_gate.set(f.io);
     // Either close path counts: the flusher's `shutDrained`, or the
     // reader's `.drained` and then the lingering close.
-    try wait.waitAtLeast(f.io, "the drained connection's send side shut", &engine.test_send_shuts, shuts + 1);
+    try wait.waitAtLeast(f.io, "the drained connection's send side shut", engine.probe.at(.send_shuts), shuts + 1);
     // The peer still talks after the server's last frame (credit, a PING),
     // as a client reading a large response does: the server reads and
     // drops it rather than answer it with a reset.
@@ -604,14 +610,14 @@ test "h2 lifecycle: keepalive closes a connection with a TLS record half read" {
     var c: Client = undefined;
     try c.open(f.io, f.addr(), true, .{});
     defer c.close();
-    const closes = engine.test_keepalive_closes.load(.acquire);
+    const closes = engine.probe.at(.keepalive_closes).load(.acquire);
     try std.testing.expectEqual(200, try c.status("/"));
     // One byte of the next record's header, then silence: the connection
     // can't park with a record half read, and each park delay wakes it
     // for nothing; the keep-alive runs from when it went idle all the same.
     try c.tcp_writer.interface.writeAll(&.{0x17});
     try c.tcp_writer.interface.flush();
-    try wait.waitAtLeast(f.io, "the connection closed at its keep-alive", &engine.test_keepalive_closes, closes + 1);
+    try wait.waitAtLeast(f.io, "the connection closed at its keep-alive", engine.probe.at(.keepalive_closes), closes + 1);
     c.untilClosed();
     try f.waitClosed();
 }

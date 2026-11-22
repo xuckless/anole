@@ -233,6 +233,76 @@ pub const Rebind = enum {
 /// request (concurrent ones share the connection, and several tasks may
 /// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
+    /// The connection's life. It changes only by `next`, in
+    /// `onHandshakeCompleted`, `onH3Shutdown` (and `testGoaway`) and
+    /// `closeLocked`; every cell is decided, `-` keeps the state:
+    ///
+    ///     state \ event     | handshake_done | goaway  | shut   | handshake_timeout
+    ///     ------------------|----------------|---------|--------|------------------
+    ///     handshaking       | open           | closing | closed | handshake_timeout
+    ///     open              | -              | closing | closed | closed
+    ///     closing           | -              | -       | closed | closed
+    ///     closed            | -              | -       | -      | -
+    ///     handshake_timeout | -              | -       | -      | -
+    ///
+    /// `closing`: the server's GOAWAY came, no new requests; those sent
+    /// finish. A GOAWAY cannot come in `handshaking` (ngtcp2 holds 1-RTT
+    /// data until the handshake callback); only `testGoaway` reaches that
+    /// cell. `closed` and `handshake_timeout` are the two ends, apart
+    /// because `waitHandshake` answers them differently; an end is final,
+    /// so a later `shut` keeps the timeout. A timeout after the handshake
+    /// (ngtcp2 reports none) is a plain close. Add behaviour as a state or
+    /// a cell here, not as a flag beside it.
+    const State = enum {
+        handshaking,
+        open,
+        closing,
+        closed,
+        handshake_timeout,
+
+        /// The table above, state by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(State, std.EnumArray(StateEvent, State)).init(.{
+            .handshaking = .init(.{ .handshake_done = .open, .goaway = .closing, .shut = .closed, .handshake_timeout = .handshake_timeout }),
+            .open = .init(.{ .handshake_done = .open, .goaway = .closing, .shut = .closed, .handshake_timeout = .closed }),
+            .closing = .init(.{ .handshake_done = .closing, .goaway = .closing, .shut = .closed, .handshake_timeout = .closed }),
+            .closed = .init(.{ .handshake_done = .closed, .goaway = .closed, .shut = .closed, .handshake_timeout = .closed }),
+            .handshake_timeout = .init(.{ .handshake_done = .handshake_timeout, .goaway = .handshake_timeout, .shut = .handshake_timeout, .handshake_timeout = .handshake_timeout }),
+        });
+
+        /// What each state allows, one row per state.
+        ///   accepting:   new requests may go out (`isOpen`, `request`, the
+        ///                425 resend).
+        ///   established: past the handshake and not ended.
+        ///   ended:       over: no QUIC calls, no stream close to wait for.
+        const Traits = struct { accepting: bool, established: bool, ended: bool };
+        const traits = std.EnumArray(State, Traits).init(.{
+            .handshaking = .{ .accepting = true, .established = false, .ended = false },
+            .open = .{ .accepting = true, .established = true, .ended = false },
+            .closing = .{ .accepting = false, .established = true, .ended = false },
+            .closed = .{ .accepting = false, .established = false, .ended = true },
+            .handshake_timeout = .{ .accepting = false, .established = false, .ended = true },
+        });
+
+        fn next(state: State, event: StateEvent) State {
+            return table.get(state).get(event);
+        }
+
+        fn accepting(state: State) bool {
+            return traits.get(state).accepting;
+        }
+
+        fn established(state: State) bool {
+            return traits.get(state).established;
+        }
+
+        fn ended(state: State) bool {
+            return traits.get(state).ended;
+        }
+    };
+
+    const StateEvent = enum { handshake_done, goaway, shut, handshake_timeout };
+
     gpa: std.mem.Allocator,
     io: std.Io,
     udp: Udp,
@@ -255,13 +325,9 @@ pub const ClientConnection = struct {
     /// unacknowledged.
     blocks: bridge.BlockPool,
     budget: bridge.Budget,
-    state: enum { handshaking, open, closed } = .handshaking,
-    /// ngtcp2 ended the handshake for taking too long.
-    handshake_timed_out: bool = false,
+    state: State = .handshaking,
     /// The default for `RequestOptions.timeout`.
     timeout: std.Io.Timeout,
-    /// The server sent GOAWAY, or `close` began: no new requests.
-    closing: bool = false,
     /// The stream ID of the server's GOAWAY: requests at or above it were
     /// not processed (`Stream.unprocessed`).
     goaway_id: i64 = std.math.maxInt(i64),
@@ -504,7 +570,7 @@ pub const ClientConnection = struct {
         };
         const socket = try any.bind(self.io, .{ .mode = .dgram, .protocol = .udp });
         self.lock();
-        if (self.state == .closed or self.rebind_to != null) {
+        if (self.state.ended() or self.rebind_to != null) {
             self.unlock();
             socket.close(self.io);
             return error.ConnectionClosed;
@@ -519,7 +585,7 @@ pub const ClientConnection = struct {
             self.lock();
             const pending = self.rebind_to != null;
             const err = self.rebind_error;
-            const closed = self.state == .closed;
+            const closed = self.state.ended();
             self.unlock();
             if (!pending) return if (err) |e| e else {};
             if (closed) return error.ConnectionClosed;
@@ -562,7 +628,7 @@ pub const ClientConnection = struct {
         placement.concurrent(&self.readers, io, .local, readerLoop, .{ self, udp }) catch {
             self.lock();
             self.rebind_error = error.ConcurrencyUnavailable;
-            self.closeLocked();
+            self.closeLocked(.shut);
             self.unlock();
         };
         self.lock();
@@ -592,9 +658,9 @@ pub const ClientConnection = struct {
             const state = self.state;
             self.unlock();
             switch (state) {
-                .open => return,
+                .open, .closing => return,
+                .handshake_timeout => return error.Timeout,
                 .closed => {
-                    if (self.handshake_timed_out) return error.Timeout;
                     log.debug("HTTP/3 handshake failed: {s}", .{c.ngtcp2_strerror(@intCast(self.last_error.error_code))});
                     return error.HandshakeFailed;
                 },
@@ -614,10 +680,9 @@ pub const ClientConnection = struct {
         const io = self.io;
         self.settle();
         self.lock();
-        self.closing = true;
-        if (self.state != .closed) {
+        if (!self.state.ended()) {
             c.ngtcp2_ccerr_set_application_error(&self.last_error, h.NGHTTP3_H3_NO_ERROR, null, 0);
-            self.fail();
+            self.fail(.shut);
         }
         self.unlock();
         // The driver first: it may be starting a reader (`rebind`).
@@ -651,13 +716,13 @@ pub const ClientConnection = struct {
     fn settle(self: *ClientConnection) void {
         const io = self.io;
         self.lock();
-        const pto: u64 = if (self.state == .open) c.ngtcp2_conn_get_pto2(self.q) else 0;
+        const pto: u64 = if (self.state.established()) c.ngtcp2_conn_get_pto2(self.q) else 0;
         self.unlock();
         const deadline = now(io) + @min(@max(3 * pto, 100 * std.time.ns_per_ms), std.time.ns_per_s);
         while (true) {
             const gen = self.gen.epoch();
             self.lock();
-            const waiting = self.state == .open and self.lingering();
+            const waiting = self.state.established() and self.lingering();
             self.unlock();
             if (!waiting) return;
             const t = now(io);
@@ -674,7 +739,7 @@ pub const ClientConnection = struct {
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
             const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
-            if (stream.lingering and !stream.protocol_done) return true;
+            if (stream.lingering and stream.holders.contains(.quic)) return true;
         }
         return false;
     }
@@ -697,7 +762,7 @@ pub const ClientConnection = struct {
     pub fn isOpen(self: *ClientConnection) bool {
         self.lock();
         defer self.unlock();
-        return !self.closing and self.state != .closed;
+        return self.state.accepting();
     }
 
     fn kick(self: *ClientConnection) void {
@@ -710,7 +775,7 @@ pub const ClientConnection = struct {
         comptime std.debug.assert(builtin.is_test);
         self.lock();
         defer self.unlock();
-        self.closing = true;
+        self.state = self.state.next(.goaway);
         self.kick();
     }
 
@@ -740,11 +805,11 @@ pub const ClientConnection = struct {
     /// call outlives the idle timeout and a download whose port a NAT
     /// rebinding moved is heard from the new address. Locked.
     fn updateKeepAlive(self: *ClientConnection) void {
-        if (self.state == .closed) {
+        if (self.state.ended()) {
             self.keep_alive_on = false;
             return;
         }
-        const want = self.keep_alive != 0 and self.live.first != null and self.state == .open;
+        const want = self.keep_alive != 0 and self.live.first != null and self.state.established();
         if (want == self.keep_alive_on) return;
         self.keep_alive_on = want;
         var interval: u64 = std.math.maxInt(u64);
@@ -797,7 +862,7 @@ pub const ClientConnection = struct {
             const gen = self.gen.epoch();
             self.lock();
             const settings = self.peer_settings;
-            const closed = self.state == .closed;
+            const closed = self.state.ended();
             self.unlock();
             if (settings) |got| return got;
             if (closed) return error.ConnectionClosed;
@@ -918,7 +983,7 @@ pub const ClientConnection = struct {
         while (true) {
             const gen = self.gen.epoch();
             self.lock();
-            if (self.closing or self.state == .closed) {
+            if (!self.state.accepting()) {
                 self.unlock();
                 return error.ConnectionClosed;
             }
@@ -957,7 +1022,7 @@ pub const ClientConnection = struct {
                 return error.Unexpected;
             }
             stream.id = id;
-            stream.submitted = true;
+            stream.send = stream.send.next(if (options.body) .submit_body else .submit_bodyless);
             if (early) stream.sentEarly(kept.?, !options.body and !hasEarlyDataField(headers));
             self.unlock();
             break;
@@ -998,7 +1063,7 @@ pub const ClientConnection = struct {
                 .blocked => {
                     s.resent();
                     s.endEarly(error.StreamReset);
-                    s.protocol_done = true;
+                    s.holders.remove(.quic);
                 },
             }
         }
@@ -1043,20 +1108,20 @@ pub const ClientConnection = struct {
     /// (`Stream.tooEarly`). Locked, once the handshake is done.
     fn resendOne(self: *ClientConnection, hc: *h.nghttp3_conn, s: *Stream, head: []h.nghttp3_nv) Resend {
         // Released or canceled meanwhile: nothing to send again.
-        if (s.user_done or s.cause != null) {
+        if (!s.holders.contains(.user) or s.cause != null) {
             s.resent();
             s.endEarly(error.Canceled);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
             return .ended;
         }
         // The server's GOAWAY (or our `close`) came first: a new stream
         // would be refused, and the request never ran there, so it ends
         // as one the server did not process (`unprocessed`).
-        if (self.closing) {
+        if (!self.state.accepting()) {
             s.unsent();
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
             return .ended;
         }
@@ -1066,7 +1131,7 @@ pub const ClientConnection = struct {
         if (rv != 0) {
             s.resent();
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             return .ended;
         }
         // The new ID from here on, whatever the submit does: the old one
@@ -1097,7 +1162,7 @@ pub const ClientConnection = struct {
                 else => {
                     log.debug("HTTP/3 client receive: {t}", .{err});
                     self.lock();
-                    self.closeLocked();
+                    self.closeLocked(.shut);
                     self.unlock();
                     return;
                 },
@@ -1109,7 +1174,7 @@ pub const ClientConnection = struct {
     fn onPacket(self: *ClientConnection, from: std.Io.net.IpAddress, ecn: u8, data: []u8) void {
         self.lock();
         defer self.unlock();
-        if (self.state == .closed) return;
+        if (self.state.ended()) return;
         var remote: Addr = .from(from);
         var p: c.ngtcp2_path = .{ .local = self.local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
         const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
@@ -1118,16 +1183,16 @@ pub const ClientConnection = struct {
             log.debug("HTTP/3 client read_pkt: {s}", .{c.ngtcp2_strerror(rv)});
             switch (rv) {
                 // The server closed, or there is nothing left to say.
-                c.NGTCP2_ERR_DRAINING, c.NGTCP2_ERR_DROP_CONN => self.closeLocked(),
+                c.NGTCP2_ERR_DRAINING, c.NGTCP2_ERR_DROP_CONN => self.closeLocked(.shut),
                 c.NGTCP2_ERR_CRYPTO => {
                     if (self.last_error.error_code == 0)
                         c.ngtcp2_ccerr_set_tls_alert(&self.last_error, c.ngtcp2_conn_get_tls_alert2(self.q), null, 0);
-                    self.fail();
+                    self.fail(.shut);
                 },
                 else => {
                     if (self.last_error.error_code == 0)
                         c.ngtcp2_ccerr_set_liberr(&self.last_error, rv, null, 0);
-                    self.fail();
+                    self.fail(.shut);
                 },
             }
         }
@@ -1143,20 +1208,19 @@ pub const ClientConnection = struct {
             self.switchSocket();
             self.flush();
             self.lock();
-            if (self.state == .closed) {
+            if (self.state.ended()) {
                 self.unlock();
                 return;
             }
             // Requests answered 425; before `now`, which must follow it.
-            if (self.resend_due > 0 and self.state == .open) self.resendDue();
+            if (self.resend_due > 0 and self.state.established()) self.resendDue();
             const t = now(io);
             const deadline = c.ngtcp2_conn_get_expiry2(self.q);
             if (deadline <= t) {
                 const rv = c.ngtcp2_conn_handle_expiry(self.q, t);
                 if (rv != 0) {
-                    if (rv == c.NGTCP2_ERR_HANDSHAKE_TIMEOUT) self.handshake_timed_out = true;
                     c.ngtcp2_ccerr_set_liberr(&self.last_error, rv, null, 0);
-                    self.fail();
+                    self.fail(if (rv == c.NGTCP2_ERR_HANDSHAKE_TIMEOUT) .handshake_timeout else .shut);
                 }
                 self.unlock();
                 continue;
@@ -1174,7 +1238,7 @@ pub const ClientConnection = struct {
     fn flush(self: *ClientConnection) void {
         while (true) {
             self.lock();
-            if (self.state == .closed) {
+            if (self.state.ended()) {
                 self.unlock();
                 return;
             }
@@ -1189,7 +1253,7 @@ pub const ClientConnection = struct {
             if (n < 0) {
                 if (self.last_error.error_code == 0)
                     c.ngtcp2_ccerr_set_liberr(&self.last_error, @intCast(n), null, 0);
-                self.fail();
+                self.fail(.shut);
                 self.unlock();
                 return;
             }
@@ -1202,10 +1266,11 @@ pub const ClientConnection = struct {
     }
 
     /// The connection failed or ends: one CONNECTION_CLOSE (a client keeps
-    /// no closing period), or nothing for an idle timeout. Locked.
-    fn fail(self: *ClientConnection) void {
-        if (self.state == .closed) return;
-        defer self.closeLocked();
+    /// no closing period), or nothing for an idle timeout. `event` says
+    /// how it ends (`State`). Locked.
+    fn fail(self: *ClientConnection, event: StateEvent) void {
+        if (self.state.ended()) return;
+        defer self.closeLocked(event);
         if (self.last_error.type == c.NGTCP2_CCERR_TYPE_IDLE_CLOSE) return;
         if (c.ngtcp2_conn_in_draining_period2(self.q) != 0) return;
         var ps: c.ngtcp2_path_storage = undefined;
@@ -1218,10 +1283,10 @@ pub const ClientConnection = struct {
         }
     }
 
-    /// Every stream sees the connection gone. Locked.
-    fn closeLocked(self: *ClientConnection) void {
-        self.state = .closed;
-        self.closing = true;
+    /// Every stream sees the connection gone; `event` (`.shut`, or
+    /// `.handshake_timeout`) ends the state. Locked.
+    fn closeLocked(self: *ClientConnection, event: StateEvent) void {
+        self.state = self.state.next(event);
         if (self.wt) |w| w.connectionClosed();
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
@@ -1306,7 +1371,7 @@ pub const ClientConnection = struct {
     fn onHandshakeCompleted(_: ?*c.ngtcp2_conn, user_data: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.state == .handshaking) {
-            self.state = .open;
+            self.state = self.state.next(.handshake_done);
             self.updateKeepAlive();
         }
         // BoringSSL says so as soon as the server's answer arrives (and
@@ -1419,7 +1484,7 @@ pub const ClientConnection = struct {
     fn onRecvStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
-        if (streamOfUser(sud)) |s| s.send_stopped = true;
+        if (streamOfUser(sud)) |s| s.send = s.send.next(.stop);
         // A writer waiting for room in the stream's queue goes on, and fails.
         self.kick();
         return 0;
@@ -1458,7 +1523,7 @@ pub const ClientConnection = struct {
         if (streamOfUser(sud)) |s| {
             if (s.reset_code == null and flags & c.NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0) s.reset_code = rx_code;
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
         }
         self.kick();
@@ -1502,7 +1567,7 @@ pub const ClientConnection = struct {
             bridge.consume(self.q, stream_id, len);
             return 0;
         };
-        if (s.user_done) {
+        if (!s.holders.contains(.user)) {
             // Let go (`releaseSent`): nobody reads it.
             bridge.consume(self.q, stream_id, len);
             return 0;
@@ -1553,12 +1618,12 @@ pub const ClientConnection = struct {
             // 425 to a request that may go again: the driver sends it once
             // the handshake is done; this stream is no longer its. Not
             // after a GOAWAY, which would refuse it.
-            if (s.status == 425 and s.early == .sent_early and !self.closing) {
+            if (s.status == 425 and s.early == .sent_early and self.state.accepting()) {
                 s.tooEarly(hc.?);
                 self.kick();
                 return 0;
             }
-            s.head_ready = true;
+            s.recv = s.recv.next(.final_head);
         } else {
             // 1xx: its fields are not the response's.
             s.headers.clearRetainingCapacity();
@@ -1566,7 +1631,7 @@ pub const ClientConnection = struct {
             s.interim += 1;
             if (s.interim > max_interim_responses) s.endEarly(error.TooManyInterimResponses);
         }
-        if (fin != 0) s.body_done = true;
+        if (fin != 0) s.recv = s.recv.next(.end);
         self.kick();
         return 0;
     }
@@ -1582,7 +1647,7 @@ pub const ClientConnection = struct {
 
     fn onH3EndStream(_: ?*h.nghttp3_conn, _: i64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
-        s.body_done = true;
+        s.recv = s.recv.next(.end);
         connOf(user_data).kick();
         return 0;
     }
@@ -1610,7 +1675,7 @@ pub const ClientConnection = struct {
     /// GOAWAY: requests already sent below `id` still finish; no new ones.
     fn onH3Shutdown(_: ?*h.nghttp3_conn, id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
-        self.closing = true;
+        self.state = self.state.next(.goaway);
         self.goaway_id = id;
         self.kick();
         return 0;
@@ -1621,7 +1686,7 @@ pub const ClientConnection = struct {
     fn readData(_: ?*h.nghttp3_conn, _: i64, vec: [*c]h.nghttp3_vec, veccnt: usize, pflags: [*c]u32, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) h.nghttp3_ssize {
         const s = streamOfUser(sud) orelse return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         if (s.out.allSent()) {
-            if (!s.send_closed) {
+            if (!s.send.ended()) {
                 s.deferred = true;
                 return h.NGHTTP3_ERR_WOULDBLOCK;
             }
@@ -1636,7 +1701,7 @@ pub const ClientConnection = struct {
             s.wants_room = false;
             s.conn.kick();
         }
-        if (s.send_closed and s.out.allSent()) pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
+        if (s.send.ended() and s.out.allSent()) pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
         return @intCast(count);
     }
 };
@@ -1648,7 +1713,9 @@ pub const Stream = struct {
     id: i64 = -1,
     node: std.DoublyLinkedList.Node = .{},
     arena: std.heap.ArenaAllocator,
-    submitted: bool = false,
+    /// The request's side (`Send`) and the response's (`Recv`).
+    send: Send = .unsent,
+    recv: Recv = .head,
     /// The request's budget, shared by every wait on the stream.
     deadline: Deadline,
 
@@ -1660,7 +1727,6 @@ pub const Stream = struct {
     header_list_size: usize = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
-    head_ready: bool = false,
     /// Why the stream ended early (reset, the connection went, the time
     /// ran out).
     cause: ?StreamError = null,
@@ -1677,28 +1743,24 @@ pub const Stream = struct {
     /// Response body bytes not yet read.
     body: std.ArrayList(u8) = .empty,
     body_start: usize = 0,
-    body_done: bool = false,
     body_reader: std.Io.Reader,
 
     has_body: bool,
     /// The request body until the server acknowledges it.
     out: bridge.SendQueue = .{},
     out_writer: std.Io.Writer,
-    send_closed: bool,
-    /// The server sent STOP_SENDING.
-    send_stopped: bool = false,
     /// nghttp3 asked for body and got none: resume it on the next write.
     deferred: bool = false,
     /// A writer found no room under the cap: the next bytes nghttp3 takes
     /// (`readData`) wake it, as well as acknowledgements.
     wants_room: bool = false,
 
-    /// Both the caller (`release`) and QUIC (stream close) are done.
-    user_done: bool = false,
+    /// The caller (`.user`, until `release`) and QUIC (`.quic`, until the
+    /// stream's close); `maybeFree` frees it once both are gone.
+    holders: std.EnumSet(bridge.Holder) = .full,
     /// Let go with `releaseSent`: what it sent is still on its way, and
     /// `ClientConnection.close` waits for it.
     lingering: bool = false,
-    protocol_done: bool = false,
     /// Where the request stands with early data.
     early: Early = .not_early,
 
@@ -1723,19 +1785,19 @@ pub const Stream = struct {
     /// Who owns the stream while it goes again. In `.sent_early` and
     /// `.sent_early_final` it is a submitted stream like any other: QUIC
     /// stream `id` carries it as user data in ngtcp2 and nghttp3, and it
-    /// is freed by `maybeFree` once the caller released it (`user_done`)
-    /// and QUIC closed `id` (`protocol_done`, from `onStreamClose`).
+    /// is freed by `maybeFree` once the caller released it (`.user` gone)
+    /// and QUIC closed `id` (`.quic` gone, in `onStreamClose`).
     /// `tooEarly` detaches it from `id`: both user data pointers are
     /// cleared (so no callback for `id` reaches it again: `onStreamClose`,
     /// the acks and `readData` see null, and nghttp3 writes no more on `id`
     /// after `nghttp3_conn_shutdown_stream_write`, so `readData` is not
     /// called), and `id` is reset with STOP_SENDING; QUIC closes `id` on
     /// its own. In `.resend_due` nothing in QUIC refers to the stream; it
-    /// is in `live`, the caller holds it, and `protocol_done` stays false,
+    /// is in `live`, the caller holds it, and `.quic` stays in `holders`,
     /// so `release` does not free it: the driver does, in `resendOne`,
     /// which either submits it on a new stream (from there it is a
     /// submitted stream again) or, released or canceled meanwhile, or
-    /// after a GOAWAY, ends it (`protocol_done`, then `maybeFree`, which
+    /// after a GOAWAY, ends it (`.quic` gone, then `maybeFree`, which
     /// frees it if released). Should the connection close first (the
     /// driver stops), `closeLocked` ends it `.unsent`, `release` frees it
     /// after the close (a closed connection has no stream close to wait
@@ -1773,6 +1835,126 @@ pub const Stream = struct {
         }
     };
 
+    /// The request's sending side (RFC 9000 3.1). It changes only by
+    /// `next`; every cell is decided, `-` keeps the state:
+    ///
+    ///     state \ event  | submit_body | submit_bodyless | close_send     | stop           | restart
+    ///     ---------------|-------------|-----------------|----------------|----------------|--------
+    ///     unsent         | open        | closed          | -              | -              | -
+    ///     open           | -           | -               | closed         | stopped        | -
+    ///     closed         | -           | -               | -              | stopped_closed | -
+    ///     stopped        | -           | -               | stopped_closed | -              | open
+    ///     stopped_closed | -           | -               | -              | -              | closed
+    ///
+    /// `submit_*` is `request` (a bodyless request's end goes with its
+    /// head); a 425's resend keeps the state, as the stream stays
+    /// submitted. `close_send` is `closeSend`, `stop` the server's
+    /// STOP_SENDING (ngtcp2 has reset the sending side), `restart` the
+    /// 425 (`tooEarly`), which forgets the stop. A stop and the caller's
+    /// end are apart (`stopped_closed`): `readData` still answers the end
+    /// to nghttp3 for it. `unsent` takes no other event: only a submitted
+    /// stream reaches the caller and QUIC.
+    const Send = enum(u8) {
+        unsent,
+        open,
+        closed,
+        stopped,
+        stopped_closed,
+
+        /// The table above, state by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(Send, std.EnumArray(SendEvent, Send)).init(.{
+            .unsent = .init(.{ .submit_body = .open, .submit_bodyless = .closed, .close_send = .unsent, .stop = .unsent, .restart = .unsent }),
+            .open = .init(.{ .submit_body = .open, .submit_bodyless = .open, .close_send = .closed, .stop = .stopped, .restart = .open }),
+            .closed = .init(.{ .submit_body = .closed, .submit_bodyless = .closed, .close_send = .closed, .stop = .stopped_closed, .restart = .closed }),
+            .stopped = .init(.{ .submit_body = .stopped, .submit_bodyless = .stopped, .close_send = .stopped_closed, .stop = .stopped, .restart = .open }),
+            .stopped_closed = .init(.{ .submit_body = .stopped_closed, .submit_bodyless = .stopped_closed, .close_send = .stopped_closed, .stop = .stopped_closed, .restart = .closed }),
+        });
+
+        /// The caller ended the body (or there is none): nghttp3 gets the
+        /// end once the queue is sent.
+        const is_ended = std.EnumArray(Send, bool).init(.{
+            .unsent = false,
+            .open = false,
+            .closed = true,
+            .stopped = false,
+            .stopped_closed = true,
+        });
+
+        /// The server sent STOP_SENDING.
+        const is_stopped = std.EnumArray(Send, bool).init(.{
+            .unsent = false,
+            .open = false,
+            .closed = false,
+            .stopped = true,
+            .stopped_closed = true,
+        });
+
+        fn next(send: Send, event: SendEvent) Send {
+            return table.get(send).get(event);
+        }
+
+        fn ended(send: Send) bool {
+            return is_ended.get(send);
+        }
+
+        fn isStopped(send: Send) bool {
+            return is_stopped.get(send);
+        }
+    };
+
+    const SendEvent = enum { submit_body, submit_bodyless, close_send, stop, restart };
+
+    /// The response's receiving side: bit 0 = a final head arrived, bit 1
+    /// = its end (FIN) arrived; all four are real. It changes only by
+    /// `next`; every cell is decided, `-` keeps the state:
+    ///
+    ///     state \ event  | final_head | end            | restart
+    ///     ---------------|------------|----------------|--------
+    ///     head           | body       | ended_headless | -
+    ///     body           | -          | done           | head
+    ///     ended_headless | done       | -              | head
+    ///     done           | -          | -              | head
+    ///
+    /// `ended_headless`: the end came with no final head (a 1xx with the
+    /// FIN, or a head `countField` refused). `restart` is the 425
+    /// (`tooEarly`): the response starts over.
+    const Recv = enum(u8) {
+        head = 0b00,
+        body = 0b01,
+        ended_headless = 0b10,
+        done = 0b11,
+
+        fn next(recv: Recv, event: RecvEvent) Recv {
+            return switch (event) {
+                .final_head => @fromBackingInt(@backingInt(recv) | 0b01),
+                .end => @fromBackingInt(@backingInt(recv) | 0b10),
+                .restart => .head,
+            };
+        }
+
+        /// A final head arrived (`waitHead`).
+        fn hasHead(recv: Recv) bool {
+            return @backingInt(recv) & 0b01 != 0;
+        }
+
+        /// The response's end arrived.
+        fn ended(recv: Recv) bool {
+            return @backingInt(recv) & 0b10 != 0;
+        }
+    };
+
+    const RecvEvent = enum { final_head, end, restart };
+
+    /// What a write fails with: the stream's cause, else the server's
+    /// STOP_SENDING, else the connection's end; null: it may go on.
+    fn writeStop(cause: ?StreamError, send: Send, conn: ClientConnection.State) ?StreamError {
+        if (cause) |e| return e;
+        if (send.isStopped()) return error.StreamReset;
+        if (conn.ended()) return error.ConnectionClosed;
+        return null;
+    }
+
     /// The request went in 0-RTT with `head` kept; `retry`: a 425 sends
     /// it again. Locked.
     fn sentEarly(self: *Stream, head: []h.nghttp3_nv, retry: bool) void {
@@ -1805,9 +1987,9 @@ pub const Stream = struct {
         self.trailers.clearRetainingCapacity();
         self.body.clearRetainingCapacity();
         self.body_start = 0;
-        self.body_done = false;
+        self.recv = self.recv.next(.restart);
         self.reset_code = null;
-        self.send_stopped = false;
+        self.send = self.send.next(.restart);
         self.deferred = false;
         self.early = .{ .resend_due = kept };
         conn.resend_due += 1;
@@ -1846,7 +2028,6 @@ pub const Stream = struct {
             .body_reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readBody } },
             .out_writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
             .has_body = has_body,
-            .send_closed = !has_body,
         };
         errdefer self.arena.deinit();
         // From the allocator, not the arena: two 16 KiB buffers would grow
@@ -1886,7 +2067,7 @@ pub const Stream = struct {
 
     /// Frees the stream once both sides let go. Locked.
     fn maybeFree(self: *Stream) void {
-        if (!(self.user_done and self.protocol_done)) return;
+        if (self.holders.count() != 0) return;
         self.conn.live.remove(&self.node);
         self.conn.updateKeepAlive();
         self.free();
@@ -1895,7 +2076,7 @@ pub const Stream = struct {
     /// The stream ended early, unless its response was complete or it
     /// already has a cause. Locked.
     fn endEarly(self: *Stream, cause: StreamError) void {
-        if (self.cause == null and !self.body_done) self.cause = cause;
+        if (self.cause == null and !self.recv.ended()) self.cause = cause;
     }
 
     fn copyHeaders(self: *Stream, headers: []const Header) ![]h.nghttp3_nv {
@@ -1945,7 +2126,7 @@ pub const Stream = struct {
         while (true) {
             const gen = conn.gen.epoch();
             conn.lock();
-            const ready = self.head_ready;
+            const ready = self.recv.hasHead();
             const cause = self.cause;
             conn.unlock();
             if (ready) return;
@@ -2021,7 +2202,7 @@ pub const Stream = struct {
         try self.out_writer.flush();
         const conn = self.conn;
         conn.lock();
-        self.send_closed = true;
+        self.send = self.send.next(.close_send);
         self.resumeLocked();
         conn.unlock();
         conn.kick();
@@ -2035,9 +2216,26 @@ pub const Stream = struct {
         self.cancelLocked(error.Canceled);
     }
 
+    /// The request reached QUIC and the connection is not over: QUIC
+    /// closes the stream (`onStreamClose`). Locked.
+    fn viaQuic(self: *const Stream) bool {
+        return self.send != .unsent and !self.conn.state.ended();
+    }
+
+    /// QUIC still holds the stream: it may be reset and given credit.
+    /// Locked.
+    fn quicHolds(self: *const Stream) bool {
+        return self.viaQuic() and self.holders.contains(.quic);
+    }
+
+    /// The server has the whole request, or wants no more of it. Locked.
+    fn requestSent(self: *const Stream) bool {
+        return !self.has_body or self.send.isStopped() or (self.send == .closed and self.out.allSent());
+    }
+
     fn cancelLocked(self: *Stream, cause: StreamError) void {
         const conn = self.conn;
-        if (self.submitted and !self.protocol_done and conn.state != .closed)
+        if (self.quicHolds())
             _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, self.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
         self.endEarly(cause);
         conn.kick();
@@ -2048,12 +2246,11 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         defer conn.unlock();
-        const sent = !self.has_body or self.send_stopped or (self.send_closed and self.out.allSent());
-        if (!(self.body_done and sent)) self.cancelLocked(error.Canceled);
-        self.user_done = true;
+        if (!(self.recv.ended() and self.requestSent())) self.cancelLocked(error.Canceled);
+        self.holders.remove(.user);
         // A stream QUIC never got, or one the connection's end left
         // behind, has no close to wait for.
-        if (!self.submitted or conn.state == .closed) self.protocol_done = true;
+        if (!self.viaQuic()) self.holders.remove(.quic);
         self.maybeFree();
     }
 
@@ -2067,7 +2264,7 @@ pub const Stream = struct {
     fn releaseSent(self: *Stream) void {
         const conn = self.conn;
         conn.lock();
-        const ended = self.send_closed and self.cause == null and !self.send_stopped;
+        const ended = self.send == .closed and self.cause == null;
         if (!ended) {
             conn.unlock();
             return self.release();
@@ -2076,13 +2273,13 @@ pub const Stream = struct {
         // The response from here on is dropped, its credit given back, so
         // the server can always reach its end.
         const unread = self.body.items.len - self.body_start;
-        if (unread > 0 and self.submitted and !self.protocol_done and conn.state != .closed)
+        if (unread > 0 and self.quicHolds())
             bridge.consume(conn.q, self.id, unread);
         self.body.clearRetainingCapacity();
         self.body_start = 0;
         self.lingering = true;
-        self.user_done = true;
-        if (!self.submitted or conn.state == .closed) self.protocol_done = true;
+        self.holders.remove(.user);
+        if (!self.viaQuic()) self.holders.remove(.quic);
         self.maybeFree();
     }
 
@@ -2115,13 +2312,13 @@ pub const Stream = struct {
                     self.body_start = 0;
                 }
                 // The server may send that much more.
-                if (!self.protocol_done and conn.state != .closed) bridge.consume(conn.q, self.id, n);
+                if (self.quicHolds()) bridge.consume(conn.q, self.id, n);
                 conn.unlock();
                 w.advance(n);
                 conn.kick();
                 return n;
             }
-            const done = self.body_done;
+            const done = self.recv.ended();
             const cause = self.cause;
             conn.unlock();
             if (done) return error.EndOfStream;
@@ -2145,8 +2342,8 @@ pub const Stream = struct {
         while (rest.len > 0) {
             const gen = conn.gen.epoch();
             conn.lock();
-            if (self.cause != null or self.send_stopped or conn.state == .closed) {
-                self.write_err = self.cause orelse if (self.send_stopped) error.StreamReset else error.ConnectionClosed;
+            if (writeStop(self.cause, self.send, conn.state)) |e| {
+                self.write_err = e;
                 conn.unlock();
                 return error.WriteFailed;
             }
@@ -2192,3 +2389,198 @@ pub const Stream = struct {
         w.end = 0;
     }
 };
+
+test "h3 client: the connection's state, every cell" {
+    const S = ClientConnection.State;
+    const rows = [_]struct { S, ClientConnection.StateEvent, S }{
+        .{ .handshaking, .handshake_done, .open },
+        .{ .handshaking, .goaway, .closing },
+        .{ .handshaking, .shut, .closed },
+        .{ .handshaking, .handshake_timeout, .handshake_timeout },
+        .{ .open, .handshake_done, .open },
+        .{ .open, .goaway, .closing },
+        .{ .open, .shut, .closed },
+        .{ .open, .handshake_timeout, .closed },
+        .{ .closing, .handshake_done, .closing },
+        .{ .closing, .goaway, .closing },
+        .{ .closing, .shut, .closed },
+        .{ .closing, .handshake_timeout, .closed },
+        .{ .closed, .handshake_done, .closed },
+        .{ .closed, .goaway, .closed },
+        .{ .closed, .shut, .closed },
+        .{ .closed, .handshake_timeout, .closed },
+        .{ .handshake_timeout, .handshake_done, .handshake_timeout },
+        .{ .handshake_timeout, .goaway, .handshake_timeout },
+        // A later close keeps the timeout: `waitHandshake` answers Timeout.
+        .{ .handshake_timeout, .shut, .handshake_timeout },
+        .{ .handshake_timeout, .handshake_timeout, .handshake_timeout },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} --{t}-->\n", .{ row[0], row[1] });
+        try std.testing.expectEqual(row[2], row[0].next(row[1]));
+    }
+}
+
+test "h3 client: the connection's state predicates" {
+    const rows = [_]struct { ClientConnection.State, bool, bool, bool }{
+        // state, accepting, established, ended
+        .{ .handshaking, true, false, false },
+        .{ .open, true, true, false },
+        .{ .closing, false, true, false },
+        .{ .closed, false, false, true },
+        .{ .handshake_timeout, false, false, true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t}\n", .{row[0]});
+        try std.testing.expectEqual(row[1], row[0].accepting());
+        try std.testing.expectEqual(row[2], row[0].established());
+        try std.testing.expectEqual(row[3], row[0].ended());
+    }
+}
+
+test "h3 client: the request side, every cell" {
+    const S = Stream.Send;
+    const rows = [_]struct { S, Stream.SendEvent, S }{
+        .{ .unsent, .submit_body, .open },
+        .{ .unsent, .submit_bodyless, .closed },
+        .{ .unsent, .close_send, .unsent },
+        .{ .unsent, .stop, .unsent },
+        .{ .unsent, .restart, .unsent },
+        .{ .open, .submit_body, .open },
+        .{ .open, .submit_bodyless, .open },
+        .{ .open, .close_send, .closed },
+        .{ .open, .stop, .stopped },
+        .{ .open, .restart, .open },
+        .{ .closed, .submit_body, .closed },
+        .{ .closed, .submit_bodyless, .closed },
+        .{ .closed, .close_send, .closed },
+        // STOP_SENDING after the end: still stopped (put fails, sent).
+        .{ .closed, .stop, .stopped_closed },
+        .{ .closed, .restart, .closed },
+        .{ .stopped, .submit_body, .stopped },
+        .{ .stopped, .submit_bodyless, .stopped },
+        // `closeSend` after a stop stays stopped.
+        .{ .stopped, .close_send, .stopped_closed },
+        .{ .stopped, .stop, .stopped },
+        .{ .stopped, .restart, .open },
+        .{ .stopped_closed, .submit_body, .stopped_closed },
+        .{ .stopped_closed, .submit_bodyless, .stopped_closed },
+        .{ .stopped_closed, .close_send, .stopped_closed },
+        .{ .stopped_closed, .stop, .stopped_closed },
+        // A 425 on a stopped bodyless request: it goes again un-stopped.
+        .{ .stopped_closed, .restart, .closed },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} --{t}-->\n", .{ row[0], row[1] });
+        try std.testing.expectEqual(row[2], row[0].next(row[1]));
+    }
+    const preds = [_]struct { S, bool, bool }{
+        // state, ended, stopped
+        .{ .unsent, false, false },
+        .{ .open, false, false },
+        .{ .closed, true, false },
+        .{ .stopped, false, true },
+        .{ .stopped_closed, true, true },
+    };
+    for (preds) |row| {
+        errdefer std.debug.print("{t}\n", .{row[0]});
+        try std.testing.expectEqual(row[1], row[0].ended());
+        try std.testing.expectEqual(row[2], row[0].isStopped());
+    }
+}
+
+test "h3 client: the response side, every cell" {
+    const R = Stream.Recv;
+    const rows = [_]struct { R, Stream.RecvEvent, R }{
+        .{ .head, .final_head, .body },
+        .{ .head, .end, .ended_headless },
+        .{ .head, .restart, .head },
+        .{ .body, .final_head, .body },
+        .{ .body, .end, .done },
+        .{ .body, .restart, .head },
+        // An end with no final head stays apart from a complete response.
+        .{ .ended_headless, .final_head, .done },
+        .{ .ended_headless, .end, .ended_headless },
+        .{ .ended_headless, .restart, .head },
+        .{ .done, .final_head, .done },
+        .{ .done, .end, .done },
+        .{ .done, .restart, .head },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} --{t}-->\n", .{ row[0], row[1] });
+        try std.testing.expectEqual(row[2], row[0].next(row[1]));
+    }
+    const preds = [_]struct { R, bool, bool }{
+        // state, hasHead, ended
+        .{ .head, false, false },
+        .{ .body, true, false },
+        .{ .ended_headless, false, true },
+        .{ .done, true, true },
+    };
+    for (preds) |row| {
+        errdefer std.debug.print("{t}\n", .{row[0]});
+        try std.testing.expectEqual(row[1], row[0].hasHead());
+        try std.testing.expectEqual(row[2], row[0].ended());
+    }
+}
+
+test "h3 client: what a request body write fails with" {
+    const rows = [_]struct { ?StreamError, Stream.Send, ClientConnection.State, ?StreamError }{
+        .{ null, .open, .open, null },
+        .{ null, .open, .closing, null },
+        .{ null, .closed, .open, null },
+        .{ null, .stopped, .open, error.StreamReset },
+        .{ null, .stopped_closed, .open, error.StreamReset },
+        .{ null, .open, .closed, error.ConnectionClosed },
+        .{ null, .open, .handshake_timeout, error.ConnectionClosed },
+        // The stop beats the connection's end, the cause beats both.
+        .{ null, .stopped, .closed, error.StreamReset },
+        .{ error.Timeout, .open, .open, error.Timeout },
+        .{ error.Canceled, .stopped, .closed, error.Canceled },
+    };
+    for (rows, 0..) |row, i| {
+        errdefer std.debug.print("row {d}\n", .{i});
+        try std.testing.expectEqual(row[3], Stream.writeStop(row[0], row[1], row[2]));
+    }
+}
+
+test "h3 client: whether QUIC holds a stream, and whether its request was sent" {
+    const Send = Stream.Send;
+    const all_sends = std.enums.values(Send);
+    const all_states = std.enums.values(ClientConnection.State);
+    var conn: ClientConnection = undefined;
+    var s: Stream = undefined;
+    s.conn = &conn;
+    // viaQuic: submitted and the connection not over; quicHolds: and QUIC
+    // still has it.
+    for (all_sends) |send| for (all_states) |state| for ([_]bool{ false, true }) |quic| {
+        errdefer std.debug.print("{t} {t} quic={}\n", .{ send, state, quic });
+        s.send = send;
+        conn.state = state;
+        s.holders = if (quic) .full else .initOne(.user);
+        const via = send != .unsent and state != .closed and state != .handshake_timeout;
+        try std.testing.expectEqual(via, s.viaQuic());
+        try std.testing.expectEqual(via and quic, s.quicHolds());
+    };
+    // requestSent: no body, a stop, or the end with every byte handed over.
+    const rows = [_]struct { bool, Send, bool, bool }{
+        // has_body, send, all_sent, sent
+        .{ false, .unsent, true, true },
+        .{ false, .closed, true, true },
+        .{ false, .stopped_closed, false, true },
+        .{ true, .unsent, true, false },
+        .{ true, .open, true, false },
+        .{ true, .open, false, false },
+        .{ true, .closed, true, true },
+        .{ true, .closed, false, false },
+        .{ true, .stopped, false, true },
+        .{ true, .stopped_closed, false, true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("has_body={} {t} all_sent={}\n", .{ row[0], row[1], row[2] });
+        s.has_body = row[0];
+        s.send = row[1];
+        s.out = .{ .written = if (row[2]) 0 else 1 };
+        try std.testing.expectEqual(row[3], s.requestSent());
+    }
+}

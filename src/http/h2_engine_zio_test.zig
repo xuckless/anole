@@ -138,7 +138,7 @@ test "h2 engine on zio: the lock-free path on one executor" {
         }
         try w.flush();
     }
-    try std.testing.expect(h2.server.test_lock_free.load(.monotonic));
+    try std.testing.expect(h2.server.probe.lock_free.load(.monotonic));
     try std.testing.expectEqual([3]u16{ 200, 200, 200 }, status);
     try std.testing.expectEqualStrings("hello", hello_body[0..bodies[0]]);
     try std.testing.expectEqual(@as(usize, "user 7".len), bodies[1]);
@@ -235,7 +235,7 @@ test "h2 engine on zio: a read that starts many handler tasks spawns them after 
             else => {},
         }
     }
-    try std.testing.expect(h2.server.test_lock_free.load(.monotonic));
+    try std.testing.expect(h2.server.probe.lock_free.load(.monotonic));
     try std.testing.expectEqual(@as(usize, streams), ok);
 
     client.close(io);

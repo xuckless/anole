@@ -3062,8 +3062,7 @@ fn finishDetached(x: *Exec, si: u32) void {
     const gen = genOf(w);
     x.unlink(si);
     if (stateOf(w) == .streaming or (stateOf(w) == .done and s.reply == .fd)) {
-        const spawned = if (d.attach()) |group| placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) else error.ConnectionClosed;
-        spawned catch {
+        d.attach(attachedTask, .{ x, si, gen }) catch {
             // The connection is going (or no task could start): a stream
             // the consumer is writing hears it is over.
             if (stateOf(w) == .streaming) x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);

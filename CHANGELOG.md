@@ -3,6 +3,32 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes.
+
+### Changed
+
+- **HTTP/2 and HTTP/3 transport state as explicit enums with declared transition tables** (#215). No behaviour change: wire bytes, frame order, error and reset codes and C ABI results are as before. Each state has one `next` (an exhaustive state x event switch) and a test row per cell; switches that only map a state to a value are comptime `std.EnumArray` tables.
+  - HTTP/2 engine (src/http/core/h2/server.zig): a stream's response side (`Resp`: none, head sent, ended, waiting for its send), its dispatch (`Dispatch`) and its request body (`ReqBody`) are one value each; a connection's output, life and drain are one `Writer`, `Life` and `Drain` value each, with the in-flight holds derived instead of counted beside them. The test seams are one comptime `Probe`, a no-op outside tests.
+  - HTTP/2 core: the inbound parser phase is one `In` union, the server's SETTINGS come from a declared table, and the never-read `Local.max_concurrent_streams` is gone; header names are classified by the core's name tokens in `onField` and the response head.
+  - HTTP/3 request stream: its 17 booleans (#215) became one phase enum covering the head and start of a request and the handler's end, including inline and detached runs.
+  - Holder sets (`std.EnumSet`) replace reference counts and done flags for HTTP/3 server, client and WebTransport streams and for the HTTP/2 client's streams; releasing an HTTP/3 server stream's holder twice now trips an assert in Debug.
+  - Connection state: the HTTP/3 server connection's life and seat, the protocol (handshaking, HTTP/3 or hq-interop) as one union with an hq stream's phase as one enum, the HTTP/2 and HTTP/3 clients' connection phase and a client stream's request and response sides, and a WebTransport session's life and send sides are one value each.
+- **`Detached.attach` takes the task function and its arguments** (`d.attach(func, args)`) and spawns the task itself, instead of returning a group for the caller to spawn into (#225, below). Code using `anole.http`'s detached responses directly needs the one-line change.
+- Performance neutral: fixed-count user-space instructions per request within +0.2% on h2c, unary gRPC, static-h2, h2 TLS, HTTP/3 and HTTP/1.1; RSS flat or lower on every cell of the A/B (bench/results/20261122-s3-batch1-ab, measured before the comptime-table commit).
+- Pins: pg.zig `anole` 8595bef (was 06ccba1).
+
+### Fixed
+
+- **A detached response's task could be spawned into a connection group that was already joined** (#225): `Detached.attach` checked the connection under its lock, let go of the lock, and the caller spawned afterwards, so on `std.Io.Threaded` a teardown could join the group in between and the task outlived the connection. The spawn now happens under the connection's lock in both engines. HTTP/2 refuses an attach once its tasks are over; HTTP/3 never needs to, because its teardown aborts every still-detached response before it joins the group.
+- **Stopping a PostgreSQL watch no longer writes Terminate into a socket another task is writing to** (#221): the watch hub stops a connection with the pg.zig fork's new `Listener.interrupt` (a shutdown without Terminate), so a LISTEN, UNLISTEN or ping in flight can't be interleaved with it or blocked behind it. A listener says goodbye on close only if it was never interrupted.
+- The C ABI test of a WebSocket handshake past its deadline no longer races (#234): it runs on one executor, so a barrier request orders the check after the handshake's record instead of waiting for a delivery that may never come.
+
+### Tests
+
+- An hq-interop round trip on aioquic's H0 ALPN, run by tests/h3/run.sh and CI; an HTTP/3 row for requests past the task cap (rejected unprocessed, stream credit returned); HTTP/2 rows for a response head too large to submit (whole, streamed, bare and on a tunnel: reset with INTERNAL_ERROR, the connection carries on).
+
 ## 0.6.1 (2026-11-22)
 
 The end of S2 and the first step of S3: zio stream writes gather more slices per send, PostgreSQL one-off queries take one round trip, io_uring's fallback names its cause, and the SAFETY regime is gone on the way to 1.0.0-rc. libanole is now a release asset for the bindings.
