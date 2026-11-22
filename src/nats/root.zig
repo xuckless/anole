@@ -243,6 +243,8 @@ pub const Client = struct {
     /// Strings the core clients point into.
     arena: std.heap.ArenaAllocator,
     label: []const u8,
+    /// The server list as `url,url` with the login stripped, for the console.
+    target: []const u8 = "",
     timeout: ?Duration,
     errors: db.ErrorMap,
     connections: Options.Connections,
@@ -266,6 +268,13 @@ pub const Client = struct {
     suppress_consumers: bool = false,
     closing: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
+
+    /// The console's `/db` entry. The core clients keep their own
+    /// connections, so there are no pools to list.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        try internal.writeConsoleHead(w, console_system, self.label, self.target);
+        try w.writeByte(']');
+    }
 
     /// Makes the core clients and checks the options; nothing connects.
     /// `app.nats` calls it; outside an app, `init` then `start`.
@@ -292,6 +301,7 @@ pub const Client = struct {
 
         var url_auth: core.Options.Auth = .none;
         const servers = try serverList(a, opts, &url_auth);
+        self.target = try std.mem.join(a, ",", servers);
         const tls_wanted = opts.tls.wanted() or anyTlsScheme(servers);
         if (tls_wanted) {
             self.tls = .{

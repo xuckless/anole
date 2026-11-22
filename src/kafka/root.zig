@@ -175,6 +175,8 @@ pub const Client = struct {
     io: std.Io,
     arena_state: std.heap.ArenaAllocator,
     name: []const u8,
+    /// The bootstrap list as `host:port,host:port`, for the console.
+    target: []const u8,
     errors: db.ErrorMap,
     timeout: ?Duration,
     readiness_enabled: bool,
@@ -199,6 +201,13 @@ pub const Client = struct {
     /// not joined (the process is frozen between invocations); producing
     /// works.
     suppress_consumers: bool = false,
+
+    /// The console's `/db` entry. The cluster keeps one connection per
+    /// broker, not pools, so there are none to list.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        try internal.writeConsoleHead(w, console_system, self.name, self.target);
+        try w.writeByte(']');
+    }
 
     /// Validates the options and prepares the connections; nothing connects
     /// before the first call (unless `connect_at_start`).
@@ -284,11 +293,13 @@ pub const Client = struct {
         errdefer prod.deinit();
 
         const name = try arena.dupe(u8, options.label orelse "kafka");
+        const target = try std.mem.join(arena, ",", brokers);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena_state = self.arena_state,
             .name = name,
+            .target = target,
             .errors = options.errors,
             .timeout = options.timeout,
             .readiness_enabled = options.readiness,

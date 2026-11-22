@@ -11,6 +11,7 @@ const service = @import("service.zig");
 const collector = @import("collector.zig");
 const websocket = if (features.websocket) @import("../websocket/root.zig") else struct {};
 const sse = @import("../sse/root.zig");
+const ResponseCache = @import("../cache/response.zig").ResponseCache;
 
 fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
     try w.print("{f}", .{std.json.fmt(s, .{})});
@@ -78,7 +79,11 @@ pub fn Of(comptime S: type) type {
                 try jsonStr(w, if (r.method) |m| m.name() else "ANY");
                 try w.writeAll(",\"pattern\":");
                 try jsonStr(w, r.info.path);
-                try w.print(",\"no_wait\":{},\"cached\":false,\"kind\":\"{t}\",\"middleware\":{d}}}", .{ r.no_wait, r.kind, r.middlewares.len });
+                // The chain holds globals, groups and `anole.cached`'s own cache.
+                const cached = for (r.middlewares) |m| {
+                    if (std.mem.eql(u8, m.name, @typeName(ResponseCache))) break true;
+                } else false;
+                try w.print(",\"no_wait\":{},\"cached\":{},\"kind\":\"{t}\",\"middleware\":{d}}}", .{ r.no_wait, cached, r.kind, r.middlewares.len });
             }
             try w.writeByte(']');
         }

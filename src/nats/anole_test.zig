@@ -8,6 +8,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const nats = @import("root.zig");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const FakeServer = @import("core/testing/FakeServer.zig");
 const golden = @import("core/protocol/golden.zig");
 
@@ -175,6 +176,31 @@ fn waitServer(r: *Rig) !void {
     const io = r.rt.io();
     try @import("anole_test_wait").waitFlag(io, "the fake server to see the expected publishes", &r.script.done);
     try r.server.await(io);
+}
+
+test "consoleInfo: the server list without a login, and no pools" {
+    var rig: Rig = undefined;
+    try rig.start(&.{}, 0, .{});
+    defer rig.deinit();
+    var url_buf: [64]u8 = undefined;
+    var parsed = try internal.expectConsoleInfo(rig.client, .{ .system = "nats", .name = "nats", .target = try FakeServer.url(&rig.listener, &url_buf), .pools = 0 });
+    parsed.deinit();
+
+    const rows = [_]struct { name: []const u8, options: nats.Options, target: []const u8, absent: []const []const u8 }{
+        .{ .name = "user and password in the url", .options = .{ .url = "nats://usr:pw0rd@127.0.0.1:1" }, .target = "nats://127.0.0.1:1", .absent = &.{ "usr", "pw0rd" } },
+        .{ .name = "token option", .options = .{ .url = "tls://127.0.0.1:1, nats://b.example:2", .auth = .{ .token = "tok3n" } }, .target = "tls://127.0.0.1:1,nats://b.example:2", .absent = &.{"tok3n"} },
+    };
+    for (rows) |row| {
+        var o = row.options;
+        o.environ = .empty;
+        const client = try nats.Client.init(testing.allocator, testing.io, o);
+        defer client.deinit();
+        var p = internal.expectConsoleInfo(client, .{ .system = "nats", .name = "nats", .target = row.target, .pools = 0, .absent = row.absent }) catch |err| {
+            std.debug.print("row: {s}\n", .{row.name});
+            return err;
+        };
+        p.deinit();
+    }
 }
 
 test "handle: a message reaches the handler as a Msg and respond publishes to its reply subject" {
