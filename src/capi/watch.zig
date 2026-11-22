@@ -341,8 +341,7 @@ fn subOf(e: *Engine, hv: u64) engine.HandleError!*Sub {
 
 /// `anole_watch_find`.
 pub fn find(e: *Engine, name: []const u8) ?*Entry {
-    for (e.watch_state.entries) |*en| if (std.mem.eql(u8, en.name, name)) return en;
-    return null;
+    return engine.findByName(Entry, e.watch_state.entries, name);
 }
 
 /// `anole_watch_listen`: events of `entry` from now on, to `home`'s

@@ -129,8 +129,7 @@ pub fn destroy(e: *Engine) void {
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Broker {
-    for (e.kafka_brokers) |*b| if (std.mem.eql(u8, b.config.name, name)) return b;
-    return null;
+    return engine.findByName(Broker, e.kafka_brokers, name);
 }
 
 fn optMs(n: u32) ?std.Io.Duration {

@@ -203,8 +203,7 @@ pub fn destroy(e: *Engine) void {
 
 pub fn find(e: *Engine, name: []const u8) ?*Mail {
     const mails = e.smtp_state.ensure(e) catch return null;
-    for (mails) |*m| if (std.mem.eql(u8, m.config.name, name)) return m;
-    return null;
+    return engine.findByName(Mail, mails, name);
 }
 
 // ---------------------------------------------------------------------------

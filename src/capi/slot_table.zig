@@ -26,6 +26,10 @@ pub const Options = struct {
     /// What `alloc` returns when the table is full.
     full: anyerror,
     locked: bool = false,
+    /// The `Handle` kind of this table's slots.
+    kind: engine.Handle.Kind,
+    /// The area's `open` state as stored in the low half of the slot word.
+    open: u32,
 };
 
 /// `free_word(gen)` is the slot word of a free slot of that generation.
@@ -43,6 +47,18 @@ pub fn SlotTable(comptime T: type, comptime opts: Options, comptime free_word: f
         nchunks: std.atomic.Value(u32) = .init(0),
         free_head: u32 = engine.no_slot,
         lock: if (opts.locked) std.atomic.Mutex else void = if (opts.locked) .unlocked else {},
+
+        pub fn gen(s: *const T) u32 {
+            return @intCast(s.word.load(.acquire) >> 32);
+        }
+
+        pub fn live(s: *const T, g: u32) bool {
+            return s.word.load(.acquire) == (@as(u64, g) << 32 | opts.open);
+        }
+
+        pub fn handle(s: *const T, g: u32) u64 {
+            return engine.Handle.encode(.{ .gen = @intCast(g), .kind = opts.kind, .slot = @intCast(s.index), .exec = s.exec.index });
+        }
 
         pub fn slot(t: *Self, i: u32) ?*T {
             // `i` may come from a made-up handle: past the table is nothing.
@@ -109,4 +125,42 @@ pub fn SlotTable(comptime T: type, comptime opts: Options, comptime free_word: f
             t.nchunks.store(0, .release);
         }
     };
+}
+
+test "accessors: live, stale generation, wrapped generation, handle kind and bytes, per table" {
+    const Slot = struct {
+        word: std.atomic.Value(u64),
+        exec: *Exec,
+        index: u32,
+        next_free: u32,
+    };
+    const Free = struct {
+        fn word(g: u32) u64 {
+            return @as(u64, g) << 32;
+        }
+    };
+    const kinds = [_]engine.Handle.Kind{ .websocket, .wt_session, .wt_stream, .net_conn, .sse, .transfer, .db_tx };
+    var x: Exec = undefined;
+    x.index = 2;
+    inline for (kinds) |kind| {
+        const Table = SlotTable(Slot, .{ .chunk_len = 4, .max_chunks = 1, .full = error.Full, .kind = kind, .open = 1 }, Free.word);
+        var s: Slot = .{ .word = .init(Free.word(7)), .exec = &x, .index = 3, .next_free = engine.no_slot };
+        try std.testing.expectEqual(@as(u32, 7), Table.gen(&s));
+        try std.testing.expect(!Table.live(&s, 7));
+        s.word.store(@as(u64, 7) << 32 | 1, .release);
+        try std.testing.expect(Table.live(&s, 7));
+        try std.testing.expect(!Table.live(&s, 6));
+        s.word.store(@as(u64, std.math.maxInt(u32)) << 32 | 1, .release);
+        try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), Table.gen(&s));
+        try std.testing.expect(Table.live(&s, std.math.maxInt(u32)));
+        try std.testing.expect(!Table.live(&s, 1));
+        const h = engine.Handle.decode(Table.handle(&s, 5));
+        try std.testing.expectEqual(kind, h.kind);
+        try std.testing.expectEqual(@as(u28, 5), h.gen);
+        try std.testing.expectEqual(@as(u23, 3), h.slot);
+        try std.testing.expectEqual(@as(u8, 2), h.exec);
+    }
+    const T = SlotTable(Slot, .{ .chunk_len = 4, .max_chunks = 1, .full = error.Full, .kind = .wt_session, .open = 1 }, Free.word);
+    var s: Slot = .{ .word = .init(0), .exec = &x, .index = 3, .next_free = engine.no_slot };
+    try std.testing.expectEqual(@as(u64, 5 | 4 << 28 | 3 << 33 | 2 << 56), T.handle(&s, 5));
 }

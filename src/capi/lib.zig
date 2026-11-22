@@ -1058,8 +1058,7 @@ export fn anole_wt_close(w: u64, code: u32, reason: Str) i32 {
 const nats_mod = engine.nats;
 
 fn natsOf(n: ?*const anyopaque) ?*nats_mod.Broker {
-    const b: *nats_mod.Broker = @ptrCast(@alignCast(@constCast(n orelse return null)));
-    return if (engine.global == b.engine) b else null;
+    return engine.ownedBy(nats_mod.Broker, n);
 }
 
 export fn anole_nats_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
@@ -1156,8 +1155,7 @@ export fn anole_nats_ack(m: u64, kind: u32, delay_ms: u32) i32 {
 const kafka_mod = engine.kafka;
 
 fn kafkaOf(k: ?*const anyopaque) ?*kafka_mod.Broker {
-    const b: *kafka_mod.Broker = @ptrCast(@alignCast(@constCast(k orelse return null)));
-    return if (engine.global == b.engine) b else null;
+    return engine.ownedBy(kafka_mod.Broker, k);
 }
 
 export fn anole_kafka_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
@@ -1231,8 +1229,7 @@ export fn anole_kafka_flush(k: ?*anyopaque, c_: ?*anyopaque, user_data: u64) i32
 const db_mod = engine.db;
 
 fn dbOf(d: ?*anyopaque) ?*db_mod.Db {
-    const db_: *db_mod.Db = @ptrCast(@alignCast(d orelse return null));
-    return if (engine.global == db_.engine) db_ else null;
+    return engine.ownedBy(db_mod.Db, d);
 }
 
 export fn anole_db_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
@@ -1665,8 +1662,7 @@ export fn anole_watch_ack(l: u64, position: Str) i32 {
 const s3_mod = engine.s3;
 
 fn s3Of(p: ?*anyopaque) ?*s3_mod.Store {
-    const st: *s3_mod.Store = @ptrCast(@alignCast(p orelse return null));
-    return if (engine.global == st.engine) st else null;
+    return engine.ownedBy(s3_mod.Store, p);
 }
 
 export fn anole_s3_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
@@ -1876,8 +1872,7 @@ export fn anole_s3_multipart_abort(p: ?*anyopaque, c_: ?*anyopaque, key: Str, up
 const smtp_mod = engine.smtp;
 
 fn smtpOf(m: ?*const anyopaque) ?*smtp_mod.Mail {
-    const mail: *smtp_mod.Mail = @ptrCast(@alignCast(@constCast(m orelse return null)));
-    return if (engine.global == mail.engine) mail else null;
+    return engine.ownedBy(smtp_mod.Mail, m);
 }
 
 fn smtpFailure(err: engine.CallError, why: *const smtp_mod.Why) i32 {

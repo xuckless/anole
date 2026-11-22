@@ -106,8 +106,7 @@ pub const State = struct {
 };
 
 pub fn find(e: *Engine, name: []const u8) ?*Store {
-    for (e.s3_state.ensure(e)) |*st| if (std.mem.eql(u8, st.config.name, name)) return st;
-    return null;
+    return engine.findByName(Store, e.s3_state.ensure(e), name);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,21 +144,13 @@ pub const TSlot = struct {
     /// Wakes a download task (credit, release).
     event: std.Io.Event = .unset,
     stopped: bool = false,
-
-    fn gen(t: *const TSlot) u32 {
-        return @intCast(t.word.load(.acquire) >> 32);
-    }
-
-    fn handle(t: *const TSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .transfer, .slot = @intCast(t.index), .exec = t.exec.index });
-    }
 };
 
 fn tFreeWord(gen: u32) u64 {
     return packT(gen, .free);
 }
 
-pub const TransferTable = SlotTable(TSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransfers }, tFreeWord);
+pub const TransferTable = SlotTable(TSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransfers, .kind = .transfer, .open = @backingInt(TState.open) }, tFreeWord);
 
 fn markStopped(t: *TSlot) void {
     t.stopped = true;
@@ -976,7 +967,7 @@ const KickCmd = struct {
         defer gpa.destroy(k);
         if (x.engine.phase.load(.acquire) == .stopped) return;
         const t = x.s3.transfers.slot(k.slot) orelse return;
-        if (t.gen() != k.gen) return;
+        if (TransferTable.gen(t) != k.gen) return;
         wakeTransfer(x, t);
     }
 };
@@ -1015,7 +1006,7 @@ fn openUpload(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!
         r.message = "too many transfers";
         return post(x, &r);
     };
-    const g = t.gen();
+    const g = TransferTable.gen(t);
     while (!t.lock.tryLock()) std.atomic.spinLoopHint();
     t.kind = .upload;
     t.up = up;
@@ -1026,7 +1017,7 @@ fn openUpload(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!
     t.released.store(false, .monotonic);
     t.word.store(packT(g, .open), .release);
     t.lock.unlock();
-    r.handle = t.handle(g);
+    r.handle = TransferTable.handle(t, g);
     r.s3_status = 200;
     post(x, &r);
     placement.concurrent(&x.s3.work, x.engine.io, .local, uploadWatch, .{ x, t, g }) catch teardownUpload(x, t, g);
@@ -1046,7 +1037,7 @@ fn teardownUpload(x: *Exec, t: *TSlot, g: u32) void {
 fn uploadWatch(x: *Exec, t: *TSlot, g: u32) std.Io.Cancelable!void {
     defer teardownUpload(x, t, g);
     const up = t.up.?;
-    const handle = t.handle(g);
+    const handle = TransferTable.handle(t, g);
     while (true) {
         const seen = up.progress.seen();
         if (t.released.load(.acquire) or t.stopped) return;
@@ -1224,7 +1215,7 @@ fn streamGet(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
         r.message = "too many transfers";
         return post(x, &r);
     };
-    const g = t.gen();
+    const g = TransferTable.gen(t);
     while (!t.lock.tryLock()) std.atomic.spinLoopHint();
     t.kind = .download;
     t.up = null;
@@ -1234,7 +1225,7 @@ fn streamGet(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
     t.event.reset();
     t.word.store(packT(g, .open), .release);
     t.lock.unlock();
-    const handle = t.handle(g);
+    const handle = TransferTable.handle(t, g);
     r.handle = handle;
     post(x, &r);
     defer {

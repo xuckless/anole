@@ -386,8 +386,7 @@ pub fn close(e: *Engine) void {
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Db {
-    for (e.dbs) |*d| if (std.mem.eql(u8, d.config.name, name)) return d;
-    return null;
+    return engine.findByName(Db, e.dbs, name);
 }
 
 pub const Verb = enum { query, exec };
@@ -932,14 +931,6 @@ pub const TxSlot = struct {
     req_slot: u32 = 0,
     has_req: bool = false,
 
-    fn gen(t: *const TxSlot) u32 {
-        return @intCast(t.word.load(.acquire) >> 32);
-    }
-
-    fn handle(t: *const TxSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .db_tx, .slot = @intCast(t.index), .exec = t.exec.index });
-    }
-
     fn setEnd(t: *TxSlot, how: TxEnd) void {
         _ = t.end.cmpxchgStrong(0, @backingInt(how), .acq_rel, .acquire);
     }
@@ -966,7 +957,7 @@ fn txFreeWord(gen: u32) u64 {
     return packTx(gen, .free);
 }
 
-pub const TxTable = SlotTable(TxSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransactions }, txFreeWord);
+pub const TxTable = SlotTable(TxSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransactions, .kind = .db_tx, .open = @backingInt(TxState.open) }, txFreeWord);
 
 /// Any thread, at the stop: every open transaction ends without answering.
 fn markTxStopped(s: *TxSlot) void {
@@ -1070,7 +1061,7 @@ const BeginCmd = struct {
             const a: Answer = .{ .user_data = b.start.user_data, .status = abi.E_NOMEM, .http_status = 500, .error_class = .other, .message = "too many open transactions" };
             return postAnswerNoWait(x, &a);
         };
-        const g = t.gen();
+        const g = TxTable.gen(t);
         t.d = b.d;
         t.head = null;
         t.tail = null;
@@ -1161,8 +1152,8 @@ fn endAnswer(t: *const TxSlot, user_data: u64) ?Answer {
 /// On the transaction's executor, for its whole life.
 fn txTask(x: *Exec, t: *TxSlot, st: TxStart) std.Io.Cancelable!void {
     const io = x.engine.io;
-    const g = t.gen();
-    const handle = t.handle(g);
+    const g = TxTable.gen(t);
+    const handle = TxTable.handle(t, g);
     t.task = placement.currentTask(io);
     var begin_arena: std.heap.ArenaAllocator = .init(gpa);
     defer begin_arena.deinit();
