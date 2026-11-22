@@ -41,7 +41,7 @@ test "encoders: a task that suspends while holding the thread's encoder panics, 
     try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: a task suspended while holding 1 lock(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a read section, begun at:") != null);
     // Debug only: an optimized binary inlines the call, and the site is
-    // then the nearest frame left out of line (as in qsbr_test.zig).
+    // then the nearest frame left out of line.
     if (builtin.mode == .debug) {
         const lines = yieldWithEncoder(null);
         for (lines) |line| {

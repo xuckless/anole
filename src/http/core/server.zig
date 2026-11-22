@@ -40,7 +40,6 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
 const admission = @import("admission.zig");
-const qsbr = @import("qsbr.zig");
 const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 const proxy_protocol = @import("proxy_protocol.zig");
@@ -2237,8 +2236,6 @@ pub fn Server(comptime Ctx: type) type {
                     // unmapped at the next trim if nothing takes them.
                     if (build_options.use_zlib) encoders.trimLocal();
                     if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
-                    // Objects retired with no writer after them (src/http/core/qsbr.zig).
-                    if (shards) qsbr.pollAll();
                 }
                 const r = row orelse continue;
                 probe.tick(now -| deadline);
