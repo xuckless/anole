@@ -48,7 +48,7 @@ const testing = std.testing;
 
 /// A flag behind a mutex, and tasks that wait for it.
 const Gate = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     changed: Broadcast = .{},
     open: bool = false,
     passed: u32 = 0,
@@ -98,7 +98,7 @@ test "one wake reaches every waiter" {
 
 test "a wait ends by its deadline" {
     const io = testing.io;
-    var mutex: safety.Mutex(.leaf) = .init;
+    var mutex: std.Io.Mutex = .init;
     var changed: Broadcast = .{};
     const start = Io.Clock.awake.now(io);
     const deadline = time.after(io, .fromMilliseconds(20));

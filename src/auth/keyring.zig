@@ -46,12 +46,12 @@ pub const Keyring = struct {
 
     /// Guards the fields below; never held across I/O, a verification or
     /// a log call (SAFETY.md L2, L3).
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// The current set; null before the first fetch.
     current: ?*Set = null,
     /// A fetch is running (single flight); the others wait on `fetched`.
     fetching: bool = false,
-    fetched: safety.Condition = .init,
+    fetched: std.Io.Condition = .init,
     /// Bumped whenever a fetch ends, successful or not.
     generation: u64 = 0,
     /// When the last fetch began (for `min_refresh`).

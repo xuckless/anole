@@ -27,7 +27,7 @@ pub const Entry = struct {
 };
 
 /// Guards everything below.
-mutex: safety.Mutex(.leaf) = .init,
+mutex: std.Io.Mutex = .init,
 /// Room for `Options.max_servers` entries; the first `len` are the pool,
 /// in the order connections try them.
 entries: []Entry,

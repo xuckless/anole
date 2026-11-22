@@ -125,7 +125,7 @@ pub fn Family(comptime T: type) type {
         buckets: []const f64 = &default_buckets,
         /// Guards `series` (a leaf: held for a lookup, an insert or a
         /// render into memory, never across the caller's writer).
-        mutex: safety.Mutex(.leaf) = .init,
+        mutex: std.Io.Mutex = .init,
         series: std.StringArrayHashMapUnmanaged(*T) = .empty,
 
         /// The series for these label values (as many as the labels).
@@ -256,7 +256,7 @@ pub const Registry = struct {
     io: std.Io,
     /// Guards the three lists (a leaf: never held while a family's lock is
     /// taken; families are never removed before `deinit`).
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     counters: std.ArrayList(*Family(Counter)) = .empty,
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,

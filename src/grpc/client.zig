@@ -137,12 +137,12 @@ pub const Channel = struct {
         http: Http,
         http3: Http3,
         /// Guards the fields below; never held across a dial (SAFETY.md L2).
-        mutex: safety.Mutex(.leaf) = .init,
+        mutex: std.Io.Mutex = .init,
         /// `activeH2`/`activeH3` are dialing (single flight: a channel uses
         /// one of them; `.auto`'s HTTP/3 dial is `h3_dialing`, which never
         /// makes a call wait). Calls that need the dial wait on `dialed`.
         redialing: bool = false,
-        dialed: safety.Condition = .init,
+        dialed: std.Io.Condition = .init,
         /// Connections replaced by a redial: they may still carry calls,
         /// so they close with the channel.
         retired: std.ArrayList(*h2.ClientConnection) = .empty,

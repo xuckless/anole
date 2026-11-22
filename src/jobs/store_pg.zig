@@ -65,7 +65,7 @@ pub const Postgres = struct {
     /// `drain` after its unlock), guarding only `session`, `holds_lock` and
     /// `held_owner`. Temporary, until the maintenance task alone owns the
     /// session and the drain asks it by message.
-    leader_mutex: safety.IoLock = .init,
+    leader_mutex: std.Io.Mutex = .init,
     /// Tests only: runs in `takeAdvisory` with the session in hand, before its query.
     test_before_leader_query: if (builtin.is_test) ?*const fn (*Postgres) void else void = if (builtin.is_test) null else {},
 

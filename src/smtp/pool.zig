@@ -12,9 +12,9 @@ const Session = session_mod.Session;
 
 /// The pool of one executor.
 pub const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Signalled when a session goes back, or a place frees up.
-    returned: safety.Condition = .init,
+    returned: std.Io.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle sessions.
     idle: []*Session,
     idle_len: usize = 0,

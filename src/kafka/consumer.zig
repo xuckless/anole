@@ -260,8 +260,8 @@ const PartState = struct {
     /// Over `chunks` and `buffered`: the fetcher appends, the delivery task
     /// takes (L1: they run on different executors). Nothing waits, calls
     /// out or takes another lock while it is held (L2-L4).
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     chunks: std.ArrayList(*Chunk) = .empty,
     buffered: usize = 0,
     /// The next offset to fetch (the fetcher's).
@@ -315,8 +315,8 @@ const Session = struct {
     deliveries: std.Io.Group = .init,
     /// Over `running`: the delivery tasks (one per partition, each on its
     /// partition's executor) and `endSession`. A leaf (L4).
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     running: usize = 0,
 
     /// Ends the session at the member's next look, for `why`. When two

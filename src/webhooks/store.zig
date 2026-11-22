@@ -572,7 +572,7 @@ pub const Memory = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Endpoints, messages and attempts. A leaf: nothing is taken under it.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     eps: std.StringArrayHashMapUnmanaged(Ep) = .empty,
     msgs: std.StringArrayHashMapUnmanaged(Msg) = .empty,
     atts: std.ArrayList(Att) = .empty,

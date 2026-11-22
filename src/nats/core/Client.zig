@@ -106,9 +106,9 @@ connection: Connection = undefined,
 /// (which may yield) and a join. An I/O lock (SAFETY.md L2's exception):
 /// it guards the manager's start and stop, no other lock's data, and is
 /// taken with no other lock held; `mutex` is taken under it.
-lifecycle: safety.IoLock = .init,
+lifecycle: std.Io.Mutex = .init,
 /// Guards the fields below.
-mutex: safety.Mutex(.leaf) = .init,
+mutex: std.Io.Mutex = .init,
 /// Woken on every change of the fields below. Any number of tasks may
 /// wait on it, as callers of `connect()` do while it connects.
 changed: Broadcast = .{},

@@ -54,7 +54,7 @@ pub const NetSlot = struct {
     /// and its gated wakes); a call's chunk is made before it and, when the
     /// connection refuses it, freed after it (`chunk_checked` panics
     /// otherwise in Debug and tests); its kick is made after it.
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     conn: ?*net.Conn = null,
     /// Its listener's: set at the open (before the OPEN record is posted),
     /// read by `write` before it takes the lock (an atomic, as a reused

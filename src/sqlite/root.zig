@@ -1300,8 +1300,8 @@ const Writer = struct {
     conn: Connection,
     thread: std.Thread,
     /// Guards every field below; the writer thread takes it too.
-    mutex: safety.Mutex(.leaf) = .init,
-    ready: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
     /// The job handed over and not yet started.
     next: ?*Job = null,
     /// The job running: a cancel may interrupt it.
@@ -1317,7 +1317,7 @@ const Writer = struct {
     /// Whether it is held is `holder` alone.
     lease: u32 = 0,
     /// Signalled when the writer is given back.
-    free: safety.Condition = .init,
+    free: std.Io.Condition = .init,
 
     /// The thread: runs each job handed over, until `Client.deinit`.
     fn loop(w: *Writer, io: std.Io) void {
@@ -1346,8 +1346,8 @@ const Readers = struct {
     /// The connections not taken, `free[0..free_len]`.
     free: []*Connection = &.{},
     free_len: usize = 0,
-    mutex: safety.Mutex(.leaf) = .init,
-    changed: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
 };
 
 // ---------------------------------------------------------------------------

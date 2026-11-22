@@ -187,14 +187,14 @@ pub const Client = struct {
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
     /// Over `consumers`, `started`, `drained` and `starting`. A leaf (L4).
-    consumers_mutex: safety.Mutex(.leaf) = .init,
+    consumers_mutex: std.Io.Mutex = .init,
     started: bool = false,
     drained: bool = false,
     /// Consumer starts under way outside the lock (`start`, `consume`):
     /// `drain` waits for them (`starts_done`) before it stops and joins the
     /// consumers, so a start never races its consumer's stop.
     starting: u32 = 0,
-    starts_done: safety.Condition = .init,
+    starts_done: std.Io.Condition = .init,
     /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
     /// not joined (the process is frozen between invocations); producing
     /// works.

@@ -27,7 +27,7 @@ pub const Health = struct {
     io: std.Io,
     /// Guards `statuses` (a leaf: no lock or wait under it; `set`'s wake is
     /// no wait).
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     statuses: std.StringArrayHashMapUnmanaged(ServingStatus) = .empty,
     /// Bumped on every change; Watch waits on it.
     generation: std.atomic.Value(u32) = .init(0),

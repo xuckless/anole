@@ -99,7 +99,7 @@ pub const MemoryStore = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Guards the store (a leaf: nothing is logged or waited for under it).
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     /// Most recently written first. The middleware gives every session the
     /// same TTL, so the far end is where they expire first.

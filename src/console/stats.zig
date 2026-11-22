@@ -86,7 +86,7 @@ fn copyCut(dst: []u8, src: []const u8) u8 {
 /// The recent 5xx answers: a ring under a spin lock held for the copy only.
 pub const ErrorRing = struct {
     /// Over the fields below; held for a bounded struct copy only.
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     entries: []ErrorEntry,
     /// Entries ever pushed.
     seq: u64 = 0,

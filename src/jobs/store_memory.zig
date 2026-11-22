@@ -39,7 +39,7 @@ pub const Memory = struct {
     io: std.Io,
     /// Every row, unique key, cron and the leader. A leaf: no store call
     /// is made under another lock, and nothing is taken under it.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     rows: std.AutoArrayHashMapUnmanaged(Id, *MemRow) = .empty,
     next_id: Id = 1,
     uniques: std.AutoHashMapUnmanaged([16]u8, Id) = .empty,

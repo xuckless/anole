@@ -58,7 +58,7 @@ pub const Conn = struct {
     /// held, until #111's reader demux. L2's exception (an I/O lock); held
     /// per task, so other tasks of the executor take their own connections'
     /// locks while this one waits for its answer.
-    mutex: safety.IoLock = .init,
+    mutex: std.Io.Mutex = .init,
     correlation: i32 = 1,
     broken: bool = false,
     node_id: i32,
@@ -256,14 +256,14 @@ pub const Cluster = struct {
     teardown: safety.Teardown = .init,
     /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
     /// waits, calls out or takes another lock while it is held.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,
     topics: std.StringHashMapUnmanaged(TopicInfo) = .empty,
     /// One metadata refresh at a time (the keyring shape: a flag and a
     /// condition under `mutex`, never a lock held across the round trip).
     /// The round that holds the turn owns `meta_conn`.
     refresh_busy: bool = false,
-    refresh_done: safety.Condition = .init,
+    refresh_done: std.Io.Condition = .init,
     meta_conn: ?*Conn = null,
     closing: std.atomic.Value(bool) = .init(false),
 

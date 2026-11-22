@@ -151,9 +151,9 @@ pub const Queue = struct {
     gpa: Allocator,
     /// Events kept at most, `closed` aside.
     limit: u32,
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// One task waits on it at most.
-    ready: safety.Condition = .init,
+    ready: std.Io.Condition = .init,
     events: std.Deque(Event) = .empty,
     /// A task waits in `next`.
     receiving: bool = false,

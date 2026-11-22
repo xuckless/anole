@@ -24,7 +24,7 @@ pub const Series = struct {
     cron_enqueued: *m.Family(m.Counter),
     /// Guards `kinds` and `names`. A leaf spin lock: nothing is allocated
     /// under it (SAFETY.md L5).
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// Label sets: at most `max_labels` names each, sized at `init`, so a
     /// put under `lock` never grows them. The names live until `deinit`.
     kinds: std.StringHashMapUnmanaged(void) = .empty,

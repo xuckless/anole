@@ -407,8 +407,8 @@ pub const Producer = struct {
     teardown: safety.Teardown = .init,
     /// Over everything below but `group`. A leaf (L4): no cluster call, no
     /// spawn, no metrics family, no I/O and no other lock while it is held.
-    mutex: safety.Mutex(.leaf) = .init,
-    drained: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    drained: std.Io.Condition = .init,
     topics: std.StringHashMapUnmanaged(*TopicState) = .empty,
     active: std.ArrayList(*Accum) = .empty,
     senders: std.AutoHashMapUnmanaged(i32, *Sender) = .empty,
@@ -425,7 +425,7 @@ pub const Producer = struct {
     epoch: i16 = -1,
     generation: u32 = 0,
     pid_fetching: bool = false,
-    pid_ready: safety.Condition = .init,
+    pid_ready: std.Io.Condition = .init,
 
     /// The waiting callers' slots (M2's fourth class).
     waits: WaitTable = .{},

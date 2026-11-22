@@ -306,8 +306,8 @@ pub const Exporter = struct {
     /// `progressed`; the task broadcasts after each batch and when it ends,
     /// `close` as it starts and once more after the join. Never held across
     /// anything but the condition's own wait (SAFETY.md L2).
-    progress_lock: safety.Mutex(.leaf) = .init,
-    progressed: safety.Condition = .init,
+    progress_lock: std.Io.Mutex = .init,
+    progressed: std.Io.Condition = .init,
     /// Tests: waits of a flusher for progress, counted under
     /// `progress_lock` as each starts. Test builds only.
     test_flush_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},

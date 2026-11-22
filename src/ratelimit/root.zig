@@ -119,7 +119,7 @@ pub const MemoryLimiter = struct {
     io: std.Io,
     /// One process-wide lock over the buckets (a leaf), held for a lookup
     /// and its arithmetic.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     buckets: std.HashMapUnmanaged(BucketKey, *Bucket, BucketKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// Most recently used first.
     lru: std.DoublyLinkedList = .{},

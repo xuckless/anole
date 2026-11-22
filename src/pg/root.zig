@@ -532,7 +532,7 @@ pub const Client = struct {
     notify_hub: ?*NotifyHub = null,
     /// Init-once guard of `notify_hub`: held only to read it or make it
     /// (an allocation).
-    notify_hub_mutex: safety.Mutex(.leaf) = .init,
+    notify_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.

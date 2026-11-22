@@ -452,7 +452,7 @@ pub const Breakers = struct {
         last_used: u64,
     };
     const Shard = struct {
-        mutex: safety.Mutex(.leaf) = .init,
+        mutex: std.Io.Mutex = .init,
         map: std.StringHashMapUnmanaged(*Entry) = .empty,
     };
 

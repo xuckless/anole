@@ -107,7 +107,7 @@ pub const Client = struct {
     /// cancels it: a run leaves `held` (`unhold`) before its task ends.
     /// Every section (hold, unhold, heartbeatOnce, drain, the tests' interruptedRun)
     /// takes no other lock, calls no store and never suspends; cancelTask only flags.
-    held_mutex: safety.Mutex(.leaf) = .init,
+    held_mutex: std.Io.Mutex = .init,
     /// The runs going on, by `JobBox.seq`.
     held: std.AutoArrayHashMapUnmanaged(u64, *JobBox) = .empty,
     /// The last `JobBox.seq` given out; under `held_mutex`.

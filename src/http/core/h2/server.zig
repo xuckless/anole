@@ -247,7 +247,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// L2's exception, as no other lock may be held while waiting
             /// for one (the nghttp2 engine's registry is an unranked
             /// `std.Io.Mutex` for the same walk). Taken with no lock held.
-            mutex: safety.IoLock = .init,
+            mutex: std.Io.Mutex = .init,
             list: std.DoublyLinkedList = .{},
 
             pub const field = "h2_conns";
@@ -336,7 +336,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// (`placement.single_executor_guarantee` and a zio `Io`), else a
         /// mutex. Nothing under it may yield.
         const ConnLock = struct {
-            mutex: safety.Mutex(.protocol) = .init,
+            mutex: std.Io.Mutex = .init,
             free: bool = false,
             owner: usize = 0,
             held: if (builtin.mode == .debug) bool else void = if (builtin.mode == .debug) false else {},

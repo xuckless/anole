@@ -37,7 +37,7 @@ pub const Chunk = struct {
 };
 
 pub const Pipe = struct {
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// The slot generation this pipe serves; 0 when it serves none.
     gen: u32 = 0,
     chunks: std.ArrayList(Chunk) = .empty,

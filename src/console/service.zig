@@ -162,7 +162,7 @@ pub const Service = struct {
 
     /// Over `clients`, the broadcast line and the language metrics; held
     /// for bounded copies only, never across an allocation (SAFETY.md L5).
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// In `clients_buf` (set by `init`).
     clients: std.ArrayList(*Client) = .empty,
     // SAFETY: only `clients.items` is read; `init` points `clients` here.

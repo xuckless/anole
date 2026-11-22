@@ -110,8 +110,8 @@ pub const default_url = "mongodb://localhost:27017";
 /// A connection pool for one server on one executor (CMAP, without the
 /// background thread: connections open when a call needs one).
 const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     /// Most recently used last.
     idle: std.ArrayList(*Connection) = .empty,
     /// Open, checked out, or being opened.
@@ -136,7 +136,7 @@ pub const Server = struct {
     /// Guards `monitor`: the monitor sets it as it starts and clears it
     /// before it returns, so whoever cancels it under this lock knows it
     /// has not returned (`placement.currentTask`'s contract).
-    task_lock: safety.Mutex(.leaf) = .init,
+    task_lock: std.Io.Mutex = .init,
     monitor: ?placement.Task = null,
     /// Under `Client.mutex`: the links of the servers whose monitors a
     /// `syncServers` starts or stops, walked after the unlock
@@ -200,7 +200,7 @@ pub const Session = struct {
 };
 
 const SessionPool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     list: std.ArrayList(*Session) = .empty,
 };
 
@@ -237,9 +237,9 @@ pub const Client = struct {
     readiness: shared.Readiness = undefined,
 
     /// Guards the topology and the server list.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Broadcast when the topology changes (selection waits on it).
-    changed: safety.Condition = .init,
+    changed: std.Io.Condition = .init,
     topology: sdam.Topology,
     servers: std.ArrayList(*Server) = .empty,
     /// Monitors.

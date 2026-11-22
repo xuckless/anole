@@ -186,7 +186,7 @@ pub const Call = struct {
         /// exception): its two takers, the handler and its streaming
         /// writer task, run on the call's executor. Replaced at the S2
         /// HTTP/2 takeover.
-        write_lock: safety.IoLock = .init,
+        write_lock: std.Io.Mutex = .init,
         /// The wire protocol and message encoding, from the request's
         /// content type.
         protocol: Protocol = .grpc,

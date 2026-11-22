@@ -51,7 +51,7 @@ pub const Filter = struct {
 const Ring = struct {
     /// Over the fields below; held for a bounded copy only.
     /// A log call made under any ranked lock panics here in debug builds once the tap is installed (D9).
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     buf: []u8 = &.{},
     /// Absolute byte offsets: the next write, and the oldest intact record.
     head: u64 = 0,

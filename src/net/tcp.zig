@@ -1253,7 +1253,7 @@ const TcpConn = struct {
     /// which may wait (an I/O lock, L2's exception, rank `io`: its takers
     /// hold no other lock). It goes once net gets a per-connection event
     /// mailbox run by one task (after S2, with the #85 relay work).
-    cb_lock: safety.IoLock = .init,
+    cb_lock: std.Io.Mutex = .init,
     /// The `open` callback failed: `serve` closes at once (set before the
     /// first `serve`, on the connection's executor; not a `Close` state:
     /// what that callback queued still goes out until `release`).

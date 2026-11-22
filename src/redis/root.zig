@@ -322,9 +322,9 @@ pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void el
 
 /// The pool of one executor: idle connections, and how many are open.
 const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Signalled when a connection goes back, or a place frees up.
-    returned: safety.Condition = .init,
+    returned: std.Io.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle connections.
     idle: []*Connection,
     idle_len: usize = 0,
@@ -469,7 +469,7 @@ pub const Client = struct {
     pubsub_hub: ?*PubSubHub = null,
     /// Init-once guard of `pubsub_hub`: held only to read it or make it
     /// (an allocation).
-    pubsub_hub_mutex: safety.Mutex(.leaf) = .init,
+    pubsub_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.

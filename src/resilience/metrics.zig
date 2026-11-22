@@ -27,7 +27,7 @@ pub const Binding = struct {
     throttled: *metrics.Family(metrics.Counter),
     /// Over `seen`: a lookup or an insert into room made beforehand, never
     /// an allocation (SAFETY.md L5).
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// Targets seen per client kind, each with room for `max_targets`
     /// from `init` on.
     seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty),
