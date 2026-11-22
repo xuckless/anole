@@ -6,7 +6,6 @@ const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 const db = @import("root.zig");
 const internal = @import("internal.zig");
-const safety = @import("anole_safety");
 
 const metrics = observe.metrics;
 
@@ -38,12 +37,12 @@ pub const Readiness = struct {
 
     /// Adds the check to `health` under `name`. `self` must stay put.
     pub fn register(self: *Readiness, health: *observe.Health, name: []const u8) !void {
-        try health.addCheck(name, check, safety.toCtx(self));
+        try health.addCheck(name, check, self);
     }
 
     /// The `observe.Health` check.
     pub fn check(context: ?*anyopaque) bool {
-        const self = safety.fromCtx(Readiness, context);
+        const self: *Readiness = @ptrCast(@alignCast(context.?));
         const io = self.io;
         const at = self.checked_ns.load(.acquire);
         if (at != 0 and nowNs(io) - at < self.ttl.nanoseconds) return self.ready.load(.monotonic);
@@ -231,7 +230,7 @@ test "Readiness: one ping per ttl, the answer kept in between" {
         pings: u32 = 0,
         up: bool = true,
         fn ping(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
-            const self = safety.fromCtx(@This(), context);
+            const self: *@This() = @ptrCast(@alignCast(context));
             self.pings += 1;
             return self.up;
         }
@@ -239,7 +238,7 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     var fake: Fake = .{};
     // A ttl no run of the test outlives while the answer must be kept, so
     // the kept answer never depends on how fast the machine is.
-    var ready: Readiness = .{ .io = testing.io, .context = safety.toCtx(&fake), .ping = Fake.ping, .ttl = .fromSeconds(600) };
+    var ready: Readiness = .{ .io = testing.io, .context = &fake, .ping = Fake.ping, .ttl = .fromSeconds(600) };
     var health = observe.Health.init(.{});
     try ready.register(&health, "db");
     try testing.expect(health.checks[0].ready(health.checks[0].ctx));
@@ -265,7 +264,7 @@ const GatedPing = struct {
     answer: bool = true,
 
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(GatedPing, context);
+        const self: *GatedPing = @ptrCast(@alignCast(context));
         _ = self.pings.fetchAdd(1, .monotonic);
         const now = self.running.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.running.fetchSub(1, .acq_rel);
@@ -286,7 +285,7 @@ test "db readiness: probes during a ping answer with the last result" {
     const wait = @import("anole_test_wait");
     const io = testing.io;
     var fake: GatedPing = .{};
-    var ready: Readiness = .{ .io = io, .context = safety.toCtx(&fake), .ping = GatedPing.ping, .ttl = .fromSeconds(600) };
+    var ready: Readiness = .{ .io = io, .context = &fake, .ping = GatedPing.ping, .ttl = .fromSeconds(600) };
     var answer: ?bool = null;
     var group: std.Io.Group = .init;
     defer group.cancel(io);
@@ -321,7 +320,7 @@ const YieldingPing = struct {
     canceled: std.atomic.Value(u32) = .init(0),
 
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(YieldingPing, context);
+        const self: *YieldingPing = @ptrCast(@alignCast(context));
         _ = self.pings.fetchAdd(1, .monotonic);
         const now = self.running.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.running.fetchSub(1, .acq_rel);
@@ -376,7 +375,7 @@ test "db readiness: [stress] probes from four executors with cancels ping one at
 
     var fake: YieldingPing = .{};
     // ttl 0: every probe pings unless a ping already runs.
-    var ready: Readiness = .{ .io = io, .context = safety.toCtx(&fake), .ping = YieldingPing.ping, .ttl = .{ .nanoseconds = 0 } };
+    var ready: Readiness = .{ .io = io, .context = &fake, .ping = YieldingPing.ping, .ttl = .{ .nanoseconds = 0 } };
     const probes_per_wave = 16;
     for (0..300) |_| {
         const answer = random.boolean();

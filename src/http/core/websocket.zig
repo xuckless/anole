@@ -6,7 +6,6 @@ const std = @import("std");
 const Transport = @import("transport.zig").Transport;
 const placement = @import("placement.zig");
 const admission = @import("admission.zig");
-const safety = @import("anole_safety");
 const mem = @import("anole_mem");
 
 const log = std.log.scoped(.anole);
@@ -2252,25 +2251,25 @@ const CallCounter = struct {
     frees: usize = 0,
 
     fn allocator(self: *CallCounter) std.mem.Allocator {
-        return .{ .ptr = safety.toCtx(self), .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self = safety.fromCtx(CallCounter, ctx);
+        const self: *CallCounter = @ptrCast(@alignCast(ctx));
         self.allocs += 1;
         return self.inner.rawAlloc(len, alignment, ra);
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-        const self = safety.fromCtx(CallCounter, ctx);
+        const self: *CallCounter = @ptrCast(@alignCast(ctx));
         self.resizes += 1;
         return self.inner.rawResize(memory, alignment, new_len, ra);
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-        const self = safety.fromCtx(CallCounter, ctx);
+        const self: *CallCounter = @ptrCast(@alignCast(ctx));
         self.remaps += 1;
         return self.inner.rawRemap(memory, alignment, new_len, ra);
     }
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
-        const self = safety.fromCtx(CallCounter, ctx);
+        const self: *CallCounter = @ptrCast(@alignCast(ctx));
         self.frees += 1;
         self.inner.rawFree(memory, alignment, ra);
     }

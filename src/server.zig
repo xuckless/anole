@@ -29,7 +29,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const zio = @import("zio");
-const safety = @import("anole_safety");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
@@ -4152,7 +4151,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime !features.http3) return;
             const registry = self.extras.metrics orelse return;
             if (self.h3 == null or self.extras.h3_metrics) return;
-            registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshH3Metrics }) catch return;
+            registry.addCollector(.{ .context = self, .refresh = refreshH3Metrics }) catch return;
             self.extras.h3_metrics = true;
         }
 
@@ -4161,18 +4160,18 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn attachAdmissionMetrics(self: *Self) void {
             const registry = self.extras.metrics orelse return;
             if (self.extras.admission_metrics) return;
-            registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshAdmissionMetrics }) catch return;
+            registry.addCollector(.{ .context = self, .refresh = refreshAdmissionMetrics }) catch return;
             self.extras.admission_metrics = true;
         }
 
         fn refreshAdmissionMetrics(context: *anyopaque, registry: *observe.metrics.Registry) void {
-            const self = safety.fromCtx(Self, context);
+            const self: *Self = @ptrCast(@alignCast(context));
             @import("observe/runtime.zig").refreshAdmission(registry, &self.server.admission);
         }
 
         fn refreshH3Metrics(context: *anyopaque, registry: *observe.metrics.Registry) void {
             if (comptime !features.http3) return;
-            const self = safety.fromCtx(Self, context);
+            const self: *Self = @ptrCast(@alignCast(context));
             const ep = self.h3 orelse return;
             @import("h3/metrics.zig").refresh(registry, ep.endpoints(), ep.steering(), ep.sendMemory(), ep.options.listener_name);
         }

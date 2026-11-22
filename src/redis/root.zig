@@ -81,7 +81,6 @@
 const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -502,7 +501,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.redis, name, opts.breaker, opts.retry),
             .observer = .{ .system = .redis, .name = name },
-            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
+            .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = opts.connect_timeout,
             .idle_timeout = opts.idle_timeout,
@@ -745,7 +744,7 @@ pub const Client = struct {
     /// check. Its failures are not logged; a cancel of the caller is
     /// `error.Canceled` (`db.Readiness` keeps no answer then).
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .last = noLast, .request = null };

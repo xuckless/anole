@@ -67,7 +67,6 @@
 //!   HTTP/2 reset, `QueryOptions.timeout`) sends a CancelRequest so the
 //!   server stops the statement, and the connection is closed.
 const std = @import("std");
-const safety = @import("anole_safety");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
@@ -559,7 +558,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.postgresql, name, opts.breaker, opts.retry),
             .observer = .{ .system = .postgresql, .name = name },
-            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
+            .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = undefined,
             .ping_timeout = opts.ping_timeout,
@@ -945,7 +944,7 @@ pub const Client = struct {
     /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
     /// answer then).
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = self.ping_timeout, .clock = .awake } });
         return deadline.run(pingOnce, .{ self, io }) catch |err| {
             const e: anyerror = err;

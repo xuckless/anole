@@ -62,7 +62,6 @@
 //! stored as text in SQLite's own format (`2026-10-21 09:30:00.25`, UTC).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -219,7 +218,7 @@ pub const Client = struct {
             .writer = .{ .conn = undefined, .thread = undefined },
             .readers = .{},
             .observer = .{ .system = .sqlite, .name = name },
-            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
+            .readiness = .{ .io = io, .context = self, .ping = ping },
             .cache = try .init(gpa, io, .sqlite, name, options.cache),
         };
         errdefer self.cache.deinit();
@@ -632,7 +631,7 @@ pub const Client = struct {
     /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
     /// answer then).
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         var buf: [1024]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = io, .arena = fba.allocator() };
