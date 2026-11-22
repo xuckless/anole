@@ -15,6 +15,7 @@ const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const fuzz = @import("../fuzz.zig");
 const out_mod = @import("out.zig");
+const tc = @import("test_client.zig");
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -642,13 +643,17 @@ test "h2: stream window overflow (WINDOW_UPDATE past 2^31-1) is a stream FLOW_CO
 // ---------------------------------------------------------------------------
 // The handshake and the stream state table
 
-test "h2 conn: initial SETTINGS ids, in wire order, per option combination" {
-    const I = frame.SettingId;
-    const rows = [_]struct { name: []const u8, opts: conn.Options, want: []const I }{
-        .{ .name = "default", .opts = .{}, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .no_rfc7540_priorities } },
-        .{ .name = "raised frame size", .opts = .{ .max_frame_size = 1 << 16 }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .max_frame_size, .no_rfc7540_priorities } },
-        .{ .name = "connect only", .opts = .{ .enable_connect_protocol = true }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .enable_connect_protocol, .no_rfc7540_priorities } },
-        .{ .name = "both", .opts = .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .max_frame_size, .enable_connect_protocol, .no_rfc7540_priorities } },
+test "h2 conn: initial SETTINGS, in wire order, per option combination" {
+    const S = frame.Setting;
+    const head = [_]S{ .{ .id = .max_concurrent_streams, .value = 250 }, .{ .id = .initial_window_size, .value = 65536 }, .{ .id = .max_header_list_size, .value = 65536 } };
+    const fs: S = .{ .id = .max_frame_size, .value = 1 << 16 };
+    const cp: S = .{ .id = .enable_connect_protocol, .value = 1 };
+    const np: S = .{ .id = .no_rfc7540_priorities, .value = 1 };
+    const rows = [_]struct { name: []const u8, opts: conn.Options, want: []const S }{
+        .{ .name = "default", .opts = .{}, .want = &(head ++ .{np}) },
+        .{ .name = "raised frame size", .opts = .{ .max_frame_size = 1 << 16 }, .want = &(head ++ .{ fs, np }) },
+        .{ .name = "connect only", .opts = .{ .enable_connect_protocol = true }, .want = &(head ++ .{ cp, np }) },
+        .{ .name = "both", .opts = .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true }, .want = &(head ++ .{ fs, cp, np }) },
     };
     for (rows) |row| {
         errdefer std.debug.print("row: {s}\n", .{row.name});
@@ -656,9 +661,29 @@ test "h2 conn: initial SETTINGS ids, in wire order, per option combination" {
         defer t.destroy();
         const first = try t.drain();
         try expectEqual(.settings, first[0].type);
-        try expectEqual(row.want.len, first[0].settings.len);
-        for (row.want, first[0].settings) |id, got| try expectEqual(id, got.id);
+        try testing.expectEqualDeep(row.want, first[0].settings);
     }
+}
+
+test "h2 conn: unframed sums the queued DATA nodes the windows hold back" {
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    const s = t.stream(1);
+    const body = try t.arena().alloc(u8, 70000);
+    @memset(body, 'x');
+    try t.c.submitHead(s, 200, &.{}, false);
+    try expectEqual(0, tc.unframed(s));
+    try t.c.submitData(s, &.{body[0..40000]}, false);
+    try t.c.submitData(s, &.{body[40000..]}, false);
+    try expectEqual(70000, tc.unframed(s));
+    // The peer's windows (65535) let 65535 through.
+    _ = try t.drain();
+    try expectEqual(70000 - 65535, tc.unframed(s));
+    try t.feed(try t.windowUpdate(0, 1 << 20));
+    try t.feed(try t.windowUpdate(1, 1 << 20));
+    _ = try t.drain();
+    try expectEqual(0, tc.unframed(s));
 }
 
 test "h2 conn: preface and SETTINGS handshake" {

@@ -317,6 +317,21 @@ test "h2 client conn: the preface is the magic, then SETTINGS with ENABLE_PUSH=0
     try expectFrames(try t.drain(), &.{.{ .type = .settings, .flags = F.ack }});
 }
 
+test "h2 client conn: raised options add MAX_FRAME_SIZE and CONNECT in wire order" {
+    const t = try CT.create(testing.allocator, .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true });
+    defer t.destroy();
+    const out = try t.drain();
+    const want = [_]frame.Setting{
+        .{ .id = .enable_push, .value = 0 },
+        .{ .id = .initial_window_size, .value = (conn.Options{}).initial_window },
+        .{ .id = .max_header_list_size, .value = (conn.Options{}).max_header_list_size },
+        .{ .id = .max_frame_size, .value = 1 << 16 },
+        .{ .id = .enable_connect_protocol, .value = 1 },
+        .{ .id = .no_rfc7540_priorities, .value = 1 },
+    };
+    try testing.expectEqualDeep(@as([]const frame.Setting, &want), out[0].settings);
+}
+
 test "h2 client conn: the server's first frame must be SETTINGS" {
     const t = try CT.create(testing.allocator, .{});
     defer t.destroy();
