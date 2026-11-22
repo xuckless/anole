@@ -1644,7 +1644,6 @@ pub fn Endpoint(comptime Ctx: type) type {
         const Conn = struct {
             ep: *Self,
             q: *c.ngtcp2_conn,
-            h3: ?*h.nghttp3_conn = null,
             ssl: *c.SSL,
             conn_ref: c.ngtcp2_crypto_conn_ref,
             scid: c.ngtcp2_cid,
@@ -1726,9 +1725,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// guess is still tiny otherwise count that data lost and send
             /// it again in 1-RTT.
             hold_off: std.atomic.Value(bool) = .init(false),
-            /// The connection speaks "hq-interop", not HTTP/3.
-            hq: bool = false,
-            hq_streams: std.AutoArrayHashMapUnmanaged(i64, *HqStream) = .empty,
+            /// Which protocol the connection speaks, decided once at the
+            /// 1-RTT tx key (`onRecvTxKey`); each protocol's state exists
+            /// only in its own case. Until then nobody is set up
+            /// (0-RTT data takes the HTTP/3 paths and finds no nghttp3).
+            proto: union(enum) {
+                handshaking,
+                h3: *h.nghttp3_conn,
+                /// "hq-interop": the request streams.
+                hq: std.AutoArrayHashMapUnmanaged(i64, *HqStream),
+            } = .handshaking,
             /// WebTransport's streams, sessions and datagrams, when the
             /// endpoint speaks it.
             wt: ?*webtransport.Core = null,
@@ -1825,15 +1831,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn destroy(conn: *Conn) void {
                 const gpa = conn.ep.gpa;
                 if (conn.seat.load(.monotonic).handedOver()) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
-                for (conn.hq_streams.values()) |hs| hs.free(gpa);
-                conn.hq_streams.deinit(gpa);
                 gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
                 for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 conn.ready.deinit(gpa);
                 conn.awaiting.deinit(gpa);
                 if (conn.wt) |w| w.destroy();
-                if (conn.h3) |hc| h.nghttp3_conn_del(hc);
+                switch (conn.proto) {
+                    .handshaking => {},
+                    .h3 => |hc| h.nghttp3_conn_del(hc),
+                    .hq => |*streams| {
+                        for (streams.values()) |hs| hs.free(gpa);
+                        streams.deinit(gpa);
+                    },
+                }
                 c.ngtcp2_conn_del(conn.q);
                 c.SSL_free(conn.ssl);
                 if (conn.close_pkt.len > 0) gpa.free(conn.close_pkt);
@@ -2199,7 +2210,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// later. Then, once nghttp3 has no streams left, close.
             /// Returns when to look again. Locked.
             fn drainStep(conn: *Conn, t: u64) u64 {
-                const hc = conn.h3 orelse {
+                const hc = conn.h3() orelse {
                     conn.closeGracefully();
                     return t;
                 };
@@ -2225,14 +2236,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 if (!conn.enter(.{ .drain_notice = conn.periodEnd() }, .none)) return;
-                if (conn.h3) |hc| _ = h.nghttp3_conn_submit_shutdown_notice(hc);
+                if (conn.h3()) |hc| _ = h.nghttp3_conn_submit_shutdown_notice(hc);
             }
 
             /// The final GOAWAY, sent, then CONNECTION_CLOSE: for a hand-over,
             /// which cannot wait for requests to finish.
             fn handOver(conn: *Conn) void {
                 conn.lock();
-                if (conn.life.isOpen()) if (conn.h3) |hc| {
+                if (conn.life.isOpen()) if (conn.h3()) |hc| {
                     _ = h.nghttp3_conn_shutdown(hc);
                 };
                 conn.unlock();
@@ -2367,7 +2378,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Once 1-RTT keys are there: the control and QPACK streams.
             /// Locked (inside an ngtcp2 callback).
             fn setupHttp3(conn: *Conn) !void {
-                if (conn.h3 != null) return;
                 if (c.ngtcp2_conn_get_streams_uni_left2(conn.q) < 3) return error.Http3SetupFailed;
                 const options = &conn.ep.options;
                 const settings = http3Settings(options);
@@ -2396,11 +2406,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (c.ngtcp2_conn_open_uni_stream(conn.q, &enc, null) != 0) return error.Http3SetupFailed;
                 if (c.ngtcp2_conn_open_uni_stream(conn.q, &dec, null) != 0) return error.Http3SetupFailed;
                 if (h.nghttp3_conn_bind_qpack_streams(hc, enc, dec) != 0) return error.Http3SetupFailed;
-                conn.h3 = hc;
+                conn.proto = .{ .h3 = hc.? };
+            }
+
+            /// The nghttp3 connection, once HTTP/3 is set up.
+            fn h3(conn: *Conn) ?*h.nghttp3_conn {
+                return switch (conn.proto) {
+                    .h3 => |hc| hc,
+                    .handshaking, .hq => null,
+                };
             }
 
             fn side(conn: *Conn) bridge.Side {
-                return .{ .q = conn.q, .h3 = conn.h3, .last_error = &conn.last_error, .wt = conn.wt };
+                return .{ .q = conn.q, .h3 = conn.h3(), .last_error = &conn.last_error, .wt = conn.wt };
             }
 
             fn consume(conn: *Conn, stream_id: i64, n: u64) void {
@@ -2451,8 +2469,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn hqRecv(conn: *Conn, flags: u32, stream_id: i64, data: []const u8) c_int {
                 const gpa = conn.ep.gpa;
                 bridge.consume(conn.q, stream_id, data.len);
-                const hs = conn.hq_streams.get(stream_id) orelse return 0;
-                if (hs.ready) return 0;
+                const hs = conn.proto.hq.get(stream_id) orelse return 0;
+                if (hs.phase != .reading_request) return 0;
                 hs.request.appendSlice(gpa, data) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 const fin = flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0;
                 const line_end = std.mem.indexOfScalar(u8, hs.request.items, '\n');
@@ -2465,7 +2483,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     log.debug("hq-interop {s}: {t}", .{ line, err });
                     break :blk &.{};
                 };
-                hs.ready = true;
+                hs.phase = .sending;
                 conn.kick();
                 return 0;
             }
@@ -2490,11 +2508,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 while (true) {
                     var picked: ?*HqStream = null;
                     var stream_id: i64 = -1;
-                    while (next < conn.hq_streams.count()) : (next += 1) {
-                        const hs = conn.hq_streams.values()[next];
-                        if (hs.ready and !hs.fin_sent) {
+                    const streams = &conn.proto.hq;
+                    while (next < streams.count()) : (next += 1) {
+                        const hs = streams.values()[next];
+                        if (hs.phase == .sending) {
                             picked = hs;
-                            stream_id = conn.hq_streams.keys()[next];
+                            stream_id = streams.keys()[next];
                             break;
                         }
                     }
@@ -2512,7 +2531,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const n = ngtcp2.connWritevStream(conn.q, p, pi, dest[0..dest_len], &data_len, flags, stream_id, datav, ts);
                     if (picked) |hs| if (data_len >= 0) {
                         hs.sent += @intCast(data_len);
-                        if (hs.sent == hs.response.len) hs.fin_sent = true;
+                        if (hs.sent == hs.response.len) hs.phase = .done;
                     };
                     if (n < 0) switch (n) {
                         // This one waits for credit or is gone; try the next.
@@ -2619,8 +2638,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// from it until the peer acknowledges).
             response: []u8 = &.{},
             sent: usize = 0,
-            ready: bool = false,
-            fin_sent: bool = false,
+            phase: enum {
+                /// The request line is still arriving.
+                reading_request,
+                /// The file is loaded and goes out; the FIN rides the write
+                /// of its last byte (the only one, if it is empty).
+                sending,
+                /// All sent, FIN included; the file stays for resends.
+                done,
+            } = .reading_request,
 
             fn free(hs: *HqStream, gpa: std.mem.Allocator) void {
                 hs.request.deinit(gpa);
@@ -3438,7 +3464,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn resume_(s: *Stream) void {
                 if (!s.deferred) return;
                 s.deferred = false;
-                if (s.conn.h3) |hc| _ = h.nghttp3_conn_resume_stream(hc, s.id);
+                if (s.conn.h3()) |hc| _ = h.nghttp3_conn_resume_stream(hc, s.id);
             }
 
             /// Waits for `signal` to change after `seen`. Unlocked.
@@ -3887,7 +3913,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
-                const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
+                const hc = conn.h3() orelse return self.fail(error.ConnectionResetByPeer);
                 if (h.nghttp3_conn_submit_info(hc, s.id, &nva, nva.len) != 0) return self.fail(error.Unexpected);
                 conn.kick();
             }
@@ -3930,7 +3956,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = s.conn;
                 if (s.send.isSubmitted()) return;
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
-                const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
+                const hc = conn.h3() orelse return self.fail(error.ConnectionResetByPeer);
                 const reader: h.nghttp3_data_reader = .{ .read_data = readData };
                 const rv = h.nghttp3_conn_submit_response(hc, s.id, s.response_nv.ptr, s.response_nv.len, &reader);
                 if (rv != 0) {
@@ -4230,7 +4256,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, offset: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const bytes: []const u8 = if (len == 0) &.{} else data[0..len];
-            if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
+            if (conn.proto == .hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
             if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| {
@@ -4268,7 +4294,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onAcked(stream_id, len)) return 0;
-            const hc = conn.h3 orelse return 0;
+            const hc = conn.h3() orelse return 0;
             if (h.nghttp3_conn_add_ack_offset(hc, stream_id, len) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
@@ -4276,10 +4302,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onStreamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (c.ngtcp2_is_bidi_stream(stream_id) == 0) return 0;
-            if (conn.hq) {
+            if (conn.proto == .hq) {
                 const hs = conn.ep.gpa.create(HqStream) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 hs.* = .{};
-                conn.hq_streams.put(conn.ep.gpa, stream_id, hs) catch {
+                conn.proto.hq.put(conn.ep.gpa, stream_id, hs) catch {
                     conn.ep.gpa.destroy(hs);
                     return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 };
@@ -4305,7 +4331,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             };
             const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
             if (rv != 0) return rv;
-            if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
+            if (conn.proto == .hq) if (conn.proto.hq.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
@@ -4330,7 +4356,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onReset(stream_id, code)) return 0;
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            if (conn.h3()) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
                 s.wakeAll();
@@ -4351,7 +4377,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// read no more of it either.
         fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            if (conn.h3()) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
@@ -4398,16 +4424,16 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onExtendMaxRemoteStreamsBidi(_: ?*c.ngtcp2_conn, max_streams: u64, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            if (conn.h3) |hc| h.nghttp3_conn_set_max_client_streams_bidi(hc, max_streams);
+            if (conn.h3()) |hc| h.nghttp3_conn_set_max_client_streams_bidi(hc, max_streams);
             return 0;
         }
 
         fn onExtendMaxStreamData(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             // More credit: the driver writes again.
-            if (conn.hq) conn.kick();
+            if (conn.proto == .hq) conn.kick();
             if (conn.wt) |w| if (w.onUnblocked(stream_id)) return 0;
-            const hc = conn.h3 orelse return 0;
+            const hc = conn.h3() orelse return 0;
             if (h.nghttp3_conn_unblock_stream(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
@@ -4415,17 +4441,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvTxKey(_: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
             if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
             const conn = connOf(user_data);
-            if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
-                conn.hq = true;
-                return 0;
+            switch (conn.proto) {
+                .handshaking => if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
+                    conn.proto = .{ .hq = .empty };
+                } else conn.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE,
+                .h3, .hq => {},
             }
-            conn.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
         fn writePkt(_: ?*c.ngtcp2_conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, len: usize, ts: c.ngtcp2_tstamp, user_data: ?*anyopaque) callconv(.c) c.ngtcp2_ssize {
             const conn = connOf(user_data);
-            if (conn.hq) return conn.hqWritePacket(p, pi, dest, len, ts);
+            if (conn.proto == .hq) return conn.hqWritePacket(p, pi, dest, len, ts);
             return bridge.writePacket(conn.side(), p, pi, dest, len, ts);
         }
 
@@ -4597,7 +4624,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
-                    if (h.nghttp3_conn_submit_trailers(s.conn.h3, stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
+                    if (h.nghttp3_conn_submit_trailers(s.conn.h3(), stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
                         return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 }
                 return 0;
@@ -4614,7 +4641,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
-                    if (h.nghttp3_conn_submit_trailers(s.conn.h3, stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
+                    if (h.nghttp3_conn_submit_trailers(s.conn.h3(), stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
                         return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 }
             }
