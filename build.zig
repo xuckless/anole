@@ -880,7 +880,7 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
-    // The validator's, the logger's, the banner's, src/safety's and
+    // The validator's, the logger's, the banner's and
     // src/resilience/core.zig's own tests: each is its own module, so the
     // anole test binary does not collect them.
     for ([_]struct { name: []const u8, mod: *std.Build.Module }{
@@ -889,7 +889,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
         .{ .name = "wait-test", .mod = core.test_wait },
-        .{ .name = "safety-test", .mod = core.safety },
         .{ .name = "mem-test", .mod = core.mem },
     }) |t| {
         const sub_tests = addSafeTest(b, .{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
@@ -1097,11 +1096,9 @@ pub fn build(b: *std.Build) void {
                 while (imports.next()) |e| m.addImport(e.key_ptr.*, e.value_ptr.*);
                 const zio_stub = bb.createModule(.{ .root_source_file = bb.path("src/http/core/zio_stub.zig"), .target = t, .optimize = opt });
                 m.addImport("zio", zio_stub);
-                const stub_safety = Core.safetyModule(bb, zio_stub, never_reuse, t, opt);
-                m.addImport("anole_safety", stub_safety);
                 m.addImport("anole_test_wait", wait);
                 // The core's runner backs std.testing.allocator with it; the
-                // same instance as the hooks module's and the safety's.
+                // same instance as the hooks module's.
                 m.addImport("anole_never_reuse", never_reuse);
                 // And the stub HTTP/2 client: Anole's would import these
                 // sources a second time.
@@ -2166,7 +2163,7 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
         // Any zio in the binary, which then reads the runner's `zio_options`
         // from test_hooks.zig: a zio left to the stub would fail to compile.
         const zio_mod: ?*std.Build.Module = findImport(m, "zio", 4);
-        // The binary's own never_reuse module if anole_safety is in it.
+        // The binary's own never_reuse module if one is in it.
         const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
             .root_source_file = b.path("src/testing/hooks.zig"),
@@ -2195,10 +2192,7 @@ fn findImport(m: *std.Build.Module, name: []const u8, depth: u8) ?*std.Build.Mod
 
 const Core = struct {
     zio: *std.Build.Module,
-    /// src/safety (SAFETY.md's debug-build checks) over that zio:
-    /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
-    safety: *std.Build.Module,
-    /// src/testing/never_reuse.zig: `anole_never_reuse` in `safety`, the test
+    /// src/testing/never_reuse.zig: `anole_never_reuse` in the test
     /// hooks and the HTTP core's tests.
     never_reuse: *std.Build.Module,
     /// src/mem.zig: `anole_mem` (allocUninit, SpinLock) in every HTTP core
@@ -2249,11 +2243,10 @@ const Core = struct {
         // test runner, declares `zio_options` (src/testing/hooks.zig).
         const debug = optimize == .debug;
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_cancel = debug }).module("zio");
-        // The test allocator's backing allocator: one instance for anole_safety,
-        // the hooks module and the core's runner (a file is in one module per
+        // The test allocator's backing allocator: one instance for the hooks
+        // module and the core's runner (a file is in one module per
         // compilation).
         const never_reuse = neverReuseModule(b, target, optimize);
-        const safety = safetyModule(b, zio_mod, never_reuse, target, optimize);
         const mem = b.createModule(.{ .root_source_file = b.path("src/mem.zig"), .target = target, .optimize = optimize });
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
@@ -2268,7 +2261,7 @@ const Core = struct {
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
         const test_wait = testWaitModule(b, target, optimize);
-        var core: Core = .{ .safety = safety, .mem = mem, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
+        var core: Core = .{ .mem = mem, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2292,7 +2285,6 @@ const Core = struct {
                                 optimize,
                             );
                             dusty_mod.addImport("resilience_core", resilience);
-                            dusty_mod.addImport("anole_safety", safety);
                             dusty_mod.addImport("anole_mem", mem);
                             dusty_mod.addImport("validate", validate);
                             dusty_mod.addImport("anole_log", anole_log);
@@ -2302,7 +2294,6 @@ const Core = struct {
                                 b,
                                 dusty_mod,
                                 if (tls) seam else null,
-                                safety,
                                 target,
                                 optimize,
                             );
@@ -2330,7 +2321,6 @@ const Core = struct {
         b: *std.Build,
         dusty_mod: *std.Build.Module,
         tls: ?*std.Build.Module,
-        safety: *std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -2344,29 +2334,13 @@ const Core = struct {
         opts.addOption(bool, "tls", tls != null);
         mod.addOptions("anole_h2_options", opts);
         mod.addImport("dusty", dusty_mod);
-        mod.addImport("anole_safety", safety);
         if (tls) |m| mod.addImport("anole_dusty_tls", m);
         dusty_mod.addImport("h2_client", mod);
         return mod;
     }
 
-    /// src/safety over `zio_mod` (the real zio, or the core's stub for its
-    /// own tests).
-    fn safetyModule(b: *std.Build, zio_mod: *std.Build.Module, never_reuse: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-        return b.createModule(.{
-            .root_source_file = b.path("src/safety/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zio", .module = zio_mod },
-                .{ .name = "anole_never_reuse", .module = never_reuse },
-            },
-        });
-    }
-
     /// src/testing/never_reuse.zig alone: the test allocator's backing
-    /// allocator, shared by anole_safety and the test runner (a file is in
+    /// allocator, shared by the test hooks and the test runner (a file is in
     /// one module per compilation).
     fn neverReuseModule(b: *std.Build, target: ?std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode) *std.Build.Module {
         return b.createModule(.{ .root_source_file = b.path("src/testing/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -2693,7 +2667,6 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     const mod = if (o.public) b.addModule("anole", create) else b.createModule(create);
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
-    mod.addImport("anole_safety", o.core.safety);
     mod.addImport("anole_mem", o.core.mem);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
