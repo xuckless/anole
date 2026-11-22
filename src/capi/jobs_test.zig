@@ -290,6 +290,34 @@ test "capi jobs: stopping a worker with nothing out ends it" {
     engine.jobs.stop(r.e, wh);
 }
 
+test "capi jobs: the drain ends a worker once with JOB_WORKER_DRAINED, however it starts (#220)" {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    const Start = enum { stop_server, stop_server_then_drain, drain };
+    for (std.enums.values(Start)) |how| {
+        errdefer std.debug.print("row: {t}\n", .{how});
+        var r: Rig = undefined;
+        try r.create("");
+        defer r.deinit();
+        const wh = try engine.jobs.work(r.e, r.c, .{ .size = @sizeOf(abi.JobsWorkOptions) }, 9);
+        try r.start();
+        switch (how) {
+            .stop_server => r.e.testStopServer(),
+            .stop_server_then_drain => {
+                r.e.testStopServer();
+                try r.e.drain();
+            },
+            // The server's own hook fires after and loses the phase change.
+            .drain => try r.e.drain(),
+        }
+        _ = try r.ev.waitFor(.stopped, 0, 5000);
+        try std.testing.expectEqual(@as(usize, 1), r.ev.count(.job_worker_end));
+        try std.testing.expectEqual(@as(usize, 1), r.ev.count(.draining));
+        const i = try r.ev.waitFor(.job_worker_end, 0, 0);
+        try std.testing.expectEqual(abi.JOB_WORKER_DRAINED, r.ev.as(abi.JobWorkerEndEvent, i).reason);
+        try std.testing.expectEqual(wh, r.ev.list.items[i].handle);
+    }
+}
+
 const HttpResult = struct { status: u16 = 0 };
 
 /// A GET carrying a trace context the server does not record (no tracing

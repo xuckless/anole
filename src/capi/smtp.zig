@@ -184,8 +184,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): no new send is taken;
-/// those in flight finish, and the client closes with the server.
+/// The drain started (however it started; once; never waits): no new send
+/// is taken; those in flight finish, and the client closes with the server.
 pub fn draining(e: *Engine) void {
     if (comptime !features.smtp) return;
     for (e.smtp_state.mails) |*m| if (m.client) |c| c.stopAccepting();

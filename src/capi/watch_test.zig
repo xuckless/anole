@@ -6,6 +6,7 @@ const std = @import("std");
 const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const engine_test = @import("engine_test.zig");
 const sse_test = @import("sse_test.zig");
 const abi = engine.abi;
 const features = anole.features;
@@ -230,12 +231,24 @@ test "capi engine: unlisten ends a watch listener with one END UNLISTENED; the h
 
 test "capi engine: the drain ends every watch listener with END DRAINED" {
     if (comptime !features.redis) return error.SkipZigTest;
+    // The watches stop through their own drain hooks, however the drain
+    // starts (#220).
+    for (std.enums.values(engine_test.DrainStart)) |how| {
+        errdefer std.debug.print("row: the drain starts {t}\n", .{how});
+        try drainEndsListeners(how);
+    }
+}
+
+fn drainEndsListeners(how: engine_test.DrainStart) !void {
     var r: WatchRig = undefined;
     try r.init();
     defer r.deinit();
     const h = try engine.watch.listen(r.e, r.orders, r.rx.c, listenOpts(2, abi.WATCH_NATIVE), 77);
     const hj = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_JSON), 2);
-    try r.e.drain();
+    switch (how) {
+        .explicit => try r.e.drain(),
+        .stop_server => r.e.testStopServer(),
+    }
     r.drained = true;
     var ended: usize = 0;
     while (ended < 2) {

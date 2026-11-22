@@ -6,6 +6,7 @@ const wait = @import("anole_test_wait");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const engine_test = @import("engine_test.zig");
 const parity = @import("parity.zig");
 const config = @import("config.zig");
 const abi = engine.abi;
@@ -161,6 +162,21 @@ const Rig = struct {
         r.rt.deinit();
     }
 };
+
+test "capi s3: a drain the console starts (App.stop) refuses new uploads while the server drains (#220)" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.start(false);
+    defer r.deinit();
+    var probe: engine_test.DrainProbe = .{ .e = r.e, .check = struct {
+        fn draining(e: *engine.Engine) bool {
+            return engine.s3.find(e, "files").?.client.?.draining.load(.acquire);
+        }
+    }.draining };
+    probe.add();
+    r.e.testStopServer();
+    try probe.expectHeld();
+}
 
 fn pattern(buf: []u8, seed: u8) void {
     for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% seed);

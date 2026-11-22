@@ -796,8 +796,8 @@ pub fn groupClose(e: *Engine, hv: u64) void {
     e.setEvent(&g.wake);
 }
 
-/// The drain started: every group finishes up and ends with
-/// `ANOLE_BROKER_END_DRAINED`.
+/// The drain started (however it started; once; never waits): every group
+/// finishes up and ends with `ANOLE_BROKER_END_DRAINED`.
 pub fn draining(e: *Engine) void {
     const st = &e.kafka_state;
     st.groups.acquire();

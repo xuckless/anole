@@ -228,8 +228,8 @@ fn sqlHandler(ctx: ?*anyopaque, job: *J.Job) anyerror!void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): workers take no more
-/// jobs; each ends when its last job is over.
+/// The drain started (however it started; once; never waits): workers take
+/// no more jobs; each ends when its last job is over.
 pub fn draining(e: *Engine) void {
     const t = &e.jobs_state.workers;
     t.acquire();

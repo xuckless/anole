@@ -7,6 +7,7 @@ const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const dusty = @import("dusty");
 const io_gate = @import("../io_gate.zig");
 const abi = engine.abi;
 const features = anole.features;
@@ -2086,8 +2087,52 @@ test "capi engine: /readyz honours readiness checks and the health listener" {
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
+/// How a test starts the drain: `anole_server_drain`, or `App.stop` as
+/// the console, a signal and a hand-off do (#220).
+pub const DrainStart = enum { explicit, stop_server };
+
+/// A drain hook added after the engine's own, so it runs right after it,
+/// on the draining task and before the server stops: `check` sees what the
+/// engine's drain start left, however the drain started (#220).
+pub const DrainProbe = struct {
+    hook: dusty.DrainHooks.Hook = .{ .callback = run },
+    e: *engine.Engine,
+    check: *const fn (*engine.Engine) bool,
+    seen: std.atomic.Value(Seen) = .init(.not_run),
+
+    const Seen = enum(u8) { not_run, held, missing };
+
+    /// On the running engine's server, after the engine's hook.
+    pub fn add(p: *DrainProbe) void {
+        const app = p.e.app.?;
+        app.server.drain_hooks.add(app.io(), &p.hook);
+    }
+
+    fn run(hook: *dusty.DrainHooks.Hook) void {
+        const p: *DrainProbe = @alignCast(@fieldParentPtr("hook", hook));
+        p.seen.store(if (p.check(p.e)) .held else .missing, .release);
+    }
+
+    fn ran(p: *const DrainProbe) bool {
+        return p.seen.load(.acquire) != .not_run;
+    }
+
+    /// Waits for the hook, then expects `check` held when it ran.
+    pub fn expectHeld(p: *const DrainProbe) !void {
+        try wait.waitUntil(engine.threadedIo(), "the drain probe ran", p, ran);
+        try std.testing.expectEqual(Seen.held, p.seen.load(.acquire));
+    }
+};
+
 test "capi engine: a request cut by the drain's deadline aborts with reason DRAIN" {
     if (comptime !features.http2) return error.SkipZigTest;
+    for (std.enums.values(DrainStart)) |how| {
+        errdefer std.debug.print("row: the drain starts {t}\n", .{how});
+        try abortReasonAfter(how);
+    }
+}
+
+fn abortReasonAfter(how: DrainStart) !void {
     const json = "{\"executors\": 2, \"timeouts\": {\"request_ms\": 10000, \"shutdown_ms\": 200}," ++
         "\"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}]," ++ routes ++ "}";
     var why_buf: [256]u8 = undefined;
@@ -2108,12 +2153,12 @@ test "capi engine: a request cut by the drain's deadline aborts with reason DRAI
     const rt = try zio.Runtime.init(alloc, .{});
     defer rt.deinit();
     const io = rt.io();
-    var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io });
+    var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io, how });
     try f.await(io);
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
-fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
+fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io, how: DrainStart) !void {
     const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
     defer conn.close();
     a.held.store(0, .release);
@@ -2124,7 +2169,10 @@ fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
     defer s.release();
     const held = try wait.waitNonZero(io, "the consumer holds the request", &a.held);
     // The drain's deadline (shutdown_ms) cuts the request nobody answered.
-    try e.drain();
+    switch (how) {
+        .explicit => try e.drain(),
+        .stop_server => e.testStopServer(),
+    }
     try wait.waitEqual(io, "the consumer heard the held request's ABORT", &a.last_abort, held);
     try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
 }
@@ -2835,6 +2883,25 @@ test "capi engine: anole_server_drain after a drain the console started posts no
     const e, const c = try ringEngine(8);
     defer e.destroy();
     e.testStopServer();
+    try e.drain();
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
+test "capi engine: a drain the console starts (App.stop) moves the phase to .draining; a later drain posts no second ANOLE_EV_DRAINING (#220)" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    var probe: DrainProbe = .{ .e = e, .check = struct {
+        fn draining(en: *engine.Engine) bool {
+            return en.phase.load(.acquire) == .draining;
+        }
+    }.draining };
+    probe.add();
+    e.testStopServer();
+    try probe.expectHeld();
     try e.drain();
     var counts: [64]u32 = @splat(0);
     try drainCounts(c, &counts, 2);

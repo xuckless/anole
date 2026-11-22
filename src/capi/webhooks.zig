@@ -133,7 +133,7 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     e.jobs_state.webhooks_admin = &adminOp;
 }
 
-/// The drain started (`anole_server_drain`, once).
+/// The drain started (however it started; once; never waits).
 pub fn draining(e: *Engine) void {
     e.webhooks_state.draining.store(true, .release);
 }

@@ -296,12 +296,6 @@ pub fn start(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): the watches stop reading;
-/// their listeners end after what is queued.
-pub fn draining(e: *Engine) void {
-    for (e.watch_state.entries) |en| en.w.stop();
-}
-
 /// The server stops: the watches are stopped and freed (their tasks are on
 /// the runtime, which is still up), their listeners end.
 pub fn close(e: *Engine) void {

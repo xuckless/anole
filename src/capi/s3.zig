@@ -305,8 +305,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): no new upload starts;
-/// those in flight finish.
+/// The drain started (however it started; once; never waits): no new
+/// upload starts; those in flight finish.
 pub fn draining(e: *Engine) void {
     if (comptime !features.s3) return;
     for (e.s3_state.stores) |*st| if (st.client) |c| c.draining.store(true, .release);
