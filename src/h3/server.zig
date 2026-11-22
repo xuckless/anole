@@ -4331,7 +4331,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             };
             const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
             if (rv != 0) return rv;
-            if (conn.proto == .hq) if (conn.proto.hq.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
+            switch (conn.proto) {
+                .hq => |*m| if (m.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa),
+                .handshaking, .h3 => {},
+            }
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
