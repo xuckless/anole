@@ -2217,7 +2217,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 while (i < conn.streams.count()) {
                     const s = conn.streams.values()[i];
                     const before = conn.streams.count();
-                    if (s.detached != null or s.parked != null) {
+                    if (s.phase.owns()) {
                         s.reset = true;
                         s.wakeAll();
                         abortDetached(s);
@@ -2548,7 +2548,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// gRPC-Web, Connect streaming): the larger send cap.
             message: bool = false,
             /// Where the request runs: its head, an awaited body, the
-            /// endpoint task, or a task (`Phase`). Locked.
+            /// endpoint task, or a task; then where a response that outlives
+            /// its handler is: detached (`dusty.Detached`, the request and
+            /// response live on in the stream's arena), attached, or parked
+            /// (`Response._park`: bursts from whichever task has something
+            /// to send, no task holding it in between, `H3Parked`).
+            /// Locked, but one read (`Phase`).
             phase: Phase = .head,
             /// The request's head came in 0-RTT, before the handshake
             /// completed.
@@ -2570,25 +2575,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// stream's task changes it once the task runs.
             holds: bool = false,
             round: u32 = 0,
-            /// The handler detached the response (`dusty.Detached`): the
-            /// request and response live on in the stream's arena, and the
-            /// handler's hold on the stream goes when it is finished or
-            /// aborted.
-            detached: ?*Exchange = null,
-            /// The response is parked (`Response._park`): bursts of body
-            /// from whichever task has something to send, no task holding
-            /// it in between (`H3Parked`).
-            parked: ?*H3Parked = null,
-            /// `serve` is still running this stream's handler (inline or on
-            /// its task), which holds the stream: an end of a detached or
-            /// parked response before it returns (a park that failed, or a
-            /// finish or release from inside the handler) leaves the
-            /// handler's hold to `serve`'s caller and sets
-            /// `ended_in_handler`, rather than letting go of a stream
-            /// `serve` still touches. Executor-local; `ended_in_handler`
-            /// is locked.
-            in_handler: bool = false,
-            ended_in_handler: bool = false,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2619,98 +2605,175 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// means freed, by `release`, the one place a holder goes
             /// (but startStream's spawn failure, which QUIC outlives).
             /// QUIC holds it from creation to its close, the handler from
-            /// `startStream`/`queueInline`/an awaited body to its end, a
-            /// parked response from `detachedPark` to `H3Parked.release`.
+            /// `startStream`/`queueInline`/an awaited body until `serve`
+            /// returns, a response that outlives the handler while its
+            /// phase `owns` it (detached, attached or parked; `move`).
             ///
-            ///   {quic}                 + handler -> {quic,handler}
-            ///   {quic}                 - quic    -> freed (credit +1)
-            ///   {quic,handler}         - quic    -> {handler} (a reset request
-            ///                                       keeps its credit until
-            ///                                       its handler ends)
-            ///   {quic,handler}         - handler -> {quic}
-            ///   {quic,handler}         + parked  -> {quic,handler,parked}
-            ///   {quic,handler,parked}  - handler -> {quic,parked}
-            ///   {quic,handler,parked}  - quic    -> {handler,parked}
-            ///   {quic,handler,parked}  - parked  -> {quic,handler} (released
-            ///                                       inside the handler)
-            ///   {quic,parked} | {handler,parked}
-            ///                          - either  -> the other one stays
-            ///   {handler} | {parked}   - it      -> freed
+            ///   {quic}                   + handler  -> {quic,handler}
+            ///   {quic}                   - quic     -> freed (credit +1)
+            ///   {quic,handler}           - quic     -> {handler} (a reset request
+            ///                                          keeps its credit until
+            ///                                          its handler ends)
+            ///   {quic,handler}           - handler  -> {quic}
+            ///   {quic,handler}           + response -> {quic,handler,response}
+            ///   {quic,handler,response}  - handler  -> {quic,response}
+            ///   {quic,handler,response}  - quic     -> {handler,response}
+            ///   {quic,handler,response}  - response -> {quic,handler} (ended
+            ///                                          inside the handler)
+            ///   {quic,response} | {handler,response}
+            ///                            - either   -> the other one stays
+            ///   {handler} | {response}   - it       -> freed
             ///
             /// Inserting a holder already in the set (queueInline, then
             /// startStream from runInline) and removing one already gone
-            /// are no-ops. QUIC never comes back once gone, and a park
-            /// needs the handler's hold.
-            const Holder = enum { quic, handler, parked };
+            /// are no-ops. QUIC never comes back once gone, and a response
+            /// takes its hold only while the handler holds the stream.
+            const Holder = enum { quic, handler, response };
 
-            /// Where a request runs, from its head to its start:
+            /// Where a request runs, from its head through its handler to
+            /// the end of a response that outlived the handler:
             ///
-            ///   phase \ event   queue      await_body     start
-            ///   head            endpoint   awaiting_body  started
-            ///   awaiting_body   endpoint   -              started
-            ///   endpoint        -          -              started
-            ///   started         -          -              -
+            ///   phase \ event  queue     await_body     start    returned  park    attach    end    abort  release
+            ///   head           endpoint  awaiting_body  started  -         -       -         -      -      -
+            ///   awaiting_body  endpoint  -              started  -         -       -         -      -      -
+            ///   endpoint       -         -              started  detached  parked  attached  ended  -      -
+            ///   started        -         -              -        -         parked  -         ended  -      -
+            ///   detached       -         -              -        -         -       attached  ended  ended  -
+            ///   attached       -         -              -        -         -       -         ended  -      -
+            ///   parked         -         -              -        -         -       -         -      -      ended
+            ///   ended          -         -              -        -         -       -         -      -      -
             ///
-            /// `queue`: a `no_wait` request is whole, in `Conn.ready`
-            /// (`queueInline`; FIN in the head block, or in the same packet
-            /// as the head). `await_body`: a `no_wait` head is complete with
-            /// its body still coming, in `Conn.awaiting`. `start`: it never
-            /// runs inline from here: `startStream` (a task, or the task
-            /// cap's or a failed spawn's REQUEST_REJECTED), let go in
-            /// `startAwaiting` on a reset, the budget full in `runInline`,
-            /// or an inline response attached or parked (its writes then
-            /// use the stream's cap). `endpoint` is both queued and running
-            /// inline (`Conn.ready` membership tells them apart); `started`
-            /// covers a task, a refusal and a let-go (`holders`, `reset`
-            /// and `task` tell them apart). The `-` cells are no-ops: a
-            /// later state never re-enters the head (a let-go stream must
-            /// not be queued by a later FIN), and a task's handler parking
-            /// is already `started`.
+            /// The head: `queue`: a `no_wait` request is whole, in
+            /// `Conn.ready` (`queueInline`; FIN in the head block, or in the
+            /// same packet as the head). `await_body`: a `no_wait` head is
+            /// complete with its body still coming, in `Conn.awaiting`.
+            /// `start`: it never runs inline from here: `startStream` (a
+            /// task, or the task cap's or a failed spawn's
+            /// REQUEST_REJECTED), let go in `startAwaiting` on a reset, or
+            /// the budget full in `runInline`. `endpoint` is both queued and
+            /// running inline (`Conn.ready` membership tells them apart);
+            /// `started` covers a task, a refusal and a let-go (`holders`,
+            /// `reset` and `task` tell them apart). A later state never
+            /// re-enters the head (a let-go stream must not be queued by a
+            /// later FIN).
             ///
-            /// The other events move nothing; their callers guard:
+            /// The handler's end (`dusty.Detached`): `returned`: `serve`
+            /// is back with the response detached on the endpoint task, its
+            /// owner to `finish` it (a task's handler only parks: `-`).
+            /// `park`: `detachedPark` (refused, `error.WriteFailed`, where
+            /// `-`: a response detached already cannot park). `attach`: the
+            /// response goes on from a task (`detachedAttach`; `Detached`
+            /// asserts it was detached, so only from these two). `end`:
+            /// `detachedEnd`'s finish of a response that is not parked (or
+            /// a park that failed); a parked one's end writes FIN and stays
+            /// parked until `release`. `abort`: `abortDetached`, the stream
+            /// or the connection gone while the owner has no task and has
+            /// not begun to finish (`d.state == .detached`, the owner's
+            /// side); an attached task is canceled with the group instead,
+            /// and a parked owner hears `peerGone` (`ParkedNotice`).
+            /// `release`: `H3Parked.release`. An end that comes while
+            /// `serve` still runs (a park that failed, a finish or a release
+            /// from inside the handler) is the same `ended`: the handler's
+            /// hold goes with `serve`'s caller, as for any answer.
             ///
-            ///   header field    kept in `head` unless `head_too_large` (a
-            ///                   fact, not a phase: `serve` answers 431 after
-            ///                   the start, inline or on a task); ignored
-            ///                   after (trailers)
-            ///   end of headers  only in `head`: `start` (not `no_wait`,
-            ///                   0-RTT, CONNECT, or a list append failed),
-            ///                   `queue` (whole) or `await_body`
-            ///   end of stream   `awaiting_body`: `queue`; others no move
-            ///   packet done     `awaiting_body`: on a reset `start` and let
-            ///                   go, else `startStream`; others skipped
-            ///   reset           no move (`reset`, read by the above and
-            ///                   by `runInline`)
-            ///   budget full     only from `endpoint` (`Conn.ready`): `start`
-            ///   attach / park   from `endpoint`: `start`; from `started`: -
+            /// Holds: the response holds the stream (`.response`) exactly
+            /// while the phase `owns` it (detached, attached, parked):
+            /// taken on entering, dropped on leaving, in `move`. The
+            /// handler's hold is the runner's, let go when `serve` returns
+            /// (`runInline`, `run`), whatever the response does; no hold
+            /// passes from one to the other.
             ///
-            /// Every move and read is under the connection lock; `serve`
+            /// Access: every move and every read is under the connection
+            /// lock, but one: `detachedEnd` picks the parked end before it
+            /// writes (the write takes the lock itself). That read is
+            /// stable: only this response's own `finish` moves a phase whose
+            /// owner has begun to finish (`abortDetached` skips it), and
+            /// everything here runs on the endpoint's executor. `serve`
             /// takes the mode at its entry as a parameter (attach and park
-            /// change the phase under the handler). Handler-end state
-            /// (`detached`, `parked`) is a second axis: a parked stream is
-            /// `started`, an unattached detached one `endpoint`. Every move
-            /// is a cell here, made through `next`; add a state or a row,
-            /// not a flag beside it.
-            const Phase = enum(u8) {
+            /// change the phase under the handler). Every move is a cell
+            /// here, made through `next`; add a state or a row, not a flag
+            /// beside it. The inline phases come last: `inlineWrites` is
+            /// one compare.
+            const Phase = union(enum(u8)) {
                 head,
                 awaiting_body,
-                endpoint,
                 started,
+                attached,
+                parked: *H3Parked,
+                ended,
+                /// Queued or running inline: writes pass the cap.
+                endpoint,
+                /// Detached on the endpoint task: its writes too.
+                detached: *Exchange,
 
-                const Event = enum { queue, await_body, start };
+                const Tag = @typeInfo(Phase).@"union".tag_type.?;
+
+                const Event = union(enum) {
+                    queue,
+                    await_body,
+                    start,
+                    returned: *Exchange,
+                    park: *H3Parked,
+                    attach,
+                    end,
+                    abort,
+                    release,
+                };
 
                 fn next(p: Phase, ev: Event) Phase {
-                    return switch (ev) {
-                        .queue => switch (p) {
-                            .head, .awaiting_body => .endpoint,
-                            .endpoint, .started => p,
+                    return switch (p) {
+                        .head => switch (ev) {
+                            .queue => .endpoint,
+                            .await_body => .awaiting_body,
+                            .start => .started,
+                            .returned, .park, .attach, .end, .abort, .release => p,
                         },
-                        .await_body => switch (p) {
-                            .head => .awaiting_body,
-                            .awaiting_body, .endpoint, .started => p,
+                        .awaiting_body => switch (ev) {
+                            .queue => .endpoint,
+                            .start => .started,
+                            .await_body, .returned, .park, .attach, .end, .abort, .release => p,
                         },
-                        .start => .started,
+                        .endpoint => switch (ev) {
+                            .start => .started,
+                            .returned => |ex| .{ .detached = ex },
+                            .park => |hp| .{ .parked = hp },
+                            .attach => .attached,
+                            .end => .ended,
+                            .queue, .await_body, .abort, .release => p,
+                        },
+                        .started => switch (ev) {
+                            .park => |hp| .{ .parked = hp },
+                            .end => .ended,
+                            .queue, .await_body, .start, .returned, .attach, .abort, .release => p,
+                        },
+                        .detached => switch (ev) {
+                            .attach => .attached,
+                            .end, .abort => .ended,
+                            .queue, .await_body, .start, .returned, .park, .release => p,
+                        },
+                        .attached => switch (ev) {
+                            .end => .ended,
+                            .queue, .await_body, .start, .returned, .park, .attach, .abort, .release => p,
+                        },
+                        .parked => switch (ev) {
+                            .release => .ended,
+                            .queue, .await_body, .start, .returned, .park, .attach, .end, .abort => p,
+                        },
+                        .ended => p,
                     };
+                }
+
+                /// The response holds the stream (`.response`).
+                fn owns(p: Phase) bool {
+                    return switch (p) {
+                        .detached, .attached, .parked => true,
+                        .head, .awaiting_body, .started, .ended, .endpoint => false,
+                    };
+                }
+
+                /// On the endpoint task: writes pass the stream's cap.
+                fn inlineWrites(p: Phase) bool {
+                    return @backingInt(@as(Tag, p)) >= @backingInt(Tag.endpoint);
                 }
             };
 
@@ -2844,6 +2907,18 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.free();
             }
 
+            /// A handler-end move (`Phase.next`) with the response's hold:
+            /// taken on entering a phase that `owns` the stream, dropped on
+            /// leaving one, which may free the stream: the caller's last
+            /// use of it, and of what lives in its arena. Locked.
+            fn move(s: *Stream, ev: Phase.Event) void {
+                const owned = s.phase.owns();
+                s.phase = s.phase.next(ev);
+                const owns = s.phase.owns();
+                if (owns and !owned) s.holders.insert(.response);
+                if (owned and !owns) s.release(.response);
+            }
+
             /// The flush need not wait for this request any longer: it has
             /// answered, or waits for something itself (the peer, most
             /// likely, which the flush must let hear from us first).
@@ -2883,7 +2958,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // under way (or ending: `over` before its last
                     // `finishBurst`) on another task, which owns `task`
                     // now; after the end that task has cleared it.
-                    const burst_owns = if (s.parked) |p| p.notice.inBurst() or p.notice == .over else false;
+                    const burst_owns = switch (s.phase) {
+                        .parked => |p| p.notice.inBurst() or p.notice == .over,
+                        else => false,
+                    };
                     if (!burst_owns) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
@@ -2894,7 +2972,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (gone) return;
                 // A parked response (`.detached`, the only detach a task's
-                // handler may do) holds the stream itself (`.parked`):
+                // handler may do) holds the stream itself (`.response`):
                 // the handler's hold goes as for any other.
                 _ = s.serve(false) catch |err| return s.failed(err);
             }
@@ -2914,22 +2992,25 @@ pub fn Endpoint(comptime Ctx: type) type {
                     return;
                 }
                 conn.unlock();
+                var served: Served = .done;
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
                     _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
-                    if (s.serve(true)) |served| {
-                        // Finished later; the stream is held till then.
-                        if (served == .detached) return;
-                    } else |err| s.failed(err) catch {
-                        // The endpoint task itself is canceled: it stops
-                        // reading once these requests are done.
-                        conn.ep.io.recancel();
+                    served = s.serve(true) catch |err| blk: {
+                        s.failed(err) catch {
+                            // The endpoint task itself is canceled: it stops
+                            // reading once these requests are done.
+                            conn.ep.io.recancel();
+                        };
+                        break :blk .done;
                     };
                 }
                 conn.lock();
                 s.release(.handler);
                 conn.unlock();
-                conn.kick();
+                // A response that outlives the handler holds the stream
+                // itself, and is kicked as it goes on.
+                if (served == .done) conn.kick();
             }
 
             /// What a handler's error means for its stream.
@@ -3030,13 +3111,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const response = &ex.response;
                 response.* = try dusty.Response._initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
                 server.configureResponse(response);
-                var detached = false;
-                defer if (!detached) response.deinit();
+                // A detached response is its owner's (or over already, a
+                // park that failed having handled the error), whatever the
+                // handler returned: the stack copy is not freed here.
+                defer if (response.detached == null) response.deinit();
                 response._request = request;
                 request._response = response;
                 // On the endpoint task the response may detach; on its own
                 // task only to be parked (an event stream, `Response._park`).
-                ex.attached = false;
                 response._detach_engine = &detach_engine;
                 response._detach_ctx = ex;
                 response._detach_park_only = !inline_mode;
@@ -3175,32 +3257,16 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                 }
 
-                // Executor-local, as everything that ends a detached or
-                // parked response runs on the endpoint's executor: set and
-                // cleared without the lock, read under it.
-                s.in_handler = true;
                 const dispatched = server.dispatch(request, response);
-                s.in_handler = false;
-                // A detached response is its owner's (or over already, a
-                // park that failed having handled the error), whatever the
-                // handler returned: the stack copy is not written or freed
-                // here.
+                // Detached: not written here. Still on the endpoint task, it
+                // becomes `detached` and holds the stream itself; over
+                // already (a park that failed, a finish or a release inside
+                // the handler) or a task's park, it is where it is.
                 if (response.detached) |d| {
-                    detached = true;
                     conn.lock();
                     defer conn.unlock();
-                    const ended = s.ended_in_handler;
-                    s.ended_in_handler = false;
-                    // Already over (a park that failed, or a finish or
-                    // release from inside the handler): `d` may be gone with
-                    // the exchange, and the handler's hold is the caller's
-                    // to let go, as for a response written in place.
-                    if (ended) return .done;
-                    // On a task the detach was a park: the park holds the
-                    // stream, and the task's hold goes as usual. Inline, the
-                    // detach keeps the handler's hold until it is finished.
-                    if (inline_mode) s.detached = exchangeOf(d);
-                    return .detached;
+                    s.move(.{ .returned = exchangeOf(d) });
+                    return if (s.phase.owns()) .detached else .done;
                 }
                 dispatched catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
@@ -3286,11 +3352,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             response: dusty.Response,
             sink_state: StreamSink,
             body_reader: BodyReader,
-            /// Its response went on from a task (`detachedAttach`),
-            /// counted in `Conn.tasks`.
-            attached: bool,
         };
 
+        /// `detached`: the response outlives the handler and holds the
+        /// stream itself (`Phase.owns`).
         const Served = enum { done, detached };
 
         /// How a detached response is finished, attached to a task, or let
@@ -3334,7 +3399,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex.request._body_held.release();
             const s = ex.sink_state.stream;
             const conn = s.conn;
-            if (s.parked != null) {
+            // Unlocked (`Phase`): only this finish moves a parked phase
+            // before the release, and the write below takes the lock.
+            if (s.phase == .parked) {
                 // The end of a parked response: FIN after what was queued
                 // (or the failure's reset). The park keeps the stream until
                 // the owner's `Parked.release`.
@@ -3342,9 +3409,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                     StreamSink.end(@ptrCast(&ex.sink_state), if (ex.response.trailers) |*t| t else null) catch {};
                 } else |err| s.failed(err) catch {};
                 ex.response.deinit();
-                conn.lock();
-                s.detached = null;
-                conn.unlock();
                 conn.kick();
                 return;
             }
@@ -3353,23 +3417,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             } else |err| s.failed(err) catch {};
             ex.response.deinit();
             conn.lock();
-            // Ended inside the handler (a park that failed, or a finish
-            // from inside it): `serve` sees it, and its caller lets go.
-            if (s.in_handler) s.ended_in_handler = true;
-            // A park that failed on a handler's task: that task still holds
-            // the stream and lets go when it ends.
-            if (ex.response._detach_park_only) {
-                conn.unlock();
-                conn.kick();
-                return;
-            }
-            s.detached = null;
-            if (s.recv != .done and !s.reset) conn.lingerRead(s);
-            if (!s.in_handler) s.release(.handler);
+            const was = s.phase;
+            // A park that failed on a handler's task: that task still runs
+            // and reads the rest of the body when it ends.
+            if (was != .started and s.recv != .done and !s.reset) conn.lingerRead(s);
+            // May free the stream, `ex` with it.
+            s.move(.end);
             conn.unlock();
             conn.kick();
             // Last: the driver may free the connection once no task runs.
-            if (ex.attached) _ = conn.tasks.fetchSub(1, .acq_rel);
+            if (was == .attached) _ = conn.tasks.fetchSub(1, .acq_rel);
         }
 
         /// The response goes on from a task, in the connection's group:
@@ -3378,11 +3435,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const ex = exchangeOf(d);
             const s = ex.sink_state.stream;
             const conn = s.conn;
-            ex.attached = true;
+            // Taken back at its end (`detachedEnd`, from the phase).
             _ = conn.tasks.fetchAdd(1, .acq_rel);
             conn.lock();
             defer conn.unlock();
-            s.phase = s.phase.next(.start);
+            s.move(.attach);
             return &conn.group;
         }
 
@@ -3392,15 +3449,20 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// detached (not attached): the owner hears of it, and the stream
         /// is let go. Locked.
         fn abortDetached(s: *Stream) void {
-            if (s.parked) |p| return p.peerGone();
-            const ex = s.detached orelse return;
-            const d = ex.response.detached.?;
-            if (d.state != .detached) return;
-            s.detached = null;
-            d.abort();
-            ex.request._body_held.release();
-            ex.response.deinit();
-            s.release(.handler);
+            switch (s.phase) {
+                .parked => |p| p.peerGone(),
+                .detached => |ex| {
+                    const d = ex.response.detached.?;
+                    // Its owner has begun to finish it.
+                    if (d.state != .detached) return;
+                    d.abort();
+                    ex.request._body_held.release();
+                    ex.response.deinit();
+                    // May free the stream, `ex` with it.
+                    s.move(.abort);
+                },
+                .head, .awaiting_body, .started, .attached, .ended, .endpoint => {},
+            }
         }
 
         /// A parked response (`Response._park`; design-realtime §3.4): its
@@ -3417,10 +3479,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex: *Exchange,
             d: *dusty.Detached,
             owner: dusty.Parked.Owner,
-            /// Parked after the response was detached on the endpoint task
-            /// (a `no_wait` route, the C ABI's requests): the detach's hold
-            /// on the stream (`.handler`) is the park's to let go too.
-            holds_handler: bool,
             /// Under the connection's lock. The stream's own `reset`
             /// is checked next to it.
             notice: dusty.ParkedNotice = .idle,
@@ -3518,7 +3576,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const s = self.s;
                 const conn = s.conn;
-                const holds_handler = self.holds_handler;
                 self.ex.request._body_held.release();
                 self.ex.response.deinit();
                 conn.lock();
@@ -3532,19 +3589,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 } else if (s.recv != .done and !s.reset and s.holders.contains(.quic)) {
                     conn.lingerRead(s);
                 }
-                s.parked = null;
-                s.detached = null;
                 conn.parked_open -= 1;
                 _ = conn.tasks.fetchSub(1, .acq_rel);
-                // The handler's hold, then the park's: `.parked` is held
-                // through the first, so only the second may free the
-                // stream, with `self` in its arena. Released from inside
-                // the handler, the handler's hold stays: `serve`'s caller
-                // lets go when it returns.
-                if (holds_handler) {
-                    if (s.in_handler) s.ended_in_handler = true else s.release(.handler);
-                }
-                s.release(.parked);
+                // May free the stream, `self` with it.
+                s.move(.release);
                 conn.kick();
                 if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.ep.io);
             }
@@ -3558,15 +3606,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             const s = ex.sink_state.stream;
             const conn = s.conn;
             const p = try ex.response.arena.create(H3Parked);
-            p.* = .{ .s = s, .ex = ex, .d = d, .owner = parked_owner, .holds_handler = !ex.response._detach_park_only };
+            p.* = .{ .s = s, .ex = ex, .d = d, .owner = parked_owner };
             conn.lock();
             defer conn.unlock();
             if (s.reset) return error.WriteFailed;
-            s.parked = p;
-            s.holders.insert(.parked);
             // Bursts run on tasks, which may wait for the peer: the stream's
             // cap applies (not a `no_wait` request's queue past it).
-            s.phase = s.phase.next(.start);
+            s.move(.{ .park = p });
+            if (s.phase != .parked) return error.WriteFailed;
             // Its handler has answered as far as the flush is concerned.
             s.unhold();
             conn.parked_open += 1;
@@ -3833,7 +3880,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return err;
                     };
                     // Inline, the write passes the cap: no need to ask it.
-                    const inline_write = s.phase == .endpoint;
+                    const inline_write = s.phase.inlineWrites();
                     const cap = if (inline_write) 0 else s.sendCap();
                     const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, inline_write) catch {
                         conn.unlock();
@@ -4167,7 +4214,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.cancelHandler();
                 if (s.wt_session) |session| session.onChannelEnd(.connection);
                 // A parked response's owner hears of it now.
-                if (s.parked) |p| p.peerGone();
+                switch (s.phase) {
+                    .parked => |p| p.peerGone(),
+                    else => {},
+                }
             }
             conn.kick();
             return 0;
@@ -4192,7 +4242,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.reset = true;
                 s.wakeAll();
                 if (code != h.NGHTTP3_H3_NO_ERROR) s.cancelHandler();
-                if (s.parked) |p| p.peerGone();
+                switch (s.phase) {
+                    .parked => |p| p.peerGone(),
+                    else => {},
+                }
             }
             conn.kick();
             return 0;
@@ -4551,24 +4604,41 @@ test "send memory: the automatic limit, in blocks, rounded up" {
     try std.testing.expectEqual(@as(i64, 16384), bridge.SendMemory.init(autoSendMemory(null, 256 * MiB)).limit.load(.monotonic));
 }
 
-test "h3 stream phase: every state x event cell" {
-    const Phase = Endpoint(void).Stream.Phase;
-    const rows = [_]struct { name: []const u8, from: Phase, ev: Phase.Event, want: Phase }{
-        .{ .name = "no_wait, whole: inline", .from = .head, .ev = .queue, .want = .endpoint },
-        .{ .name = "no_wait, body coming: awaited", .from = .head, .ev = .await_body, .want = .awaiting_body },
-        .{ .name = "not no_wait: a task", .from = .head, .ev = .start, .want = .started },
-        .{ .name = "FIN within the packet: inline", .from = .awaiting_body, .ev = .queue, .want = .endpoint },
-        .{ .name = "the head ends once", .from = .awaiting_body, .ev = .await_body, .want = .awaiting_body },
-        .{ .name = "body after the packet: a task, or let go on a reset", .from = .awaiting_body, .ev = .start, .want = .started },
-        .{ .name = "never re-queued", .from = .endpoint, .ev = .queue, .want = .endpoint },
-        .{ .name = "inline never awaits", .from = .endpoint, .ev = .await_body, .want = .endpoint },
-        .{ .name = "budget full, attach or park: a task's cap", .from = .endpoint, .ev = .start, .want = .started },
-        .{ .name = "a let-go stream is never queued by a later FIN", .from = .started, .ev = .queue, .want = .started },
-        .{ .name = "a started stream never awaits", .from = .started, .ev = .await_body, .want = .started },
-        .{ .name = "a task's own park", .from = .started, .ev = .start, .want = .started },
+test "h3 stream phase: every state x event cell, and what each phase writes and holds" {
+    const E = Endpoint(void);
+    const Phase = E.Stream.Phase;
+    const Tag = Phase.Tag;
+    const ex: *E.Exchange = @ptrFromInt(0x1000);
+    const hp: *E.H3Parked = @ptrFromInt(0x2000);
+    const events = [_]Phase.Event{ .queue, .await_body, .start, .{ .returned = ex }, .{ .park = hp }, .attach, .end, .abort, .release };
+    // One row a phase, in declaration order; `want` in the order of
+    // `events`. The cells' reasons are in `Phase`'s doc comment.
+    const rows = [_]struct { from: Phase, want: [events.len]Tag, inline_writes: bool, owns: bool }{
+        .{ .from = .head, .want = .{ .endpoint, .awaiting_body, .started, .head, .head, .head, .head, .head, .head }, .inline_writes = false, .owns = false },
+        .{ .from = .awaiting_body, .want = .{ .endpoint, .awaiting_body, .started, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body }, .inline_writes = false, .owns = false },
+        .{ .from = .started, .want = .{ .started, .started, .started, .started, .parked, .started, .ended, .started, .started }, .inline_writes = false, .owns = false },
+        .{ .from = .attached, .want = .{ .attached, .attached, .attached, .attached, .attached, .attached, .ended, .attached, .attached }, .inline_writes = false, .owns = true },
+        .{ .from = .{ .parked = hp }, .want = .{ .parked, .parked, .parked, .parked, .parked, .parked, .parked, .parked, .ended }, .inline_writes = false, .owns = true },
+        .{ .from = .ended, .want = .{ .ended, .ended, .ended, .ended, .ended, .ended, .ended, .ended, .ended }, .inline_writes = false, .owns = false },
+        .{ .from = .endpoint, .want = .{ .endpoint, .endpoint, .started, .detached, .parked, .attached, .ended, .endpoint, .endpoint }, .inline_writes = true, .owns = false },
+        .{ .from = .{ .detached = ex }, .want = .{ .detached, .detached, .detached, .detached, .detached, .attached, .ended, .ended, .detached }, .inline_writes = true, .owns = true },
     };
-    for (rows) |r| {
-        errdefer std.debug.print("row: {s}\n", .{r.name});
-        try std.testing.expectEqual(r.want, r.from.next(r.ev));
+    try std.testing.expectEqual(std.enums.values(Tag).len, rows.len);
+    for (rows, 0..) |r, i| {
+        errdefer std.debug.print("phase: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(i, @backingInt(@as(Tag, r.from)));
+        try std.testing.expectEqual(r.inline_writes, r.from.inlineWrites());
+        try std.testing.expectEqual(r.owns, r.from.owns());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            const got = r.from.next(ev);
+            try std.testing.expectEqual(want, @as(Tag, got));
+            // A payload comes from the event, or stays.
+            switch (got) {
+                .detached => |p| try std.testing.expectEqual(ex, p),
+                .parked => |p| try std.testing.expectEqual(hp, p),
+                else => {},
+            }
+        }
     }
 }

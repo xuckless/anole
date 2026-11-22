@@ -3489,13 +3489,18 @@ const H3Park = struct {
 
     /// Runs `op` on the request's executor and waits for it.
     fn on(io: std.Io, op: Op) !void {
-        var group: std.Io.Group = .init;
         var result: anyerror!void = {};
-        try dusty.placement.concurrent(&group, io, .{ .executor = exec }, opTask, .{ op, &result });
-        try group.await(io);
+        try runOn(io, exec, opTask, .{ op, &result });
         return result;
     }
 };
+
+/// Runs `func` with `args` as a task on executor `exec` and waits for it.
+fn runOn(io: std.Io, exec: usize, comptime func: anytype, args: anytype) !void {
+    var group: std.Io.Group = .init;
+    try dusty.placement.concurrent(&group, io, .{ .executor = exec }, func, args);
+    try group.await(io);
+}
 
 /// Request streams the server still holds, on its one connection.
 fn serverStreams(ep: *Endpoint) usize {
@@ -3719,4 +3724,190 @@ test "parked h3: a no_wait handler that ends and releases its park before it ret
     try std.testing.expectEqualStrings("hello over h3", hello_body);
     try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
     try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
+}
+
+/// `no_wait` routes that detach their response (as the C ABI does): one
+/// finishes it inside the handler, one attaches it there and waits for its
+/// task to finish it, one leaves it to the test (`on`).
+const H3Detach = struct {
+    var slot: ?*dusty.Detached = null;
+    var exec: usize = 0;
+    var detached: std.Io.Event = .unset;
+    var attached_done: std.Io.Event = .unset;
+    var aborts: std.atomic.Value(u32) = .init(0);
+    var dummy: u8 = 0;
+
+    fn reset() void {
+        slot = null;
+        detached = .unset;
+        attached_done = .unset;
+        aborts.store(0, .monotonic);
+    }
+
+    fn onAbort(_: *anyopaque) void {
+        slot = null;
+        _ = aborts.fetchAdd(1, .monotonic);
+    }
+
+    fn detach(req: *dusty.Request, res: *dusty.Response) !*dusty.Detached {
+        exec = dusty.placement.currentExecutor(req.io) orelse 0;
+        return res.detach(req, .{ .abort = onAbort, .ctx = &dummy });
+    }
+
+    fn now(req: *dusty.Request, res: *dusty.Response) !void {
+        const d = try detach(req, res);
+        d.response.body = "now";
+        d.finish({});
+    }
+
+    fn later(req: *dusty.Request, res: *dusty.Response) !void {
+        slot = try detach(req, res);
+        detached.set(req.io);
+    }
+
+    /// The handler waits until the attached task has finished the
+    /// response: the response ends while `serve` still runs.
+    fn attachInside(req: *dusty.Request, res: *dusty.Response) !void {
+        attached_done = .unset;
+        const d = try detach(req, res);
+        try dusty.placement.concurrent(d.attach().?, req.io, .local, attachedTask, .{ d, req.io });
+        try attached_done.wait(req.io);
+    }
+
+    fn attachedTask(d: *dusty.Detached, io: std.Io) std.Io.Cancelable!void {
+        d.enter();
+        d.response.body = "attached";
+        d.finish({});
+        attached_done.set(io);
+    }
+
+    const Op = enum { finish, attach };
+
+    fn opTask(op: Op, io: std.Io) std.Io.Cancelable!void {
+        const d = slot.?;
+        slot = null;
+        switch (op) {
+            .finish => {
+                d.response.body = "later";
+                d.finish({});
+            },
+            .attach => dusty.placement.concurrent(d.attach().?, io, .local, attachedTask, .{ d, io }) catch |err| d.finish(err),
+        }
+    }
+
+    /// Ends the response left to the test, on the request's executor.
+    fn on(io: std.Io, op: Op) !void {
+        try runOn(io, exec, opTask, .{ op, io });
+    }
+};
+
+test "h3 server: a no_wait handler that detaches and finishes inside it lets go of the stream once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Detach.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/now", H3Detach.now, .{ .no_wait = true });
+    f.http.router.addRouteWith(.get, "/nw/attach", H3Detach.attachInside, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const rows = [_]struct { path: []const u8, body: []const u8 }{
+        .{ .path = "/nw/now", .body = "now" },
+        .{ .path = "/nw/attach", .body = "attached" },
+    };
+    for (rows) |r| for (0..3) |_| {
+        errdefer std.debug.print("row: {s}\n", .{r.path});
+        const body = try get(conn, r.path, gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings(r.body, body);
+    };
+    // A double release would have broken the stream count.
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+    try std.testing.expectEqual(@as(u32, 0), H3Detach.aborts.load(.monotonic));
+}
+
+test "h3 server: a detached no_wait response finished later, plain or attached, frees its stream and lets the connection end" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Detach.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/later", H3Detach.later, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+    var closed = false;
+    defer if (!closed) conn.close();
+
+    const rows = [_]struct { op: H3Detach.Op, body: []const u8 }{
+        .{ .op = .finish, .body = "later" },
+        .{ .op = .attach, .body = "attached" },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {t}\n", .{r.op});
+        H3Detach.detached = .unset;
+        const s = try request(conn, "GET", "/nw/later", .{});
+        try wait.waitEvent(io, "the handler detached", &H3Detach.detached);
+        try H3Detach.on(io, r.op);
+        const body = try finish(s, gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings(r.body, body);
+    }
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+    // The attached task was counted out: the connection's end waits for
+    // none.
+    conn.close();
+    closed = true;
+    try wait.waitUntil(io, "noConnections", f.ep, noConnections);
+    try std.testing.expectEqual(@as(u32, 0), H3Detach.aborts.load(.monotonic));
+}
+
+test "h3 server: a detached no_wait response never finished: a stream reset or the connection's end tells the owner once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const Gone = enum { stream_reset, connection_closed };
+    for ([_]Gone{ .stream_reset, .connection_closed }) |gone| {
+        errdefer std.debug.print("row: {t}\n", .{gone});
+        H3Detach.reset();
+        var f = try Fixture.start(gpa, io);
+        defer f.stop(gpa, io);
+        f.http.router.addRouteWith(.get, "/nw/later", H3Detach.later, .{ .no_wait = true });
+        const conn = try f.connect(gpa, io);
+        var closed = false;
+        defer if (!closed) conn.close();
+
+        const s = try request(conn, "GET", "/nw/later", .{});
+        try wait.waitEvent(io, "the handler detached", &H3Detach.detached);
+        switch (gone) {
+            .stream_reset => {
+                s.cancel();
+                s.release();
+            },
+            .connection_closed => {
+                s.release();
+                conn.close();
+                closed = true;
+            },
+        }
+        try wait.waitAtLeast(io, "the detached response's owner was told", &H3Detach.aborts, 1);
+        switch (gone) {
+            .stream_reset => {
+                try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+                const hello_body = try get(conn, "/hello", gpa);
+                defer gpa.free(hello_body);
+                try std.testing.expectEqualStrings("hello over h3", hello_body);
+            },
+            .connection_closed => try wait.waitUntil(io, "noConnections", f.ep, noConnections),
+        }
+        try std.testing.expectEqual(@as(u32, 1), H3Detach.aborts.load(.monotonic));
+        try std.testing.expectEqual(@as(?*dusty.Detached, null), H3Detach.slot);
+    }
 }
