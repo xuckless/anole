@@ -1177,7 +1177,7 @@ test "WebSocket over HTTP/2 on the new engine: a send from a task on another exe
     try std.testing.expect(dusty.h2_core_for_tests.server.test_hops.load(.acquire) >= hops + 3);
 }
 
-const HeldSend = enum(u8) { pending, canceled, not_canceled };
+const HeldSend = enum(u8) { pending, canceled, not_canceled, send_succeeded };
 var held_task: std.atomic.Value(?dusty.placement.Task) = .init(null);
 /// A `HeldSend`, as its integer (an atomic holds no enum).
 var held_outcome: std.atomic.Value(u8) = .init(@backingInt(HeldSend.pending));
@@ -1193,8 +1193,10 @@ fn poke_held(req: *dusty.Request, res: *dusty.Response) !void {
     _ = ws.receive() catch return;
     const other = parked_socket.load(.acquire) orelse return error.NoParkedSocket;
     held_task.store(dusty.placement.currentTask(req.io), .release);
-    other.send(.text, "never delivered") catch {};
-    const outcome: HeldSend = if (req.io.checkCancel()) .not_canceled else |_| .canceled;
+    const sent = other.send(.text, "never delivered");
+    const outcome: HeldSend = if (!std.meta.isError(sent))
+        .send_succeeded
+    else if (req.io.checkCancel()) .not_canceled else |_| .canceled;
     held_outcome.store(@backingInt(outcome), .release);
 }
 
@@ -1229,8 +1231,8 @@ test "WebSocket over HTTP/2 on the new engine: a send canceled while its hop is 
 
     const server_core = dusty.h2_core_for_tests.server;
     var hold: std.Io.Event = .unset;
-    server_core.test_hop_hold = &hold;
-    defer server_core.test_hop_hold = null;
+    server_core.test_hop_hold.store(&hold, .release);
+    defer server_core.test_hop_hold.store(null, .release);
     held_task.store(null, .release);
     held_outcome.store(@backingInt(HeldSend.pending), .release);
     const hops = server_core.test_hops.load(.acquire);
