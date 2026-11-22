@@ -787,7 +787,10 @@ test "h2 engine: POST body echoed, with and without content-length" {
 test "h2 engine: the request pseudo-headers reach the handler" {
     // :protocol is the RFC 8441 tunnel row ("h2 engine: an RFC 8441 tunnel:
     // ..." and src/websocket/h2_test.zig); :scheme is stored but nothing
-    // reads it, so no row can see it.
+    // reads it, so no row can see it. The two content-length rows only show
+    // the body flows with and without a declared length: es.content_length
+    // sizes buffers and the window, which no black-box row can see; the
+    // fields_test token table pins that half.
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
