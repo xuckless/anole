@@ -17,6 +17,7 @@ const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const fuzz = @import("../fuzz.zig");
 const ct = @import("conn_test.zig");
+const tc = @import("test_client.zig");
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -622,7 +623,7 @@ test "h2 client conn: on_goaway_received: streams above last-stream-id close REF
     try expectEqual(.refused_stream, t.rec.closeCode(5).?);
     try expect(t.rec.closeCode(1) == null and t.rec.closeCode(3) == null);
     try expectEqual(2, t.c.table.size);
-    try expect(!t.c.canOpen());
+    try expect(!tc.canOpen(&t.c));
     try expectError(error.GoawayReceived, t.c.submitRequest(&get, true, null));
     // No RST_STREAM for them: the server already let them go.
     try expectFrames(try t.drain(), &.{});
@@ -657,10 +658,10 @@ test "h2 client conn: max_concurrent_streams: 100 until the server's SETTINGS, t
     try expectError(error.StreamLimit, t.c.submitRequest(&get, true, null));
     try t.head(1, &ok, true);
     // Still open: our half isn't ended.
-    try expect(!t.c.canOpen());
+    try expect(!tc.canOpen(&t.c));
     try t.c.submitData(t.c.table.get(1).?, &.{}, true);
     _ = try t.drain();
-    try expect(t.c.canOpen());
+    try expect(tc.canOpen(&t.c));
     const s = try t.request(&get, true);
     try expectEqual(203, s.id);
 }
@@ -673,7 +674,7 @@ test "h2 client conn: SETTINGS without MAX_CONCURRENT_STREAMS lift the limit, an
     for (0..300) |_| _ = try t.request(&get, false);
     _ = try t.drain();
     try expectEqual(300, t.c.table.size);
-    try expect(t.c.canOpen());
+    try expect(tc.canOpen(&t.c));
     // One walk of the table, closing as it goes.
     try t.feed(try t.srv.goaway(1, .no_error));
     try expectEqual(1, t.c.table.size);

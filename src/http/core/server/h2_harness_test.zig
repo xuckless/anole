@@ -311,7 +311,7 @@ pub const TestClient = struct {
         while (it.next()) |e| {
             const resp = e.value_ptr.*;
             if (!resp.has_body) continue;
-            if (self.cn.table.get(@intCast(e.key_ptr.*))) |s| resp.src.framed(&self.cn, s);
+            if (self.cn.table.get(@intCast(e.key_ptr.*))) |s| resp.src.framed(s);
         }
     }
 

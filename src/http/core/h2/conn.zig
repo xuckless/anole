@@ -184,7 +184,6 @@ pub const Options = struct {
 /// The settings one side enforces. Our own apply once the peer
 /// acknowledges them (RFC 9113 §6.5.3); until then nghttp2's defaults.
 const Local = struct {
-    max_concurrent_streams: u32 = std.math.maxInt(u32),
     initial_window: u31 = default_window,
     max_frame_size: u24 = frame.min_max_frame_size,
 };
@@ -243,7 +242,7 @@ fn minEncoded(hdrs: []const hpack.Field) usize {
 
 /// One queued submitData call: the caller's parts, by reference, framed
 /// lazily by `pending`.
-const Pending = struct {
+pub const Pending = struct {
     node: std.DoublyLinkedList.Node = .{},
     parts: []const []const u8,
     part: usize = 0,
@@ -443,31 +442,26 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 @memcpy(m[0..client_magic.len], client_magic);
                 c.out.commit(client_magic.len);
             }
-            var entries: [6]frame.Setting = undefined;
-            var n: usize = 0;
-            for ([_]frame.Setting{
+            // Wire order; null is an optional entry that is off.
+            const table = [_]?frame.Setting{
                 if (role == .server)
                     .{ .id = .max_concurrent_streams, .value = opts.max_concurrent_streams }
                 else
                     .{ .id = .enable_push, .value = 0 },
                 .{ .id = .initial_window_size, .value = opts.initial_window },
                 .{ .id = .max_header_list_size, .value = opts.max_header_list_size },
-            }) |e| {
-                entries[n] = e;
-                n += 1;
-            }
-            if (opts.max_frame_size > frame.min_max_frame_size) {
-                entries[n] = .{ .id = .max_frame_size, .value = opts.max_frame_size };
-                n += 1;
-            }
-            if (opts.enable_connect_protocol) {
-                entries[n] = .{ .id = .enable_connect_protocol, .value = 1 };
-                n += 1;
-            }
-            entries[n] = .{ .id = .no_rfc7540_priorities, .value = 1 };
-            n += 1;
-            const b = try c.out.writable(frame.header_len + n * frame.setting_len);
-            c.out.commit(frame.writeSettings(b, false, entries[0..n]));
+                if (opts.max_frame_size > frame.min_max_frame_size)
+                    .{ .id = .max_frame_size, .value = opts.max_frame_size }
+                else
+                    null,
+                if (opts.enable_connect_protocol) .{ .id = .enable_connect_protocol, .value = 1 } else null,
+                .{ .id = .no_rfc7540_priorities, .value = 1 },
+            };
+            var buf: [table.len]frame.Setting = undefined;
+            var entries: std.ArrayList(frame.Setting) = .initBuffer(&buf);
+            for (table) |e| if (e) |setting| entries.appendAssumeCapacity(setting);
+            const b = try c.out.writable(frame.header_len + entries.items.len * frame.setting_len);
+            c.out.commit(frame.writeSettings(b, false, entries.items));
             if (cw > default_window) try c.queueWindowUpdate(0, cw - default_window);
         }
 
@@ -1131,7 +1125,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         fn applyLocalSettings(c: *Self) RecvError!void {
             const old = c.local.initial_window;
             c.local = .{
-                .max_concurrent_streams = c.opts.max_concurrent_streams,
                 .initial_window = c.opts.initial_window,
                 .max_frame_size = c.opts.max_frame_size,
             };
@@ -1509,12 +1502,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return s;
         }
 
-        /// The client role: whether `submitRequest` would find room under
-        /// the server's limit (and no GOAWAY).
-        pub fn canOpen(c: *const Self) bool {
-            return c.in != .dead and !c.goaway_recv and c.goaway_sent == null and c.table.size < c.remote.max_concurrent_streams;
-        }
-
         /// The response head: `:status` then `hdrs`, HEADERS split into
         /// CONTINUATIONs at the peer's SETTINGS_MAX_FRAME_SIZE, encoded now.
         /// With `end_stream` the stream may close (and `s` go) before this
@@ -1595,16 +1582,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const node = s.pending.first orelse return false;
             const p: *const Pending = @fieldParentPtr("node", node);
             return p.parts.ptr == parts.ptr;
-        }
-
-        /// Bytes of `s`'s queued DATA not framed yet: what the peer's
-        /// windows have held back (tests: test_client.zig `Source.framed`).
-        pub fn unframed(c: *const Self, s: *const Stream) u64 {
-            _ = c;
-            var n: u64 = 0;
-            var it = s.pending.first;
-            while (it) |node| : (it = node.next) n += @as(*const Pending, @fieldParentPtr("node", node)).left;
-            return n;
         }
 
         /// Trailers, by reference, sent with END_STREAM once the queued

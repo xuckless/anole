@@ -642,6 +642,25 @@ test "h2: stream window overflow (WINDOW_UPDATE past 2^31-1) is a stream FLOW_CO
 // ---------------------------------------------------------------------------
 // The handshake and the stream state table
 
+test "h2 conn: initial SETTINGS ids, in wire order, per option combination" {
+    const I = frame.SettingId;
+    const rows = [_]struct { name: []const u8, opts: conn.Options, want: []const I }{
+        .{ .name = "default", .opts = .{}, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .no_rfc7540_priorities } },
+        .{ .name = "raised frame size", .opts = .{ .max_frame_size = 1 << 16 }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .max_frame_size, .no_rfc7540_priorities } },
+        .{ .name = "connect only", .opts = .{ .enable_connect_protocol = true }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .enable_connect_protocol, .no_rfc7540_priorities } },
+        .{ .name = "both", .opts = .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true }, .want = &.{ .max_concurrent_streams, .initial_window_size, .max_header_list_size, .max_frame_size, .enable_connect_protocol, .no_rfc7540_priorities } },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        const t = try T.create(testing.allocator, row.opts);
+        defer t.destroy();
+        const first = try t.drain();
+        try expectEqual(.settings, first[0].type);
+        try expectEqual(row.want.len, first[0].settings.len);
+        for (row.want, first[0].settings) |id, got| try expectEqual(id, got.id);
+    }
+}
+
 test "h2 conn: preface and SETTINGS handshake" {
     {
         const t = try T.create(testing.allocator, .{});
@@ -667,7 +686,6 @@ test "h2 conn: preface and SETTINGS handshake" {
         try expectEqual(65535, t.c.local.initial_window);
         try t.feed(try t.settingsAck());
         try expectEqual(65536, t.c.local.initial_window);
-        try expectEqual(250, t.c.local.max_concurrent_streams);
         // A second ACK is unexpected.
         try expectError(error.ConnectionError, t.feed(try t.settingsAck()));
         try expectFrames(try t.drain(), &.{goawayWith(.protocol_error)});

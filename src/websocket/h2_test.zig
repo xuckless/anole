@@ -237,7 +237,7 @@ const Client = struct {
     /// Whether the core has framed everything queued on the stream.
     fn allFramed(self: *Client) bool {
         const s = self.cn.table.get(self.stream_id) orelse return true;
-        return self.cn.unframed(s) == 0;
+        return tc.unframed(s) == 0;
     }
 
     /// Sends what is queued on the stream.

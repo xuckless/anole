@@ -82,6 +82,21 @@ pub fn queue(arena: Allocator, cn: anytype, s: *conn.Stream, bytes: []const u8, 
     try cn.submitData(s, parts, end);
 }
 
+/// Bytes of `s`'s queued DATA not framed yet: what the peer's windows
+/// have held back.
+pub fn unframed(s: *const conn.Stream) u64 {
+    var n: u64 = 0;
+    var it = s.pending.first;
+    while (it) |node| : (it = node.next) n += @as(*const conn.Pending, @fieldParentPtr("node", node)).left;
+    return n;
+}
+
+/// The client role: whether `submitRequest` would find room under the
+/// server's limit (and no GOAWAY).
+pub fn canOpen(c: anytype) bool {
+    return c.in != .dead and !c.goaway_recv and c.goaway_sent == null and c.table.size < c.remote.max_concurrent_streams;
+}
+
 /// An nghttp2 data provider: the request body as the test hands it over.
 /// `data` may be replaced by a longer slice as the test goes (what
 /// `nghttp2_session_resume_data` was for); each `poll` queues what is new,
@@ -117,7 +132,7 @@ pub const Source = struct {
     }
 
     /// After a write: the bytes the core has taken out of `data`.
-    pub fn framed(src: *Source, cn: anytype, s: *const conn.Stream) void {
-        @atomicStore(usize, &src.sent, src.queued - @as(usize, @intCast(cn.unframed(s))), .release);
+    pub fn framed(src: *Source, s: *const conn.Stream) void {
+        @atomicStore(usize, &src.sent, src.queued - @as(usize, @intCast(unframed(s))), .release);
     }
 };
