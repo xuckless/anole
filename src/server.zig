@@ -949,7 +949,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             failed_system: ?[]const u8 = null,
             failed_cause: ?[]const u8 = null,
             /// One certificate reload at a time, across its file reads
-            /// (SAFETY.md L2's exception: the reload is the resource; it
+            /// (an I/O lock: the reload is the resource; it
             /// guards the certificate sources, which only a reload
             /// touches). Taken with no other lock held: SIGHUP's task, the
             /// console's thread, a C ABI thread.
@@ -1939,7 +1939,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // tasks run up to drain_timeout + the cancel grace longer.
             // Out of this pass: only jobs has stopWork, so a NATS/Kafka
             // consumer made before app.jobs can still reach a freed jobs
-            // client between jobs' deinit and its own (the same M2 class).
+            // client between jobs' deinit and its own (the same class).
             var w = extras.connectors.items.len;
             while (w > 0) {
                 w -= 1;
@@ -3528,7 +3528,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Puts `next` (one per `certs`) in place on the TLS listeners and
         /// HTTP/3, or none of it. Takes `next` on success. Under
         /// `cert_lock` (an I/O lock, so the listeners' TLS spin locks and
-        /// HTTP/3's taken here are below it: L4).
+        /// HTTP/3's taken here are below it).
         fn switchCertificates(self: *Self, next: []const CertState.Pem) !void {
             const gpa = self.gpa;
             // HTTP/3's context first: it checks the certificate and key, and

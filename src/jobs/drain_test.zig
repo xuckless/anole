@@ -339,7 +339,7 @@ test "jobs: the teardown's cancel inside a maintenance store call ends the maint
 }
 
 /// A run that outlives the HTTP drain and then uses `app.webhooks`, a
-/// connector made after the queue (#J1, SAFETY.md M2): the app must end it
+/// connector made after the queue (#J1): the app must end it
 /// before it frees any connector.
 const AfterHttp = struct {
     const wh = @import("../webhooks/root.zig");
@@ -404,7 +404,7 @@ test "jobs: a run still going after the HTTP drain ends before a connector made 
     if (comptime anole.features.webhooks) try AfterHttp.body() else return error.SkipZigTest;
 }
 
-/// SAFETY.md M2's teardown with runs in flight on every executor, at seeded
+/// The teardown with runs in flight on every executor, at seeded
 /// points; TESTING.md W3 keeps it out of the unit suite (`zig build
 /// test-stress`). The deterministic claim is the test above.
 const TeardownLoad = struct {
@@ -481,7 +481,7 @@ test "jobs: [stress] app teardown with runs in flight on four executors never fr
 /// A run that outlives the HTTP drain and then uses the app's own UDP
 /// socket (`app.udpSocket`), which the app frees with its raw listeners:
 /// the app must end the run before it frees anything a handler may use,
-/// not only before the connectors (J1, SAFETY.md M2).
+/// not only before the connectors (J1).
 const AfterHttpUdp = struct {
     const Drop = struct {
         pub fn datagram(_: *anole.net.Datagram) !void {}

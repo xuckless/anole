@@ -1,4 +1,4 @@
-//! Counters kept per executor and summed when read (SAFETY.md L6/L7: the
+//! Counters kept per executor and summed when read (the
 //! "counters and gauges" pattern), as Linux's `percpu_counter` and folly's
 //! `ThreadCachedInt` do: a task adds to its executor's slot, each slot on a
 //! cache line of its own, so a counter written on every request moves no

@@ -1291,7 +1291,7 @@ const Holder = union(enum) {
     held: ?placement.Task,
 };
 
-/// owner: the `Client` (process-wide, M2); the thread is joined in
+/// owner: the `Client` (process-wide); the thread is joined in
 /// `Client.deinit` before anything here is freed, so it wakes callers
 /// directly.
 const Writer = struct {

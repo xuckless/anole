@@ -778,7 +778,7 @@ fn fetchMany(io: std.Io, url: []const u8, n: usize, ok: *std.atomic.Value(usize)
     }
 }
 
-// SAFETY.md L6's multi-thread stress test of the pin; TESTING.md W3 keeps
+// The multi-thread stress test of the pin; TESTING.md W3 keeps
 // it out of the unit suite (`zig build test-stress`). The deterministic
 // claims are the pin-hook tests above.
 test "capi jobs: enqueue(opts.req) and the answer racing on two threads, many requests: no answer is GONE [stress]" {

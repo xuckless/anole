@@ -287,8 +287,8 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
 
 /// The socket of an attempt in progress, for the manager or `close()` to
 /// shut down: the attempt may have lost its cancellation and would wait on
-/// the socket for good. The shutdown runs with no lock held (SAFETY.md L2:
-/// it is a zio I/O call); `shutting` keeps the socket and this frame alive
+/// the socket for good. The shutdown runs with no lock held (it
+/// is a zio I/O call); `shutting` keeps the socket and this frame alive
 /// meanwhile.
 ///
 /// owner: the manager's frame (`openFirst`, `reconnect`), tracked in

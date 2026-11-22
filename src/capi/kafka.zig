@@ -348,7 +348,7 @@ fn failedDelivery(b: *Broker, user_data: u64, topic: []const u8, class: anole.db
 // ---------------------------------------------------------------------------
 // Producing
 
-/// The records a pump task drains, in the order they came (SAFETY.md L7's
+/// The records a pump task drains, in the order they came (a
 /// push-list hand-off). owner (the taking side): the one running pump,
 /// named by `running`; producers: any consumer thread. Sealed by
 /// `destroy`, so a push after it is refused, not lost.

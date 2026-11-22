@@ -1057,7 +1057,7 @@ const H1Callbacks = struct {
 /// reading at the front of the window, so a run of small messages never
 /// squeezes reads into its tail.
 ///
-/// owner: one run of `H1Callbacks.serve` (SAFETY.md M2, a batch: the run).
+/// owner: one run of `H1Callbacks.serve` (a batch: the run).
 /// Only that run's task touches it and the reader; the block goes back to
 /// the pool at a quiet wait (`quiet`) or as the run returns (`release`,
 /// deferred, so on every exit), after the reader has let go of it.

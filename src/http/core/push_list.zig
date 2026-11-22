@@ -1,4 +1,4 @@
-//! SAFETY.md L7's hand-off pattern: an intrusive, sealable MPSC push list.
+//! The hand-off pattern: an intrusive, sealable MPSC push list.
 //! Any thread pushes; one documented owner takes (`takeAll`) and, at the
 //! end of the owner's life, seals it (`seal`): from then on a push fails
 //! with `error.Closed`, so nothing is accepted and then lost.

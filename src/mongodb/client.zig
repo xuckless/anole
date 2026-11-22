@@ -606,7 +606,7 @@ pub const Client = struct {
     /// none, retirement for those it dropped, checks it asked for,
     /// generations copied over. Spawns, cancels and logs nothing: the
     /// monitors to start and stop are in the result, for `applyChanges`
-    /// after the unlock (SAFETY.md L2, L3: a spawn may yield).
+    /// after the unlock (a spawn may yield).
     fn syncServers(self: *Client) Changes {
         var changes: Changes = .{};
         for (self.topology.servers.items) |*ts| {
@@ -972,8 +972,7 @@ pub const Client = struct {
     /// Gives `c` back to its pool, or closes it when it is broken, stale,
     /// or the client is closing.
     fn release(self: *Client, s: *Server, c: *Connection, io: std.Io) void {
-        // The pool it came from, wherever it is given back (SAFETY.md T3;
-        // mongo-go-driver's checkIn refuses another pool's).
+        // The pool it came from, wherever it is given back (mongo-go-driver's checkIn refuses another pool's).
         const p: *Pool = @ptrCast(@alignCast(c.pool.?));
         const keep = !c.broken and !self.closing.load(.acquire) and !self.stale(s, c, io);
         p.mutex.lockUncancelable(io);

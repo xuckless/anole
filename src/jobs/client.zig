@@ -67,11 +67,11 @@ const JobBox = struct {
     arena_state: std.heap.ArenaAllocator,
     row: store.Row,
     /// Set by `prepare` before `hold` publishes the box; after that the
-    /// heartbeat writes only its atomics (SAFETY.md M3/T3).
+    /// heartbeat writes only its atomics.
     job: Job = undefined,
     /// The run's key in `Client.held`, set by `hold`: unique per run, where
     /// the job's id is not (a lost run may still be ending when its job is
-    /// claimed again). A local generation (SAFETY.md M2 fourth class, T4).
+    /// claimed again). A local generation.
     seq: u64 = 0,
     task: ?placement.Task = null,
     started: std.Io.Clock.Timestamp = undefined,
@@ -811,7 +811,7 @@ pub const Client = struct {
     const Plan = struct { f: store.Finish, outcome: Outcome };
 
     /// Builds the run's `Job` before `hold` publishes the box to the
-    /// heartbeat and the drain (SAFETY.md M3/T3). No I/O.
+    /// heartbeat and the drain. No I/O.
     fn prepare(self: *Client, box: *JobBox) void {
         const row = box.row;
         const a = box.arena_state.allocator();
@@ -1255,7 +1255,7 @@ pub const Client = struct {
     /// A store call's failure, in a task that carries on after one: a
     /// cancel (the teardown's) is passed on, never taken for a failure that
     /// the task logs and goes past, or its next wait parks with the cancel
-    /// gone (SAFETY.md).
+    /// gone.
     fn passCancel(err: anyerror) std.Io.Cancelable!void {
         if (err == error.Canceled) return error.Canceled;
     }

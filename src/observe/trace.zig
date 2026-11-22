@@ -159,7 +159,7 @@ pub const Span = struct {
     /// the Sidekiq instrumentation link by default).
     ///
     /// owner: the Exporter, through the span that carries
-    /// it. M2 class: child of the exporter (on its allocator), freed by
+    /// it. A child of the exporter (on its allocator), freed by
     /// `Exporter.release` exactly once: when the span is sent, dropped,
     /// left over at `close`, or given back by a test's `Taken.deinit`.
     pub const JobRun = struct {
@@ -275,7 +275,7 @@ pub const Options = struct {
 /// slow requests. `app.tracing(.{})` makes one owned by the server,
 /// already started.
 ///
-/// owner: whoever made it (`App` for `app.tracing`). M2 class:
+/// owner: whoever made it (`App` for `app.tracing`):
 /// process-wide. Teardown runs in two steps, as the OpenTelemetry
 /// SDK's Shutdown: `close` sends what is queued and stops the task (it
 /// needs `client`'s server still running), after which `submit`, `job`
@@ -414,12 +414,12 @@ pub const Exporter = struct {
         // takes the lock to broadcast: a change after this check wakes the
         // wait below.
         while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .alive) {
-            // A wake under the leaf lock, not a wait (L2 holds).
+            // A wake under the leaf lock, not a wait.
             self.kick.set(self.io);
             if (comptime builtin.is_test) _ = self.test_flush_waits.fetchAdd(1, .release);
             self.progressed.waitTimeout(self.io, &self.progress_lock, deadline) catch |err| switch (err) {
                 error.Timeout => return,
-                // SAFETY.md C3: the caller stays canceled.
+                // The caller stays canceled.
                 error.Canceled => {
                     self.io.recancel();
                     return;

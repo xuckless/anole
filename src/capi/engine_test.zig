@@ -1061,7 +1061,7 @@ fn h3Get(io: std.Io, port: u16, ca: []const u8, client: ?*const anole.tls.Pem) !
 }
 
 /// A request one side's TLS must refuse: it fails with one of `refusals`;
-/// a cancel goes up (SAFETY C3), and an answer is `served`.
+/// a cancel goes up, and an answer is `served`.
 fn expectRefused(r: anyerror![]u8, comptime refusals: []const anyerror, served: anyerror) !void {
     const body = r catch |err| {
         if (err == error.Canceled) return error.Canceled;
@@ -2238,7 +2238,7 @@ const RawWs = struct {
 };
 
 /// Reads the rest of a response into `w`. A read error past the response
-/// (the server's close) ends it; a cancel goes up (SAFETY C3), and so does
+/// (the server's close) ends it; a cancel goes up, and so does
 /// a response too large for `w`.
 fn readRest(r: *std.Io.net.Stream.Reader, w: *std.Io.Writer) !void {
     _ = r.interface.streamRemaining(w) catch |err| switch (err) {

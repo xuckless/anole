@@ -1,5 +1,5 @@
 //! Zig 0.17.0's default test runner (lib/compiler/test_runner.zig, MIT,
-//! Copyright (c) Zig contributors), with changes for SAFETY.md E1: the
+//! Copyright (c) Zig contributors), with changes: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
@@ -599,7 +599,7 @@ pub const std_options: std.Options = .{
 };
 
 /// ANOLE: zio reads its options from the root, the runner in a test binary:
-/// SAFETY.md's zio checks on in every test build, Debug or not (see
+/// zio's `debug_cancel` on in every test build, Debug or not (see
 /// src/testing/hooks.zig). Only a binary with zio reads it, and only
 /// those get `test_hooks.zig`, which declares it.
 pub const zio_options = hooks.zio_options;

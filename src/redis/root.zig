@@ -332,7 +332,7 @@ const Pool = struct {
     max: usize,
     /// `max` slots; the first `spare_len` hold the memory of closed
     /// connections, which the next dial reuses. A pooled `Connection` is
-    /// freed only in `deinit` (process-wide, M2): a `Conn` from an earlier
+    /// freed only in `deinit` (process-wide): a `Conn` from an earlier
     /// checkout reads a lease, never freed memory. Every one is
     /// counted in `open` or here, so there are `max` at most.
     spare: []*Connection,
@@ -358,7 +358,7 @@ const Connection = struct {
     /// nothing of the call reached the server.
     sent: u64 = 0,
     /// Bumped by every give-back, under its pool's `mutex`: a `Conn` from
-    /// an earlier checkout gives nothing back (SAFETY.md M6, as pgxpool's
+    /// an earlier checkout gives nothing back (as pgxpool's
     /// idempotent `Release`). Read without the lock only by its holder.
     lease: u32 = 0,
 

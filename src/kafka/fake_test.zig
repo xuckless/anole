@@ -534,7 +534,7 @@ test "fake broker: a broker serving Produce 0-7 and ListOffsets 0-4 (Redpanda) i
 }
 
 // ---------------------------------------------------------------------------
-// SAFETY.md §8 step 4: nothing waits under the producer's, the cluster's or
+// Nothing waits under the producer's, the cluster's or
 // the client's locks (forced interleavings through test_hold.zig).
 
 const hold_mod = @import("test_hold.zig");
@@ -1054,8 +1054,8 @@ test "kafka: a broker connection's round trip canceled while it waits for the an
 test "kafka: a broker connection opens on an executor where another connection's task is suspended in its round trip" {
     // One executor: both connections' tasks run on the same thread. The
     // first holds its connection's I/O lock while it waits for an answer;
-    // the second takes its own connection's lock meanwhile (SAFETY.md L2's
-    // exception: one I/O lock per task, not per thread).
+    // the second takes its own connection's lock meanwhile
+    // (one I/O lock per task, not per thread).
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();

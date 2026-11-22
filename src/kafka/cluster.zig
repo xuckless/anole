@@ -54,7 +54,7 @@ pub const Conn = struct {
     settings: Settings,
     stream: *net.ClientStream,
     /// One round trip at a time on this socket, taken with no other lock
-    /// held, until #111's reader demux. L2's exception (an I/O lock); held
+    /// held, until #111's reader demux. An I/O lock; held
     /// per task, so other tasks of the executor take their own connections'
     /// locks while this one waits for its answer.
     mutex: std.Io.Mutex = .init,
@@ -243,9 +243,9 @@ const TopicInfo = struct {
 
 const BrokerInfo = struct { host: []u8, port: u16 };
 
-/// owner: Client. M2 process-wide: `deinit` runs after the producer and the
+/// owner: Client, process-wide: `deinit` runs after the producer and the
 /// consumers are torn down (every task that calls it is joined first).
-/// Shared by every executor under `mutex` (L1: real cross-thread state).
+/// Shared by every executor under `mutex` (real cross-thread state).
 pub const Cluster = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -356,7 +356,7 @@ pub const Cluster = struct {
     /// (cancelable), then runs its own round holding no lock.
     pub fn refresh(self: *Cluster, topics: []const []const u8, allow_auto_create: bool) ConnError!void {
         try self.takeRefreshTurn();
-        // C2: the turn goes back on every exit, a cancel included.
+        // The turn goes back on every exit, a cancel included.
         defer self.giveRefreshTurn();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();

@@ -713,8 +713,8 @@ pub const Exec = struct {
         c.wake();
     }
 
-    /// `postRecord`'s waiter was canceled while it waited for room. C3:
-    /// the cancel goes back to the caller's next wait. C2/U4: the record
+    /// `postRecord`'s waiter was canceled while it waited for room: the
+    /// cancel goes back to the caller's next wait. The record
     /// (often the end of something: ws_close, net_close) still takes its
     /// place in the ring, uncancelably, for at most `cancel_post_wait_ns`;
     /// past that the consumer is not polling. Not the overflow list: `poll`
@@ -3028,7 +3028,7 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             // send_headers, an answer call that failed), where
             // `requestTrace` could pin it: `gone` tells the pin the
             // memory went, and a pin taken before this saw it is waited
-            // out (SAFETY.md M3, T4: never a freed pointer).
+            // out (never a freed pointer).
             .responding, .done, .streaming => {
                 s.orphan = true;
                 s.gone.store(true, .seq_cst);
@@ -3636,7 +3636,7 @@ pub const TraceContext = struct {
 /// thread's call held it (`Slot.gone`, set by `detachedAborted`) has no
 /// memory left to read, even once that call hands it back to `out`: the
 /// pin sees `gone` and reads nothing. The pin only copies into stack
-/// buffers (SAFETY.md L5: an executor may spin on it, so it never
+/// buffers (an executor may spin on it, so it never
 /// allocates or waits); the copies go into `a` after it. Nothing is
 /// copied at dispatch: requests that hand nothing on pay nothing (the
 /// header scan stays off the hot path).

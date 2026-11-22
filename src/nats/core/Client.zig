@@ -102,7 +102,7 @@ connection_tasks: Io.Group = .init,
 connection: Connection = undefined,
 
 /// Held while connect, close and deinit start or stop the manager: a spawn
-/// (which may yield) and a join. An I/O lock (SAFETY.md L2's exception):
+/// (which may yield) and a join. An I/O lock:
 /// it guards the manager's start and stop, no other lock's data, and is
 /// taken with no other lock held; `mutex` is taken under it.
 lifecycle: std.Io.Mutex = .init,
@@ -1090,7 +1090,7 @@ fn closeWith(client: *Client, reason: CloseReason) void {
     // of the attempt's socket, a zio I/O call.
     if (was_open) log.debug("closing the client", .{});
     if (attempt_stream) |stream| attempt.?.finishStop(io, stream);
-    // The engine's raw locks below are taken with `client.mutex` let go (their order: SAFETY reasons).
+    // The engine's raw locks below are taken with `client.mutex` let go.
     // Before the outbound queue wakes them, requests learn why. After a
     // drain, the streams of requestMany keep what they received.
     if (reason == .drained) client.inbox.endDrained(io) else client.inbox.end(io, .closed);

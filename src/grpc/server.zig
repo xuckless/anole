@@ -181,8 +181,8 @@ pub const Call = struct {
         json_array: bool = false,
         /// The call's response stream: one writer at a time, across the
         /// stream's write and flush; also orders `addHeader` against the
-        /// head the first write sends. An I/O lock (SAFETY.md L2's
-        /// exception): its two takers, the handler and its streaming
+        /// head the first write sends. An I/O lock
+        /// (held across a wait): its two takers, the handler and its streaming
         /// writer task, run on the call's executor. Replaced at the S2
         /// HTTP/2 takeover.
         write_lock: std.Io.Mutex = .init,

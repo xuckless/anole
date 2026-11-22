@@ -2144,9 +2144,8 @@ fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const
 
 /// `b.addTest` with src/testing/runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a
-/// test during which zio reports a swallowed cancellation (SAFETY.md E1,
-/// C3). The root module gets `anole_test_hooks`, which the runner asks for
-/// that count: over the module's zio (its own import, or anole's), or a
+/// test during which zio reports a swallowed cancellation. The root module gets `anole_test_hooks`, which the runner
+/// asks for that count: over the module's zio (its own import, or anole's), or a
 /// stub without one.
 fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
     var o = options;

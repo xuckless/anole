@@ -236,10 +236,9 @@ pub fn Engine(comptime Ctx: type) type {
         /// its drain if its socket wakes it, and the stop closes it.
         pub const Registry = struct {
             /// Held across the drain's walk, which waits for each
-            /// connection's lock where it has a mutex (`request`): SAFETY.md
-            /// L2's exception, as no other lock may be held while waiting
-            /// for one (the nghttp2 engine's registry is an unranked
-            /// `std.Io.Mutex` for the same walk). Taken with no lock held.
+            /// connection's lock where it has a mutex (`request`), so
+            /// no other lock may be held while waiting for one.
+            /// Taken with no lock held.
             mutex: std.Io.Mutex = .init,
             list: std.DoublyLinkedList = .{},
 

@@ -18,7 +18,7 @@ const metrics = observe.metrics;
 ///     state.ready = .{ .io = io, .context = pg, .ping = Db.ping };
 ///     try state.ready.register(app.health(.{}), "postgres");
 ///
-/// owner: the connector it is a field of (process-wide, M2). Any thread:
+/// owner: the connector it is a field of (process-wide). Any thread:
 /// its state is atomics (a single flight with no waiters, no lock).
 pub const Readiness = struct {
     io: std.Io,
@@ -50,7 +50,7 @@ pub const Readiness = struct {
         if (self.pinging.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return self.ready.load(.monotonic);
         defer self.pinging.store(false, .release);
         const ok = self.ping(self.context, io) catch {
-            // SAFETY.md C3: the cancel is the caller's; nothing is kept.
+            // The cancel is the caller's; nothing is kept.
             io.recancel();
             return self.ready.load(.monotonic);
         };

@@ -69,9 +69,9 @@ pub const cgroup = @import("cgroup.zig");
 pub const admission = @import("admission.zig");
 /// Internal, for tests on the real runtime: the per-thread encoders.
 pub const _encoders = @import("encoders.zig");
-/// Counters kept per executor and summed when read (SAFETY.md L6/L7).
+/// Counters kept per executor and summed when read.
 pub const exec_counter = @import("exec_counter.zig");
-/// A sealable multi-producer, single-consumer push list (SAFETY.md L7's
+/// A sealable multi-producer, single-consumer push list (for
 /// hand-offs between executors or threads).
 pub const push_list = @import("push_list.zig");
 pub const hooks = @import("hooks.zig");

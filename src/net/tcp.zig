@@ -8,8 +8,8 @@
 //! Writing never waits on the peer, and takes no lock. `Conn.send` reserves
 //! its bytes against `write_max` and returns: on the connection's executor
 //! it appends to the outbox directly; from elsewhere its bytes go, as one
-//! owned chunk, onto the connection's inbox (a sealable push list,
-//! SAFETY.md L7). One *net driver* task per executor writes the outboxes
+//! owned chunk, onto the connection's inbox (a sealable push list).
+//! One *net driver* task per executor writes the outboxes
 //! that were kicked since its last round, straight from the driver with a
 //! non-blocking `sendmsg` on plain TCP, so every connection a consumer
 //! answered in one round costs one syscall and no task switch. A TLS
@@ -635,7 +635,7 @@ var next_conn_id: std.atomic.Value(u64) = .init(1);
 
 /// A raw TCP listener's service and per-executor drivers: the object behind
 /// `http.Listener.raw`. owner: the server, which makes it (`create`) and
-/// frees it (`destroy`) after the core has stopped (M2: process-wide).
+/// frees it (`destroy`) after the core has stopped (process-wide).
 pub const TcpListener = struct {
     raw: dusty.Raw,
     gpa: std.mem.Allocator,
@@ -1170,7 +1170,7 @@ const Sched = struct {
 };
 
 /// One raw TCP connection. owner: the core's connection (an `Adopter`,
-/// released by it, M2: a child of its owner); its executor is the
+/// released by it: a child of its owner); its executor is the
 /// connection's: every helper task is a child in `group`, spawned
 /// there. Applications hold `*Conn` by contract until `close` returns
 /// (docs/net.md §1), from any thread.
@@ -1243,7 +1243,7 @@ const TcpConn = struct {
     writable_pending: std.atomic.Value(bool) = .init(false),
     /// Serves callbacks one at a time on the Zig path (the C ABI's never
     /// wait and skip it): a callback serializer held across the callback,
-    /// which may wait (an I/O lock, L2's exception, rank `io`: its takers
+    /// which may wait (an I/O lock: its takers
     /// hold no other lock). It goes once net gets a per-connection event
     /// mailbox run by one task (after S2, with the #85 relay work).
     cb_lock: std.Io.Mutex = .init,
@@ -1343,7 +1343,7 @@ const TcpConn = struct {
     /// The core is done with the connection (on its task, its executor).
     /// In this order (Go's `fd.Close` shape): no send is taken and no
     /// helper spawned from the first step on, the driver can't reach it,
-    /// the helpers end (T1: cancel, join), what is still queued is
+    /// the helpers end (cancel, join), what is still queued is
     /// dropped, and only then it is freed.
     fn release(a: *dusty.Adopter) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
@@ -1390,8 +1390,8 @@ const TcpConn = struct {
         t.decoder.deinit();
         t.frames.deinit(t.gpa);
         // Writers still in `waitUnder` (a task outside the connection's,
-        // woken above by `wakeWaiters`) leave before the memory goes (M2:
-        // the owner frees after the join). Uncancelable, and short: they
+        // woken above by `wakeWaiters`) leave before the memory goes (the
+        // owner frees after the join). Uncancelable, and short: they
         // are awake and only look at the flags on their way out.
         while (true) {
             const w = t.waiters.load(.seq_cst);
@@ -1507,7 +1507,7 @@ const TcpConn = struct {
     }
 
     /// Wakes every task waiting on `word`: directly on the connection's
-    /// executor, else through its driver's gate (T5: the caller may be a
+    /// executor, else through its driver's gate (the caller may be a
     /// thread that outlives the runtime).
     fn wakeAll(t: *TcpConn, word: *std.atomic.Value(u32)) void {
         if (t.onOwner()) return t.io.futexWake(u32, &word.raw, std.math.maxInt(u32));
@@ -1632,7 +1632,7 @@ const TcpConn = struct {
 
     /// Takes `c` (whole, framed already) into the inbox: reserved, then
     /// pushed. On an error `c` stays the caller's (to free after any lock
-    /// it holds, L5). The kick, if one is due, is the caller's to make.
+    /// it holds). The kick, if one is due, is the caller's to make.
     fn pushChunk(t: *TcpConn, c: *OutChunk) Conn.SendError!Conn.Queued {
         const n = c.len;
         if (n > t.service.options.write_max) return error.TooLarge;

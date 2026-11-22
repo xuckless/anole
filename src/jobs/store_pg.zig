@@ -59,7 +59,7 @@ pub const Postgres = struct {
     held_owner: ?[]u8 = null,
     /// The leader's session: one pooled connection that holds the advisory
     /// lock for as long as it is open (Que's and GoodJob's shape). An I/O
-    /// lock (SAFETY.md L2's exception): held across the session checkout
+    /// lock: held across the session checkout
     /// and the leader query, taken with no other lock held (`maintain`, and
     /// `drain` after its unlock), guarding only `session`, `holds_lock` and
     /// `held_owner`. Temporary, until the maintenance task alone owns the

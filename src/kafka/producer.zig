@@ -58,7 +58,7 @@ pub const Result = union(enum) {
 };
 
 /// Where a waiting caller learns what became of its record
-/// (`appendWaiting`, then `waitFor` or `abandon`). M2's fourth class: stable
+/// (`appendWaiting`, then `waitFor` or `abandon`). Stable
 /// memory in the producer's `waits` table (chunks of 64, freed only by
 /// `Producer.deinit`), named by a generation-checked `Ref`. A batch keeps
 /// the ref, never a pointer it could outlive. The holder of the ref (one
@@ -102,7 +102,7 @@ pub const Wait = struct {
 
 /// The wait slots. owner: the producer. The free list is taken under
 /// `Producer.mutex`; holders give slots back from any task or thread
-/// through `freed` (SAFETY.md L7's push-list hand-off: any thread pushes,
+/// through `freed` (a push-list hand-off: any thread pushes,
 /// the mutex holder takes). Bounded by the records pending: it keeps
 /// its high-water mark until `Producer.deinit`.
 const WaitTable = struct {
@@ -114,7 +114,7 @@ const WaitTable = struct {
 
     /// Under `Producer.mutex`: makes `free` non-empty, from the slots given
     /// back or a new chunk (a `Mutex`, not a spin lock: allocating here is
-    /// allowed, L5).
+    /// allowed).
     fn reserve(t: *WaitTable, gpa: std.mem.Allocator) error{OutOfMemory}!void {
         if (t.free != null) return;
         var n = t.freed.takeAll();
@@ -165,7 +165,7 @@ pub const AppendError = error{ BufferFull, TooLarge, UnknownTopic, BadPartition,
 
 const resolver_id: i32 = -1;
 
-/// One request's worth of records of one partition. M2 class 2: its arena
+/// One request's worth of records of one partition. Its arena
 /// holds the records, freed in one go by `destroyBatch`. owner: the queue
 /// that holds it (an accumulator's `open` or `ready`, a sender's in-flight
 /// work, a `Done` list): it moves between them only under `Producer.mutex`,
@@ -389,10 +389,10 @@ const Rec = struct {
     timestamp_ms: i64,
 };
 
-/// owner: Client (M2 process-wide). Teardown: `deinit`, after every caller
+/// owner: Client (process-wide). Teardown: `deinit`, after every caller
 /// is joined (handlers, consumer deliveries, the C ABI's pump and waiters:
 /// capi/engine.zig joins `x.kafka.work` before `app.deinit`). Shared by
-/// every executor under `mutex` (L1: real cross-thread state).
+/// every executor under `mutex` (real cross-thread state).
 pub const Producer = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -424,7 +424,7 @@ pub const Producer = struct {
     pid_fetching: bool = false,
     pid_ready: std.Io.Condition = .init,
 
-    /// The waiting callers' slots (M2's fourth class).
+    /// The waiting callers' slots.
     waits: WaitTable = .{},
 
     /// The senders.
@@ -570,7 +570,7 @@ pub const Producer = struct {
 
     /// Under `mutex`. Every fallible step (the topic, accumulator and batch,
     /// the record's copies, `active`'s capacity) comes before the record
-    /// joins its batch; past that point nothing fails (M1: the batch owns
+    /// joins its batch; past that point nothing fails (the batch owns
     /// the record, and the wait is taken there, so an error never leaves a
     /// wait behind). `settle_unknown`: a partition whose leader is still
     /// unknown goes to the resolver.
@@ -789,7 +789,7 @@ pub const Producer = struct {
 
     /// No lock held on entry. Starts the sender of broker `id` unless it is
     /// running or starting; the spawn runs after the lock is let go (zio's
-    /// spawn backpressure may suspend the caller there, L2). A start that
+    /// spawn backpressure may suspend the caller there). A start that
     /// fails gives the partitions led by `id` back to the resolver
     /// (`startFailedLocked`), a start canceled at its lock included.
     fn startSender(self: *Producer, id: i32) error{ OutOfMemory, Closing, Canceled }!void {
@@ -853,7 +853,7 @@ pub const Producer = struct {
 
     /// Starts the resolver unless it runs, and wakes it: for partitions
     /// given back to it outside its own rounds. A caller's pending cancel
-    /// waits until after (C3: it meets it at its next wait).
+    /// waits until after (it meets it at its next wait).
     fn kickResolver(self: *Producer) void {
         const was = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(was);
@@ -1284,7 +1284,7 @@ pub const Producer = struct {
             testHold(self.io, .stale_settled);
             self.startSender(resolver_id) catch |err| switch (err) {
                 // Not this sender's wait point: it meets the cancel at its
-                // next wait (C3; the lock's wait consumed it).
+                // next wait (the lock's wait consumed it).
                 error.Canceled => self.io.recancel(),
                 else => {},
             };
@@ -1327,7 +1327,7 @@ pub const Producer = struct {
     /// No lock held on entry. The batches were detached under the lock, so
     /// the caller is their only owner: completes every record's wait, counts
     /// the telemetry (a metrics family takes its own lock: never under
-    /// `mutex`, L3), then gives the buffer space and the records' flush
+    /// `mutex`), then gives the buffer space and the records' flush
     /// generations back in one section and frees them. Completions come
     /// first, so `flush` returns only after every waiter of the records it
     /// waits for has its outcome.
@@ -1402,7 +1402,7 @@ pub const Producer = struct {
     /// The producer id, asking for one when there is none. One task asks at
     /// a time and the others wait for its answer (the keyring shape): the
     /// round trip runs with no lock held, so the connection's I/O lock is
-    /// the only one (L2's exception).
+    /// the only one.
     fn ensurePid(self: *Producer, conn: *cluster_mod.Conn, arena: std.mem.Allocator) cluster_mod.ConnError!Ids {
         {
             try self.mutex.lock(self.io);
@@ -1415,7 +1415,7 @@ pub const Producer = struct {
             self.pid_fetching = true;
         }
         const got = fetchPid(self, conn, arena);
-        // C2: the flag is cleared on every exit, a cancel included.
+        // The flag is cleared on every exit, a cancel included.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.pid_fetching = false;
