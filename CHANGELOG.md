@@ -3,18 +3,55 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.6.1 (2026-11-22)
+
+The end of S2 and the first step of S3: zio stream writes gather more slices per send, PostgreSQL one-off queries take one round trip, io_uring's fallback names its cause, and the SAFETY regime is gone on the way to 1.0.0-rc. libanole is now a release asset for the bindings.
+
+### Highlights
+
+On my box (i7-14700F), against 0.6.0. Instructions per request are fixed-count on 1 executor; req/s, CPU and RSS are a rested A/B on 5 executors, one pass.
+
+| Cell | 0.6.0 | 0.6.1 |
+|---|---|---|
+| h2c json `/json/50`: kernel instructions per request | 19,987 | 6,586 (−67%) |
+| h2c json `/json/50`: sendmsg per request | 0.656 | 0.096 |
+| json-h2c, 4096 connections, 120 s: req/s | 230.1k | 259.1k (+12.6%) |
+| json-h2c, 4096 connections: CPU per request | 6.90 µs | 5.94 µs (−13.9%) |
+| json-h2c, 4096 connections: RSS | 2466 MB | 2192 MB |
+
+Everything else (static-h2, unary gRPC, h2c baseline, HTTP/1.1, HTTP/3, the WebSocket relay) is flat within one-pass noise. The S3 step-1 changes keep user-space instructions per request within ±0.2% on HTTP/1.1, h2c, unary gRPC and HTTP/3. Results: bench/results/20261122-s2-finish-ab, 20261122-s3-step1-gate.
+
+### Changed
+
+- **zio stream writes gather up to 64 iovecs (was 8)** when the caller passes 8 or more slices. This is the h2c gain above: an HTTP/2 flush round of up to 64 slices takes one sendmsg instead of up to eight (one sendmsg per 10 responses instead of per 1.5). Small responses already fit one send and don't change; TLS output was already sealed into one buffer.
+- **PostgreSQL calls that skip the statement cache take one round trip after their first run** (#132; `describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.
+- **The startup line names the real reason io_uring is off** (#134; the error zio kept from the ring's setup) instead of guessing from the kernel version; only an EPERM without `kernel.io_uring_disabled` is still "likely a seccomp profile". New `io_engine` option (`.auto` or `.io_uring`, also `"io_engine"` in the C ABI config): `.io_uring` refuses to start on epoll, naming the cause.
+- The rate-limit middleware resolves its policy once at init instead of per request (#204).
+- gRPC routes transcoded from JSON for Zig services honour `no_wait`; a route shared by several bindings is `no_wait` only if every binding is (#50).
+- QUIC `SSL`s (server and client) shed their handshake configuration after the handshake, as the TLS listeners already did (#50).
+- WebSocket over HTTP/2 and HTTP/3 sizes its message buffer once from the length the frames declare, instead of growing it piece by piece (A2-7).
+- Pins: zio `anole-diag` d7380db (was 3c863fc), pg.zig `anole` 06ccba1 (was 4abc2ca).
+
+### Fixed
+
+- **HTTP/2: a send from a task on another executor swallowed a cancel** (#236): the engine's cross-executor hop caught `error.Canceled` and turned it into a write failure, so the sender's next cancelable call didn't see it. It now re-raises the cancel (`io.recancel()`).
+- **A plain GET to a `wsCallbacks` route crashed under `anole.testing`** (#237): it read the connection before checking for an upgrade. The upgrade check now runs first and the route answers 426, as it already did over a socket.
+- **libanole failed to link against glibc older than 2.25**: the ngtcp2 build defined `HAVE_EXPLICIT_BZERO` on every Linux target, leaving `__explicit_bzero_chk` undefined. It is now set only for glibc >= 2.25 and musl; older glibc uses ngtcp2's own fallback.
+- Console (part of #128): the `/routes` `cached` flag is filled from the route's middleware chain (it was always false), and Redis, MongoDB, NATS and Kafka report a `consoleInfo` for `/db`. The `/db` call rates and latencies are still open.
 
 ### Removed
 
 - SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.
+- **`zig build lint` and `zig build safety-test` no longer exist**; scripts that call them need to drop them.
 
-### Changed
+### Added
 
-- **PostgreSQL calls that skip the statement cache take one round trip after their first run** (`describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Needs the pg.zig fork's description cache. Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.
+- **`zig build capi-dist`**: `libanole-<arch>-<os>.a`, `anole.h`, `anole.abi.json`, `anole.schema.json` and `SHA256SUMS-libanole` for x86_64 and aarch64 `linux-gnu.2.17` and x86_64 and aarch64 macOS, stripped ReleaseSafe, into `zig-out/capi-dist`. The stripped libanole.a is about 24 MB (19 MB with `-Dprofile=web`) and exports only the `anole_*` symbols. These ship as release assets from this release on, next to the `anole` CLI binaries. New `-Dstrip` option for `zig build capi`.
 
-- The startup line now names the real reason io_uring is off (the error zio kept from the ring's setup) instead of guessing from the kernel version; only an EPERM without `kernel.io_uring_disabled` is still "likely a seccomp profile".
-- New `io_engine` option (`.auto` or `.io_uring`, also `"io_engine"` in the C ABI config): `.io_uring` refuses to start on epoll, naming the cause.
+### Known issues
+
+- The QUIC and WebTransport interop CI jobs are red, on 0.6.0's code too (#244, #243).
+- HTTP/3 still costs 2.4x h2c's CPU per request (h3 1.62 against h2c 0.68 µs at one connection, 64 streams).
 
 ## 0.6.0 (2026-11-16)
 
