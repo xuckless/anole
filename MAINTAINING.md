@@ -345,7 +345,12 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   `Listener.sendListen`/`sendUnlisten`/`sendPing`/`nextEvent`, which
   `anole.watch` uses to LISTEN and UNLISTEN on a connection another task
   waits on (branch `listener-nonblocking`, generic, merged into `anole`;
-  the fork's own test of it needs a PostgreSQL on 127.0.0.1:5432). The first four are
+  the fork's own test of it needs a PostgreSQL on 127.0.0.1:5432), and a
+  description cache (`Opts.describe_cache_size`; branch `describe-cache`,
+  generic, merged into `anole`): a call that skips the statement cache
+  takes one round trip after its first run (Parse with the cached types,
+  Bind, Describe, Execute and Sync in one write, as pgx's
+  `QueryExecModeCacheDescribe`; the fork's `tests/run.sh` covers it). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig

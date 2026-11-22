@@ -329,6 +329,10 @@ pub const Config = struct {
         /// Statements each connection keeps prepared; 0 behind PgBouncer
         /// before 1.21 in transaction mode.
         statement_cache_size: u16 = 256,
+        /// Statement descriptions each connection remembers for calls that
+        /// skip the statement cache, which then take one round trip after
+        /// their first run; 0: off.
+        describe_cache_size: u16 = 64,
         /// Connections older than this are closed; 0: no limit.
         max_lifetime_ms: u32 = 60 * 60 * 1000,
         /// Connections idle this long are closed; 0: no limit.

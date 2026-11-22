@@ -381,7 +381,13 @@ try tx.commit(req); // under the request's deadline, like every call
   first time it runs it and keeps it (`statement_cache_size`), so every
   later run is one round trip. For SQL built at run time that seldom
   repeats, `app.db.with(.{ .prepare = false })`. Behind PgBouncer older
-  than 1.21 in transaction mode, set `statement_cache_size = 0`.
+  than 1.21 in transaction mode, set `statement_cache_size = 0`. Such
+  calls (`.prepare = false`, or the cache off) also take one round trip
+  once they have run: each connection remembers the parameter and column
+  types of the last `describe_cache_size` (64) of them and sends Parse,
+  Bind and Execute together, with nothing left prepared on the server.
+  If the table changed in between (a new column), the first call after
+  the change may fail with a PostgreSQL error; the next one is fine.
 - **Deadlines.** A call waits as long as the request may. When the
   request's deadline passes or the client goes away (an HTTP/2 reset),
   the call is canceled, Anole sends PostgreSQL a CancelRequest so the
