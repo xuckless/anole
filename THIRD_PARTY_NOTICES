@@ -31,8 +31,10 @@ zio (async runtime)
             and the executor stall watchdog, src/diag.zig, the held-lock
             report hook, and the per-executor quiescent-state counters,
             quiescent_state; fast_send, the no-park yield and
-            Loop.idle_ns)
-  Pinned:   commit 806b5e4fa82592564f4e788ab4797370e43a99a5 of the fork
+            Loop.idle_ns; direct UDP batches on io_uring; Stream writes
+            gathering up to 64 iovecs and the io_uring setup error kept
+            behind the epoll fallback)
+  Pinned:   commit d7380db551367a3ba82ce3fc9c030ab803c8781b of the fork
   Linked:   always
 
 sfparse (Structured Field Values parser, shipped inside nghttp3)
@@ -159,7 +161,7 @@ pg.zig (PostgreSQL client)
             accepted, so a failed call is run again only when none left;
             a description cache, so a call that skips the statement cache
             takes one round trip after its first run)
-  Pinned:   commit 6327fc61f3a3e90aa5b014af21e12bbb073e0fcc of the fork
+  Pinned:   commit 06ccba16b9f5fea10e735f2ad78dd93e641694cd of the fork
   Linked:   -Dpostgres=true
 
 buffer.zig (byte buffers; a dependency of pg.zig)
