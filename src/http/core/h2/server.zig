@@ -2459,7 +2459,7 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         /// Takes `connection`, initialized, over for HTTP/2: it becomes the
-        /// server's `Adopter` (`connection.adopter`), which the caller then
+        /// server's `Adopter` (`connection.adopt`), which the caller then
         /// serves (`Server.serveAdopted`) until it closes or parks, and
         /// releases once (`Adopter.release`). The caller has given the
         /// connection's in-flight count back (`Server.giveCount`): from now
@@ -2508,7 +2508,7 @@ pub fn Engine(comptime Ctx: type) type {
             probe.outHigh(&opts.limits);
             try conn.proto.initAt(server.allocator, conn, opts);
             if (comptime registered()) @field(server, Registry.field).add(conn);
-            connection.adopter = &conn.adopter;
+            connection.adopt(&conn.adopter);
         }
 
         /// `start`, then the connection served on the calling task as a
@@ -2518,11 +2518,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// their own.
         pub fn serve(server: *Server, listener: *const Listener, secure: bool, connection: *Connection) !void {
             try start(server, listener, secure, connection);
-            const a = connection.adopter.?;
-            defer {
-                connection.adopter = null;
-                a.release(a);
-            }
+            const a = connection.mode.adopter().?;
+            defer connection.releaseAdopter();
             var timer: Timer = .init(null);
             defer timer.clear(server.io);
             var burst: server_mod.Burst = .{ .connection = connection, .io = server.io, .timer = &timer, .park_after = null, .deadline = null };

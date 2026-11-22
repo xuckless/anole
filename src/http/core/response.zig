@@ -1067,7 +1067,7 @@ pub const Response = struct {
         if (self._lent != null or self._sink != null or self._headers_written or self.head) return false;
         const conn = self._conn orelse return false;
         const pool = conn.write_pool orelse return false;
-        if (conn.upgraded or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
+        if (conn.mode.upgraded() or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
         const total = std.math.add(usize, w.end, needed) catch return false;
         if (total <= BodyBuffer.first_segment_len or total > pool.write_buffer_len -| head_room) return false;
         const lent = pool.takeWriteBuffer(@intFromPtr(conn)) catch return false;
@@ -1112,7 +1112,7 @@ pub const Response = struct {
         const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
         const conn = self._conn.?;
         const buf = conn.write_pool.?.writeBytes(lent);
-        if (first.data != buf[head_room..].ptr or conn.upgraded) return false;
+        if (first.data != buf[head_room..].ptr or conn.mode.upgraded()) return false;
         const w = conn.writer;
         // Between requests the server gives the writer's buffer back unless
         // it holds corked responses.
@@ -1686,7 +1686,7 @@ pub const Response = struct {
             return engine.park != null;
         }
         const conn = self._conn orelse return false;
-        return conn.adopter == null and !conn.upgraded and self.status != .switching_protocols;
+        return conn.mode.state == .http;
     }
 
     /// Writes the head (status and headers as set; chunked over HTTP/1.1)
@@ -1718,7 +1718,7 @@ pub const Response = struct {
         // the adopter instead of waiting for a next request.
         self.keepalive = false;
         const h1 = Parked_H1.create(conn, chunked, owner) catch return error.OutOfMemory;
-        conn.adopter = &h1.adopter;
+        conn.adopt(&h1.adopter);
         return &h1.parked;
     }
 
@@ -1804,7 +1804,7 @@ pub const Response = struct {
         if (self._sink != null or !self._headers_written) return error.Unsupported;
         // A 101, or a streamed 200 (a parked event stream).
         if (self.status != .switching_protocols and !(self._streaming or self._chunked)) return error.Unsupported;
-        self._conn.?.adopter = adopter;
+        self._conn.?.adopt(adopter);
     }
 
     /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
@@ -2260,7 +2260,7 @@ pub const Response = struct {
         }
         // An upgrade's 101 went out with it, and the connection is the
         // upgraded protocol's: its writer is not this response's to flush.
-        if (self.status == .switching_protocols and self._sink == null and self._conn.?.upgraded) {
+        if (self._sink == null and self._conn.?.mode.upgraded()) {
             self._written = true;
             return;
         }

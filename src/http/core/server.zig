@@ -427,8 +427,9 @@ pub const Connection = struct {
     proxied_secure: bool = false,
     /// The address the PROXY header says the client connected to.
     proxied_local: ?std.Io.net.IpAddress = null,
-    /// What took the connection over after an upgrade (`Response.adopt`).
-    adopter: ?*Adopter = null,
+    /// Whether a request took the connection out of HTTP/1.x, and what
+    /// serves it now (`Mode`).
+    mode: Mode = .{},
     /// Where the writer takes a buffer from when a response first writes
     /// (`prepareWrite`), and gives it back to once that is out
     /// (`releaseWriteBuffer`). Without one, the writer's buffer is what
@@ -436,8 +437,6 @@ pub const Connection = struct {
     write_pool: ?*RequestBuffersPool = null,
     /// The buffer the writer took from `write_pool`, while it has it.
     write_held: ?*WriteBuffer = null,
-    /// A request upgraded it (`finishUpgrade`): no more responses.
-    upgraded: bool = false,
     tls_rng: std.Random.IoSource = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
@@ -580,7 +579,7 @@ pub const Connection = struct {
     /// answer holds none. Without memory for one, the writes go out
     /// unbuffered, one each.
     pub fn prepareWrite(self: *Connection) void {
-        if (self.upgraded) return;
+        if (self.mode.upgraded()) return;
         lendWriteBuffer(self);
     }
 
@@ -768,8 +767,99 @@ pub const Connection = struct {
     /// connection is open.
     pub fn finishUpgrade(self: *Connection) void {
         self.releaseWriteBuffer();
-        self.upgraded = true;
+        self.mode = self.mode.next(.finish_upgrade);
     }
+
+    /// Hands the connection to `a` (`Adopter`): the server runs it rather
+    /// than the HTTP/1.x loop, and calls its `release` when it closes.
+    pub fn adopt(self: *Connection, a: *Adopter) void {
+        self.mode = self.mode.next(.{ .adopt = a });
+    }
+
+    /// The adopter's last call, once: the mode no longer holds it when its
+    /// `release` runs. Nothing without one.
+    pub fn releaseAdopter(self: *Connection) void {
+        const a = self.mode.adopter() orelse return;
+        self.mode = self.mode.next(.release);
+        a.release(a);
+    }
+
+    /// Whether a request took the connection out of HTTP/1.x, and who
+    /// serves it. Every change is a row of `transitions`, made only through
+    /// `finishUpgrade`, `adopt` and `releaseAdopter`: add a state or a row
+    /// there, not a flag beside it.
+    ///
+    /// Upgraded and adopted are two facts: the h2 engine and a raw listener
+    /// adopt without an upgrade (their writes still borrow a pooled buffer
+    /// per response, `prepareWrite`), a task-based WebSocket upgrades
+    /// without an adopter. A release keeps the upgrade: the connection
+    /// serves no more HTTP/1.x either way. A second adopt replaces the
+    /// first. The adopter is held in the adopted states only.
+    ///
+    /// One word, the state in the adopter pointer's low bits: a tagged
+    /// union would be two, and `Connection` must not grow.
+    pub const Mode = packed struct(usize) {
+        state: State = .http,
+        /// The adopter's address >> 2 in the adopted states, 0 otherwise.
+        adopter_bits: @Int(.unsigned, @bitSizeOf(usize) - 2) = 0,
+
+        pub const State = enum(u2) {
+            /// Plain HTTP/1.x: requests and responses.
+            http,
+            /// The 101 (or a parked stream's head) is out and nothing
+            /// adopted it: a task-based WebSocket, or the moment before
+            /// `adopt`.
+            upgraded,
+            /// Served by an adopter without an upgrade: the h2 engine, a
+            /// raw listener, a streamed response handed over by
+            /// `Response.adopt`.
+            adopted,
+            /// Upgraded, then adopted: a WebSocket served through
+            /// callbacks, a parked HTTP/1.x stream.
+            upgraded_adopted,
+        };
+
+        pub const Event = union(enum) { finish_upgrade, adopt: *Adopter, release };
+
+        comptime {
+            std.debug.assert(@alignOf(Adopter) >= 4);
+        }
+
+        /// state x event -> next state. The adopter goes with the event:
+        /// `finish_upgrade` keeps it, `adopt(b)` makes it b, `release`
+        /// drops it.
+        const transitions = std.EnumArray(State, std.EnumArray(std.meta.Tag(Event), State)).init(.{
+            .http = .init(.{ .finish_upgrade = .upgraded, .adopt = .adopted, .release = .http }),
+            .upgraded = .init(.{ .finish_upgrade = .upgraded, .adopt = .upgraded_adopted, .release = .upgraded }),
+            .adopted = .init(.{ .finish_upgrade = .upgraded_adopted, .adopt = .adopted, .release = .http }),
+            .upgraded_adopted = .init(.{ .finish_upgrade = .upgraded_adopted, .adopt = .upgraded_adopted, .release = .upgraded }),
+        });
+
+        const upgraded_states = std.EnumArray(State, bool).init(.{
+            .http = false,
+            .upgraded = true,
+            .adopted = false,
+            .upgraded_adopted = true,
+        });
+
+        pub fn next(m: Mode, ev: Event) Mode {
+            const a: ?*Adopter = switch (ev) {
+                .finish_upgrade => m.adopter(),
+                .adopt => |b| b,
+                .release => null,
+            };
+            return .{ .state = transitions.get(m.state).get(ev), .adopter_bits = @intCast(@intFromPtr(a) >> 2) };
+        }
+
+        /// A request upgraded the connection: no more responses on it.
+        pub fn upgraded(m: Mode) bool {
+            return upgraded_states.get(m.state);
+        }
+
+        pub fn adopter(m: Mode) ?*Adopter {
+            return @ptrFromInt(@as(usize, m.adopter_bits) << 2);
+        }
+    };
 
     /// `Transport.WriteBuffers.take`: a buffer from `write_pool`, upgraded
     /// or not.
@@ -3073,14 +3163,14 @@ pub fn Server(comptime Ctx: type) type {
                 .group = self.connections_group orelse return .close,
             };
             const a = (try raw.start(raw, &conn.connection, &info)) orelse return .close;
-            conn.connection.adopter = a;
+            conn.connection.adopt(a);
             return self.serveRequests(conn, timer);
         }
 
         /// HTTP/1.x on `conn` until it closes or parks. A TLS connection that
         /// ends without failing sends close_notify.
         fn serveRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
-            const outcome = if (conn.connection.adopter != null)
+            const outcome = if (conn.connection.mode.adopter() != null)
                 try self.serveAdopted(conn, timer)
             else
                 try self.handleRequests(conn, timer);
@@ -3090,7 +3180,7 @@ pub fn Server(comptime Ctx: type) type {
 
         /// A run of what took `conn` over (`Adopter`).
         fn serveAdopted(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
-            const a = conn.connection.adopter.?;
+            const a = conn.connection.mode.adopter().?;
             var burst: Burst = .{
                 .connection = &conn.connection,
                 .io = self.io,
@@ -3166,7 +3256,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Closes `conn`'s socket, frees it and gives back its slot. On a
         /// task on its executor, with no other task serving it.
         fn closeConn(self: *Self, conn: *Conn) void {
-            if (conn.connection.adopter) |a| a.release(a);
+            conn.connection.releaseAdopter();
             // A buffer an upgraded writer borrowed and never gave back (its
             // last flush failed).
             if (conn.connection.write_held != null) conn.connection.releaseWriteBuffer();
@@ -3396,7 +3486,7 @@ pub fn Server(comptime Ctx: type) type {
             defer if (buffers) |b| {
                 // An adopter's writer is its own, under its lock: it took
                 // it out of the buffers before it returned.
-                if (connection.adopter == null) {
+                if (connection.mode.adopter() == null) {
                     // The exits that pass `flushOwed`, `flushOwedBeforeClose`
                     // or `dropOwed` leave nothing owed. The others are
                     // errors before the next response wrote anything (its
@@ -3415,10 +3505,7 @@ pub fn Server(comptime Ctx: type) type {
             // takes the adopter's windows out of the buffers: the adopter is
             // done with before they go back.
             var adopter_ran = false;
-            defer if (connection.adopter) |a| if (!adopter_ran) {
-                connection.adopter = null;
-                a.release(a);
-            };
+            defer if (!adopter_ran) connection.releaseAdopter();
 
             var request: Request = .{
                 // The pooled arena, once a request has arrived.
@@ -3807,10 +3894,10 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
-                    if (response.status != .switching_protocols and !response._parked and hasUnreadInput(connection, &parser)) {
+                    if (!connection.mode.upgraded() and !response._parked and hasUnreadInput(connection, &parser)) {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
-                    if (connection.adopter != null) {
+                    if (connection.mode.adopter() != null) {
                         // The count stays held: in flight until it closes
                         // (`Count`).
                         // The adopter keeps nothing of the request's

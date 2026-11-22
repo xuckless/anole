@@ -1143,6 +1143,16 @@ const CorkCtx = struct {
     /// What `/wait` waits for: the client sets it once it has read the
     /// responses before it.
     event: std.Io.Event = .unset,
+    /// What `/ws-mode` saw: `_canPark` before and after the upgrade, and the
+    /// connection's mode after it.
+    park_before: bool = false,
+    park_after: bool = true,
+    mode_after: dusty.Connection.Mode.State = .http,
+
+    /// What `/adopt-stream` hands its connection to: it closes at once.
+    adopter: dusty.Adopter = .{ .serve = adopterServe, .release = adopterRelease },
+    adopter_served: u32 = 0,
+    adopter_released: u32 = 0,
 
     const big_len = 1024;
     const big_body: [big_len]u8 = @splat('b');
@@ -1157,6 +1167,39 @@ const CorkCtx = struct {
         server.router.addRouteWith(.get, "/badlen", badLength, .{ .no_wait = true });
         server.router.get("/wait", waitForClient);
         server.router.addRouteWith(.post, "/ignore", ignore, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/ws-mode", wsMode, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/adopt-stream", adoptStream, .{ .no_wait = true });
+    }
+
+    fn wsMode(ctx: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        ctx.park_before = res._canPark();
+        var socket = (try res._upgradeWebSocket(req)).?;
+        defer socket.deinit();
+        ctx.park_after = res._canPark();
+        ctx.mode_after = res._conn.?.mode.state;
+        try socket.send(.text, "hi");
+    }
+
+    fn adopterServe(ad: *dusty.Adopter, _: *dusty.Burst) anyerror!dusty.Burst.End {
+        const ctx: *CorkCtx = @fieldParentPtr("adopter", ad);
+        _ = @atomicRmw(u32, &ctx.adopter_served, .Add, 1, .release);
+        return .close;
+    }
+
+    fn adopterRelease(ad: *dusty.Adopter) void {
+        const ctx: *CorkCtx = @fieldParentPtr("adopter", ad);
+        _ = @atomicRmw(u32, &ctx.adopter_released, .Add, 1, .release);
+    }
+
+    /// A streamed 200 handed over without an upgrade, its body left open:
+    /// `Response.write` still ends it.
+    fn adoptStream(ctx: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        var buf: [64]u8 = undefined;
+        var body = try res.stream(&buf);
+        try body.interface.writeAll("hello");
+        try body.interface.flush();
+        try res.adopt(&ctx.adopter);
+        res.keepalive = false;
     }
 
     /// Answers without reading its body.
@@ -1464,6 +1507,117 @@ test "Server: a response corked before a WebSocket upgrade arrives before the 10
     }
     const frame = try r.takeArray(4);
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, frame);
+}
+
+test "Server: a WebSocket upgrade leaves the connection upgraded, not parkable" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /ws-mode HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    const r = &client.reader.interface;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    // The frame is sent after the handler looked.
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, try r.takeArray(4));
+    try std.testing.expect(client.ctx.park_before);
+    try std.testing.expect(!client.ctx.park_after);
+    try std.testing.expectEqual(.upgraded, client.ctx.mode_after);
+}
+
+test "Server: a streamed 200 adopted without an upgrade is still ended, then served and released once" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /adopt-stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const raw = try client.reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n5\r\nhello\r\n0\r\n\r\n"));
+    try wait.waitUntil(std.testing.io, "the adopter released", &client.ctx, struct {
+        fn released(ctx: *const CorkCtx) bool {
+            return @atomicLoad(u32, &ctx.adopter_released, .acquire) == 1;
+        }
+    }.released);
+    try std.testing.expectEqual(1, @atomicLoad(u32, &client.ctx.adopter_served, .acquire));
+}
+
+test "Connection.Mode: every state x event cell" {
+    const Mode = dusty.Connection.Mode;
+    const noop = struct {
+        fn serve(_: *dusty.Adopter, _: *dusty.Burst) anyerror!dusty.Burst.End {
+            return .close;
+        }
+        fn release(_: *dusty.Adopter) void {}
+    };
+    var a: dusty.Adopter = .{ .serve = noop.serve, .release = noop.release };
+    var b: dusty.Adopter = .{ .serve = noop.serve, .release = noop.release };
+    // The start states, each reached by the event that makes it.
+    const http: Mode = .{};
+    const upgraded = http.next(.finish_upgrade);
+    const adopted = http.next(.{ .adopt = &a });
+    const upgraded_adopted = upgraded.next(.{ .adopt = &a });
+    const Row = struct { []const u8, Mode, Mode.Event, Mode.State, bool, ?*dusty.Adopter };
+    const rows = [_]Row{
+        .{ "http + finish_upgrade", http, .finish_upgrade, .upgraded, true, null },
+        .{ "http + adopt", http, .{ .adopt = &b }, .adopted, false, &b },
+        .{ "http + release: nothing to release", http, .release, .http, false, null },
+        .{ "upgraded + finish_upgrade", upgraded, .finish_upgrade, .upgraded, true, null },
+        .{ "upgraded + adopt: the WebSocket order", upgraded, .{ .adopt = &b }, .upgraded_adopted, true, &b },
+        .{ "upgraded + release: a second release", upgraded, .release, .upgraded, true, null },
+        .{ "adopted + finish_upgrade keeps the adopter", adopted, .finish_upgrade, .upgraded_adopted, true, &a },
+        .{ "adopted + adopt replaces", adopted, .{ .adopt = &b }, .adopted, false, &b },
+        .{ "adopted + release: the h2 engine, a raw listener", adopted, .release, .http, false, null },
+        .{ "upgraded_adopted + finish_upgrade", upgraded_adopted, .finish_upgrade, .upgraded_adopted, true, &a },
+        .{ "upgraded_adopted + adopt replaces", upgraded_adopted, .{ .adopt = &b }, .upgraded_adopted, true, &b },
+        .{ "upgraded_adopted + release stays upgraded", upgraded_adopted, .release, .upgraded, true, null },
+    };
+    for (rows) |row| {
+        const name, const start, const ev, const state, const is_upgraded, const adopter = row;
+        errdefer std.debug.print("row: {s}\n", .{name});
+        const got = start.next(ev);
+        try std.testing.expectEqual(state, got.state);
+        try std.testing.expectEqual(is_upgraded, got.upgraded());
+        try std.testing.expectEqual(adopter, got.adopter());
+    }
+}
+
+test "Connection.releaseAdopter: the adopter's release runs once, the mode cleared before it" {
+    const Probe = struct {
+        adopter: dusty.Adopter = .{ .serve = serve, .release = release },
+        connection: *dusty.Connection,
+        released: u32 = 0,
+        held_during_release: bool = false,
+
+        fn serve(_: *dusty.Adopter, _: *dusty.Burst) anyerror!dusty.Burst.End {
+            return .close;
+        }
+        fn release(a: *dusty.Adopter) void {
+            const self: *@This() = @fieldParentPtr("adopter", a);
+            self.released += 1;
+            self.held_during_release = self.connection.mode.adopter() != null;
+        }
+    };
+    var w: std.Io.Writer = .fixed(&.{});
+    var connection: dusty.Connection = undefined;
+    connection.initWriterForTesting(&w);
+    var probe: Probe = .{ .connection = &connection };
+
+    // A plain connection has nothing to release.
+    connection.releaseAdopter();
+    try std.testing.expectEqual(0, probe.released);
+
+    connection.finishUpgrade();
+    connection.adopt(&probe.adopter);
+    connection.releaseAdopter();
+    connection.releaseAdopter();
+    try std.testing.expectEqual(1, probe.released);
+    try std.testing.expect(!probe.held_during_release);
+    try std.testing.expectEqual(.upgraded, connection.mode.state);
 }
 
 test "Server: a CONNECT ends the connection, its body unserved" {
