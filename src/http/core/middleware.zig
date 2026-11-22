@@ -488,8 +488,6 @@ fn makeTestResponse(conn: *Connection) Response {
         ._written = false,
         ._headers_written = false,
         .keepalive = true,
-        ._chunked = false,
-        ._streaming = false,
     };
 }
 

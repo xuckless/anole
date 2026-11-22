@@ -491,9 +491,7 @@ pub const BodyWriter = struct {
     pub fn end(self: *BodyWriter) Error!void {
         // Idempotent, so `defer body.end() catch {}` alongside an explicit
         // `end` on the success path is harmless rather than a second body.
-        if (!self.res._body_writer_open) return;
-        self.res._body_writer_open = false;
-        self.res._body_writer_buffering = false;
+        if (!self.res.closeBodyWriter()) return;
         // Cannot fail: see `flush`.
         self.interface.flush() catch unreachable;
         // A write that failed was reported then; the body is not complete
@@ -501,6 +499,67 @@ pub const BodyWriter = struct {
         if (self.err) |err| return err;
     }
 };
+
+/// How a response's body is framed on the wire (RFC 9112 §6), one value.
+/// Every move is a row here; add a framing as a state, not as a flag.
+///
+///   state            stream()            _upgradeWebSocket
+///   buffered         forStream(..)       streaming
+///   chunked          x                   x
+///   streaming        x                   x
+///   declared_length  x                   x
+///
+/// x: not reached. Both run only while the head is not out (`stream` through
+/// `checkBodyNotStarted`, the upgrade through `header`), every other mode
+/// means it is out, and `resetBody` refuses once it is: the mode is set once,
+/// from `buffered`, and never goes back. Every other event only reads it:
+/// `writer`, both `end`s (the terminator for `chunked`), `resetBody`,
+/// `clearWriter`, `write` with an abandoned writer (keepalive off for a
+/// `declared_length` not met), `adopt` (a 200 only for `chunked` or
+/// `streaming`), `_park` (its `chunked` flag).
+const BodyMode = enum(u8) {
+    /// Not streamed: the head carries the body's length when `write`
+    /// sends both (the handler's own Content-Length, if set).
+    buffered,
+    /// Transfer-Encoding: chunked.
+    chunked,
+    /// Unframed by us: a sink's protocol frames it, an HTTP/1.0 body ends
+    /// with the connection, or the 101's upgraded protocol owns it.
+    streaming,
+    /// The handler's Content-Length header; `Response.content_length` has
+    /// the number.
+    declared_length,
+
+    /// `stream()`'s framing: a declared length first, then a sink's own
+    /// framing, then HTTP/1.0's close, else chunked.
+    fn forStream(declared: bool, sink: bool, http10: bool) BodyMode {
+        if (declared) return .declared_length;
+        if (sink or http10) return .streaming;
+        return .chunked;
+    }
+};
+
+/// The body writer a response has handed out and not ended, one value.
+/// Every move is a cell here; add a writer kind as a state, not a flag.
+///
+///   state           writer()          stream()          close
+///   none            open_buffering    open              none (no-op)
+///   open            = BodyWriterOpen  = BodyWriterOpen  none
+///   open_buffering  = BodyWriterOpen  = BodyWriterOpen  none
+///
+/// claim (`startBody`) is refused by `checkBodyNotStarted` before it moves,
+/// in this order: BodyWriterOpen, HeadersAlreadySent, BodyAlreadySet.
+/// close (`closeBodyWriter`) is `BodyWriter.end`, `StreamingBodyWriter.end`,
+/// `resetBody`, `write` with a writer the handler abandoned, `_park` and
+/// `parkAfterHead`; in `none` it is a no-op, which makes `end` idempotent.
+/// Kept as they were: `open` stays after a `stream()` that failed before its
+/// head (until `resetBody` or `write`); both `end`s are one event, so a stale
+/// `BodyWriter` ended after `resetBody` + `stream()` closes the stream's claim;
+/// `StreamingBodyWriter.end` in `open_buffering` is not reached (a stream
+/// exists only after its head, and `writer()` is refused after it).
+/// `clearWriter` reads it (spares an `open_buffering` writer's bytes), as do
+/// `json`, `memoryBodyLen` and `checkBodyNotStarted`.
+const BodyWriterState = enum(u8) { none, open, open_buffering };
 
 /// Writes a response body straight to the connection as it is produced.
 ///
@@ -579,7 +638,7 @@ pub const StreamingBodyWriter = struct {
         // the peer (or a proxy reusing the connection) as the start of the
         // next response. Nothing of this write goes out, and the
         // connection is not reused.
-        if (self.res.content_length) |declared| if (!self.res._chunked and total > declared -| self.res.body_sent) {
+        if (self.res.content_length) |declared| if (total > declared -| self.res.body_sent) {
             self.res.keepalive = false;
             self.err = error.ContentLengthMismatch;
             return error.WriteFailed;
@@ -607,8 +666,7 @@ pub const StreamingBodyWriter = struct {
         const res = self.res;
         // Idempotent: a second `end` must not write a second terminator,
         // which the peer would read as the start of the next message.
-        if (!res._body_writer_open) return;
-        res._body_writer_open = false;
+        if (!res.closeBodyWriter()) return;
         // From here the bytes already sent are the response, whatever
         // happens next, so `write` must not add a terminator or a body to
         // them.
@@ -626,7 +684,7 @@ pub const StreamingBodyWriter = struct {
         } else {
             try res.resolve(self.interface.flush());
         }
-        if (res._chunked and res.sendsBody()) try res.resolve(res._conn.?.writer.writeAll("0\r\n\r\n"));
+        if (res._body_mode == .chunked and res.sendsBody()) try res.resolve(res._conn.?.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.finish(res.bodyOut()));
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
@@ -817,22 +875,23 @@ pub const Response = struct {
     _written: bool = false,
     _headers_written: bool = false,
     keepalive: bool = true,
-    _chunked: bool = false,
-    _streaming: bool = false,
+    /// How the body is framed on the wire; see `BodyMode`. Moved only by
+    /// `setBodyMode`. Every mode but `buffered` means the head is out
+    /// (`handOverLent`, `memoryBodyLen` and `sendBody` rely on it).
+    _body_mode: BodyMode = .buffered,
+    /// The body writer handed out and not ended; see `BodyWriterState`.
+    /// Moved only by `startBody` and `closeBodyWriter`.
+    _body_writer: BodyWriterState = .none,
     /// The request was a HEAD, so the headers go out describing the body
     /// a GET would have sent, and the body itself does not. Set by the
     /// server; a handler writes its body either way and does not have to
     /// know.
     head: bool = false,
-    /// A body writer was handed out and has not been ended yet.
-    _body_writer_open: bool = false,
-    /// The open body writer is a `BodyWriter`, whose length the response
-    /// only learns when it ends.
-    _body_writer_buffering: bool = false,
     /// The request was HTTP/1.0, so the peer does not understand chunked
     /// encoding. Set by the server.
     http10: bool = false,
-    /// Length declared before streaming, if any. On the response rather
+    /// Length declared before streaming, if any: set with `_body_mode`
+    /// `.declared_length`, null in every other mode. On the response rather
     /// than the writer so that `write` can still tell whether the body
     /// that went out matched it, even if the writer was abandoned.
     content_length: ?usize = null,
@@ -1108,7 +1167,7 @@ pub const Response = struct {
     noinline fn handOverLent(self: *Response) bool {
         const lent = self._lent orelse return false;
         // `write` sends the buffer only when it holds anything, else `body`.
-        if (!self.sendsBody() or self._chunked or self._streaming or self.body_buffer.len() == 0) return false;
+        if (!self.sendsBody() or self._body_mode != .buffered or self.body_buffer.len() == 0) return false;
         const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
         const conn = self._conn.?;
         const buf = conn.write_pool.?.writeBytes(lent);
@@ -1254,8 +1313,7 @@ pub const Response = struct {
     ///
     /// Call `end` on the result before returning from the handler.
     pub fn writer(self: *Response) http.MisuseError!BodyWriter {
-        try self.startBody();
-        self._body_writer_buffering = true;
+        try self.startBody(.open_buffering);
         // Without the memory, the first write fails the same way.
         self.body_buffer.reserveFirst(self.arena) catch {};
         return .init(self);
@@ -1270,7 +1328,7 @@ pub const Response = struct {
     /// The headers are on the wire when this returns, so nothing can change
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
-        try self.startBody();
+        try self.startBody(.open);
         // Everything that can fail comes before anything is committed: a
         // handler that gets an error from here still has open headers,
         // and the error response written in their place must not inherit
@@ -1294,20 +1352,13 @@ pub const Response = struct {
 
         if (compression != .off) self.addVary();
         if (compression.isCoding()) self.markCompressed(compression);
-        if (declared) |len| {
-            self.content_length = len;
-        } else if (self._sink != null) {
-            // The protocol under a sink frames the body itself.
-            self._streaming = true;
-        } else if (self.http10) {
-            // Chunked encoding came with HTTP/1.1. Before it, a body of
-            // unknown length ends when the connection does. A response
-            // that sends no body needs no such end.
-            self._streaming = true;
-            if (self.sendsBody()) self.keepalive = false;
-        } else {
-            self._chunked = true;
-        }
+        const mode: BodyMode = .forStream(declared != null, self._sink != null, self.http10);
+        self.setBodyMode(mode);
+        self.content_length = declared;
+        // Chunked encoding came with HTTP/1.1. Before it, a body of
+        // unknown length ends when the connection does. A response that
+        // sends no body needs no such end.
+        if (mode == .streaming and self._sink == null and self.sendsBody()) self.keepalive = false;
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
         // A sink sizes its body writer once the head is recorded, on its
         // first `body()` after it. Taken here, on the handler's task: the
@@ -1321,22 +1372,36 @@ pub const Response = struct {
 
     /// A body can be started: no writer open, no head sent, no body set.
     fn checkBodyNotStarted(self: *const Response) http.MisuseError!void {
-        if (self._body_writer_open) return error.BodyWriterOpen;
+        if (self._body_writer != .none) return error.BodyWriterOpen;
         if (self._headers_written) return error.HeadersAlreadySent;
         if (self.body.len != 0 or self.body_buffer.len() != 0) return error.BodyAlreadySet;
     }
 
-    fn startBody(self: *Response) http.MisuseError!void {
+    /// Claims the body for a writer of `kind` (`.open` for a stream,
+    /// `.open_buffering` for a `BodyWriter`): `BodyWriterState`'s claim.
+    fn startBody(self: *Response, kind: BodyWriterState) http.MisuseError!void {
         try self.checkBodyNotStarted();
-        self._body_writer_open = true;
+        self._body_writer = kind;
+    }
+
+    /// `BodyWriterState`'s close: true if a writer was open.
+    fn closeBodyWriter(self: *Response) bool {
+        const was_open = self._body_writer != .none;
+        self._body_writer = .none;
+        return was_open;
+    }
+
+    /// `BodyMode`'s one move, from `buffered`, while the head is not out.
+    fn setBodyMode(self: *Response, mode: BodyMode) void {
+        self._body_mode = mode;
     }
 
     /// Throws away the body written so far. Not while a body writer is
     /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
         // A buffering writer is open: its bytes are its own.
-        if (self._body_writer_buffering) return;
-        self.clearBody(self._body_writer_open);
+        if (self._body_writer == .open_buffering) return;
+        self.clearBody(self._body_writer == .open);
     }
 
     /// Forgets the body. One in a write buffer (`promote`) gives it back
@@ -1363,10 +1428,7 @@ pub const Response = struct {
         if (self._headers_written) return error.HeadersAlreadySent;
         // An open writer is abandoned with the body: `end` on it does
         // nothing once it is no longer the open one.
-        const writer_open = self._body_writer_open;
-        self._body_writer_open = false;
-        self._body_writer_buffering = false;
-        self.clearBody(writer_open);
+        self.clearBody(self.closeBodyWriter());
         self.body = "";
         self.closeFile();
         // Everything that described the old body has to go with it.
@@ -1407,7 +1469,7 @@ pub const Response = struct {
         });
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
-        if (self._body_writer_buffering) return error.BodyWriterOpen;
+        if (self._body_writer == .open_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
         const json_formatter = std.json.fmt(value, options);
@@ -1416,7 +1478,7 @@ pub const Response = struct {
     }
 
     fn jsonOut(self: *Response, value: anytype, options: json_out.Options) !void {
-        if (self._body_writer_buffering) return error.BodyWriterOpen;
+        if (self._body_writer == .open_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
         try json_out.write(&w.interface, value, options);
@@ -1709,11 +1771,11 @@ pub const Response = struct {
         var w = self.stream(&.{}) catch return error.WriteFailed;
         _ = &w;
         // The head is out and the writer is the park's from here.
-        self._body_writer_open = false;
+        _ = self.closeBodyWriter();
         self._written = true;
         self._parked = true;
         conn.finishUpgrade();
-        const chunked = self._chunked;
+        const chunked = self._body_mode == .chunked;
         // The connection is the parked stream's: the server hands it to
         // the adopter instead of waiting for a next request.
         self.keepalive = false;
@@ -1736,7 +1798,7 @@ pub const Response = struct {
             return error.WriteFailed;
         };
         _ = &w;
-        self._body_writer_open = false;
+        _ = self.closeBodyWriter();
         self._parked = true;
         return p;
     }
@@ -1803,7 +1865,7 @@ pub const Response = struct {
     pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
         if (self._sink != null or !self._headers_written) return error.Unsupported;
         // A 101, or a streamed 200 (a parked event stream).
-        if (self.status != .switching_protocols and !(self._streaming or self._chunked)) return error.Unsupported;
+        if (self.status != .switching_protocols and self._body_mode != .streaming and self._body_mode != .chunked) return error.Unsupported;
         self._conn.?.adopter = adopter;
     }
 
@@ -1827,7 +1889,7 @@ pub const Response = struct {
         try self.header("Upgrade", "websocket");
         try self._putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
-        self._streaming = true;
+        self.setBodyMode(.streaming);
         // The connection is a WebSocket's from here: small windows, and the
         // request buffers' other pages back to the OS, the 101 included. It
         // cannot serve another request after that.
@@ -2157,7 +2219,8 @@ pub const Response = struct {
         total: usize,
     ) std.Io.Writer.Error!void {
         const out = self.bodyOut();
-        if (self._chunked) {
+        const chunked = self._body_mode == .chunked;
+        if (chunked) {
             // 16 hex digits covers any usize, plus the CRLF.
             var size_buf: [18]u8 = undefined;
             try out.writeAll(std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable);
@@ -2165,7 +2228,7 @@ pub const Response = struct {
         try out.writeAll(pending);
         for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
         try out.splatBytesAll(data[data.len - 1], splat);
-        if (self._chunked) try out.writeAll("\r\n");
+        if (chunked) try out.writeAll("\r\n");
         try out.flush();
     }
 
@@ -2236,16 +2299,14 @@ pub const Response = struct {
         // Framing, for a status that has a body to frame. RFC 9112 §6.1
         // and RFC 9110 §8.6 forbid both headers on a 1xx or 204; a HEAD
         // still reports the length its GET would have.
-        if (statusHasBody(self.status)) {
-            if (self._chunked) {
-                try w.writeAll("Transfer-Encoding: chunked\r\n");
-            } else if (!self._streaming) {
-                // Write Content-Length if not manually set (skip for streaming responses like SSE)
-                const has_content_length = self.headers.get("Content-Length") != null;
-                // The length and the end of the head, in one write.
-                if (!has_content_length) return writeLengthTail(w, self.bodyLen());
-            }
-        }
+        if (statusHasBody(self.status)) switch (self._body_mode) {
+            // The length and the end of the head, in one write, unless the
+            // handler set its own Content-Length (always, when declared).
+            .buffered, .declared_length => if (self.headers.get("Content-Length") == null) return writeLengthTail(w, self.bodyLen()),
+            .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
+            // Framed by the sink, by the close, or by the upgraded protocol.
+            .streaming => {},
+        };
 
         // End of headers (applies to both chunked and non-chunked)
         try w.writeAll("\r\n");
@@ -2268,11 +2329,9 @@ pub const Response = struct {
         // `end`. Its buffer is gone, so whatever it held is lost either
         // way; recover rather than take the process down, and make sure a
         // started body is still framed correctly.
-        if (self._body_writer_open) {
-            self._body_writer_open = false;
-            // A body writer that was never ended goes out as far as it was
-            // last flushed, framed to match.
-            self._body_writer_buffering = false;
+        // A body writer that was never ended goes out as far as it was last
+        // flushed, framed to match.
+        if (self.closeBodyWriter()) {
             // Streaming under way with a declared length: whatever the
             // writer still held is gone with the handler's buffer, so the
             // body is short. Nothing can make it match the length we
@@ -2281,10 +2340,8 @@ pub const Response = struct {
             // needs no such care: `sendBody` terminates it, and a
             // truncated but well framed body is one the peer can finish,
             // though a gzipped one will not decode to the end.
-            if (self._headers_written and !self._chunked) {
-                if (self.content_length) |declared| {
-                    if (self.body_sent != declared) self.keepalive = false;
-                }
+            if (self.content_length) |declared| {
+                if (self.body_sent != declared) self.keepalive = false;
             }
             // If nothing was sent yet, a buffered body lives in the arena
             // and is still good, so leave it be: an error handler that
@@ -2315,7 +2372,7 @@ pub const Response = struct {
         // body of another length cannot be framed as promised, and the
         // connection cannot carry another response after it.
         // A streamed body is the streaming writer's to account for.
-        if (self.sendsBody() and !self._chunked and !self._streaming and self.content_length == null) {
+        if (self.sendsBody() and self._body_mode == .buffered) {
             if (try self.declaredLength()) |declared| {
                 if (self.bodyLen() != declared) {
                     self.keepalive = false;
@@ -2459,7 +2516,7 @@ pub const Response = struct {
     /// `copyBody` takes its bytes. Null for any other: a file, a stream,
     /// a body writer still open, or headers already sent.
     pub fn memoryBodyLen(self: *const Response) ?usize {
-        if (self.file != null or self._headers_written or self._body_writer_open or self._streaming or self._chunked) return null;
+        if (self.file != null or self._headers_written or self._body_writer != .none or self._body_mode != .buffered) return null;
         return self.bodyLen();
     }
 
@@ -2487,7 +2544,7 @@ pub const Response = struct {
     /// sentinel, as anything writing to a `std.Io.Writer` does; `write`
     /// resolves it.
     fn sendBody(self: *Response, w: *std.Io.Writer, send_header: bool) std.Io.Writer.Error!void {
-        if (self._chunked) {
+        if (self._body_mode == .chunked) {
             // A streaming writer sent the headers; all that is left is the
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
@@ -2497,7 +2554,7 @@ pub const Response = struct {
 
         if (send_header) {
             try self.sendHeader(w);
-        } else if (self._streaming or self.content_length != null) {
+        } else if (self._body_mode != .buffered) {
             // A stream's head is out with its framing (a declared length,
             // close-delimited, or the sink's), and what it sent is the
             // body. One abandoned before `end` stays short: a `body` set
@@ -2536,8 +2593,15 @@ pub const Response = struct {
     /// no body.
     fn headLength(self: *const Response) ?usize {
         if (!statusHasBody(self.status)) return null;
-        if (self._streaming or self._chunked) return self.content_length;
-        return self.bodyLen();
+        return switch (self._body_mode) {
+            .buffered => self.bodyLen(),
+            .chunked, .streaming => null,
+            // Kept as it was: bodyLen(), not `content_length`, so a
+            // declared stream reports what is buffered (0), against the
+            // doc above and sink.zig's. No wire byte depends on it; h3's
+            // `length_hint` sizes the stream's buffer from it.
+            .declared_length => self.bodyLen(),
+        };
     }
 };
 
@@ -6114,6 +6178,24 @@ test "misuse: a writer while a stream is open is BodyWriterOpen; after the head,
     try body.end();
     try std.testing.expectError(error.HeadersAlreadySent, response.writer());
     try std.testing.expectError(error.HeadersAlreadySent, response.resetBody());
+}
+
+test "BodyMode.forStream: a declared length first, then a sink, then HTTP/1.0, else chunked" {
+    const Row = struct { declared: bool, sink: bool, http10: bool, expected: BodyMode };
+    const rows = [_]Row{
+        .{ .declared = false, .sink = false, .http10 = false, .expected = .chunked },
+        .{ .declared = false, .sink = false, .http10 = true, .expected = .streaming },
+        .{ .declared = false, .sink = true, .http10 = false, .expected = .streaming },
+        .{ .declared = false, .sink = true, .http10 = true, .expected = .streaming },
+        .{ .declared = true, .sink = false, .http10 = false, .expected = .declared_length },
+        .{ .declared = true, .sink = false, .http10 = true, .expected = .declared_length },
+        .{ .declared = true, .sink = true, .http10 = false, .expected = .declared_length },
+        .{ .declared = true, .sink = true, .http10 = true, .expected = .declared_length },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {any}\n", .{row});
+        try std.testing.expectEqual(row.expected, BodyMode.forStream(row.declared, row.sink, row.http10));
+    }
 }
 
 /// How a body-writer table row reaches its state, through the public API.
