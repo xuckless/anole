@@ -16,6 +16,7 @@ const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const SlotTable = @import("slot_table.zig").SlotTable;
+const Lane = @import("lane.zig").Lane;
 const placement = dusty.placement;
 const websocket = anole.websocket;
 const origin = @import("../origin.zig");
@@ -97,9 +98,7 @@ pub const ExecState = struct {
     work: std.Io.Group = .init,
     /// The publish lane: publishes to topics that hash to this executor,
     /// in the order they were taken, and the one task that fans them out.
-    lane_head: ?*PublishCmd = null,
-    lane_tail: ?*PublishCmd = null,
-    lane_running: bool = false,
+    lane: Lane(PublishCmd) = .{},
 
     /// A slot for a socket whose handshake the consumer is deciding
     /// (executor-local): not open yet, its handle not handed out. The
@@ -139,7 +138,7 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.dropLane();
+        _ = st.lane.dropAll();
         st.slots.deinit(freeSlotBuffers);
     }
 
@@ -152,15 +151,6 @@ pub const ExecState = struct {
         gpa.free(s.close_reason);
         for (s.topics.items) |t| gpa.free(t);
         s.topics.deinit(gpa);
-    }
-
-    /// Frees the publishes left in the lane.
-    fn dropLane(st: *ExecState) void {
-        while (st.lane_head) |p| {
-            st.lane_head = p.next;
-            p.free();
-        }
-        st.lane_tail = null;
     }
 
     /// Cancels the executor's WebSocket work (at the server's end).
@@ -588,17 +578,6 @@ fn topicChangeDone(e: *Engine) void {
     e.wakeFutex(&e.topic_changes_done);
 }
 
-/// Waits until every `subscribe` taken before `want` was counted is
-/// applied: joins and leaves run on each socket's executor, a publish on
-/// any, and one must not overtake the other.
-fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
-    while (true) {
-        const done = e.topic_changes_done.load(.acquire);
-        if (@as(i32, @bitCast(done -% want)) >= 0) return;
-        try e.io.futexWait(u32, &e.topic_changes_done.raw, done);
-    }
-}
-
 fn runTopic(cmd: *Command, x: *Exec) void {
     const c: *TopicCmd = @fieldParentPtr("cmd", cmd);
     const e = x.engine;
@@ -669,7 +648,7 @@ const PublishCmd = struct {
     /// The next publish in the executor's lane.
     next: ?*PublishCmd = null,
 
-    fn free(p: *PublishCmd) void {
+    pub fn free(p: *PublishCmd) void {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
         _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.payload.len, .monotonic);
         gpa.free(p.topic);
@@ -730,48 +709,28 @@ fn runPublish(cmd: *Command, x: *Exec) void {
     const p: *PublishCmd = @fieldParentPtr("cmd", cmd);
     if (x.engine.phase.load(.acquire) == .stopped) return p.free();
     const st = &x.ws;
-    p.next = null;
-    if (st.lane_tail) |t| t.next = p else st.lane_head = p;
-    st.lane_tail = p;
-    if (st.lane_running) return;
-    st.lane_running = true;
+    if (!st.lane.push(p)) return;
     placement.concurrent(&st.work, x.engine.io, .local, publishLane, .{ x.engine, x }) catch {
         // No task to spare: what is queued is dropped, and counted.
-        st.lane_running = false;
-        while (st.lane_head) |q| {
-            st.lane_head = q.next;
-            _ = x.engine.publish_dropped.fetchAdd(1, .monotonic);
-            q.free();
-        }
-        st.lane_tail = null;
+        _ = x.engine.publish_dropped.fetchAdd(st.lane.dropAll(), .monotonic);
     };
 }
 
 /// Takes the executor's publishes one after the other, in order: each waits
-/// for the topic changes taken before it, then fans out to the topic's
-/// members (every member's queue gets it before the next publish starts).
+/// for the topic changes taken before it (joins and leaves run on each
+/// socket's executor, a publish on any, and one must not overtake the
+/// other), then fans out to the topic's members (every member's queue gets
+/// it before the next publish starts).
 fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
-    const st = &x.ws;
-    while (true) {
-        const p = st.lane_head orelse {
-            st.lane_running = false;
-            return;
-        };
-        st.lane_head = p.next;
-        if (st.lane_head == null) st.lane_tail = null;
-        defer p.free();
-        awaitTopicChanges(e, p.after) catch |err| {
-            // The stop: what is left is dropped.
-            st.lane_running = false;
-            st.dropLane();
-            return err;
-        };
-        // Only compared, never followed: a stale handle names no member.
-        var except: ?*Socket = null;
-        if (p.except != 0) if (slotOf(e, p.except)) |found| {
-            if (Slots.live(found[0], found[1])) except = found[0].socket;
-        } else |_| {};
-        const reached = e.rooms.broadcastPayload(p.topic, p.payload, except);
-        _ = e.ws_out.fetchAdd(reached, .monotonic);
-    }
+    return x.ws.lane.run(e.io, &e.topic_changes_done, e, fanOut);
+}
+
+fn fanOut(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
+    // Only compared, never followed: a stale handle names no member.
+    var except: ?*Socket = null;
+    if (p.except != 0) if (slotOf(e, p.except)) |found| {
+        if (Slots.live(found[0], found[1])) except = found[0].socket;
+    } else |_| {};
+    const reached = e.rooms.broadcastPayload(p.topic, p.payload, except);
+    _ = e.ws_out.fetchAdd(reached, .monotonic);
 }

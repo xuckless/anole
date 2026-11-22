@@ -4272,6 +4272,7 @@ test "ownedBy: null, foreign engine, own engine" {
 
 test {
     _ = @import("slot_table.zig");
+    _ = @import("lane.zig");
     _ = config_mod;
     _ = @import("engine_test.zig");
     _ = @import("nats_test.zig");
