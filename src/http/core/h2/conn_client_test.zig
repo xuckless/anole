@@ -17,6 +17,7 @@ const hpack = @import("hpack.zig");
 const conn = @import("conn.zig");
 const fuzz = @import("../fuzz.zig");
 const ct = @import("conn_test.zig");
+const tc = @import("test_client.zig");
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -316,12 +317,77 @@ test "h2 client conn: the preface is the magic, then SETTINGS with ENABLE_PUSH=0
     try expectFrames(try t.drain(), &.{.{ .type = .settings, .flags = F.ack }});
 }
 
+test "h2 client conn: raised options add MAX_FRAME_SIZE and CONNECT in wire order" {
+    const t = try CT.create(testing.allocator, .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true });
+    defer t.destroy();
+    const out = try t.drain();
+    const want = [_]frame.Setting{
+        .{ .id = .enable_push, .value = 0 },
+        .{ .id = .initial_window_size, .value = (conn.Options{}).initial_window },
+        .{ .id = .max_header_list_size, .value = (conn.Options{}).max_header_list_size },
+        .{ .id = .max_frame_size, .value = 1 << 16 },
+        .{ .id = .enable_connect_protocol, .value = 1 },
+        .{ .id = .no_rfc7540_priorities, .value = 1 },
+    };
+    try testing.expectEqualDeep(@as([]const frame.Setting, &want), out[0].settings);
+}
+
 test "h2 client conn: the server's first frame must be SETTINGS" {
     const t = try CT.create(testing.allocator, .{});
     defer t.destroy();
     _ = try t.drain();
     try expectError(error.ConnectionError, t.feed(try t.srv.ping(false, @splat(0))));
     try expectFrames(try t.drain(), &.{goawayWith(.protocol_error)});
+}
+
+test "h2 client conn: inbound phase and the GOAWAY facts" {
+    // The client role's rows of the `In` table (conn_test.zig's
+    // "h2 conn: inbound phase" has the rest), and GOAWAY sent and received
+    // as two facts that coexist.
+    const Step = enum { settings, ping, srv_goaway, our_goaway };
+    const Row = struct {
+        name: []const u8,
+        opts: conn.Options = .{},
+        steps: []const Step = &.{},
+        /// What the last step fails with.
+        err: ?anyerror = null,
+        tag: std.meta.Tag(CC.In),
+        goaway_sent: ?ErrorCode = null,
+        goaway_recv: bool = false,
+        max_concurrent_streams: u32 = std.math.maxInt(u32),
+    };
+    const rows = [_]Row{
+        .{ .name = "fresh: no magic to read, the server's SETTINGS first", .tag = .first_settings, .max_concurrent_streams = conn.client_initial_peer_streams },
+        .{ .name = "the server's PING first", .steps = &.{.ping}, .err = error.ConnectionError, .tag = .dead, .goaway_sent = .protocol_error, .max_concurrent_streams = conn.client_initial_peer_streams },
+        .{ .name = "the server's SETTINGS lift the limit", .steps = &.{.settings}, .tag = .frame },
+        // Lifted before the flood check, as nghttp2 (and before this
+        // rework) did.
+        .{ .name = "a first SETTINGS over the control budget", .opts = .{ .limits = .{ .control_frame_budget = 0 } }, .steps = &.{.settings}, .err = error.ConnectionError, .tag = .dead, .goaway_sent = .enhance_your_calm },
+        .{ .name = "GOAWAY received, then ours", .steps = &.{ .settings, .srv_goaway, .our_goaway }, .tag = .frame, .goaway_sent = .no_error, .goaway_recv = true },
+        .{ .name = "ours, then GOAWAY received", .steps = &.{ .settings, .our_goaway, .srv_goaway }, .tag = .frame, .goaway_sent = .no_error, .goaway_recv = true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        const t = try CT.create(testing.allocator, row.opts);
+        defer t.destroy();
+        // The magic is queued (`drain` checks it), then our SETTINGS.
+        try expectEqual(frame.Type.settings, (try t.drain())[0].type);
+        for (row.steps, 0..) |step, i| {
+            const r = switch (step) {
+                .settings => t.feed(try t.srv.settings(&.{})),
+                .ping => t.feed(try t.srv.ping(false, @splat(0))),
+                .srv_goaway => t.feed(try t.srv.goaway(0, .no_error)),
+                .our_goaway => t.c.goaway(.no_error, ""),
+            };
+            if (i + 1 == row.steps.len and row.err != null) try expectError(row.err.?, r) else try r;
+        }
+        try expectEqual(row.tag, std.meta.activeTag(t.c.in));
+        try expectEqual(row.goaway_sent, t.c.goaway_sent);
+        try expectEqual(row.goaway_recv, t.c.goaway_recv);
+        try expectEqual(row.max_concurrent_streams, t.c.remote.max_concurrent_streams);
+        if (row.goaway_sent != null or row.goaway_recv)
+            try expectError(error.GoawayReceived, t.c.submitRequest(&get, true, null));
+    }
 }
 
 test "h2 client conn: requests open odd IDs in order, and HEADERS carry the request head" {
@@ -572,7 +638,7 @@ test "h2 client conn: on_goaway_received: streams above last-stream-id close REF
     try expectEqual(.refused_stream, t.rec.closeCode(5).?);
     try expect(t.rec.closeCode(1) == null and t.rec.closeCode(3) == null);
     try expectEqual(2, t.c.table.size);
-    try expect(!t.c.canOpen());
+    try expect(!tc.canOpen(&t.c));
     try expectError(error.GoawayReceived, t.c.submitRequest(&get, true, null));
     // No RST_STREAM for them: the server already let them go.
     try expectFrames(try t.drain(), &.{});
@@ -607,10 +673,10 @@ test "h2 client conn: max_concurrent_streams: 100 until the server's SETTINGS, t
     try expectError(error.StreamLimit, t.c.submitRequest(&get, true, null));
     try t.head(1, &ok, true);
     // Still open: our half isn't ended.
-    try expect(!t.c.canOpen());
+    try expect(!tc.canOpen(&t.c));
     try t.c.submitData(t.c.table.get(1).?, &.{}, true);
     _ = try t.drain();
-    try expect(t.c.canOpen());
+    try expect(tc.canOpen(&t.c));
     const s = try t.request(&get, true);
     try expectEqual(203, s.id);
 }
@@ -623,7 +689,7 @@ test "h2 client conn: SETTINGS without MAX_CONCURRENT_STREAMS lift the limit, an
     for (0..300) |_| _ = try t.request(&get, false);
     _ = try t.drain();
     try expectEqual(300, t.c.table.size);
-    try expect(t.c.canOpen());
+    try expect(tc.canOpen(&t.c));
     // One walk of the table, closing as it goes.
     try t.feed(try t.srv.goaway(1, .no_error));
     try expectEqual(1, t.c.table.size);

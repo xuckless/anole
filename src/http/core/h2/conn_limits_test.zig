@@ -187,9 +187,11 @@ test "h2 limits: CONTINUATION flood" {
         const junk: [600]u8 = @splat('~');
         try t.feed(try t.headersFrame(1, .{ .end_stream = true, .end_headers = false, .fragment = &junk }));
         try t.feed(try t.continuation(1, false, junk[0..424]));
+        try expect(t.c.in.continuation.buf.items.len <= 1024);
         try expectError(error.ConnectionError, t.feed(try t.continuation(1, false, junk[0..1])));
         try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
-        try expect(t.c.block.?.buf.items.len <= 1024);
+        // Freed with the connection's death.
+        try expect(t.c.in == .dead);
         try expectEqual(0, t.rec.count(.field));
     }
 }

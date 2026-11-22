@@ -233,11 +233,98 @@ test "h2 client: 20 concurrent streams share one connection" {
     try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
 }
 
+test "h2 client: the connection's phase moves only by its table, and only forward" {
+    const P = h2.ClientConnection.Phase;
+    const Row = struct { from: P, retire: P, close: P, end: P, freed: P };
+    // The table in `Phase`'s doc comment, cell for cell.
+    const rows = [_]Row{
+        .{ .from = .open, .retire = .draining, .close = .shutting, .end = .dead, .freed = .open },
+        .{ .from = .draining, .retire = .draining, .close = .shutting, .end = .dead, .freed = .draining },
+        .{ .from = .shutting, .retire = .shutting, .close = .shutting, .end = .dead, .freed = .shutting },
+        .{ .from = .dead, .retire = .dead, .close = .dead, .end = .dead, .freed = .freed },
+        .{ .from = .freed, .retire = .freed, .close = .freed, .end = .freed, .freed = .freed },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("from {t}\n", .{r.from});
+        try std.testing.expectEqual(r.retire, r.from.next(.retire));
+        try std.testing.expectEqual(r.close, r.from.next(.close));
+        try std.testing.expectEqual(r.end, r.from.next(.end));
+        try std.testing.expectEqual(r.freed, r.from.next(.freed));
+    }
+    // `reached`: the declaration order.
+    for (std.enums.values(P)) |p| for (std.enums.values(P)) |at| {
+        try std.testing.expectEqual(@backingInt(p) >= @backingInt(at), p.reached(at));
+    };
+    try std.testing.expect(P.freed.reached(.dead) and !P.shutting.reached(.dead) and P.open.reached(.open));
+}
+
+test "h2 client: a stream's request side moves only by its table" {
+    const Q = h2.Stream.Req;
+    const Row = struct { from: Q, wait: Q, room: Q, close_send: Q };
+    // The table in `Req`'s doc comment, cell for cell; none x close_send
+    // stays none (a stream with no writer never gets one).
+    const rows = [_]Row{
+        .{ .from = .none, .wait = .none, .room = .none, .close_send = .none },
+        .{ .from = .open, .wait = .waiting_room, .room = .open, .close_send = .closed },
+        .{ .from = .waiting_room, .wait = .waiting_room, .room = .open, .close_send = .closed },
+        .{ .from = .closed, .wait = .closed, .room = .closed, .close_send = .closed },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("from {t}\n", .{r.from});
+        try std.testing.expectEqual(r.wait, r.from.next(.wait));
+        try std.testing.expectEqual(r.room, r.from.next(.room));
+        try std.testing.expectEqual(r.close_send, r.from.next(.close_send));
+    }
+}
+
+test "h2 client: a stream's response moves only by its table; the first cause wins" {
+    const R = h2.Stream.Resp;
+    const Row = struct { name: []const u8, from: R, ev: R.Event, to: R };
+    const a: h2.StreamError = error.Timeout;
+    const b: h2.StreamError = error.StreamReset;
+    // The table in `Resp`'s doc comment, cell for cell.
+    const rows = [_]Row{
+        .{ .name = "waiting x head", .from = .waiting, .ev = .head, .to = .head },
+        .{ .name = "waiting x end", .from = .waiting, .ev = .end, .to = .waiting },
+        .{ .name = "waiting x fail", .from = .waiting, .ev = .{ .fail = a }, .to = .{ .failed_before_head = a } },
+        .{ .name = "head x head", .from = .head, .ev = .head, .to = .head },
+        .{ .name = "head x end", .from = .head, .ev = .end, .to = .done },
+        .{ .name = "head x fail", .from = .head, .ev = .{ .fail = a }, .to = .{ .failed_after_head = a } },
+        .{ .name = "done x head", .from = .done, .ev = .head, .to = .done },
+        .{ .name = "done x end", .from = .done, .ev = .end, .to = .done },
+        .{ .name = "done x fail: a complete response keeps no cause", .from = .done, .ev = .{ .fail = a }, .to = .done },
+        .{ .name = "failed_before_head x head", .from = .{ .failed_before_head = a }, .ev = .head, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_before_head x end", .from = .{ .failed_before_head = a }, .ev = .end, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_before_head x fail: the first cause wins", .from = .{ .failed_before_head = a }, .ev = .{ .fail = b }, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_after_head x head", .from = .{ .failed_after_head = a }, .ev = .head, .to = .{ .failed_after_head = a } },
+        .{ .name = "failed_after_head x end", .from = .{ .failed_after_head = a }, .ev = .end, .to = .{ .failed_after_head = a } },
+        .{ .name = "failed_after_head x fail: the first cause wins", .from = .{ .failed_after_head = a }, .ev = .{ .fail = b }, .to = .{ .failed_after_head = a } },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        try std.testing.expectEqual(r.to, r.from.next(r.ev));
+    }
+    // What `waitHead`, `unprocessed`, `resetCode` and reads see per state.
+    const Seen = struct { state: R, cause: ?h2.StreamError, head: bool };
+    const seen = [_]Seen{
+        .{ .state = .waiting, .cause = null, .head = false },
+        .{ .state = .head, .cause = null, .head = true },
+        .{ .state = .done, .cause = null, .head = true },
+        .{ .state = .{ .failed_before_head = a }, .cause = a, .head = false },
+        .{ .state = .{ .failed_after_head = b }, .cause = b, .head = true },
+    };
+    for (seen) |r| {
+        errdefer std.debug.print("state: {t}\n", .{r.state});
+        try std.testing.expectEqual(r.cause, r.state.cause());
+        try std.testing.expectEqual(r.head, r.state.headSeen());
+    }
+}
+
 /// The core has closed the stream: its whole response is in.
 fn streamClosed(s: *h2.Stream) bool {
     s.conn.mutex.lockUncancelable(s.conn.io);
     defer s.conn.mutex.unlock(s.conn.io);
-    return s.protocol_done;
+    return !s.holders.contains(.protocol);
 }
 
 test "h2 client: a body read after its stream closed gives its window back to the connection" {
@@ -997,7 +1084,7 @@ const Scripted = struct {
                 if (c.p.taken.load(.acquire) == c.p.given.load(.acquire)) return true;
                 c.conn.mutex.lockUncancelable(c.p.io);
                 defer c.conn.mutex.unlock(c.p.io);
-                return c.conn.dead;
+                return c.conn.phase.reached(.dead);
             }
         };
         try wait.waitUntil(self.io, "the client read every frame sent, or ended its session", C{ .p = self, .conn = conn }, C.f);
@@ -1602,7 +1689,7 @@ test "h2 client: a body writer whose stream the server ended gets WriteFailed, n
         fn f(st: *h2.Stream) bool {
             st.conn.mutex.lockUncancelable(st.conn.io);
             defer st.conn.mutex.unlock(st.conn.io);
-            return st.waiting_room;
+            return st.req == .waiting_room;
         }
     }.f);
     // The server answers in full, then ends the stream (grpc-go after an

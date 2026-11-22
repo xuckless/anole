@@ -1236,7 +1236,7 @@ const CallerState = struct {
         const s = st.stream.load(.acquire) orelse return false;
         s.conn.mutex.lockUncancelable(st.io);
         defer s.conn.mutex.unlock(st.io);
-        return s.waiting_room;
+        return s.req == .waiting_room;
     }
 };
 
