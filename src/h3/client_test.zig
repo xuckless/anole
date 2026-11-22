@@ -3770,7 +3770,7 @@ const H3Detach = struct {
     fn attachInside(req: *dusty.Request, res: *dusty.Response) !void {
         attached_done = .unset;
         const d = try detach(req, res);
-        try dusty.placement.concurrent(d.attach().?, req.io, .local, attachedTask, .{ d, req.io });
+        try d.attach(attachedTask, .{ d, req.io });
         try attached_done.wait(req.io);
     }
 
@@ -3791,7 +3791,7 @@ const H3Detach = struct {
                 d.response.body = "later";
                 d.finish({});
             },
-            .attach => dusty.placement.concurrent(d.attach().?, io, .local, attachedTask, .{ d, io }) catch |err| d.finish(err),
+            .attach => d.attach(attachedTask, .{ d, io }) catch |err| d.finish(err),
         }
     }
 
