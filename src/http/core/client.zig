@@ -1460,8 +1460,6 @@ pub const Connection = struct {
     }
 };
 
-/// HTTP client response.
-/// Call deinit() when done to release the connection.
 /// Where a response body is: nobody has asked, a reader owns the wire, or
 /// the whole body is in memory (null when empty or bodyless). Every
 /// transition is in `ClientResponse.body` and `reader`.
@@ -1477,6 +1475,8 @@ const BodyState = union(enum) {
     cached: ?[]const u8,
 };
 
+/// HTTP client response.
+/// Call deinit() when done to release the connection.
 pub const ClientResponse = struct {
     // Direct pointers for reading (testable without full connection)
     arena: std.mem.Allocator,
@@ -3467,6 +3467,11 @@ test "ClientResponse.body: a body read that failed before it started can be aske
     // encoding, and asking twice must not trip the one-reader assert.
     try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
     try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+    // reader() itself leaves the state unread, so a third ask still errors.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.reader(&buf));
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.reader(&buf));
+    try std.testing.expectEqual(.unread, std.meta.activeTag(response._body_state));
 }
 
 test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {

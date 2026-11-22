@@ -2835,5 +2835,7 @@ test "Client: a body past max_response_size is ResponseTooLarge and not cached" 
     var resp = try client.fetch(url, .{ .stream = true });
     defer resp.deinit();
     try std.testing.expectError(error.ResponseTooLarge, resp.body());
+    // The failed read took the wire; nothing was cached.
+    try std.testing.expectEqual(.reader_taken, std.meta.activeTag(resp._body_state));
     peer_future.cancel(io);
 }
