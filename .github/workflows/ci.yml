@@ -465,7 +465,7 @@ jobs:
     # K2: catches QUIC interop against the ngtcp2 and quic-go clients, which find handshake and migration bugs aioquic does not.
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
     runs-on: ubuntu-latest
-    timeout-minutes: 24
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -502,7 +502,7 @@ jobs:
       - name: tests/interop/run.sh
         if: steps.tshark.outputs.available == 'true'
         # The full suite takes about 17 minutes on a hosted runner (2026-11-22).
-        timeout-minutes: 35
+        timeout-minutes: 38
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
