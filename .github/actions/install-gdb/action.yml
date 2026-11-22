@@ -1,7 +1,7 @@
 name: gdb for hang dumps
 description: >-
   Installs gdb on a Linux runner, so that a hung unit test's dump (the test
-  runner, src/safety/test_runner.zig) carries every thread's backtrace. A
+  runner, src/testing/runner.zig) carries every thread's backtrace. A
   failed install only warns: the hung test is still named.
 runs:
   using: composite

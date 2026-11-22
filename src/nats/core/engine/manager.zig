@@ -38,7 +38,6 @@ const events = @import("../events.zig");
 const incoming = @import("incoming.zig");
 const dialer = @import("connect.zig");
 const time = @import("time.zig");
-const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 
 /// Why a connection ends.
@@ -288,8 +287,8 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
 
 /// The socket of an attempt in progress, for the manager or `close()` to
 /// shut down: the attempt may have lost its cancellation and would wait on
-/// the socket for good. The shutdown runs with no lock held (SAFETY.md L2:
-/// it is a zio I/O call); `shutting` keeps the socket and this frame alive
+/// the socket for good. The shutdown runs with no lock held (it
+/// is a zio I/O call); `shutting` keeps the socket and this frame alive
 /// meanwhile.
 ///
 /// owner: the manager's frame (`openFirst`, `reconnect`), tracked in
@@ -373,7 +372,7 @@ pub const AttemptState = struct {
         if (!state.shutting) return;
         const was = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(was);
-        // With cancellation blocked the wait returns no error, and a cancel stays pending (C3).
+        // With cancellation blocked the wait returns no error, and a cancel stays pending.
         while (state.shutting) state.client.changed.wait(io, &state.client.mutex, null) catch {};
     }
 };

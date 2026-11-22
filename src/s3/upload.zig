@@ -16,7 +16,6 @@ const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
-const safety = @import("anole_safety");
 const root = @import("root.zig");
 const endpoint = @import("endpoint.zig");
 const xml = @import("xml.zig");
@@ -76,11 +75,9 @@ const Fail = struct {
 
 /// owner: whoever opened it (`open`: a `put`, a handler's `Client.upload`,
 /// the C ABI's transfer slot), which calls `deinit` once. Lifetime: a child
-/// of that owner; its driver and part tasks are its children (T1): `deinit`
+/// of that owner; its driver and part tasks are its children: `deinit`
 /// cancels and joins their groups, then frees.
 pub const Upload = struct {
-    /// SAFETY.md M5: `deinit` runs once; a use after it panics in debug builds.
-    teardown: safety.Teardown = .init,
     client: *Client,
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -154,7 +151,6 @@ pub const Upload = struct {
     /// `write` without waking the driver: the C ABI posts the wake itself
     /// from the upload's executor when `rotated`.
     pub fn copyIn(self: *Upload, c: anytype, bytes: []const u8) Error!Copied {
-        self.teardown.assertAlive();
         self.lock();
         defer self.unlock();
         if (self.failure) |f| return self.replay(c, f);
@@ -238,7 +234,6 @@ pub const Upload = struct {
     /// Marks the upload as ending; the driver does the rest. For the ABI,
     /// which rings the wake itself and answers by event.
     pub fn beginFinish(self: *Upload, c: anytype) Error!void {
-        self.teardown.assertAlive();
         self.lock();
         defer self.unlock();
         if (self.failure) |f| return self.replay(c, f);
@@ -256,7 +251,7 @@ pub const Upload = struct {
 
     /// Waits for the driver to end, then returns its result, its strings
     /// copied into the call's arena: the result outlives the upload, whose
-    /// arena `deinit` frees (SAFETY.md M4).
+    /// arena `deinit` frees.
     pub fn awaitDone(self: *Upload, c: anytype) Error!Stored {
         while (true) {
             const seen = self.progress.seen();
@@ -320,7 +315,6 @@ pub const Upload = struct {
 
     /// Aborts unless finished; frees.
     pub fn deinit(self: *Upload) void {
-        self.teardown.begin();
         self.lock();
         const finished = self.done and self.failure == null and !self.aborted;
         self.unlock();
@@ -339,7 +333,6 @@ pub const Upload = struct {
         self.etags.deinit(gpa);
         self.arena.deinit();
         _ = client.uploads_live.fetchSub(1, .acq_rel);
-        self.teardown.end();
         gpa.destroy(self);
     }
 

@@ -28,17 +28,15 @@
         // dependency.
         // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
         // counters and stack stats for the runtime gauges on /metrics. Plus
-        // SAFETY.md's checks: `debug_held_locks` (4a2dd7c), a task that
-        // suspends holding a counted lock panics (L2), and a count of
-        // `debug_cancel` reports (3accc88, exported in 42f97ae), on which
-        // the test runner fails a test (C3), and no report for a cancel an
-        // AutoCancel consumed as its timeout (812eac3), and a report hook
-        // (`held_locks.report`, baf4e5f) through which src/safety names
-        // where each held lock was taken; and `quiescent_state` (c21be0b,
-        // its ordering notes in d4b3ba6, fork only): a quiescent-state
-        // counter per executor and a grace-period number
-        // (`Runtime.quiescentSnapshot`/`quiescentPassed`) for
-        // src/http/core/qsbr.zig's reclamation. Pinned on the fork's
+        // `debug_held_locks` (4a2dd7c), a task that suspends holding a
+        // counted lock panics, and a count of `debug_cancel` reports
+        // (3accc88, exported in 42f97ae), on which the test runner fails a
+        // test, and no report for a cancel an AutoCancel consumed as its
+        // timeout (812eac3), and a report hook (`held_locks.report`,
+        // baf4e5f) naming where each held lock was taken (Anole no longer
+        // enables the first or sets the hook). The fork also has
+        // `quiescent_state` (c21be0b, fork only), which
+        // Anole no longer enables. Pinned on the fork's
         // `anole-diag` branch (d4b3ba6, `anole` + four commits): in
         // Debug and test builds, `diagnostics` also keeps a live-task list
         // per executor and a registry of runtimes for `zio.dumpTasks`, which

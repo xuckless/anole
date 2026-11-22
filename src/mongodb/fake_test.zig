@@ -7,6 +7,7 @@ const std = @import("std");
 const zio = @import("zio");
 const bson = @import("bson");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const wire = @import("wire.zig");
 const mongodb = @import("root.zig");
 const client_mod = @import("client.zig");
@@ -14,7 +15,6 @@ const dusty = @import("dusty");
 
 const testing = std.testing;
 const wait = @import("anole_test_wait");
-const safety = @import("anole_safety");
 const gpa = testing.allocator;
 
 const Fake = struct {
@@ -258,6 +258,57 @@ test "fake mongod: the shared verbs are the same calls, and with() hands its opt
     try testing.expectEqualStrings("app", timed.database);
     try testing.expectEqual(@as(usize, 10), (try timed.all(Row, &c, .{}, .{ .batch_size = 4 })).len);
     try testing.expect(client.with(.{ .coalesce = true }).db("app").collection("users").options.coalesce);
+}
+
+test "fake mongod: consoleInfo lists a pool per executor, and none in use once the call is over" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    try client.ping(&c);
+    var parsed = try internal.expectConsoleInfo(client, .{ .system = "mongodb", .name = "mongodb", .target = fake.addr(), .pools = 2 });
+    defer parsed.deinit();
+    var in_use: i64 = 0;
+    var open_total: i64 = 0;
+    for (parsed.value.object.get("pools").?.array.items) |p| {
+        in_use += p.object.get("in_use").?.integer;
+        open_total += p.object.get("open").?.integer;
+        try testing.expectEqual(@as(i64, 50), p.object.get("max").?.integer);
+    }
+    try testing.expectEqual(@as(i64, 0), in_use);
+    try testing.expect(open_total >= 1);
+}
+
+test "mongodb: consoleInfo names the seeds and never the login" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const rows = [_]struct {
+        name: []const u8,
+        url: []const u8,
+        target: []const u8,
+        absent: []const []const u8 = &.{},
+    }{
+        .{ .name = "one seed", .url = "mongodb://127.0.0.1:1/", .target = "127.0.0.1:1" },
+        .{ .name = "several seeds", .url = "mongodb://127.0.0.1:1,127.0.0.1:2/?replicaSet=rs0", .target = "127.0.0.1:1,127.0.0.1:2" },
+        .{ .name = "user and password", .url = "mongodb://carol:s3cret@127.0.0.1:1/?authSource=admin", .target = "127.0.0.1:1", .absent = &.{ "carol", "s3cret" } },
+    };
+    for (rows) |row| {
+        const client = try mongodb.Client.init(gpa, io, .{ .url = row.url });
+        defer client.deinit();
+        var parsed = internal.expectConsoleInfo(client, .{ .system = "mongodb", .name = "mongodb", .target = row.target, .pools = 2, .absent = row.absent }) catch |err| {
+            std.debug.print("row: {s}\n", .{row.name});
+            return err;
+        };
+        parsed.deinit();
+    }
 }
 
 test "fake mongod: a cursor left early is killed" {
@@ -630,11 +681,8 @@ test "mongodb: with(options).dynamic is the dynamic runner with the context firs
 /// busy: the new monitor waits in its run queue.
 const SpawnYield = struct {
     var ran: std.atomic.Value(bool) = .init(false);
-    /// The locks the spawning task held at the spawn.
-    var held: std.atomic.Value(usize) = .init(0);
 
     fn yield(io: std.Io) void {
-        held.store(safety.heldLocks(), .release);
         ran.store(true, .release);
         zio.yield() catch io.recancel();
     }
@@ -655,7 +703,7 @@ const SpawnYield = struct {
     }
 };
 
-test "mongodb: a monitor started while the executor is busy does not suspend under the topology lock" {
+test "mongodb: a monitor whose spawn yields on a busy executor leaves the client working" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
@@ -663,7 +711,6 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     try fake.init(io);
     defer fake.deinit(io);
     SpawnYield.ran.store(false, .release);
-    SpawnYield.held.store(0, .release);
     client_mod.test_after_monitor_spawn = SpawnYield.yield;
     defer client_mod.test_after_monitor_spawn = null;
     // On executor 0, where the monitor is spawned.
@@ -673,10 +720,8 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, SpawnYield.openAndPing, .{ &fake, io, &failure });
     try group.await(io);
     if (failure) |err| return err;
-    // A monitor was spawned, and its spawn (which may yield) ran with no
-    // lock held.
+    // A monitor was spawned, and its spawn yielded.
     try testing.expect(SpawnYield.ran.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), SpawnYield.held.load(.acquire));
 }
 
 /// The close test's hooks: a monitor's end, watched from `deinit` without suspending.

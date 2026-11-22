@@ -1,6 +1,6 @@
 //! Test points of the Kafka client (test builds only): where a test stops a
 //! task or a thread to force an interleaving the scheduler makes only
-//! sometimes (TESTING.md D5, SAFETY.md §8 step 4). Outside test builds
+//! sometimes (TESTING.md D5). Outside test builds
 //! `testHold` is empty and `test_hold` is void.
 //!
 //! The shape of the raw TCP driver's holds (src/net/tcp.zig), kept local to

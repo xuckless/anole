@@ -4,7 +4,7 @@
 // lib/nghttp2_ratelim.c. See LICENSE.nghttp2 and THIRD_PARTY_NOTICES. The
 // limit set (`Limits`) is Anole's own.
 
-//! The HTTP/2 engine's flood limits (research/h2h3-takeover/PLAN.md §5.4):
+//! The HTTP/2 protocol core's flood limits (research/h2h3-takeover/PLAN.md §5.4):
 //! a token bucket and the default limit set, as data. The engine charges
 //! the buckets and picks the answers; nothing here reads a clock.
 
@@ -54,7 +54,7 @@ pub const TokenBucket = struct {
 /// (config.ServerConfig.Http2: stream_reset_burst/rate, charged per D15
 /// point 1 only for streams not yet answered, provoked resets included;
 /// refused_stream_burst/rate; max_continuations; conn.Options defaults to
-/// them). conn.zig charges these; their config keys come with M3. Every
+/// them). conn.zig charges these; they have no config keys. Every
 /// default is here or in config.zig, nowhere else.
 pub const Limits = struct {
     /// Queued control answers (PING ACK, SETTINGS ACK, RST_STREAM) before
@@ -86,7 +86,7 @@ pub const Limits = struct {
     /// Bytes queued for the peer and not yet written past which new
     /// streams are refused (CVE-2019-9517, a peer that stops reading; PLAN
     /// §3.3, h2o's H2O_HTTP2_DEFAULT_OUTBUF_SOFT_MAX_SIZE). The write
-    /// timeout that then closes the connection is M3's sweeper.
+    /// timeout that then closes the connection is the server's write timeout.
     out_high: usize = 1 << 20,
     /// SETTINGS entries in one frame (nghttp2's NGHTTP2_DEFAULT_MAX_SETTINGS);
     /// more is ENHANCE_YOUR_CALM (frame.Options.max_settings).

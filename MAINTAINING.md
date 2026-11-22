@@ -84,8 +84,8 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      `tls13_add_key_update` (the reply sealed into the flight before the key
      changes), `tls_write_app_data`'s `write_shutdown` check, and
      `do_send_new_session_ticket`'s deferral to the first write. The
-     SAFETY.md L5 exception for BoringSSL's record buffers rests on
-     `SSLBuffer::EnsureCap` and `Clear`.
+     rule that the SSL calls under a connection's spin lock never allocate
+     (BoringSSL's record buffers) rests on `SSLBuffer::EnsureCap` and `Clear`.
    - **HTTP/2 is Anole's own code** (`src/http/core/h2`), translated from
      nghttp2 1.70.0 (attribution in THIRD_PARTY_NOTICES, licence in
      `LICENSE.nghttp2`). There is no pin to bump: read nghttp2's release
@@ -258,25 +258,29 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   on its spawn executor's list from `AnyTask.create` until it finishes;
   `zio.dumpTasks` walks each suspended task's saved frame pointers, and the
   test runner prints it after the thread backtraces of a hang dump
-  (src/safety/test_hooks.zig). A watchdog thread per runtime reports an
+  (src/testing/hooks.zig). A watchdog thread per runtime reports an
   executor that has not passed its scheduler (`getNextTask`) for
   `RuntimeOptions.stall_watchdog.threshold` (200 ms) while its run queue
   holds tasks, taking the stack with SIGURG on Linux and macOS. Run the
   fork's suite with `--diagnostics` too (`./check.sh --diagnostics` and
   `./check.sh --scheduling pinned --diagnostics`). Fork only, not offered
   upstream (user, 2026-10-28).
-  The branch also carries SAFETY.md's zio checks, fork only as well:
-  `debug_held_locks` (a task that suspends while `zio.held_locks` counts a
-  lock panics; `held_locks.report`, a function pointer src/safety/lock.zig
-  sets, names where each held lock was taken before the panic) and
+  The branch also carries two more checks, fork only as well:
   `debug_cancel` with its report count (the test runner fails a test on
-  it). Re-apply them on every upstream merge, and run the suite once with
-  both on (check.sh has no switch for them: `zig build test
-  -Dscheduling=pinned -Ddebug_held_locks=true -Ddebug_cancel=true`).
+  it with `error.SwallowedCancel`; src/testing/hooks.zig turns it on in
+  every test build) and `debug_held_locks` (a task that suspends while
+  `zio.held_locks` counts a lock panics; `held_locks.report` names where
+  each held lock was taken). Nothing in Anole enables `debug_held_locks`
+  or sets `held_locks.report` any more, so they are idle fork patches, as is
+  `quiescent_state` below. Re-apply them on every upstream merge, and run
+  the suite once with `debug_cancel` on (check.sh has no switch for it:
+  `zig build test -Dscheduling=pinned -Ddebug_cancel=true`).
   And `quiescent_state` (fork only, never offered upstream; user,
-  2026-10-28): a quiescent-state counter per executor, on a cache line of
+  2026-10-28; idle in Anole since S3, which deleted its only consumer,
+  src/http/core/qsbr.zig, and no longer enables it; the patch is dropped at
+  the next zio merge): a quiescent-state counter per executor, on a cache line of
   its own, and a grace-period number in the runtime, which
-  src/http/core/qsbr.zig's reclamation waits on
+  an external reclamation scheme could wait on
   (`Runtime.quiescentSnapshot`, `Runtime.quiescentPassed`). A scheduler
   pass (`getNextTask`) loads the number and the executor's counter and
   stores only when a grace period has started since its last pass; the
@@ -289,8 +293,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   earlier writers through its release sequence). Run the suite with
   `./check.sh --scheduling pinned --quiescent-state` and once with Anole's
   whole set (`zig build test -Dscheduling=pinned -Dfast_accept=true
-  -Ddiagnostics=true -Ddebug_held_locks=true -Ddebug_cancel=true
-  -Dquiescent_state=true`). Under ReleaseSafe two diag tests that look for
+  -Ddiagnostics=true -Ddebug_cancel=true`). Under ReleaseSafe two diag tests that look for
   function names in stack traces fail (inlining), on baf4e5f as well.
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with
@@ -336,6 +339,16 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 - **The `anole` CLI** (`tools/anole`): after tagging, `zig build cli-dist`
   builds the five binaries and SHA256SUMS in `zig-out/dist`; attach them with
   `gh release upload vX.Y.Z zig-out/dist/*`.
+- **libanole** (the C ABI, for the bindings): `zig build capi-dist` builds
+  `libanole-{x86_64,aarch64}-{linux,macos}.a` (stripped, ReleaseSafe, the
+  Linux ones against glibc 2.17; each passes the anole_*-only symbol check),
+  `anole.h`, `anole.abi.json`, `anole.schema.json` and `SHA256SUMS-libanole` in
+  `zig-out/capi-dist`; attach them with
+  `gh release upload vX.Y.Z zig-out/capi-dist/*`, with the default profile.
+  The checksums file is not named `SHA256SUMS` because the CLI's is on the same
+  release. anole-node and anole-py fetch these assets by tag. A stripped build
+  has no source locations in a Zig panic message; `zig build capi
+  -Dstrip=true` makes the same build for the host.
 - **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
   read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
   cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a
@@ -543,7 +556,7 @@ Moving to the next minor version (0.18):
    README's requirements, and the CI workflows' `version:`.
 3. Re-run the `@bitCast`, `@cImport`/translate-c and `std.Io` audits the 0.17
    move needed (see the release notes of the new version).
-4. Re-copy `src/safety/test_runner.zig` from the new
+4. Re-copy `src/testing/runner.zig` from the new
    `lib/compiler/test_runner.zig` and apply the `ANOLE:` changes again. Check
    that the build runner's `--test-timeout` still works the way the hang dump
    assumes (`lib/compiler/Maker/Step/Run.zig` in 0.17): at the limit it
@@ -552,7 +565,7 @@ Moving to the next minor version (0.18):
    still defers to `root.debug.handleSegfault` (the crash flush). Then run
    `zig build hang-probe --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5`
    and `zig build crash-probe` on Linux and macOS.
-5. `safety.allocUninit` (src/safety/root.zig) and dusty_tls's `mallocUninit`
+5. `mem.allocUninit` (src/mem.zig) and dusty_tls's `mallocUninit`
    call `Allocator.rawAlloc` to skip `alloc`'s `undefined` fill: re-check
    `rawAlloc`'s signature, and that `alloc` still fills (if not, drop both
    helpers for plain `alloc`).

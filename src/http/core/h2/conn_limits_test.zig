@@ -517,7 +517,7 @@ test "h2 limits: a peer that stops reading" {
     try t.feed(try t.settings(&.{.{ .id = .initial_window_size, .value = 70000 }}));
     try expectEqual(70000, t.c.remote.initial_window);
     try t.feed(try t.ping(false, @splat(9)));
-    // The write timeout that would close this connection is M3's sweeper.
+    // The write timeout that would close this connection is the server's write timeout.
     const out = try t.drain();
     try expectEqual(ErrorCode.refused_stream, find(out, .rst_stream, 5).?.code.?);
     try expect(find(out, .data, 1) != null);

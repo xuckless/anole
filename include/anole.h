@@ -363,14 +363,12 @@ typedef struct anole_stats {
   uint64_t ws_messages_out;
   uint64_t wt_sessions;          /* WebTransport sessions open now */
   uint64_t wt_datagrams_dropped; /* outgoing datagrams dropped: past datagram_queue, or too large */
-  /* ---- p3/net ---- */
   uint64_t net_connections;       /* raw TCP connections open now */
   uint64_t net_bytes_in;          /* bytes read from raw TCP connections (added as each closes) */
   uint64_t net_bytes_out;
   uint64_t udp_datagrams_in;
   uint64_t udp_datagrams_out;
   uint64_t udp_datagrams_dropped; /* received but lost (kernel buffer, too large) or refused to send */
-  /* ---- end p3/net ---- */
 } anole_stats;
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
@@ -518,7 +516,6 @@ enum anole_event_type {
   ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
                                     ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
   ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
-  /* ---- p3/net ---- */
   ANOLE_EV_NET_OPEN = 96,        /* anole_net_open_event; handle: anole_net_conn, until
                                     ANOLE_EV_NET_CLOSE */
   ANOLE_EV_NET_DATA = 97,        /* anole_net_data_event; handle: anole_net_conn */
@@ -530,25 +527,19 @@ enum anole_event_type {
                                     tcp.close_on_drain is false, in no set order with
                                     ANOLE_EV_DRAINING */
   ANOLE_EV_NET_DATAGRAMS = 100,  /* anole_net_datagrams_event; handle: anole_net_udp */
-  /* ---- end p3/net ---- */
 
-  /* ---- p3/jobs ---- */
   ANOLE_EV_JOB_ENQUEUED = 104,    /* anole_job_enqueued_event; handle 0 (user_data), or the anole_db_tx it ran on */
   ANOLE_EV_JOB = 105,             /* anole_job_event; handle: anole_job; owes anole_job_finish
                                      (anole_handle_release = retry now) */
   ANOLE_EV_JOB_CANCEL = 106,      /* anole_job_cancel_event; handle: anole_job, now over */
   ANOLE_EV_JOB_WORKER_END = 107,  /* anole_job_worker_end_event; handle: anole_job_worker, now over */
   ANOLE_EV_JOBS_RESULT = 108,     /* anole_jobs_result_event: the answer to anole_jobs_admin */
-  /* ---- end p3/jobs ---- */
 
-  /* ---- p3/webhooks ---- */
   ANOLE_EV_WEBHOOK_PUBLISHED = 109, /* anole_webhook_published_event: the answer to
                                     anole_webhooks_publish; handle 0, or the anole_db_tx it ran in */
   ANOLE_EV_WEBHOOK_STATUS = 110, /* anole_webhook_status_event: a delivery ran out of attempts, or an
                                     endpoint was disabled; only after anole_webhooks_watch */
-  /* ---- end p3/webhooks ---- */
 
-  /* ---- p3/realtime ---- */
   ANOLE_EV_SSE_SUBSCRIBE = 112,  /* anole_request_event; handle: anole_req. A subscription on a route
                                     with "sse": {"handler": ...}: answer it with anole_sse_accept, or
                                     refuse it with any answer to a request (anole_req_respond,
@@ -558,24 +549,16 @@ enum anole_event_type {
                                     "ack": "manual" owes anole_watch_ack for it */
   ANOLE_EV_WATCH_STATUS = 117,   /* anole_watch_status_event; handle: anole_watch_sub */
   ANOLE_EV_WATCH_END = 118,      /* anole_watch_end_event; handle: anole_watch_sub, now over */
-  /* ---- end p3/realtime ---- */
 
-  /* ---- p3/s3 ---- */
   ANOLE_EV_S3_RESULT = 124,  /* anole_s3_result_event: the answer of an anole_s3_* call. Handle: 0, or
                                 the anole_s3_transfer it opens (anole_s3_upload_open, a streamed
                                 anole_s3_get: owes write/finish/read_more until done, or
                                 anole_handle_release) or ends (UPLOAD_FINISH) */
   ANOLE_EV_S3_DATA = 125,    /* anole_s3_data_event: the next bytes of a streamed download
                                 (handle: the download; its FIN ends the handle) */
-  /* ---- end p3/s3 ---- */
 
-  /* ---- p3/smtp ---- */
   ANOLE_EV_SMTP_RESULT = 126,    /* anole_smtp_result_event: the answer to anole_smtp_send or
                                     anole_smtp_send_raw; handle 0 (user_data) */
-  /* ---- end p3/smtp ---- */
-
-  /* ---- p3/lambda ---- */
-  /* ---- end p3/lambda ---- */
 
   ANOLE_EV_CONSOLE_CLOSED = 132  /* anole_console_closed_event, handle 0: the in-process console
                                     (anole_console_open) closed; the terminal is the binding's
@@ -1862,7 +1845,6 @@ typedef struct anole_kafka_assign_event {
   uint32_t nentries;
 } anole_kafka_assign_event; /* 32 bytes */
 
-/* ---- p3/net ---- */
 /* ---- raw TCP and UDP ----
    A "tcp" or "udp" key on a listener in the configuration serves that
    listener's connections (TCP, optionally with TLS, PROXY protocol and a
@@ -2029,9 +2011,7 @@ ANOLE_API anole_status anole_net_udp_send(anole_net_udp u, const anole_net_datag
    having received (any socket of a listener sends from its port). After
    anole_server_start. ANOLE_E_INVALID ("UnknownListener"). */
 ANOLE_API anole_status anole_net_udp_find(anole_server *s, anole_str listener, anole_net_udp *out);
-/* ---- end p3/net ---- */
 
-/* ---- p3/jobs ---- */
 /* Durable background jobs ("jobs" in the configuration): enqueued from any
    thread, run by a worker of this consumer's language, retried with backoff,
    kept in the configured database. A job runs at least once. */
@@ -2203,9 +2183,7 @@ typedef struct anole_jobs_result_event {
   anole_span json;         /* the answer */
   anole_span error;
 } anole_jobs_result_event; /* 48 bytes */
-/* ---- end p3/jobs ---- */
 
-/* ---- p3/webhooks ---- */
 /* ---- webhooks out ----
    The configuration's "webhooks" (it needs "jobs"): endpoints, signed deliveries run as jobs,
    retries and the delivery log. Endpoint management and replay go through anole_jobs_admin
@@ -2257,9 +2235,7 @@ typedef struct anole_webhook_status_event {
   anole_span message;
   anole_span error;
 } anole_webhook_status_event; /* 64 bytes */
-/* ---- end p3/webhooks ---- */
 
-/* ---- p3/realtime ---- */
 /* ---- Server-Sent Events ---------------------------------------------------- */
 
 /* anole_sse and anole_watch_sub are declared with the other handle types. */
@@ -2419,10 +2395,7 @@ typedef struct anole_watch_end_event {
   uint32_t reason;     /* 28 ANOLE_WATCH_END_* */
   anole_span detail;   /* 32 FAILED: why (anole_last_error-style text) */
 } anole_watch_end_event; /* 40 bytes */
-/* ---- end p3/realtime ---- */
 
-/* ---- p3/s3 ---- */
-/* ---- p3/s3 ---- */
 /* ---- Object storage (S3, R2, MinIO, B2, Supabase) --------------------------- */
 
 typedef struct anole_s3 anole_s3; /* opaque; lives until anole_server_destroy */
@@ -2689,9 +2662,7 @@ ANOLE_API anole_status anole_s3_multipart_abort(anole_s3 *s3, anole_consumer *c,
                                                 const anole_s3_options *opts, uint64_t user_data);
 /* anole_handle_release(t): an upload aborts (AbortMultipartUpload), parts in flight canceled, not
    answered; a download stops reading and closes the connection, no more DATA. A cleanup call. */
-/* ---- end p3/s3 ---- */
 
-/* ---- p3/smtp ---- */
 /* Mail. The configuration's "mail" entries are SMTP servers (smtp:// with
    STARTTLS, smtps:// with TLS from the first byte), pooled per executor.
    A send is a command for an executor, which composes and sends it; the
@@ -2785,10 +2756,6 @@ typedef struct anole_smtp_rejected {
   uint32_t reserved2;
   anole_span message;
 } anole_smtp_rejected;     /* 24 bytes */
-/* ---- end p3/smtp ---- */
-
-/* ---- p3/lambda ---- */
-/* ---- end p3/lambda ---- */
 
 #ifdef __cplusplus
 }

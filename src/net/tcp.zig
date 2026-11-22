@@ -1,4 +1,4 @@
-//! Raw TCP servers (p3/net, design-net.md §2.2 to §3): the application's own
+//! Raw TCP servers (design-net.md §2.2 to §3): the application's own
 //! protocol on Anole's listeners. The HTTP core's accept loops, connection
 //! cap, PROXY protocol, TLS and parking do the work up to a ready
 //! connection (`Listener.raw`); from there a `TcpConn` serves it, as the
@@ -8,8 +8,8 @@
 //! Writing never waits on the peer, and takes no lock. `Conn.send` reserves
 //! its bytes against `write_max` and returns: on the connection's executor
 //! it appends to the outbox directly; from elsewhere its bytes go, as one
-//! owned chunk, onto the connection's inbox (a sealable push list,
-//! SAFETY.md L7). One *net driver* task per executor writes the outboxes
+//! owned chunk, onto the connection's inbox (a sealable push list).
+//! One *net driver* task per executor writes the outboxes
 //! that were kicked since its last round, straight from the driver with a
 //! non-blocking `sendmsg` on plain TCP, so every connection a consumer
 //! answered in one round costs one syscall and no task switch. A TLS
@@ -17,7 +17,7 @@
 //! Exactly one party is responsible for an outbox at any time (`sched`),
 //! so bytes leave in send order.
 //!
-//! Lifetimes (SAFETY.md M2, T1, T4): a connection is a child of the core's
+//! Lifetimes: a connection is a child of the core's
 //! connection; its helper tasks (flusher, writable, drain) are children in
 //! its own group, joined before it is freed. The driver reaches it only
 //! through its kick slot, stable memory resolved on the driver's (and the
@@ -26,7 +26,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole_log = @import("anole_log");
-const safety = @import("anole_safety");
 const framing_mod = @import("framing.zig");
 const net_metrics = @import("metrics.zig");
 
@@ -484,7 +483,7 @@ pub const Conn = struct {
     /// the caller filled, or an `OutChunk.borrowed`), with the listener's
     /// framing around it when `frame`. Takes the chunk on success (unless
     /// `taken` says otherwise); on an error it stays the caller's. Never
-    /// allocates, frees or waits, so a caller may hold a spin lock (L5):
+    /// allocates, frees or waits, so a caller may hold a spin lock:
     /// it frees a chunk left to it, and makes the returned wake, after.
     pub fn queueChunk(c: *Conn, chunk: *OutChunk, frame: bool) SendError!Queued {
         const t = c.tc();
@@ -636,7 +635,7 @@ var next_conn_id: std.atomic.Value(u64) = .init(1);
 
 /// A raw TCP listener's service and per-executor drivers: the object behind
 /// `http.Listener.raw`. owner: the server, which makes it (`create`) and
-/// frees it (`destroy`) after the core has stopped (M2: process-wide).
+/// frees it (`destroy`) after the core has stopped (process-wide).
 pub const TcpListener = struct {
     raw: dusty.Raw,
     gpa: std.mem.Allocator,
@@ -665,7 +664,7 @@ pub const TcpListener = struct {
     }
 
     /// The driver of the caller's executor, started by its first
-    /// connection. No lock (T3): only this executor's connections call it.
+    /// connection. No lock: only this executor's connections call it.
     /// `started` is set before the spawn, which can suspend (zio's spawn
     /// backpressure yields the spawner): a connection opening meanwhile
     /// finds the driver started, not a second one. A spawn that fails has
@@ -673,12 +672,8 @@ pub const TcpListener = struct {
     /// by nobody.
     fn driverFor(self: *TcpListener, info: *const dusty.RawInfo) !*Driver {
         const d = &self.drivers[info.executor % self.drivers.len];
-        if (d.started) {
-            d.owner.check(info.io);
-            return d;
-        }
+        if (d.started) return d;
         d.io = info.io;
-        d.owner = .here(info.io);
         d.started = true;
         placement.concurrent(info.group, info.io, .local, Driver.run, .{d}) catch |err| {
             d.started = false;
@@ -700,14 +695,13 @@ pub const TcpListener = struct {
 /// One per executor and listener: writes the outboxes kicked since its last
 /// round, and starts the connections' drain callbacks. owner: its
 /// `TcpListener` (process-wide memory); it runs on one executor and only
-/// there (T3), set by the first `driverFor`. Its task lives in the server's
+/// there, set by the first `driverFor`. Its task lives in the server's
 /// connection group and ends with it.
 ///
-/// It reaches connections only through their kick slots (T4), which it
+/// It reaches connections only through their kick slots, which it
 /// resolves on its own executor: a kick from any thread touches the slot,
 /// never the connection.
 const Driver = struct {
-    owner: safety.Owner = .none,
     /// Started (`driverFor`, its executor only).
     started: bool = false,
     io: std.Io = undefined,
@@ -715,8 +709,8 @@ const Driver = struct {
     kicks: push_list.PushList = .{},
     signal: placement.Signal = .{},
     /// Every wake of this driver, and of its connections' tasks, from off
-    /// its executor goes through it (T5); closed when `run` ends.
-    gate: safety.IoGate = .{},
+    /// its executor goes through it; closed when `run` ends.
+    gate: @import("../io_gate.zig").IoGate = .{},
     /// Its connections' kick slots (its executor only).
     slots: KickSlots = .{},
 
@@ -846,7 +840,7 @@ pub const Kick = struct {
 // ---------------------------------------------------------------------------
 // One connection
 
-/// One send's bytes, made before anything shared is touched (L5): what a
+/// One send's bytes, made before anything shared is touched: what a
 /// send copies into, or (borrowed) what the C ABI lends. An owned chunk is
 /// one allocation: this header, then `Framing.max_prefix` bytes of room, the
 /// payload, and room for a suffix, so a frame's prefix and suffix are
@@ -1176,8 +1170,8 @@ const Sched = struct {
 };
 
 /// One raw TCP connection. owner: the core's connection (an `Adopter`,
-/// released by it, M2: a child of its owner); its executor is the
-/// connection's (T3): every helper task is a child in `group`, spawned
+/// released by it: a child of its owner); its executor is the
+/// connection's: every helper task is a child in `group`, spawned
 /// there. Applications hold `*Conn` by contract until `close` returns
 /// (docs/net.md §1), from any thread.
 const TcpConn = struct {
@@ -1190,7 +1184,6 @@ const TcpConn = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     driver: *Driver,
-    owner: safety.Owner,
     /// The connection's executor, for the sends' fast path (null off zio:
     /// never taken).
     exec: ?usize,
@@ -1228,14 +1221,14 @@ const TcpConn = struct {
     inflight: Fifo = .{},
     /// One written chunk kept for the next sends (an echo then allocates
     /// nothing): the biggest an owner send made, up to `OutChunk.spareMax`.
-    /// owner: the connection (M2), its executor only, no atomics; freed
+    /// owner: the connection, its executor only, no atomics; freed
     /// when it parks (and not refilled while parked) and at `release`.
     /// Sends from other threads and the C ABI make their own chunks.
     spare: ?*OutChunk = null,
     /// Parked: no task, no spare (its executor only).
     parked: bool = false,
     /// The helper tasks (flusher, writable, drain): children of the
-    /// connection (T1), canceled and joined by `release`.
+    /// connection, canceled and joined by `release`.
     group: std.Io.Group = .init,
 
     /// Futex word: 1 once the connection's serving is to end (its `Close`
@@ -1250,10 +1243,10 @@ const TcpConn = struct {
     writable_pending: std.atomic.Value(bool) = .init(false),
     /// Serves callbacks one at a time on the Zig path (the C ABI's never
     /// wait and skip it): a callback serializer held across the callback,
-    /// which may wait (an I/O lock, L2's exception, rank `io`: its takers
+    /// which may wait (an I/O lock: its takers
     /// hold no other lock). It goes once net gets a per-connection event
     /// mailbox run by one task (after S2, with the #85 relay work).
-    cb_lock: safety.IoLock = .init,
+    cb_lock: std.Io.Mutex = .init,
     /// The `open` callback failed: `serve` closes at once (set before the
     /// first `serve`, on the connection's executor; not a `Close` state:
     /// what that callback queued still goes out until `release`).
@@ -1306,7 +1299,6 @@ const TcpConn = struct {
             .io = info.io,
             .gpa = gpa,
             .driver = driver,
-            .owner = .here(info.io),
             .exec = placement.currentExecutor(info.io),
             .kick = kick,
             .id = next_conn_id.fetchAdd(1, .monotonic),
@@ -1351,12 +1343,11 @@ const TcpConn = struct {
     /// The core is done with the connection (on its task, its executor).
     /// In this order (Go's `fd.Close` shape): no send is taken and no
     /// helper spawned from the first step on, the driver can't reach it,
-    /// the helpers end (T1: cancel, join), what is still queued is
+    /// the helpers end (cancel, join), what is still queued is
     /// dropped, and only then it is freed.
     fn release(a: *dusty.Adopter) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         const io = t.io;
-        t.owner.check(io);
         // Every spawn site checks this and spawns without a suspension in
         // between, on this executor.
         _ = t.flags.fetchOr(Flag.closed, .seq_cst);
@@ -1373,7 +1364,7 @@ const TcpConn = struct {
         // No drain hook runs for it after this (it runs under the drain's
         // lock, which `remove` takes).
         t.info.drain_hooks.remove(io, &t.drain_hook);
-        // A writable or drain callback still running is canceled (C1).
+        // A writable or drain callback still running is canceled.
         t.group.cancel(io);
         // A sender between its reservation and its push now gets Closed
         // (and frees its own chunk); what got in is dropped here.
@@ -1399,8 +1390,8 @@ const TcpConn = struct {
         t.decoder.deinit();
         t.frames.deinit(t.gpa);
         // Writers still in `waitUnder` (a task outside the connection's,
-        // woken above by `wakeWaiters`) leave before the memory goes (M2:
-        // the owner frees after the join). Uncancelable, and short: they
+        // woken above by `wakeWaiters`) leave before the memory goes (the
+        // owner frees after the join). Uncancelable, and short: they
         // are awake and only look at the flags on their way out.
         while (true) {
             const w = t.waiters.load(.seq_cst);
@@ -1507,16 +1498,16 @@ const TcpConn = struct {
 
     /// The caller runs on the connection's executor. Off zio (`exec` null,
     /// as on `std.Io.Threaded`) never: the executor reasoning in this file
-    /// (T3's owner checks, M3's "nothing suspends between a look and its
-    /// use", the driver's slots) assumes zio's pinned executors, which
-    /// every Anole server runs on; it does not hold elsewhere.
+    /// ("nothing suspends between a look and its use", the driver's
+    /// slots) assumes zio's pinned executors, which every Anole server runs
+    /// on; it does not hold elsewhere.
     fn onOwner(t: *const TcpConn) bool {
         const e = t.exec orelse return false;
         return placement.currentExecutor(t.io) == e;
     }
 
     /// Wakes every task waiting on `word`: directly on the connection's
-    /// executor, else through its driver's gate (T5: the caller may be a
+    /// executor, else through its driver's gate (the caller may be a
     /// thread that outlives the runtime).
     fn wakeAll(t: *TcpConn, word: *std.atomic.Value(u32)) void {
         if (t.onOwner()) return t.io.futexWake(u32, &word.raw, std.math.maxInt(u32));
@@ -1576,7 +1567,6 @@ const TcpConn = struct {
     /// refusal paths go on with `t`; a zio whose spawn could yield and then
     /// fail would make them use-after-free (MAINTAINING.md, zio bumps).
     fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) Spawned {
-        t.owner.check(t.io);
         if (t.isClosed()) return .refused;
         const slot = t.kick;
         const gen = slot.gen;
@@ -1642,7 +1632,7 @@ const TcpConn = struct {
 
     /// Takes `c` (whole, framed already) into the inbox: reserved, then
     /// pushed. On an error `c` stays the caller's (to free after any lock
-    /// it holds, L5). The kick, if one is due, is the caller's to make.
+    /// it holds). The kick, if one is due, is the caller's to make.
     fn pushChunk(t: *TcpConn, c: *OutChunk) Conn.SendError!Conn.Queued {
         const n = c.len;
         if (n > t.service.options.write_max) return error.TooLarge;
@@ -1864,7 +1854,7 @@ const TcpConn = struct {
     /// The driver's turn with a kicked connection, on its executor. It
     /// suspends only in a spawn (the drain's, WRITABLE's, the flusher's:
     /// zio's spawn backpressure), and `release`, on this executor too, may
-    /// run and free `t` meanwhile (M3): after each spawn it goes on only
+    /// run and free `t` meanwhile: after each spawn it goes on only
     /// when `spawn` says the connection is still the one in its slot, and
     /// after a spawn that ends its turn (`handOver`) it touches nothing.
     ///
@@ -1873,7 +1863,6 @@ const TcpConn = struct {
     /// against the driver's `kicked` store then these loads, so a kick
     /// dropped because the slot was still listed finds its flag here.
     fn serviceKick(t: *TcpConn) void {
-        t.owner.check(t.io);
         if (t.flags.load(.seq_cst) & Flag.drain_pending != 0) {
             const f = t.flags.fetchAnd(~Flag.drain_pending, .seq_cst);
             if (f & Flag.drain_pending != 0) {
@@ -2085,7 +2074,6 @@ const TcpConn = struct {
     }
 
     fn writableTask(t: *TcpConn) void {
-        t.owner.check(t.io);
         t.writable_pending.store(false, .release);
         if (t.isClosed()) return;
         t.callLock();
@@ -2151,7 +2139,6 @@ const TcpConn = struct {
     fn flusher(t: *TcpConn) void {
         const io = t.io;
         const o = &t.service.options;
-        t.owner.check(io);
         while (true) {
             if (t.isDead()) {
                 t.discardAll();
@@ -2325,7 +2312,6 @@ const TcpConn = struct {
     /// ends (or `linger` passes), so a client that closes on FIN goes at
     /// once instead of holding the stop until `timeouts.shutdown`.
     fn drainTask(t: *TcpConn) void {
-        t.owner.check(t.io);
         if (t.isClosed()) return;
         t.callLock();
         defer t.callUnlock();
@@ -2455,7 +2441,6 @@ const TcpConn = struct {
     /// Hands a burst's bytes to the handler. False when the connection
     /// ended meanwhile (a bad frame, a failed callback).
     fn deliver(t: *TcpConn, bytes: []const u8) anyerror!bool {
-        t.owner.check(t.io);
         const table = t.service.table;
         const f = table.data orelse return true;
         const o = &t.service.options;

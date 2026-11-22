@@ -6,6 +6,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const kafka = @import("root.zig");
 const records = @import("records.zig");
 const FakeBroker = @import("testing.zig").FakeBroker;
@@ -209,6 +210,35 @@ test "fake broker: errors are anole.db errors with the code in lastError" {
         return error.ShouldHaveFailed;
     } else |err| try testing.expect(err == error.GatewayTimeout or err == error.ServiceUnavailable);
     broker.fail_produce.store(0, .release);
+}
+
+test "fake broker: consoleInfo names the bootstrap list, lists no pools, and never shows the SASL login" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const rows = [_]struct {
+        name: []const u8,
+        sasl: ?kafka.Options.Sasl = null,
+        absent: []const []const u8 = &.{},
+    }{
+        .{ .name = "no login" },
+        .{ .name = "sasl user and password", .sasl = .{ .mechanism = .plain, .username = "kuser", .password = "kpass" }, .absent = &.{ "kuser", "kpass" } },
+    };
+    for (rows) |row| {
+        var o = opts(broker, .{});
+        o.sasl = row.sasl;
+        const client = try kafka.Client.init(gpa, io, o);
+        defer client.deinit();
+        const want = try std.mem.join(gpa, ",", broker.bootstrap());
+        defer gpa.free(want);
+        var parsed = internal.expectConsoleInfo(client, .{ .system = "kafka", .name = "kafka", .target = want, .pools = 0, .absent = row.absent }) catch |err| {
+            std.debug.print("row: {s}\n", .{row.name});
+            return err;
+        };
+        parsed.deinit();
+    }
 }
 
 test "fake broker: SASL PLAIN and SCRAM, and a wrong password" {
@@ -534,7 +564,7 @@ test "fake broker: a broker serving Produce 0-7 and ListOffsets 0-4 (Redpanda) i
 }
 
 // ---------------------------------------------------------------------------
-// SAFETY.md §8 step 4: nothing waits under the producer's, the cluster's or
+// Nothing waits under the producer's, the cluster's or
 // the client's locks (forced interleavings through test_hold.zig).
 
 const hold_mod = @import("test_hold.zig");
@@ -1054,8 +1084,8 @@ test "kafka: a broker connection's round trip canceled while it waits for the an
 test "kafka: a broker connection opens on an executor where another connection's task is suspended in its round trip" {
     // One executor: both connections' tasks run on the same thread. The
     // first holds its connection's I/O lock while it waits for an answer;
-    // the second takes its own connection's lock meanwhile (SAFETY.md L2's
-    // exception: one I/O lock per task, not per thread).
+    // the second takes its own connection's lock meanwhile
+    // (one I/O lock per task, not per thread).
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();

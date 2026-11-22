@@ -451,7 +451,7 @@ pub fn fillListeners(a: std.mem.Allocator, opts: *ServerOptions, r: *Resolved) e
                 l.address = r.default_address;
                 r.filled.address = true;
             }
-            // A raw listener (p3/net) names its own port: $PORT and the 8080
+            // A raw listener names its own port: $PORT and the 8080
             // default are HTTP's. UDP has no PROXY header to default.
             const raw = l.tcp != null or l.udp != null;
             if (l.port == null and !raw) {

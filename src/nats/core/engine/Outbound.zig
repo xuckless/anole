@@ -36,9 +36,8 @@
 //! holding the ones before it, none while holding one after it: tickets
 //! (`admit`) and `restore`'s callbacks run under this queue's mutex and take
 //! the inbox's or the registry's, which take a subscription queue's. These
-//! four are raw `Io.Mutex`es outside SAFETY.md's ranked wrappers (whose
-//! check refuses a lock wait under a held lock); no ranked lock is held
-//! across an engine call, and no engine lock across a ranked one.
+//! four are raw `Io.Mutex`es; no other lock is held
+//! across an engine call, and no engine lock across another.
 
 const std = @import("std");
 const builtin = @import("builtin");

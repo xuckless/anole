@@ -52,7 +52,7 @@
 //!   fails, not only the next spawn (#48).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const placement = @import("placement.zig");
 
 /// `ServerConfig.admission`.
@@ -211,7 +211,7 @@ pub const State = struct {
 
     /// Taken only on a row's hot/cool transitions, at most twice a window
     /// per executor: a few stores, nothing allocated, no wait.
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// Hot rows (under `lock`).
     hot_rows: u32 = 0,
     /// When the limit was last lifted, in awake-clock nanoseconds (under

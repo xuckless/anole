@@ -722,7 +722,7 @@ pub fn build(b: *std.Build) void {
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
     // then fetches everything requested and runs build() again.
-    const c_mods = CModules.init(b, features, target, optimize) orelse {
+    const stack = TargetStack.init(b, features, target, optimize) orelse {
         // A project depending on Anole asks for its modules in this same
         // pass, and `Dependency.module` panics on a missing one, so they
         // exist here as stand-ins. The pass is thrown away once the lazy
@@ -731,21 +731,9 @@ pub fn build(b: *std.Build) void {
         if (features.grpc) _ = b.addModule("protobuf", .{});
         return;
     };
-
-    // Core: zio (runtime) and the HTTP core (src/http/core), always on.
-    const core = Core.init(b, c_mods, target, optimize);
-    // pg.zig's TLS: Anole's BoringSSL client (src/pg/tls.zig).
-    if (c_mods.pg_tls) |pg| pg.addImport("tls", b.createModule(.{
-        .root_source_file = b.path("src/pg/tls.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "anole_dusty_tls", .module = core.tls_seam.? }},
-    }));
-
-    // BSON (src/bson), the codec under the MongoDB client: pure Zig, its own
-    // module, imported by the anole module as "bson" when -Dmongodb is on
-    // (here or in a test-flags combination); nothing compiles it otherwise.
-    const bson_mod = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
+    const c_mods = stack.c;
+    const core = stack.core;
+    const bson_mod = stack.bson;
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
     const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .public = true });
@@ -781,7 +769,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = use_llvm,
     });
     // `-Dtest-shards=N` runs the main suite as N processes of the same
-    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
+    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/testing/runner.zig)
     // and the HTTP core's as max(1, N/2), 4 and 2 by default;
     // each shard's tests are its index modulo N. With a live server
     // (`-D*-test-url`, `-Dredis-test-port`) the default is 1: the live
@@ -833,7 +821,7 @@ pub fn build(b: *std.Build) void {
         run_main_fuzz.skip_foreign_checks = true;
         fuzz_step.dependOn(&run_main_fuzz.step);
     }
-    // The hang probe (src/safety/hang_probe.zig): a test that never returns,
+    // The hang probe (src/testing/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
     // It imports Anole's zio for the test whose hang is a task suspended
@@ -841,7 +829,7 @@ pub fn build(b: *std.Build) void {
     {
         const probe = addSafeTest(b, .{
             .name = "hang-probe",
-            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/testing/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
             .use_llvm = use_llvm,
         });
         const run_probe = b.addRunArtifact(probe);
@@ -849,7 +837,7 @@ pub fn build(b: *std.Build) void {
         b.step("hang-probe", "Run a deliberately hanging test to see the hang dump (use --test-timeout; fails by design)").dependOn(&run_probe.step);
         if (b.option(bool, "hang-probe", "Add the deliberately hanging test to `zig build test` (fails by design)") orelse false) test_step.dependOn(&run_probe.step);
     }
-    // The crash probe (src/safety/crash_probe.zig): a test that segfaults,
+    // The crash probe (src/testing/crash_probe.zig): a test that segfaults,
     // one that aborts and one that panics with the log lock held, each in
     // its own binary run without the build runner's protocol; passes when
     // each died of SIGABRT (the segfault handler and a panic end in abort)
@@ -865,7 +853,7 @@ pub fn build(b: *std.Build) void {
             const name, const what, const expect = probe_case;
             const probe = addSafeTest(b, .{
                 .name = b.fmt("crash-probe-{s}", .{name}),
-                .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+                .root_module = b.createModule(.{ .root_source_file = b.path("src/testing/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
                 .filters = &.{b.fmt("crash probe: {s}", .{what})},
                 .use_llvm = use_llvm,
             });
@@ -880,7 +868,7 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
-    // The validator's, the logger's, the banner's, src/safety's and
+    // The validator's, the logger's, the banner's and
     // src/resilience/core.zig's own tests: each is its own module, so the
     // anole test binary does not collect them.
     for ([_]struct { name: []const u8, mod: *std.Build.Module }{
@@ -889,7 +877,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
         .{ .name = "wait-test", .mod = core.test_wait },
-        .{ .name = "safety-test", .mod = core.safety },
+        .{ .name = "mem-test", .mod = core.mem },
     }) |t| {
         const sub_tests = addSafeTest(b, .{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
@@ -897,32 +885,6 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_sub.step);
         compile_tests_step.dependOn(&sub_tests.step);
         b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
-    }
-
-    // ---- p3/lambda ----
-    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src
-    // against the ratchet baseline tools/safety_lint.baseline.tsv (and the
-    // tool's own tests). CI's `lint` job runs the same check with `zig run`
-    // (no dependency fetch). `-Dlint-update` lowers the baseline to today's
-    // counts (never raises it); `-Dlint-tests` includes test code and runs
-    // without the baseline.
-    {
-        const lint_mod = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
-        const lint_exe = b.addExecutable(.{ .name = "safety-lint", .root_module = lint_mod });
-        const run_lint = b.addRunArtifact(lint_exe);
-        run_lint.setCwd(b.path("."));
-        const lint_update = b.option(bool, "lint-update", "zig build lint: lower tools/safety_lint.baseline.tsv to today's counts (never raises one)") orelse false;
-        if (b.option(bool, "lint-tests", "zig build lint: check test code too (without the baseline)") orelse false) {
-            run_lint.addArg("--tests");
-        } else {
-            run_lint.addArgs(&.{ if (lint_update) "--update-baseline" else "--baseline", "tools/safety_lint.baseline.tsv" });
-        }
-        if (b.option([]const u8, "lint-rules", "zig build lint: check only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
-        run_lint.addArg("src");
-        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, T5, U1, U3, C3, L2) and doc-comment names (DOC), with the ratchet baseline");
-        lint_step.dependOn(&run_lint.step);
-        const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
-        lint_step.dependOn(&b.addRunArtifact(lint_tests).step);
     }
 
     // tools/lambda_zip.zig: the std-only zip writer of `zig build lambda`
@@ -945,7 +907,6 @@ pub fn build(b: *std.Build) void {
         });
         b.step("lambda-zip", "Build the zip writer used by zig build lambda (host tool)").dependOn(&b.addInstallArtifact(zip_tool, .{}).step);
     }
-    // ---- end p3/lambda ----
 
     // test-compile-errors: routes and calls the compiler must refuse, each a
     // tiny file in tests/compile_errors with the message it must give.
@@ -1069,7 +1030,6 @@ pub fn build(b: *std.Build) void {
         b.step("test-kafka", "Run the Kafka live tests (live with -Dkafka-test-url=host:port)").dependOn(&run_kafka_tests.step);
     }
 
-    // ---- p3/s3 ----
     // test-s3: the S3 client's tests alone ("s3: ..."), and the C ABI's
     // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
     // server (tests/s3/run.sh).
@@ -1079,7 +1039,6 @@ pub fn build(b: *std.Build) void {
         run_s3_tests.has_side_effects = s3_test_url != null;
         b.step("test-s3", "Run the S3 tests (live with -Ds3-test-url=http://...)").dependOn(&run_s3_tests.step);
     }
-    // ---- end p3/s3 ----
 
     // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
     // HTTP/3 detached answers, the configuration parser).
@@ -1110,7 +1069,7 @@ pub fn build(b: *std.Build) void {
         // core's zio stub: its tests run on std.testing.io, and the real
         // zio's timers need a zio task.
         const core_test_mod = struct {
-            fn make(bb: *std.Build, full: *std.Build.Module, wait: *std.Build.Module, t: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+            fn make(bb: *std.Build, full: *std.Build.Module, wait: *std.Build.Module, never_reuse: *std.Build.Module, t: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
                 const m = bb.createModule(.{
                     .root_source_file = full.root_source_file.?,
                     .target = t,
@@ -1121,12 +1080,10 @@ pub fn build(b: *std.Build) void {
                 while (imports.next()) |e| m.addImport(e.key_ptr.*, e.value_ptr.*);
                 const zio_stub = bb.createModule(.{ .root_source_file = bb.path("src/http/core/zio_stub.zig"), .target = t, .optimize = opt });
                 m.addImport("zio", zio_stub);
-                const stub_safety = Core.safetyModule(bb, zio_stub, t, opt);
-                m.addImport("anole_safety", stub_safety);
-                // resilience_core imports anole_safety too: on the stub, or
-                // src/safety/root.zig would be in two modules.
-                m.addImport("resilience_core", bb.createModule(.{ .root_source_file = bb.path("src/resilience/core.zig"), .target = t, .optimize = opt, .imports = &.{.{ .name = "anole_safety", .module = stub_safety }} }));
                 m.addImport("anole_test_wait", wait);
+                // The core's runner backs std.testing.allocator with it; the
+                // same instance as the hooks module's.
+                m.addImport("anole_never_reuse", never_reuse);
                 // And the stub HTTP/2 client: Anole's would import these
                 // sources a second time.
                 m.addAnonymousImport("h2_client", .{ .root_source_file = bb.path("src/http/core/h2_client_stub.zig") });
@@ -1135,7 +1092,7 @@ pub fn build(b: *std.Build) void {
                 return m;
             }
         }.make;
-        const test_mod = core_test_mod(b, core_full, core.test_wait, target, optimize);
+        const test_mod = core_test_mod(b, core_full, core.test_wait, core.never_reuse, target, optimize);
         // The core's test runner (some tests log at err on purpose).
         const core_tests = b.addTest(.{
             .name = "core-test",
@@ -1193,7 +1150,7 @@ pub fn build(b: *std.Build) void {
         if (core.dusty_by[0][0][0][0][0]) |core_bare| {
             const bare_tests = b.addTest(.{
                 .name = "core-test-bare",
-                .root_module = core_test_mod(b, core_bare, core.test_wait, target, optimize),
+                .root_module = core_test_mod(b, core_bare, core.test_wait, core.never_reuse, target, optimize),
                 .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
                 .use_llvm = use_llvm,
             });
@@ -1432,42 +1389,17 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&bench.step);
     }
 
+    // Hashes the files of the release steps (cli-dist, capi-dist).
+    const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/anole/sums.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+
     // capi: libanole, the C ABI (include/anole.h) as a static and a shared
     // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
     {
-        // libanole never carries OpenAPI: the bindings use their ecosystems' generators.
-        var capi_features = features;
-        capi_features.openapi = false;
-        const capi_anole_mod = anoleModule(b, .{ .features = capi_features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize });
-        const capi_mod = b.createModule(.{
-            .root_source_file = b.path("src/capi/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            // Linked into shared objects (a Node addon, a Python extension).
-            .pic = true,
-            .imports = &.{.{ .name = "anole", .module = capi_anole_mod }},
-        });
-        const capi_opts = b.addOptions();
-        capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
-        capi_mod.addOptions("capi_options", capi_opts);
-        // The C++ runtime symbols BoringSSL's objects need, so that libanole
-        // needs no libstdc++ or libc++ in the final link (Linux has no
-        // std::__1 in libstdc++ at all).
-        if ((target.result.os.tag == .linux or target.result.os.tag.isDarwin()) and features.tls == .boringssl) {
-            capi_mod.link_libcpp = true;
-            capi_mod.addCSourceFile(.{ .file = b.path("src/capi/cxx_shim.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
-        }
         const capi_step = b.step("capi", "Build libanole (static and shared, only anole_* exported) and install include/anole.h");
-        // capi-zig: the Zig part alone, as a static library (not
-        // self-contained), e.g. to check that it cross-compiles.
-        const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
-        b.step("capi-zig", "Build only the Zig part of libanole (libanole_zig.a, not self-contained)").dependOn(&b.addInstallArtifact(zig_lib, .{}).step);
-        // Packing, with Zig alone: one relocatable object holds the Zig
-        // code, every C library it links (the linker pulls in what is
-        // used), compiler-rt and, in Debug, the UBSan runtime; it needs only
-        // libc. tools/capi_symbols.zig then hides every symbol but anole_*,
-        // and the two libraries are made from that object.
         const symbols_tool = b.addExecutable(.{
             .name = "capi_symbols",
             .root_module = b.createModule(.{
@@ -1476,54 +1408,17 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
             }),
         });
+        const lib = capiLibrary(b, symbols_tool, stack, features, target, optimize, b.option(bool, "strip", "capi: no debug information in libanole and, since the modules are shared, in everything else built from this target (capi-dist always strips its own stacks)"), capi_step);
+        const capi_mod = lib.mod;
         const os = target.result.os.tag;
-        const packable = os == .linux or os.isDarwin();
-        var lib_obj: std.Build.LazyPath = undefined;
-        var shared_lib: *std.Build.Step.Compile = undefined;
-        var static_lib_opt: ?*std.Build.Step.Compile = null;
-        if (packable) {
-            const merged = b.addObject(.{ .name = "anole", .root_module = capi_mod });
-            merged.bundle_compiler_rt = true;
-            merged.bundle_ubsan_rt = true;
-            const hide = b.addRunArtifact(symbols_tool);
-            hide.addArg("hide");
-            hide.addFileArg(merged.getEmittedBin());
-            lib_obj = hide.addOutputFileArg("anole.o");
-            // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the
-            // tool takes back from the inputs (tools/capi_symbols.zig).
-            if (os.isDarwin()) for (linkedInputs(b, capi_mod)) |input| hide.addFileArg(input);
-            const static_lib = b.addLibrary(.{
-                .name = "anole",
-                .linkage = .static,
-                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
-            });
-            static_lib.root_module.addObjectFile(lib_obj);
-            capi_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
-            static_lib_opt = static_lib;
-            shared_lib = b.addLibrary(.{
-                .name = "anole",
-                .linkage = .dynamic,
-                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .pic = true }),
-            });
-            shared_lib.root_module.addObjectFile(lib_obj);
-        } else {
-            // COFF cannot merge objects into one, and a DLL exports only
-            // what is dllexport (the anole_* functions): Windows gets
-            // anole.dll and its import library, linked from the module.
-            shared_lib = b.addLibrary(.{ .name = "anole", .linkage = .dynamic, .root_module = capi_mod });
-            shared_lib.bundle_compiler_rt = true;
-            shared_lib.bundle_ubsan_rt = true;
-        }
+        const shared_lib = lib.shared;
+        const static_lib_opt = lib.static;
+        // capi-zig: the Zig part alone, as a static library (not
+        // self-contained), e.g. to check that it cross-compiles.
+        const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
+        b.step("capi-zig", "Build only the Zig part of libanole (libanole_zig.a, not self-contained)").dependOn(&b.addInstallArtifact(zig_lib, .{}).step);
+        if (static_lib_opt) |static_lib| capi_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
         capi_step.dependOn(&b.addInstallArtifact(shared_lib, .{}).step);
-        // The symbol check runs with every build of libanole on Linux and
-        // macOS: the object and the shared library export anole_* alone.
-        if (packable) for ([_]std.Build.LazyPath{ lib_obj, shared_lib.getEmittedBin() }) |file| {
-            const check = b.addRunArtifact(symbols_tool);
-            check.addArg("check");
-            check.addFileArg(file);
-            check.expectExitCode(0);
-            capi_step.dependOn(&check.step);
-        };
 
         // include/anole.abi.json, generated from src/capi/abi.zig: installed
         // beside the header, regenerated with `zig build capi-abi-json`, and
@@ -1541,6 +1436,45 @@ pub fn build(b: *std.Build) void {
         const abi_json_gen = b.addRunArtifact(abi_json);
         const abi_json_out = abi_json_gen.addOutputFileArg("anole.abi.json");
         capi_step.dependOn(&b.addInstallHeaderFile(abi_json_out, "anole.abi.json").step);
+
+        // capi-dist: libanole for the targets the bindings ship, stripped,
+        // with the files they need, as flat release assets (like cli-dist).
+        // Every row is a whole target stack (C libraries, core) built
+        // ReleaseSafe; the symbol check runs for each.
+        const capi_dist_targets = [_]struct { query: std.Target.Query, name: []const u8 }{
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .name = "libanole-x86_64-linux.a" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .name = "libanole-aarch64-linux.a" },
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "libanole-x86_64-macos.a" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "libanole-aarch64-macos.a" },
+        };
+        // Only the root build: a consumer never runs it and would pay four target stacks.
+        if (b.isRoot()) {
+            const capi_dist_names = comptime blk: {
+                var names: []const u8 = "";
+                for (capi_dist_targets) |dt| names = names ++ dt.name ++ ", ";
+                break :blk names;
+            };
+            const capi_dist = b.step("capi-dist", "Build " ++ capi_dist_names ++ "anole.h, anole.abi.json, anole.schema.json and SHA256SUMS-libanole into zig-out/capi-dist");
+            var capi_dist_files: [capi_dist_targets.len + 3]DistFile = undefined;
+            var capi_dist_n: usize = 0;
+            for (capi_dist_targets) |dt| {
+                const dist_target = b.resolveTargetQuery(dt.query);
+                // Dependencies are cached by target and optimize mode: a second stack for the
+                // main build's own pair would share and rewire its modules.
+                if (dist_target.query.eql(target.query) and optimize == .safe) {
+                    capi_dist.dependOn(&b.addFail("capi-dist: the build's own -Dtarget/-Doptimize equals a dist row; run it without them").step);
+                    continue;
+                }
+                const dist_stack = TargetStack.init(b, features, dist_target, .ReleaseSafe) orelse continue;
+                const dist_lib = capiLibrary(b, symbols_tool, dist_stack, features, dist_target, .ReleaseSafe, true, capi_dist);
+                capi_dist_files[capi_dist_n] = .{ .name = dt.name, .path = dist_lib.static.?.getEmittedBin() };
+                capi_dist_n += 1;
+            }
+            capi_dist_files[capi_dist_n] = .{ .name = "anole.h", .path = b.path("include/anole.h") };
+            capi_dist_files[capi_dist_n + 1] = .{ .name = "anole.abi.json", .path = abi_json_out };
+            capi_dist_files[capi_dist_n + 2] = .{ .name = "anole.schema.json", .path = b.path("include/anole.schema.json") };
+            distFiles(b, sums_exe, capi_dist, "capi-dist", "SHA256SUMS-libanole", capi_dist_files[0 .. capi_dist_n + 3]);
+        }
         const abi_json_update = b.addUpdateSourceFiles();
         abi_json_update.addCopyFileToSource(abi_json_out, "include/anole.abi.json");
         b.step("capi-abi-json", "Regenerate include/anole.abi.json from src/capi/abi.zig").dependOn(&abi_json_update.step);
@@ -1969,13 +1903,6 @@ pub fn build(b: *std.Build) void {
         b.step("cli-test", "Run the anole command line's unit tests").dependOn(&run_cli_tests.step);
 
         const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
-        const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/anole/sums.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }) });
-        const sums = b.addRunArtifact(sums_exe);
-        const sums_out = sums.addOutputFileArg("SHA256SUMS");
         const dist_targets = [_]struct { query: std.Target.Query, name: []const u8 }{
             .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .name = "anole-x86_64-linux" },
             .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .name = "anole-aarch64-linux" },
@@ -1983,19 +1910,14 @@ pub fn build(b: *std.Build) void {
             .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "anole-aarch64-macos" },
             .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .name = "anole-x86_64-windows.exe" },
         };
-        for (dist_targets) |dt| {
+        var files: [dist_targets.len]DistFile = undefined;
+        for (dist_targets, &files) |dt, *file| {
             // Stripped: the release binaries carry no debug information
             // (ReleaseSafe keeps it otherwise; the Linux ones were ~7x larger).
             const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe, true) });
-            const installed = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "dist" }, dt.name);
-            dist.dependOn(&installed.step);
-            // The sums are over the built files, named as they are installed.
-            const named = b.addWriteFiles();
-            const copy = named.addCopyFile(exe.getEmittedBin(), dt.name);
-            sums.addFileArg(copy);
+            file.* = .{ .name = dt.name, .path = exe.getEmittedBin() };
         }
-        const install_sums = b.addInstallFileWithDir(sums_out, .{ .custom = "dist" }, "SHA256SUMS");
-        dist.dependOn(&install_sums.step);
+        distFiles(b, sums_exe, dist, "dist", "SHA256SUMS", &files);
     }
 
     // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop
@@ -2173,15 +2095,14 @@ fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const
     return runs;
 }
 
-/// `b.addTest` with src/safety/test_runner.zig: Zig's default test runner
+/// `b.addTest` with src/testing/runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a
-/// test during which zio reports a swallowed cancellation (SAFETY.md E1,
-/// C3). The root module gets `anole_test_hooks`, which the runner asks for
-/// that count: over the module's zio (its own import, or anole's), or a
+/// test during which zio reports a swallowed cancellation. The root module gets `anole_test_hooks`, which the runner
+/// asks for that count: over the module's zio (its own import, or anole's), or a
 /// stub without one.
 fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
     var o = options;
-    o.test_runner = .{ .path = b.path("src/safety/test_runner.zig"), .mode = .server };
+    o.test_runner = .{ .path = b.path("src/testing/runner.zig"), .mode = .server };
     const m = o.root_module;
     // Frame pointers in every mode (Debug keeps them anyway): the hang
     // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
@@ -2190,15 +2111,15 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
         // Any zio in the binary, which then reads the runner's `zio_options`
         // from test_hooks.zig: a zio left to the stub would fail to compile.
         const zio_mod: ?*std.Build.Module = findImport(m, "zio", 4);
-        // The binary's own never_reuse module if anole_safety is in it.
+        // The binary's own never_reuse module if one is in it.
         const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
-            .root_source_file = b.path("src/safety/test_hooks.zig"),
+            .root_source_file = b.path("src/testing/hooks.zig"),
             .target = m.resolved_target,
             .optimize = m.optimize,
             .imports = &.{ .{ .name = "zio", .module = z }, .{ .name = "anole_never_reuse", .module = never_reuse } },
         }) else b.createModule(.{
-            .root_source_file = b.path("src/safety/test_hooks_none.zig"),
+            .root_source_file = b.path("src/testing/hooks_none.zig"),
             .target = m.resolved_target,
             .optimize = m.optimize,
             .imports = &.{.{ .name = "anole_never_reuse", .module = never_reuse }},
@@ -2219,9 +2140,12 @@ fn findImport(m: *std.Build.Module, name: []const u8, depth: u8) ?*std.Build.Mod
 
 const Core = struct {
     zio: *std.Build.Module,
-    /// src/safety (SAFETY.md's debug-build checks) over that zio:
-    /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
-    safety: *std.Build.Module,
+    /// src/testing/never_reuse.zig: `anole_never_reuse` in the test
+    /// hooks and the HTTP core's tests.
+    never_reuse: *std.Build.Module,
+    /// src/mem.zig: `anole_mem` (allocUninit, SpinLock) in every HTTP core
+    /// instance and in anole.
+    mem: *std.Build.Module,
     /// src/testing/wait.zig (TESTING.md D1/D2/D6), `anole_test_wait` in every
     /// HTTP core instance and in anole; only test code uses it.
     test_wait: *std.Build.Module,
@@ -2260,19 +2184,18 @@ const Core = struct {
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` and `fast_send` (see `anole.zio_options`), so a
         // program whose own `zio_options` leave them out still has them. And
-        // `quiescent_state` (src/http/core/qsbr.zig: lock-free reads on the
-        // executors).
-        // In Debug: `debug_held_locks`, a task that suspends holding a lock
-        // panics (SAFETY.md L2; src/safety counts the locks); `debug_cancel`,
-        // a task that parks after swallowing error.Canceled is reported (C3),
-        // and the test runner fails the test. These are the defaults of a
-        // binary with no `zio_options` of its own. Test binaries have both
-        // on in every optimize mode: their root, the safety test runner,
-        // declares `zio_options` (src/safety/test_hooks.zig), so a
-        // ReleaseSafe test binary checks suspensions as it counts locks.
+        // in Debug `debug_cancel`: a task that parks after swallowing
+        // error.Canceled is reported, and the test runner fails the
+        // test. The default of a binary with no `zio_options` of its own.
+        // Test binaries have it on in every optimize mode: their root, the
+        // test runner, declares `zio_options` (src/testing/hooks.zig).
         const debug = optimize == .debug;
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .quiescent_state = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
-        const safety = safetyModule(b, zio_mod, target, optimize);
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_cancel = debug }).module("zio");
+        // The test allocator's backing allocator: one instance for the hooks
+        // module and the core's runner (a file is in one module per
+        // compilation).
+        const never_reuse = neverReuseModule(b, target, optimize);
+        const mem = b.createModule(.{ .root_source_file = b.path("src/mem.zig"), .target = target, .optimize = optimize });
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -2280,15 +2203,13 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        // Its breakers' shard locks are ranked (SAFETY.md L4): it takes the
-        // same anole_safety as every module it is imported into.
-        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "anole_safety", .module = safety }} });
+        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
         const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
         const test_wait = testWaitModule(b, target, optimize);
-        var core: Core = .{ .safety = safety, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
+        var core: Core = .{ .mem = mem, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2312,7 +2233,7 @@ const Core = struct {
                                 optimize,
                             );
                             dusty_mod.addImport("resilience_core", resilience);
-                            dusty_mod.addImport("anole_safety", safety);
+                            dusty_mod.addImport("anole_mem", mem);
                             dusty_mod.addImport("validate", validate);
                             dusty_mod.addImport("anole_log", anole_log);
                             dusty_mod.addImport("anole_test_wait", test_wait);
@@ -2321,7 +2242,6 @@ const Core = struct {
                                 b,
                                 dusty_mod,
                                 if (tls) seam else null,
-                                safety,
                                 target,
                                 optimize,
                             );
@@ -2349,7 +2269,6 @@ const Core = struct {
         b: *std.Build,
         dusty_mod: *std.Build.Module,
         tls: ?*std.Build.Module,
-        safety: *std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -2363,32 +2282,16 @@ const Core = struct {
         opts.addOption(bool, "tls", tls != null);
         mod.addOptions("anole_h2_options", opts);
         mod.addImport("dusty", dusty_mod);
-        mod.addImport("anole_safety", safety);
         if (tls) |m| mod.addImport("anole_dusty_tls", m);
         dusty_mod.addImport("h2_client", mod);
         return mod;
     }
 
-    /// src/safety over `zio_mod` (the real zio, or the core's stub for its
-    /// own tests).
-    fn safetyModule(b: *std.Build, zio_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-        return b.createModule(.{
-            .root_source_file = b.path("src/safety/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zio", .module = zio_mod },
-                .{ .name = "anole_never_reuse", .module = neverReuseModule(b, target, optimize) },
-            },
-        });
-    }
-
-    /// src/safety/never_reuse.zig alone: the test allocator's backing
-    /// allocator, shared by anole_safety and the test runner (a file is in
+    /// src/testing/never_reuse.zig alone: the test allocator's backing
+    /// allocator, shared by the test hooks and the test runner (a file is in
     /// one module per compilation).
     fn neverReuseModule(b: *std.Build, target: ?std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode) *std.Build.Module {
-        return b.createModule(.{ .root_source_file = b.path("src/safety/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        return b.createModule(.{ .root_source_file = b.path("src/testing/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one
@@ -2712,7 +2615,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     const mod = if (o.public) b.addModule("anole", create) else b.createModule(create);
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
-    mod.addImport("anole_safety", o.core.safety);
+    mod.addImport("anole_mem", o.core.mem);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
     mod.addImport("validate", o.core.validate);
@@ -2742,14 +2645,12 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
         mod.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
     }
-    // ---- p3/lambda ----
     // The sample events the adapter's tests parse (tests/lambda/events).
     if (f.lambda and o.for_test) {
         const wf = b.addWriteFiles();
         _ = wf.addCopyDirectory(b.path("tests/lambda/events"), "events", .{});
         mod.addAnonymousImport("anole_lambda_events", .{ .root_source_file = wf.add("events.zig", "pub fn get(comptime name: []const u8) []const u8 {\n    return @embedFile(\"events/\" ++ name ++ \".json\");\n}\n") });
     }
-    // ---- end p3/lambda ----
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
         .target = o.target,
@@ -2800,21 +2701,164 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     return mod;
 }
 
+/// What one target needs to build the anole module: its C libraries, the
+/// core, the BSON codec. One per target; `build` makes the main one and
+/// capi-dist one per release target.
+const TargetStack = struct {
+    c: CModules,
+    core: Core,
+    bson: *std.Build.Module,
+
+    /// Null on the configure pass that still fetches lazy dependencies.
+    fn init(b: *std.Build, features: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?TargetStack {
+        const c = CModules.init(b, features, target, optimize) orelse return null;
+        // Core: zio (runtime) and the HTTP core (src/http/core), always on.
+        const core = Core.init(b, c, target, optimize);
+        // pg.zig's TLS: Anole's BoringSSL client (src/pg/tls.zig).
+        if (c.pg_tls) |pg| pg.addImport("tls", b.createModule(.{
+            .root_source_file = b.path("src/pg/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "anole_dusty_tls", .module = core.tls_seam.? }},
+        }));
+        // BSON (src/bson), the codec under the MongoDB client: pure Zig, its
+        // own module, imported by the anole module as "bson" when -Dmongodb
+        // is on (here or in a test-flags combination); nothing compiles it
+        // otherwise.
+        const bson = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
+        return .{ .c = c, .core = core, .bson = bson };
+    }
+};
+
+/// libanole for one target: the Zig code, the C++ shim, and on Linux and
+/// macOS one relocatable object holding the Zig code, every C library it
+/// links (the linker pulls in what is used), compiler-rt and, in Debug, the
+/// UBSan runtime, needing only libc. tools/capi_symbols.zig hides every
+/// symbol but anole_* and the static and shared libraries are made from that
+/// object; Windows gets a DLL from the module (COFF cannot merge). The
+/// symbol checks are added to `gate`. `strip` true removes debug information
+/// from the whole linked module graph, null keeps the optimize mode's default.
+fn capiLibrary(
+    b: *std.Build,
+    symbols_tool: *std.Build.Step.Compile,
+    stack: TargetStack,
+    features: Features,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
+    gate: *std.Build.Step,
+) struct { mod: *std.Build.Module, static: ?*std.Build.Step.Compile, shared: *std.Build.Step.Compile } {
+    // libanole never carries OpenAPI: the bindings use their ecosystems' generators.
+    var capi_features = features;
+    capi_features.openapi = false;
+    const capi_anole_mod = anoleModule(b, .{ .features = capi_features, .core = stack.core, .c = stack.c, .bson = stack.bson, .target = target, .optimize = optimize });
+    const capi_mod = b.createModule(.{
+        .root_source_file = b.path("src/capi/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        // Linked into shared objects (a Node addon, a Python extension).
+        .pic = true,
+        .strip = strip,
+        .imports = &.{.{ .name = "anole", .module = capi_anole_mod }},
+    });
+    const capi_opts = b.addOptions();
+    capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    capi_mod.addOptions("capi_options", capi_opts);
+    // The C++ runtime symbols BoringSSL's objects need, so that libanole
+    // needs no libstdc++ or libc++ in the final link (Linux has no
+    // std::__1 in libstdc++ at all).
+    if ((target.result.os.tag == .linux or target.result.os.tag.isDarwin()) and features.tls == .boringssl) {
+        capi_mod.link_libcpp = true;
+        capi_mod.addCSourceFile(.{ .file = b.path("src/capi/cxx_shim.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+    }
+    // The strip flag is per module and every C library is its own compile:
+    // one walk over everything the module links sets it on all of them.
+    const linked = linkedInputs(b, capi_mod);
+    if (strip == true) for (linked.modules) |m| {
+        m.strip = true;
+    };
+    const os = target.result.os.tag;
+    if (os != .linux and !os.isDarwin()) {
+        // COFF cannot merge objects into one, and a DLL exports only what is
+        // dllexport (the anole_* functions): Windows gets anole.dll and its
+        // import library, linked from the module.
+        const shared = b.addLibrary(.{ .name = "anole", .linkage = .dynamic, .root_module = capi_mod });
+        shared.bundle_compiler_rt = true;
+        shared.bundle_ubsan_rt = true;
+        return .{ .mod = capi_mod, .static = null, .shared = shared };
+    }
+    const merged = b.addObject(.{ .name = "anole", .root_module = capi_mod });
+    merged.bundle_compiler_rt = true;
+    merged.bundle_ubsan_rt = true;
+    const hide = b.addRunArtifact(symbols_tool);
+    hide.addArg("hide");
+    hide.addFileArg(merged.getEmittedBin());
+    const lib_obj = hide.addOutputFileArg("anole.o");
+    // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the tool
+    // takes back from the inputs (tools/capi_symbols.zig).
+    if (os.isDarwin()) for (linked.inputs) |input| hide.addFileArg(input);
+    const static = b.addLibrary(.{
+        .name = "anole",
+        .linkage = .static,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    static.root_module.addObjectFile(lib_obj);
+    const shared = b.addLibrary(.{
+        .name = "anole",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .pic = true }),
+    });
+    shared.root_module.addObjectFile(lib_obj);
+    // The symbol check runs with every build of libanole: the object and
+    // the shared library export anole_* alone.
+    for ([_]std.Build.LazyPath{ lib_obj, shared.getEmittedBin() }) |file| {
+        const check = b.addRunArtifact(symbols_tool);
+        check.addArg("check");
+        check.addFileArg(file);
+        check.expectExitCode(0);
+        gate.dependOn(&check.step);
+    }
+    return .{ .mod = capi_mod, .static = static, .shared = shared };
+}
+
+/// One file of a release step: the name it is installed and hashed under.
+const DistFile = struct { name: []const u8, path: std.Build.LazyPath };
+
+/// Installs `files` into zig-out/<dir> and a checksums file `sums_name` over
+/// them, in the order given. The sums are over copies named as installed, so
+/// the basenames match the release assets.
+fn distFiles(b: *std.Build, sums_exe: *std.Build.Step.Compile, step: *std.Build.Step, dir: []const u8, sums_name: []const u8, files: []const DistFile) void {
+    const sums = b.addRunArtifact(sums_exe);
+    const sums_out = sums.addOutputFileArg(sums_name);
+    const named = b.addWriteFiles();
+    for (files) |file| {
+        step.dependOn(&b.addInstallFileWithDir(file.path, .{ .custom = dir }, file.name).step);
+        sums.addFileArg(named.addCopyFile(file.path, file.name));
+    }
+    step.dependOn(&b.addInstallFileWithDir(sums_out, .{ .custom = dir }, sums_name).step);
+}
+
 /// Every static library and object a module links, through the modules it
-/// imports and the libraries those link (for tools/capi_symbols.zig).
-fn linkedInputs(b: *std.Build, root: *std.Build.Module) []const std.Build.LazyPath {
+/// imports and the libraries those link (for tools/capi_symbols.zig), and
+/// every module met on the way.
+fn linkedInputs(b: *std.Build, root: *std.Build.Module) struct { inputs: []const std.Build.LazyPath, modules: []const *std.Build.Module } {
     var out: std.ArrayList(std.Build.LazyPath) = .empty;
+    var mods: std.ArrayList(*std.Build.Module) = .empty;
     var seen: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
     var todo: std.ArrayList(*std.Build.Module) = .empty;
     todo.append(b.allocator, root) catch @panic("OOM");
-    while (todo.pop()) |top| for (top.getGraph().modules) |m| for (m.link_objects.items) |lo| switch (lo) {
-        .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
-        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
-            if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
-            out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
-            todo.append(b.allocator, c.root_module) catch @panic("OOM");
-        },
-        else => {},
+    while (todo.pop()) |top| for (top.getGraph().modules) |m| {
+        mods.append(b.allocator, m) catch @panic("OOM");
+        for (m.link_objects.items) |lo| switch (lo) {
+            .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
+            .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+                if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
+                out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
+                todo.append(b.allocator, c.root_module) catch @panic("OOM");
+            },
+            else => {},
+        };
     };
-    return out.items;
+    return .{ .inputs = out.items, .modules = mods.items };
 }

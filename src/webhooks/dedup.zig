@@ -3,7 +3,6 @@
 //! after anything else. A bounded in-memory store (process-wide, sharded)
 //! and a Redis/Valkey one.
 const std = @import("std");
-const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 
 pub const Claim = enum { new, pending, done };
@@ -56,7 +55,7 @@ pub const Memory = struct {
 
     const Shard = struct {
         /// The shard's map and order. A leaf: nothing is taken under it.
-        mutex: safety.Mutex(.leaf) = .init,
+        mutex: std.Io.Mutex = .init,
         map: std.AutoHashMapUnmanaged(u128, Entry) = .empty,
         order: std.ArrayList(u128) = .empty,
         head: usize = 0,

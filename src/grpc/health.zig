@@ -12,7 +12,6 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const server = @import("server.zig");
-const safety = @import("anole_safety");
 /// The generated grpc.health.v1 messages and service.
 pub const pb = @import("gen/grpc/health/v1.pb.zig");
 
@@ -27,7 +26,7 @@ pub const Health = struct {
     io: std.Io,
     /// Guards `statuses` (a leaf: no lock or wait under it; `set`'s wake is
     /// no wait).
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     statuses: std.StringArrayHashMapUnmanaged(ServingStatus) = .empty,
     /// Bumped on every change; Watch waits on it.
     generation: std.atomic.Value(u32) = .init(0),

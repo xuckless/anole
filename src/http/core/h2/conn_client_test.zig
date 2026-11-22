@@ -4,7 +4,7 @@
 // tests/nghttp2_session_test.c and tests/nghttp2_http_test.c. See
 // LICENSE.nghttp2 and THIRD_PARTY_NOTICES.
 
-//! Tests for conn.zig's client role (M5). The ones named after an nghttp2
+//! Tests for conn.zig's client role. The ones named after an nghttp2
 //! session test (`h2 client conn: <name>`, without its test_nghttp2_
 //! prefix) port its client-side scenario to the Conn API. A server is
 //! played by hand: its frames are built with conn_test.zig's `T` (a server

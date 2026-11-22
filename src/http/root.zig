@@ -217,12 +217,10 @@ test "port in use on zio: a second server on the same port fails instead of shar
 test {
     // Idle parking is off on Windows (the core's server/park.zig).
     if (@import("builtin").os.tag != .windows) _ = @import("park_test.zig");
-    // The core's QSBR cells and per-executor counters on the real zio
-    // (the core's own suite runs on its stub).
-    _ = @import("core/qsbr_test.zig");
+    // The per-executor counters on the real zio (the core's own suite runs
+    // on its stub).
     _ = @import("core/exec_counter_test.zig");
-    // The per-thread encoders' debug check (SAFETY.md M3).
-    _ = @import("core/encoders_test.zig");
+    // The per-thread encoders' debug check.
     // The push list under real threads (W1 seeds; [stress] in test-stress).
     _ = @import("core/push_list_test.zig");
     // The HTTP/2 engine's wakes, in zio's known waiter order.

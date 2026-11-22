@@ -7,7 +7,7 @@ const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
-const safety = @import("anole_safety");
+const io_gate = @import("../io_gate.zig");
 const abi = engine.abi;
 const features = anole.features;
 const zio = anole.zio;
@@ -1061,7 +1061,7 @@ fn h3Get(io: std.Io, port: u16, ca: []const u8, client: ?*const anole.tls.Pem) !
 }
 
 /// A request one side's TLS must refuse: it fails with one of `refusals`;
-/// a cancel goes up (SAFETY C3), and an answer is `served`.
+/// a cancel goes up, and an answer is `served`.
 fn expectRefused(r: anyerror![]u8, comptime refusals: []const anyerror, served: anyerror) !void {
     const body = r catch |err| {
         if (err == error.Canceled) return error.Canceled;
@@ -1392,7 +1392,7 @@ test "capi engine: a reload from another thread holds the server's stop until it
 }
 
 /// Holds one thread's wake inside an executor's `IoGate`
-/// (`safety.io_gate_test_hook`) until the test lets it go; other threads pass.
+/// (`io_gate.test_hook`) until the test lets it go; other threads pass.
 const WakeHold = struct {
     var thread: std.atomic.Value(std.Thread.Id) = .init(0);
     var entered: std.Io.Event = .unset;
@@ -1426,8 +1426,8 @@ test "capi engine: a wake from a consumer thread under way holds the server's st
     const tio = engine.threadedIo();
     WakeHold.entered = .unset;
     WakeHold.go = .unset;
-    safety.io_gate_test_hook = &WakeHold.hook;
-    defer safety.io_gate_test_hook = null;
+    io_gate.test_hook = &WakeHold.hook;
+    defer io_gate.test_hook = null;
     const t = try std.Thread.spawn(.{}, WakeHold.wake, .{e});
     // The wake is inside the gate, about to call into the runtime.
     WakeHold.entered.waitUncancelable(tio);
@@ -2238,7 +2238,7 @@ const RawWs = struct {
 };
 
 /// Reads the rest of a response into `w`. A read error past the response
-/// (the server's close) ends it; a cancel goes up (SAFETY C3), and so does
+/// (the server's close) ends it; a cancel goes up, and so does
 /// a response too large for `w`.
 fn readRest(r: *std.Io.net.Stream.Reader, w: *std.Io.Writer) !void {
     _ = r.interface.streamRemaining(w) catch |err| switch (err) {

@@ -23,7 +23,6 @@
 const std = @import("std");
 const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
-const safety = @import("anole_safety");
 
 /// The pool's settings: `ServerOptions.blocking`, or `Pool.init`.
 pub const Options = struct {
@@ -78,8 +77,8 @@ pub const Pool = struct {
     /// `Options.max_waiting`.
     max_waiting: ?usize = null,
     /// Guards the counts; a job holds a slot (`running`) while it runs.
-    mutex: safety.Mutex(.leaf) = .init,
-    changed: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
     running: usize = 0,
     /// Callers waiting for a slot.
     waiting: usize = 0,

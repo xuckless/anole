@@ -1,4 +1,4 @@
-//! C ABI tests for p3/s3: the engine's S3 calls against `anole.s3.testing.FakeServer`,
+//! C ABI tests for s3: the engine's S3 calls against `anole.s3.testing.FakeServer`,
 //! driven through the engine's Zig entry points as in nats_test.zig. Waits poll
 //! the consumer with generous bounds; no assertion is about time.
 const std = @import("std");

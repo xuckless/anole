@@ -36,7 +36,6 @@
 //! producers put them; librdkafka's default differs.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
@@ -175,6 +174,8 @@ pub const Client = struct {
     io: std.Io,
     arena_state: std.heap.ArenaAllocator,
     name: []const u8,
+    /// The bootstrap list as `host:port,host:port`, for the console.
+    target: []const u8,
     errors: db.ErrorMap,
     timeout: ?Duration,
     readiness_enabled: bool,
@@ -186,19 +187,26 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    /// Over `consumers`, `started`, `drained` and `starting`. A leaf (L4).
-    consumers_mutex: safety.Mutex(.leaf) = .init,
+    /// Over `consumers`, `started`, `drained` and `starting`. A leaf.
+    consumers_mutex: std.Io.Mutex = .init,
     started: bool = false,
     drained: bool = false,
     /// Consumer starts under way outside the lock (`start`, `consume`):
     /// `drain` waits for them (`starts_done`) before it stops and joins the
     /// consumers, so a start never races its consumer's stop.
     starting: u32 = 0,
-    starts_done: safety.Condition = .init,
+    starts_done: std.Io.Condition = .init,
     /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
     /// not joined (the process is frozen between invocations); producing
     /// works.
     suppress_consumers: bool = false,
+
+    /// The console's `/db` entry. The cluster keeps one connection per
+    /// broker, not pools, so there are none to list.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        try internal.writeConsoleHead(w, console_system, self.name, self.target);
+        try w.writeByte(']');
+    }
 
     /// Validates the options and prepares the connections; nothing connects
     /// before the first call (unless `connect_at_start`).
@@ -284,11 +292,13 @@ pub const Client = struct {
         errdefer prod.deinit();
 
         const name = try arena.dupe(u8, options.label orelse "kafka");
+        const target = try std.mem.join(arena, ",", brokers);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena_state = self.arena_state,
             .name = name,
+            .target = target,
             .errors = options.errors,
             .timeout = options.timeout,
             .readiness_enabled = options.readiness,
@@ -338,7 +348,7 @@ pub const Client = struct {
         // The consumers added before `started` is set are started here, the
         // ones after it by `consume`: each by exactly one of the two. A start
         // spawns (and may suspend), and the log line may wait: both after
-        // the lock (L2, L3).
+        // the lock.
         const n = blk: {
             self.consumers_mutex.lockUncancelable(self.io);
             defer self.consumers_mutex.unlock(self.io);

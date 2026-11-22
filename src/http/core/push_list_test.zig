@@ -1,6 +1,6 @@
-//! The sealable push list (push_list.zig) under real threads (SAFETY.md L7:
-//! each hand-off wrapper has a multi-thread stress test). Producers and the
-//! consumer are plain OS threads (SAFETY.md §6a); nothing waits on time:
+//! The sealable push list (push_list.zig) under real threads (each hand-off
+//! wrapper has a multi-thread stress test). Producers and the
+//! consumer are plain OS threads; nothing waits on time:
 //! the consumer takes until it has seen every node, and every outcome is
 //! checked node by node. Seeds are fixed (TESTING.md D4) and printed on a
 //! failure.

@@ -372,6 +372,24 @@ pub fn PerExecutor(comptime Pool: type) type {
     };
 }
 
+/// One executor's pool as the console's `/db` shows it.
+pub const PoolStat = struct { max: usize, open: usize, idle: usize };
+
+/// The console entry's text up to the open `"pools":[` (no braces; the
+/// host's object wraps it), as pg writes it: Redis, MongoDB, NATS and Kafka
+/// share it. The caller writes each pool with `writePool`, then `]`.
+pub fn writeConsoleHead(w: *std.Io.Writer, system: []const u8, name: []const u8, target: []const u8) !void {
+    try w.print("\"system\":{f},\"name\":{f},\"target\":{f},\"pools\":[", .{
+        std.json.fmt(system, .{}), std.json.fmt(name, .{}), std.json.fmt(target, .{}),
+    });
+}
+
+/// Pool number `index` of `writeConsoleHead`'s list. Waiters are not counted.
+pub fn writePool(w: *std.Io.Writer, index: usize, p: PoolStat) !void {
+    if (index > 0) try w.writeByte(',');
+    try w.print("{{\"max\":{d},\"open\":{d},\"idle\":{d},\"in_use\":{d},\"waiting\":0}}", .{ p.max, p.open, p.idle, p.open -| p.idle });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 
@@ -672,4 +690,31 @@ pub fn testEnviron(comptime vars: []const [:0]const u8) std.process.Environ {
         const kept = block;
     };
     return .{ .block = .{ .slice = &S.kept } };
+}
+
+/// For the connectors' tests: `{` + the client's `consoleInfo` + `}` parses
+/// as JSON, names `system`, `name` and `target`, lists `pools` pools, and
+/// holds none of `absent` (the credentials the client was given). Returns
+/// the parsed object for the pool counts.
+pub fn expectConsoleInfo(client: anytype, want: struct {
+    system: []const u8,
+    name: []const u8,
+    target: []const u8,
+    pools: usize,
+    absent: []const []const u8 = &.{},
+}) !std.json.Parsed(std.json.Value) {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try aw.writer.writeByte('{');
+    try client.consoleInfo(&aw.writer);
+    try aw.writer.writeByte('}');
+    for (want.absent) |secret| try testing.expect(std.mem.find(u8, aw.written(), secret) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    errdefer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings(want.system, o.get("system").?.string);
+    try testing.expectEqualStrings(want.name, o.get("name").?.string);
+    try testing.expectEqualStrings(want.target, o.get("target").?.string);
+    try testing.expectEqual(want.pools, o.get("pools").?.array.items.len);
+    return parsed;
 }

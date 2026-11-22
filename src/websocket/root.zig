@@ -69,7 +69,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const placement = dusty.placement;
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec").server;
@@ -85,8 +84,7 @@ pub const WebSocket = dusty.WebSocket;
 /// A message from `Socket.receive` or `Socket.next`: its `type`, its
 /// `data`, and for a close its `close_code`. `data` is valid until the
 /// next `receive` or `next`, and may point into the connection's read
-/// buffer: copy what must outlive it or go to another task (Debug builds
-/// overwrite it with 0xDD at the next read).
+/// buffer: copy what must outlive it or go to another task.
 pub const Message = WebSocket.Message;
 /// `.text`, `.binary`, `.close`, `.ping` or `.pong` (and `.continuation`,
 /// which `receive` never returns).
@@ -340,9 +338,6 @@ pub const Socket = struct {
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
         if (self._read.conn != null) {
-            // The last messages' bytes read 0xDD before a window change
-            // can take their buffer (`WebSocket.poisonLent`).
-            self._conn.h1.poisonLent();
             self._read.between(self._conn.h1.transport.reader);
         }
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
@@ -496,7 +491,6 @@ pub const Socket = struct {
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
         if (self._read.conn != null) {
-            self._conn.h1.poisonLent();
             self._read.release(self._conn.h1.transport.reader);
         }
         switch (self._conn) {
@@ -650,7 +644,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
                 // HTTP/1.1; over HTTP/2 and HTTP/3 the process's, the
                 // stream having no allocator of its own here. Freed by
                 // `Socket.deinit`.
-                d.* = .init(accepted.config, options.deflate, if (h2) safety.process_gpa else res._conn.?.allocator);
+                d.* = .init(accepted.config, options.deflate, if (h2) std.heap.smp_allocator else res._conn.?.allocator);
                 deflate = d;
             }
         }
@@ -944,6 +938,8 @@ const H1Callbacks = struct {
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
+        // A plain GET has no connection to adopt (anole.testing has none at all).
+        if (!isUpgrade(req)) return null;
         const gpa = res._conn.?.allocator;
         const self = try gpa.create(H1Callbacks);
         errdefer gpa.destroy(self);
@@ -995,8 +991,6 @@ const H1Callbacks = struct {
         // close, a failed read or callback, and a cancel alike.
         defer window.release(ws.transport.reader);
         while (true) {
-            // As `Socket.receive`: before the window may move to a block.
-            ws.poisonLent();
             window.adapt(ws.transport.reader);
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {
@@ -1065,7 +1059,7 @@ const H1Callbacks = struct {
 /// reading at the front of the window, so a run of small messages never
 /// squeezes reads into its tail.
 ///
-/// owner: one run of `H1Callbacks.serve` (SAFETY.md M2, a batch: the run).
+/// owner: one run of `H1Callbacks.serve` (a batch: the run).
 /// Only that run's task touches it and the reader; the block goes back to
 /// the pool at a quiet wait (`quiet`) or as the run returns (`release`,
 /// deferred, so on every exit), after the reader has let go of it.
@@ -1286,13 +1280,12 @@ const UpgradedWindow = struct {
 const read_block_len = 16 * 1024 + 512;
 
 /// The blocks `ReadWindow` reads into, kept per thread for reuse, and
-/// beyond `cap` given back to `safety.process_gpa` (`smp_allocator` in
-/// release builds; never reused in tests). None of the HTTP core's pools fits:
+/// beyond `cap` given back to `std.heap.smp_allocator`. None of the HTTP core's pools fits:
 /// its write buffers are `response.write_buffer_size` long (configurable,
 /// 16384 by default: no room for a frame's tail ahead of a whole record),
 /// `block_cache` serves past 32 KiB, and the TLS module's ciphertext
-/// blocks are its own (and absent without TLS). Owned by the process
-/// (SAFETY.md M2); a block taken is the taking run's until it gives it
+/// blocks are its own (and absent without TLS). Owned by the process;
+/// a block taken is the taking run's until it gives it
 /// back. No I/O or suspension runs between a pool's reads and writes, so a
 /// task that later runs on another thread just gives the block to that
 /// thread's pool.
@@ -1310,7 +1303,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else safety.allocUninit(safety.process_gpa, read_block_len) catch return null;
+        } else @import("anole_mem").allocUninit(std.heap.smp_allocator, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1318,18 +1311,15 @@ const read_blocks = struct {
     fn give(b: []u8) void {
         std.debug.assert(b.len == read_block_len);
         _ = held.fetchSub(1, .monotonic);
-        // SAFETY.md M6: poisoned in Debug and test builds, so a reader left
-        // pointing at a returned block reads 0xDD rather than old frames.
-        safety.poison(b);
         if (free_len < cap) {
             free[free_len] = b.ptr;
             free_len += 1;
             return;
         }
         // rawFree, not `free`: `free` fills the block with `undefined`
-        // first, 0xAA in ReleaseSafe, and process_gpa is Zig code, so the
-        // store isn't dropped as dead (C1). Poisoned above anyway.
-        safety.process_gpa.rawFree(b, .@"1", @returnAddress());
+        // first, 0xAA in ReleaseSafe, and the allocator is Zig code, so the
+        // store isn't dropped as dead.
+        std.heap.smp_allocator.rawFree(b, .@"1", @returnAddress());
     }
 };
 
@@ -1979,7 +1969,7 @@ fn testHandshake(a: std.mem.Allocator) !dusty.Request {
     return req;
 }
 
-test "websocket: a read block from an empty pool is new, poisoned in test builds, and counted while held" {
+test "websocket: a read block from an empty pool is new and counted while held" {
     // This thread's pool, emptied, so `take` allocates (`allocUninit`).
     var kept: [read_blocks.cap][]u8 = undefined;
     var kept_len: usize = 0;
@@ -1989,9 +1979,16 @@ test "websocket: a read block from an empty pool is new, poisoned in test builds
     const held = _readBlocksHeld();
     const b = read_blocks.take().?;
     try std.testing.expectEqual(read_block_len, b.len);
-    for (b) |byte| try std.testing.expectEqual(safety.poison_byte, byte);
     try std.testing.expectEqual(held + 1, _readBlocksHeld());
     read_blocks.give(b);
+    try std.testing.expectEqual(held, _readBlocksHeld());
+
+    // Past the cap, a given block is freed instead of pooled.
+    var more: [read_blocks.cap + 1][]u8 = undefined;
+    for (&more) |*m| m.* = read_blocks.take().?;
+    try std.testing.expectEqual(held + more.len, _readBlocksHeld());
+    for (more) |m| read_blocks.give(m);
+    try std.testing.expectEqual(read_blocks.cap, read_blocks.free_len);
     try std.testing.expectEqual(held, _readBlocksHeld());
 }
 

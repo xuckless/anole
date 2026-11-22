@@ -4,7 +4,6 @@
 //! and the observer; this is the shared state and the parts that only
 //! touch it.
 const std = @import("std");
-const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const session_mod = @import("session.zig");
 
@@ -12,9 +11,9 @@ const Session = session_mod.Session;
 
 /// The pool of one executor.
 pub const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Signalled when a session goes back, or a place frees up.
-    returned: safety.Condition = .init,
+    returned: std.Io.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle sessions.
     idle: []*Session,
     idle_len: usize = 0,
@@ -28,8 +27,8 @@ pub const Pool = struct {
 
     /// Closes the idle sessions that have been idle longer than `limit`
     /// (all of them when null): QUIT, close, and their places freed.
-    /// Takes up to 16 per lock section and closes them after the unlock
-    /// (SAFETY.md L2, L3); allocates nothing. Returns how many.
+    /// Takes up to 16 per lock section and closes them after the unlock;
+    /// allocates nothing. Returns how many.
     pub fn closeIdle(self: *Pool, io: std.Io, observer: *const db.Observer, limit: ?std.Io.Duration) usize {
         const batch_len = 16;
         var total: usize = 0;

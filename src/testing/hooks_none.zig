@@ -10,5 +10,5 @@ pub fn dumpTasks(w: *std.Io.Writer) void {
     _ = w;
 }
 
-/// The test allocator's backing allocator (src/safety/never_reuse.zig).
+/// The test allocator's backing allocator (src/testing/never_reuse.zig).
 pub const never_reuse = @import("anole_never_reuse");

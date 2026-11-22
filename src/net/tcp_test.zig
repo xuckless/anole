@@ -3,17 +3,13 @@
 //! latency or a short timing window.
 const std = @import("std");
 const wait = @import("anole_test_wait");
-const safety = @import("anole_safety");
 const features = @import("build_options");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
 const ClientStream = net.ClientStream;
 
 const App = server_mod.App;
-/// The App's allocator panics at an allocation under a spin lock (SAFETY.md
-/// L5, E1): std's test allocator can't be intercepted, so it is wrapped.
-var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
-const alloc = checked.allocator();
+const alloc = std.testing.allocator;
 
 fn connect(a: *App, port_of: u16) !*ClientStream {
     return ClientStream.connect(alloc, a.io(), .{ .host = "127.0.0.1", .port = port_of, .address = .{ .ip4 = .loopback(port_of) } });
@@ -1575,7 +1571,7 @@ test "net tcp: a task waiting in waitWritable when the connection is released an
     LateWaiter.waiter_hold = .{ .point = .waiter_woken };
     tcp.test_write_waits.store(0, .monotonic);
     // Every allocation its own pages, made inaccessible when freed.
-    var app = try App.init(safety.never_reuse_allocator, .{ .executors = .exact(1) });
+    var app = try App.init(@import("anole_test_hooks").never_reuse.allocator, .{ .executors = .exact(1) });
     defer app.deinit();
     defer tcp.test_hold.store(null, .release);
     LateWaiter.io = app.io();

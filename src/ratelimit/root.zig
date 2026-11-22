@@ -14,7 +14,6 @@
 //! LRU list so a full table costs O(1) per new key.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const declarations = @import("../openapi/declarations.zig");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
@@ -119,7 +118,7 @@ pub const MemoryLimiter = struct {
     io: std.Io,
     /// One process-wide lock over the buckets (a leaf), held for a lookup
     /// and its arithmetic.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     buckets: std.HashMapUnmanaged(BucketKey, *Bucket, BucketKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     /// Most recently used first.
     lru: std.DoublyLinkedList = .{},

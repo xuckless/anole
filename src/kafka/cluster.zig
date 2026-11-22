@@ -9,7 +9,6 @@
 //! I/O lock only keeps accidental sharing safe.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const testHold = @import("test_hold.zig").testHold;
 const protocol = @import("protocol.zig");
 const sasl = @import("sasl.zig");
@@ -55,10 +54,10 @@ pub const Conn = struct {
     settings: Settings,
     stream: *net.ClientStream,
     /// One round trip at a time on this socket, taken with no other lock
-    /// held, until #111's reader demux. L2's exception (an I/O lock); held
+    /// held, until #111's reader demux. An I/O lock; held
     /// per task, so other tasks of the executor take their own connections'
     /// locks while this one waits for its answer.
-    mutex: safety.IoLock = .init,
+    mutex: std.Io.Mutex = .init,
     correlation: i32 = 1,
     broken: bool = false,
     node_id: i32,
@@ -195,7 +194,7 @@ pub const Conn = struct {
     }
 
     /// A failed read or write: the cancel that ended it, so it reaches the
-    /// caller (C3), else the connection is gone.
+    /// caller, else the connection is gone.
     fn lost(cause: ?anyerror) ConnError {
         if (cause) |e| if (e == error.Canceled) return error.Canceled;
         return error.ConnectionLost;
@@ -244,26 +243,25 @@ const TopicInfo = struct {
 
 const BrokerInfo = struct { host: []u8, port: u16 };
 
-/// owner: Client. M2 process-wide: `deinit` runs after the producer and the
+/// owner: Client, process-wide: `deinit` runs after the producer and the
 /// consumers are torn down (every task that calls it is joined first).
-/// Shared by every executor under `mutex` (L1: real cross-thread state).
+/// Shared by every executor under `mutex` (real cross-thread state).
 pub const Cluster = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    teardown: safety.Teardown = .init,
-    /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
+    /// Over `brokers`, `topics` and `refresh_busy`. A leaf: nothing
     /// waits, calls out or takes another lock while it is held.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,
     topics: std.StringHashMapUnmanaged(TopicInfo) = .empty,
     /// One metadata refresh at a time (the keyring shape: a flag and a
     /// condition under `mutex`, never a lock held across the round trip).
     /// The round that holds the turn owns `meta_conn`.
     refresh_busy: bool = false,
-    refresh_done: safety.Condition = .init,
+    refresh_done: std.Io.Condition = .init,
     meta_conn: ?*Conn = null,
     closing: std.atomic.Value(bool) = .init(false),
 
@@ -286,7 +284,6 @@ pub const Cluster = struct {
     }
 
     pub fn deinit(self: *Cluster) void {
-        self.teardown.begin();
         self.closing.store(true, .release);
         // No round holds the turn: every caller is joined.
         if (self.meta_conn) |c| c.close();
@@ -301,7 +298,6 @@ pub const Cluster = struct {
         self.topics.deinit(self.gpa);
         for (self.bootstrap) |s| self.gpa.free(s);
         self.gpa.free(self.bootstrap);
-        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -360,7 +356,7 @@ pub const Cluster = struct {
     /// (cancelable), then runs its own round holding no lock.
     pub fn refresh(self: *Cluster, topics: []const []const u8, allow_auto_create: bool) ConnError!void {
         try self.takeRefreshTurn();
-        // C2: the turn goes back on every exit, a cancel included.
+        // The turn goes back on every exit, a cancel included.
         defer self.giveRefreshTurn();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();

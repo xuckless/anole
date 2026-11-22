@@ -1,5 +1,5 @@
 //! `anole_net_*`: raw TCP and UDP listeners whose connections and datagrams
-//! go to a consumer (p3/net, design-net.md §6.4). Handle kinds 10
+//! go to a consumer (design-net.md §6.4). Handle kinds 10
 //! (`anole_net_conn`) and 11 (`anole_net_udp`); events 96-100.
 //!
 //! The listeners are Anole's own (`anole.net`): the configuration's "tcp"
@@ -19,7 +19,7 @@
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const SlotTable = @import("slot_table.zig").SlotTable;
@@ -31,9 +31,6 @@ const Exec = engine.Exec;
 const Handle = engine.Handle;
 const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
-/// The writes' chunks come from it: in Debug and test builds an allocation
-/// or a free under a slot's spin lock panics (L5); elsewhere it is `gpa`.
-var chunk_checked: safety.SpinCheckedAllocator = .init(engine.gpa);
 
 /// The most a DATA record holds of one connection's bytes: bigger bursts
 /// come as several records (a frame larger than this in one of its own).
@@ -48,13 +45,12 @@ fn pack(g: u32, st: SlotState) u64 {
 pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
-    /// the connection, `onClose` while it takes it away. A leaf (L4):
+    /// the connection, `onClose` while it takes it away. A leaf:
     /// nothing is taken, allocated, freed or woken under it but the
     /// connection's atomics (a reset's non-blocking `setsockopt`/`shutdown`
     /// and its gated wakes); a call's chunk is made before it and, when the
-    /// connection refuses it, freed after it (`chunk_checked` panics
-    /// otherwise in Debug and tests); its kick is made after it.
-    lock: safety.SpinLock(.leaf) = .init,
+    /// connection refuses it, freed after it; its kick is made after it.
+    lock: SpinLock = .init,
     conn: ?*net.Conn = null,
     /// Its listener's: set at the open (before the OPEN record is posted),
     /// read by `write` before it takes the lock (an atomic, as a reused
@@ -133,10 +129,10 @@ pub const UdpState = struct {
     /// Set once the sockets exist (the first batch, or the start), cleared
     /// at the stop before they are freed.
     group: std.atomic.Value(?*net.UdpGroup) = .init(null),
-    /// The calls from consumer threads inside the group (T5): closed at the
+    /// The calls from consumer threads inside the group: closed at the
     /// stop, which waits for those inside. A send queues its batch inside
     /// it (the batch's one allocation included): short, never a wait.
-    gate: safety.IoGate = .{},
+    gate: @import("../io_gate.zig").IoGate = .{},
 
     fn enter(u: *UdpState) ?*net.UdpGroup {
         if (!u.gate.enter()) return null;
@@ -601,14 +597,14 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     // The SENT record first: a call that fails takes nothing.
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    // The chunk before the lock (L5): nothing allocates under it, and one
+    // The chunk before the lock: nothing allocates under it, and one
     // the call did not take is freed here, after it.
     var chunk: ?*net.OutChunk = null;
     defer if (chunk) |c| c.destroy();
     if (sent != null and !copy) {
-        chunk = try net.OutChunk.borrowed(chunk_checked.allocator(), data, @intFromPtr(sent.?.ptr));
+        chunk = try net.OutChunk.borrowed(gpa, data, @intFromPtr(sent.?.ptr));
     } else if (frame or data.len > 0) {
-        const c = try net.OutChunk.create(chunk_checked.allocator(), data.len);
+        const c = try net.OutChunk.create(gpa, data.len);
         @memcpy(c.payload(), data);
         chunk = c;
     }

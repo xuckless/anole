@@ -237,8 +237,11 @@ pub fn configureC(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void
                 "HAVE_BYTESWAP_H",
                 "HAVE_DECL_BE64TOH",
                 "HAVE_DECL_BSWAP_64",
-                "HAVE_EXPLICIT_BZERO",
             }) |name| mod.addCMacro(name, "1");
+            // explicit_bzero is glibc 2.25+ (musl has it); older glibc targets
+            // (capi-dist's gnu.2.17) take ngtcp2's volatile-memset fallback.
+            const has_bzero = if (target.result.isGnuLibC()) target.result.os.versionRange().gnuLibCVersion().?.order(.{ .major = 2, .minor = 25, .patch = 0 }) != .lt else true;
+            if (has_bzero) mod.addCMacro("HAVE_EXPLICIT_BZERO", "1");
         },
         .macos, .ios, .tvos, .watchos, .visionos => {
             // Darwin: no endian.h/byteswap.h; ngtcp2_net.h uses libkern/OSByteOrder.h under

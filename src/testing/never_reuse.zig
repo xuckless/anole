@@ -1,4 +1,4 @@
-//! E1: a page allocator that never hands out an address twice, the backing
+//! A page allocator that never hands out an address twice, the backing
 //! allocator of the test allocator (`std.heap.SafeAllocator`, which then
 //! never reuses memory either). Freed pages are replaced by a fresh
 //! inaccessible mapping (`mmap(MAP_FIXED, PROT_NONE)`: one call that gives

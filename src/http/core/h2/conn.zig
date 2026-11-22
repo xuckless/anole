@@ -6,7 +6,7 @@
 // in `pending`, the WINDOW_UPDATE batching) is Anole's own.
 
 //! The sans-IO HTTP/2 protocol core (research/h2h3-takeover/PLAN.md §3.2),
-//! for a server (`Conn(.server, H)`) or a client (`Conn(.client, H)`, M5):
+//! for a server (`Conn(.server, H)`) or a client (`Conn(.client, H)`):
 //! `recv` takes the bytes the transport read, runs RFC 9113's connection
 //! and stream state machines over them and calls the handler; the submit
 //! functions queue output in `out`, which the transport drains with
@@ -142,9 +142,9 @@ const priority_update_type = 0x10;
 const h2_defaults: config.ServerConfig.Http2 = .{};
 
 /// The connection's limits. The defaults are config.ServerConfig.Http2's
-/// and Request's (M3 maps the config into this), except `max_frame_size`,
+/// and Request's (the server maps the config into this), except `max_frame_size`,
 /// which has no config key and is advertised only above 16384, and
-/// `limits`, whose keys come with M3 (PLAN §5.4).
+/// `limits`, which has no config keys (PLAN §5.4).
 pub const Options = struct {
     /// SETTINGS_MAX_CONCURRENT_STREAMS (`max_concurrent_streams`); a
     /// request past it is refused (REFUSED_STREAM, the refused budget).
@@ -445,7 +445,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         /// Frees everything. No onStreamClose for the streams still open:
-        /// the caller (M3's engine) ends its own side of them.
+        /// the caller (the engine) ends its own side of them.
         pub fn deinit(c: *Self) void {
             std.debug.assert(c.depth == 0 and c.closing.first == null);
             var i: usize = 0;
@@ -810,8 +810,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // is framed only at `pending`, a writev's worth at a time, so its
             // size follows the peer's frame size and the writer's iovecs,
             // not a stalled reader. The other half, closing a connection
-            // whose flushes stall, is M3's sweeper (`timeouts.write`, PLAN
-            // §3.3).
+            // whose flushes stall, is the server's write timeout (PLAN §3.3).
             if (c.table.size >= c.opts.max_concurrent_streams or c.out.ownedUnsent() > c.opts.limits.out_high) {
                 try c.refuse(id);
                 return .ignore;
@@ -1270,7 +1269,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// Rapid reset (CVE-2023-44487) and provoked resets. nghttp2 answers
         /// a graceful GOAWAY INTERNAL_ERROR (:4196); PLAN §5.4 and
         /// INTENTIONAL.md, limits 2: ENHANCE_YOUR_CALM, and close.
-        /// Not for the client role (PLAN M5: a busy server's refusals and
+        /// Not for the client role (a busy server's refusals and
         /// cancels are ordinary traffic): what a client queues in answer
         /// still counts against the control budget.
         fn chargeReset(c: *Self) RecvError!void {
@@ -1618,7 +1617,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return c.data_in == null and c.block == null;
         }
 
-        /// An idle connection's memory back (PLAN §3.4, M3): the output
+        /// An idle connection's memory back (PLAN §3.4): the output
         /// blocks and ready queue, the stream slab's chunks, the stream
         /// table and the spare Pending nodes, which the next stream
         /// allocates again. Only with no stream in the table or closing
@@ -1676,7 +1675,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         /// Borrowed DATA parts or trailers are still referenced, framed or
-        /// not (M3's batch arena waits for false).
+        /// not (the engine waits for false before reusing them).
         pub fn borrowing(c: *const Self) bool {
             return c.pending_nodes != 0 or c.out.borrowing();
         }

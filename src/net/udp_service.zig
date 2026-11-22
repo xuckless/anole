@@ -1,4 +1,4 @@
-//! Raw UDP servers (p3/net, design-net.md §2.6 and §4): datagram handlers
+//! Raw UDP servers (design-net.md §2.6 and §4): datagram handlers
 //! on Anole's runtime. One SO_REUSEPORT socket per executor on Linux (the
 //! kernel's 4-tuple hash keeps a peer on one socket, so per-peer state needs
 //! no lock), one elsewhere. Each socket has a reader task, which receives
@@ -9,7 +9,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const low = @import("udp.zig");
 const sessions_mod = @import("sessions.zig");
 const handoff = @import("../handoff.zig");
@@ -244,7 +243,7 @@ const Pending = struct { to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, 
 
 /// One `send`/`sendMany` call: its datagrams' addresses and bytes in one
 /// allocation (this header, the `Pending` entries, then the bytes), made
-/// before anything shared is touched (L5). owner: the caller until it is
+/// before anything shared is touched. owner: the caller until it is
 /// pushed; then the socket's sender, which frees it once sent.
 const Batch = struct {
     node: push_list.Node = .{},
@@ -322,8 +321,6 @@ pub const UdpSocket = struct {
     last_dropped: ?u32 = null,
     table: ?SessionNode = null,
 
-    /// The executor its tasks run on (T3): `go` and the sender check it.
-    owner: safety.Owner = .none,
     // Sends from any task or thread: no lock.
     /// Batches to send; owner: the sender, which seals it when it ends.
     pending: push_list.PushList = .{},
@@ -332,7 +329,7 @@ pub const UdpSocket = struct {
     queue_bytes: std.atomic.Value(u64) = .init(0),
     want_writable: std.atomic.Value(bool) = .init(false),
     signal: placement.Signal = .{},
-    /// `go`'s tasks: children of the socket, on its executor (T1).
+    /// `go`'s tasks: children of the socket, on its executor.
     tasks: std.Io.Group = .init,
     // Sender task only.
     send_box: ?low.Udp.Outbox = null,
@@ -410,7 +407,7 @@ pub const UdpSocket = struct {
 
     /// The batch is made first (the only allocation), then its bytes are
     /// reserved, then it is pushed; the sender is woken when the list was
-    /// empty, through the group's gate (T5).
+    /// empty, through the group's gate.
     fn enqueue(s: *UdpSocket, items: []const Outgoing) Datagram.SendError!void {
         const cap = s.group.service.options.send_queue;
         var total: u64 = 0;
@@ -461,7 +458,6 @@ pub const UdpSocket = struct {
     /// executor). Canceled at the stop.
     pub fn go(s: *UdpSocket, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) error{ OutOfMemory, Closed }!void {
         if (s.closed.load(.acquire)) return error.Closed;
-        s.owner.check(s.group.io);
         placement.concurrent(&s.tasks, s.group.io, .local, func, args) catch return error.OutOfMemory;
     }
 
@@ -499,8 +495,6 @@ pub const UdpSocket = struct {
     fn reader(s: *UdpSocket) std.Io.Cancelable!void {
         const g = s.group;
         const io = g.io;
-        // The reader and the sender run on this socket's executor.
-        s.owner = .here(io);
         const o = &g.service.options;
         const table = g.service.table;
         defer {
@@ -673,7 +667,6 @@ pub const UdpSocket = struct {
 
     fn sender(s: *UdpSocket) std.Io.Cancelable!void {
         const io = s.group.io;
-        s.owner = .here(io);
         defer {
             // Sealed first, so a later send gets Closed; what got in goes
             // out before the socket does.
@@ -689,7 +682,6 @@ pub const UdpSocket = struct {
     }
 
     fn drainQueue(s: *UdpSocket) void {
-        s.owner.check(s.group.io);
         s.sendBatches(s.pending.takeAll());
     }
 
@@ -770,9 +762,9 @@ pub const UdpGroup = struct {
     sockets: []UdpSocket,
     readers: std.Io.Group = .init,
     senders: std.Io.Group = .init,
-    /// Every wake of a sender from off its executor goes through it (T5);
+    /// Every wake of a sender from off its executor goes through it;
     /// closed at the end of `run`, once the senders have ended.
-    gate: safety.IoGate = .{},
+    gate: @import("../io_gate.zig").IoGate = .{},
     handed_over: std.atomic.Value(bool) = .init(false),
     /// The Prometheus series, set before serving when the app has metrics.
     series: ?*net_metrics.UdpSeries = null,
@@ -956,7 +948,7 @@ pub const UdpGroup = struct {
         forever.wait(io) catch return error.Canceled;
     }
 
-    /// Wakes `s`'s sender from any thread (T5).
+    /// Wakes `s`'s sender from any thread.
     fn wake(g: *UdpGroup, s: *UdpSocket) void {
         if (!g.gate.enter()) return;
         defer g.gate.leave();

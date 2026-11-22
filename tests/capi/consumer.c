@@ -4640,7 +4640,7 @@ static void test_ws_subprotocols_auto(void) {
 
 #define NET_STR(lit) ((anole_str){(lit), sizeof(lit) - 1})
 
-/* ---- raw TCP and UDP listeners (p3/net) -------------------------------------------------- */
+/* ---- raw TCP and UDP listeners -------------------------------------------------- */
 
 /* Polls until `done()` says so, handing every event to `on_ev`. */
 typedef struct {

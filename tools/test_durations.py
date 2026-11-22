@@ -6,7 +6,7 @@
     tools/test_durations.py /tmp/d.tsv [--top 30] [--budget 60] [--per-test 1]
 
 Each line of the file is `<ns>\\t<result>\\t<test name>\\t<binary>`, written by
-src/safety/test_runner.zig and src/http/core/test_runner.zig (binary is the
+src/testing/runner.zig and src/http/core/test_runner.zig (binary is the
 executable's name, plus `#i/n` for a shard of `-Dtest-shards`). Prints:
 
 - the slowest tests;

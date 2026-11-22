@@ -2,12 +2,12 @@
 //! thread) copy a record into one of up to 16 byte rings under a spin lock
 //! held for the copy only; readers copy a ring's live bytes out under it and
 //! parse them after, keep cursors and learn how many records the rings
-//! lapped. Nothing allocates under a ring's lock (SAFETY.md L5), and nothing
+//! lapped. Nothing allocates under a ring's lock, and nothing
 //! here ever waits for a console.
 const std = @import("std");
 const logging = @import("anole_log");
 const ui = @import("anole_console_ui");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 pub const ring_count = 16;
 pub const header_len = 16;
@@ -51,7 +51,7 @@ pub const Filter = struct {
 const Ring = struct {
     /// Over the fields below; held for a bounded copy only.
     /// A log call made under any ranked lock panics here in debug builds once the tap is installed (D9).
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     buf: []u8 = &.{},
     /// Absolute byte offsets: the next write, and the oldest intact record.
     head: u64 = 0,

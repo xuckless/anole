@@ -44,7 +44,6 @@
 //! Tests that need no server use `anole.smtp.testing.FakeServer`.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const features = @import("build_options");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -268,7 +267,7 @@ pub const Client = struct {
             .pools = undefined,
             .guard = try .init(.smtp, name, opts.breaker, opts.retry),
             .observer = .{ .system = .smtp, .name = name },
-            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping, .ttl = .fromSeconds(30) },
+            .readiness = .{ .io = io, .context = self, .ping = ping, .ttl = .fromSeconds(30) },
             .readiness_on = opts.readiness,
         };
         errdefer self.arena.deinit();
@@ -379,7 +378,7 @@ pub const Client = struct {
     /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
     /// answer then).
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };

@@ -13,7 +13,6 @@ const Allocator = std.mem.Allocator;
 const Options = @import("../Options.zig");
 const ServerAddress = @import("../ServerAddress.zig");
 const server_error = @import("../protocol/server_error.zig");
-const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 const Pool = @This();
 
@@ -27,7 +26,7 @@ pub const Entry = struct {
 };
 
 /// Guards everything below.
-mutex: safety.Mutex(.leaf) = .init,
+mutex: std.Io.Mutex = .init,
 /// Room for `Options.max_servers` entries; the first `len` are the pool,
 /// in the order connections try them.
 entries: []Entry,
@@ -114,7 +113,7 @@ pub const Updated = struct {
 /// no longer names leave, but the current one. An empty list changes
 /// nothing: a server outside a cluster sends none. Each change is noted in
 /// `changes` (`max_changes` long), for the caller to act on with the
-/// pool's lock let go (SAFETY.md L3).
+/// pool's lock let go.
 pub fn update(pool: *Pool, io: Io, urls: []const []const u8, changes: []Change) Updated {
     std.debug.assert(changes.len >= max_changes);
     var updated: Updated = .{ .changes = changes[0..0] };

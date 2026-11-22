@@ -1,5 +1,5 @@
 //! Server-sent events with topics: publish once, every subscriber gets it,
-//! with heartbeats and `Last-Event-ID` replay (p3/realtime, design-
+//! with heartbeats and `Last-Event-ID` replay (design-
 //! realtime.md).
 //!
 //!     const live = try app.sseTopics(.{});

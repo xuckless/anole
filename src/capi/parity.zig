@@ -291,10 +291,8 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].http3", .json = "listeners[].http3" },
     .{ .zig = "listeners[].proxy_protocol", .json = "listeners[].proxy_protocol" },
     .{ .zig = "listeners[].proxy_protocol_from", .json = "listeners[].proxy_protocol_from" },
-    // ---- p3/net ----
     .{ .zig = "listeners[].tcp", .json = "listeners[].tcp", .kind = .custom, .note = "the keys of `anole.net.Tcp.Options` (net_tcp below) plus handler, the number carried in the listener's records" },
     .{ .zig = "listeners[].udp", .json = "listeners[].udp", .kind = .custom, .note = "the keys of `anole.net.Udp.Options` (net_udp below) plus handler" },
-    // ---- end p3/net ----
     .{ .zig = "listeners[].tls", .json = "listeners[].tls", .kind = .custom, .note = "cert: cert_file + key_file, cert_pem + key_pem or self_signed; client_auth: client_auth + one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system; alpn: alpn" },
     .{ .zig = "http3", .json = "http3", .kind = .same },
     .{ .zig = "http3.idle_timeout", .json = "http3.idle_timeout_ms", .kind = .ms },
@@ -339,13 +337,11 @@ pub const server_options = [_]Entry{
     .{ .zig = "_console_runtime", .omitted = "internal: the ABI's console.runtime" },
     .{ .zig = "env_files", .omitted = "the binding reads .env files into its language's environment (anole_dotenv_read)" },
     .{ .zig = "_resolved", .omitted = "internal: the C ABI resolves the modes at create" },
-    // ---- p3/lambda ----
     .{ .zig = "lambda", .json = "lambda", .kind = .same },
     .{ .zig = "lambda.deadline_margin", .json = "lambda.deadline_margin_ms", .kind = .ms },
     .{ .zig = "lambda.idle_reset", .json = "lambda.idle_reset_ms", .kind = .ms },
     .{ .zig = "lambda.shutdown_timeout", .json = "lambda.shutdown_timeout_ms", .kind = .ms },
     .{ .zig = "lambda.flush_timeout", .json = "lambda.flush_timeout_ms", .kind = .ms },
-    // ---- end p3/lambda ----
 };
 
 // ---------------------------------------------------------------------------
@@ -499,7 +495,6 @@ pub const kafka_options = [_]Entry{
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
 };
 
-// ---- p3/net ----
 /// `anole.net.Tcp.Options` against `listeners[].tcp`.
 pub const net_tcp = [_]Entry{
     .{ .zig = "framing", .json = "listeners[].tcp.framing", .kind = .custom, .note = "an object with exactly one of lines {max, strip_cr, crlf}, length {bytes, endian, includes_header, max}, varint {max}; left out: none" },
@@ -528,9 +523,7 @@ pub const net_udp = [_]Entry{
     .{ .zig = "send_buffer", .json = "listeners[].udp.send_buffer" },
     .{ .zig = "sessions", .omitted = "per-peer state is the binding's: a Map or dict keyed by address" },
 };
-// ---- end p3/net ----
 
-// ---- p3/jobs ----
 /// `anole.jobs.Options` against `jobs`.
 pub const jobs_options = [_]Entry{
     .{ .zig = "store", .json = "jobs.store", .kind = .custom, .note = "a databases[].name (SQLite, PostgreSQL or Redis), or \"memory\"" },
@@ -569,9 +562,6 @@ pub const jobs_cron = [_]Entry{
     .{ .zig = "catch_up", .json = "jobs.cron[].catch_up_ms", .kind = .ms },
     .{ .zig = "job", .omitted = "the schedule's job takes its kind's defaults" },
 };
-// ---- end p3/jobs ----
-
-// ---- p3/webhooks ----
 
 /// `anole.webhooks.Options` against `webhooks`.
 pub const webhooks_options = [_]Entry{
@@ -605,9 +595,7 @@ pub const webhook_verify_options = [_]Entry{
     .{ .zig = "hmac", .json = "middleware[].webhook_verify.hmac", .kind = .custom, .note = "header, algorithm, encoding, prefix, id_header" },
     .{ .zig = "clock", .omitted = "tests / Zig only" },
 };
-// ---- end p3/webhooks ----
 
-// ---- p3/realtime ----
 /// `anole.sse.Topics.Options` against `sse`.
 pub const sse_options = [_]Entry{
     .{ .zig = "heartbeat", .json = "sse.heartbeat_ms", .kind = .ms },
@@ -681,9 +669,7 @@ pub const watch_mongodb = [_]Entry{
     .{ .zig = "batch_size", .json = "watches[].mongodb.batch_size" },
     .{ .zig = "show_expanded_events", .json = "watches[].mongodb.show_expanded_events" },
 };
-// ---- end p3/realtime ----
 
-// ---- p3/s3 ----
 const s3_tls_note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify";
 
 /// `anole.s3.Options` against `storage[]`.
@@ -712,9 +698,7 @@ pub const s3_options = [_]Entry{
     .{ .zig = "readiness", .json = "storage[].s3.readiness" },
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
 };
-// ---- end p3/s3 ----
 
-// ---- p3/smtp ----
 /// `anole.smtp.Options` against `mail[].smtp`.
 pub const smtp_options = [_]Entry{
     .{ .zig = "url", .json = "mail[].smtp.url" },
@@ -740,7 +724,3 @@ pub const smtp_options = [_]Entry{
     .{ .zig = "environment", .omitted = "the server's environment (`environment` in the configuration)" },
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
 };
-// ---- end p3/smtp ----
-
-// ---- p3/lambda ----
-// ---- end p3/lambda ----

@@ -14,7 +14,6 @@
 const std = @import("std");
 const Io = std.Io;
 const time = @import("time.zig");
-const safety = @import("anole_safety");
 const Broadcast = @This();
 
 /// Changes on every wake; a sleeper waits for it to change.
@@ -22,8 +21,7 @@ epoch: std.atomic.Value(u32) = .init(0),
 /// Tasks in `wait`; a wake without any costs nothing.
 waiters: u32 = 0,
 
-/// Releases `mutex` (a `*safety.Mutex(rank)`, or a NATS engine lock's
-/// `*Io.Mutex`), sleeps until `wake`, the deadline or a spurious wakeup,
+/// Releases `mutex` (a `*Io.Mutex`), sleeps until `wake`, the deadline or a spurious wakeup,
 /// and takes `mutex` back, also when canceled.
 pub fn wait(b: *Broadcast, io: Io, mutex: anytype, deadline: ?Io.Clock.Timestamp) Io.Cancelable!void {
     // Read under the mutex: a wake after the caller's last look changes it.
@@ -48,7 +46,7 @@ const testing = std.testing;
 
 /// A flag behind a mutex, and tasks that wait for it.
 const Gate = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     changed: Broadcast = .{},
     open: bool = false,
     passed: u32 = 0,
@@ -98,7 +96,7 @@ test "one wake reaches every waiter" {
 
 test "a wait ends by its deadline" {
     const io = testing.io;
-    var mutex: safety.Mutex(.leaf) = .init;
+    var mutex: std.Io.Mutex = .init;
     var changed: Broadcast = .{};
     const start = Io.Clock.awake.now(io);
     const deadline = time.after(io, .fromMilliseconds(20));

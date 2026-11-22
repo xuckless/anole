@@ -152,7 +152,7 @@ pub const Connection = struct {
     /// The client's per-server state this connection belongs to.
     server: ?*anyopaque = null,
     /// The pool (one server's, on one executor) a call connection goes
-    /// back to (`safety.toCtx`); null for a monitor's.
+    /// back to; null for a monitor's.
     pool: ?*anyopaque = null,
     builder: bson.Builder,
     read_buf: std.ArrayList(u8) = .empty,

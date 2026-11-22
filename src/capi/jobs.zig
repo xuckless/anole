@@ -1,5 +1,5 @@
 //! `anole_jobs_*` and `anole_job_*`: durable jobs enqueued and worked by a
-//! consumer (p3/jobs, design-jobs.md §10). Handle kinds 12 (`anole_job_worker`)
+//! consumer (design-jobs.md §10). Handle kinds 12 (`anole_job_worker`)
 //! and 13 (`anole_job`); events 104-108.
 //!
 //! A language worker is a handler of the Zig queue (`anole.jobs.Client`) that

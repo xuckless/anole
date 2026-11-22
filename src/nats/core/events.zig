@@ -26,7 +26,6 @@ const Allocator = std.mem.Allocator;
 const ServerAddress = @import("ServerAddress.zig");
 const CloseReason = @import("Client.zig").CloseReason;
 const time = @import("engine/time.zig");
-const safety = @import("anole_safety");
 
 pub const Event = union(enum) {
     /// The first connection is up.
@@ -151,9 +150,9 @@ pub const Queue = struct {
     gpa: Allocator,
     /// Events kept at most, `closed` aside.
     limit: u32,
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// One task waits on it at most.
-    ready: safety.Condition = .init,
+    ready: std.Io.Condition = .init,
     events: std.Deque(Event) = .empty,
     /// A task waits in `next`.
     receiving: bool = false,
