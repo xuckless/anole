@@ -890,6 +890,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "banner-test", .mod = core.banner },
         .{ .name = "wait-test", .mod = core.test_wait },
         .{ .name = "safety-test", .mod = core.safety },
+        .{ .name = "mem-test", .mod = core.mem },
     }) |t| {
         const sub_tests = addSafeTest(b, .{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
@@ -2203,6 +2204,9 @@ const Core = struct {
     /// src/testing/never_reuse.zig: `anole_never_reuse` in `safety`, the test
     /// hooks and the HTTP core's tests.
     never_reuse: *std.Build.Module,
+    /// src/mem.zig: `anole_mem` (allocUninit, SpinLock) in every HTTP core
+    /// instance and in anole.
+    mem: *std.Build.Module,
     /// src/testing/wait.zig (TESTING.md D1/D2/D6), `anole_test_wait` in every
     /// HTTP core instance and in anole; only test code uses it.
     test_wait: *std.Build.Module,
@@ -2256,6 +2260,7 @@ const Core = struct {
         // compilation).
         const never_reuse = neverReuseModule(b, target, optimize);
         const safety = safetyModule(b, zio_mod, never_reuse, target, optimize);
+        const mem = b.createModule(.{ .root_source_file = b.path("src/mem.zig"), .target = target, .optimize = optimize });
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -2271,7 +2276,7 @@ const Core = struct {
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
         const test_wait = testWaitModule(b, target, optimize);
-        var core: Core = .{ .safety = safety, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
+        var core: Core = .{ .safety = safety, .mem = mem, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2296,6 +2301,7 @@ const Core = struct {
                             );
                             dusty_mod.addImport("resilience_core", resilience);
                             dusty_mod.addImport("anole_safety", safety);
+                            dusty_mod.addImport("anole_mem", mem);
                             dusty_mod.addImport("validate", validate);
                             dusty_mod.addImport("anole_log", anole_log);
                             dusty_mod.addImport("anole_test_wait", test_wait);
@@ -2696,6 +2702,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
     mod.addImport("anole_safety", o.core.safety);
+    mod.addImport("anole_mem", o.core.mem);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
     mod.addImport("validate", o.core.validate);
