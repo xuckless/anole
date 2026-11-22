@@ -339,6 +339,16 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 - **The `anole` CLI** (`tools/anole`): after tagging, `zig build cli-dist`
   builds the five binaries and SHA256SUMS in `zig-out/dist`; attach them with
   `gh release upload vX.Y.Z zig-out/dist/*`.
+- **libanole** (the C ABI, for the bindings): `zig build capi-dist` builds
+  `libanole-{x86_64,aarch64}-{linux,macos}.a` (stripped, ReleaseSafe, the
+  Linux ones against glibc 2.17; each passes the anole_*-only symbol check),
+  `anole.h`, `anole.abi.json`, `anole.schema.json` and `SHA256SUMS-libanole` in
+  `zig-out/capi-dist`; attach them with
+  `gh release upload vX.Y.Z zig-out/capi-dist/*`, with the default profile.
+  The checksums file is not named `SHA256SUMS` because the CLI's is on the same
+  release. anole-node and anole-py fetch these assets by tag. A stripped build
+  has no source locations in a Zig panic message; `zig build capi
+  -Dstrip=true` makes the same build for the host.
 - **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
   read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
   cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a
