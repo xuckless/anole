@@ -2115,8 +2115,12 @@ const WsDecider = struct {
     close_code: std.atomic.Value(u32) = .init(0),
     held: std.atomic.Value(u64) = .init(0),
     aborts: std.atomic.Value(u32) = .init(0),
+    /// The consumer's start gate: set from the start, or by the test for a
+    /// consumer that must not poll yet.
+    go: std.Io.Event = .is_set,
 
     fn run(self: *WsDecider) void {
+        self.go.waitUncancelable(engine.threadedIo());
         var buf: [64 * 1024]u8 align(8) = undefined;
         var need: u32 = 0;
         while (!self.stop.load(.acquire)) {
@@ -2274,9 +2278,12 @@ const RawGet = struct {
 /// engine with the consumer-decided routes (/decide, /app, /plain) and its
 /// consumer thread, then drains the engine. `upgrades`: the handshakes the
 /// claim makes, each of which the consumer must have been asked about.
-fn wsDecideRun(comptime claim: anytype, upgrades: u32) !void {
+/// `paused`: the consumer does not poll until the claim sets `go`. One
+/// executor, so one ring: a request on a second connection is handled after
+/// the earlier records of the first.
+fn wsDecideRun(comptime claim: anytype, upgrades: u32, paused: bool) !void {
     const json =
-        \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
+        \\{"executors": 1, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
         \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
         \\ "routes": [
         \\   {"path": "/decide", "timeout_ms": 300, "websocket": {"handler": 10, "accept": "consumer", "origins": ["*"]}},
@@ -2295,8 +2302,11 @@ fn wsDecideRun(comptime claim: anytype, upgrades: u32) !void {
     const c = try e.attach(null, null, true);
     try e.start();
     var a: WsDecider = .{ .e = e, .c = c };
+    if (paused) a.go = .unset;
     const t = try std.Thread.spawn(.{}, WsDecider.run, .{&a});
     defer {
+        // A failed claim must not leave the consumer gated.
+        a.go.set(engine.threadedIo());
         a.stop.store(true, .release);
         t.join();
     }
@@ -2348,32 +2358,69 @@ const WsDecideClaims = struct {
         try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 400"));
     }
 
+    /// A plain GET of /app (route 11), answered by the consumer: a barrier
+    /// on the one executor's ring.
+    fn plainApp(a: *WsDecider, port: u16, io: std.Io) !void {
+        var plain: RawGet = undefined;
+        try plain.open(io, port, "/app");
+        defer plain.close(io);
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try readRest(&plain.reader, &w);
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "HTTP/1.1 200"));
+        try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "plain"));
+        try std.testing.expect(a.plains.load(.acquire) >= 1);
+    }
+
+    /// Whether the consumer polled the handshake before its deadline
+    /// depends on the machine; a handshake still queued at its deadline is
+    /// expired and never delivered. The barrier tells the two apart: once
+    /// a later request is answered, the consumer has handled the
+    /// handshake's record if it ever will.
     fn deadline(a: *WsDecider, port: u16, io: std.Io) !void {
-        var c: RawWs = undefined;
-        try c.open(io, port, "/decide?silent", "");
-        defer c.close(io);
-        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 504"));
-        // The consumer may take the handshake after its deadline answered
-        // (a busy machine): wait for it.
-        const h = try waitHeld(io, &a.held);
-        // The decision came late: the handle is stale.
+        const expired0 = a.e.stats().expired;
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?silent", "");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 504"));
+        }
+        try std.testing.expect(a.e.stats().expired >= expired0 + 1);
+        try plainApp(a, port, io);
+        const h = a.held.load(.acquire);
+        if (h == 0) {
+            try std.testing.expectEqual(@as(u32, 0), a.aborts.load(.acquire));
+            return;
+        }
+        // The decision came late: the handle is stale, and the consumer hears why.
         try std.testing.expectError(error.Gone, engine.wsAccept(a.e, h, "", &.{}));
+        try wait.waitAtLeast(io, "the consumer heard the ABORT", &a.aborts, 1);
+    }
+
+    /// The consumer starts polling after the 504: the handshake surely
+    /// expired while queued, so it is never delivered and nothing is aborted.
+    fn deadlineQueued(a: *WsDecider, port: u16, io: std.Io) !void {
+        const expired0 = a.e.stats().expired;
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?silent", "");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 504"));
+        }
+        try std.testing.expect(a.e.stats().expired >= expired0 + 1);
+        a.go.set(engine.threadedIo());
+        try plainApp(a, port, io);
+        try std.testing.expectEqual(@as(u64, 0), a.held.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), a.upgrades.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), a.aborts.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), a.plains.load(.acquire));
     }
 
     fn oneRoute(a: *WsDecider, port: u16, io: std.Io) !void {
         var buf: [256]u8 = undefined;
         // A GET without Upgrade headers: the plain handler (route 11).
-        {
-            var plain: RawGet = undefined;
-            try plain.open(io, port, "/app");
-            defer plain.close(io);
-            var out: [512]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&out);
-            try readRest(&plain.reader, &w);
-            try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "HTTP/1.1 200"));
-            try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "plain"));
-            try std.testing.expectEqual(@as(u32, 1), a.plains.load(.acquire));
-        }
+        try plainApp(a, port, io);
+        try std.testing.expectEqual(@as(u32, 1), a.plains.load(.acquire));
         // A handshake: the websocket handler (route 12).
         var c: RawWs = undefined;
         try c.open(io, port, "/app", "");
@@ -2456,42 +2503,47 @@ const WsDecideClaims = struct {
 
 test "capi engine: anole_ws_accept sends the chosen subprotocol and headers on the 101, a message sent right after the accept arrives first, no WS_OPEN, and the request handle is GONE" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.accept, 1);
+    try wsDecideRun(WsDecideClaims.accept, 1, false);
 }
 
 test "capi engine: a consumer's answer to a WebSocket handshake refuses it with its status" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.refuse, 1);
+    try wsDecideRun(WsDecideClaims.refuse, 1, false);
 }
 
 test "capi engine: anole_ws_accept with an unoffered subprotocol or a reserved header is INVALID, and the handshake is still owed its answer" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.badArguments, 1);
+    try wsDecideRun(WsDecideClaims.badArguments, 1, false);
 }
 
 test "capi engine: a WebSocket handshake past its deadline gets 504, and a late anole_ws_accept is GONE" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.deadline, 1);
+    try wsDecideRun(WsDecideClaims.deadline, 0, false);
+}
+
+test "capi engine: a WebSocket handshake that expired while queued is never delivered" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.deadlineQueued, 0, true);
 }
 
 test "capi engine: one route takes plain requests (its handler) and WebSocket handshakes (its websocket handler)" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.oneRoute, 1);
+    try wsDecideRun(WsDecideClaims.oneRoute, 1, false);
 }
 
 test "capi engine: an upgrade the admission gate refuses never reaches the consumer; an accepted socket holds one unit until it closes, a declined one none" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.admission, 2);
+    try wsDecideRun(WsDecideClaims.admission, 2, false);
 }
 
 test "capi engine: a native WebSocket route's refused upgrade is counted once" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.admissionNative, 0);
+    try wsDecideRun(WsDecideClaims.admissionNative, 0, false);
 }
 
 test "capi engine: anole_ws_accept on a plain request is STATE, and the request is still owed its answer" {
     if (comptime !features.websocket) return error.SkipZigTest;
-    try wsDecideRun(WsDecideClaims.acceptPlain, 0);
+    try wsDecideRun(WsDecideClaims.acceptPlain, 0, false);
 }
 
 test "capi engine: two publishes to one topic from one thread never swap, on 4 executors, 2000 rounds" {

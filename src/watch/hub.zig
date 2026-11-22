@@ -531,6 +531,8 @@ fn Fake(comptime ka: ?Keepalive) type {
             index: u32,
             magic: u32 = alive,
             ended: std.Io.Event = .unset,
+            /// A write (send, ping, or close's goodbye) is in progress.
+            writing: std.atomic.Value(bool) = .init(false),
         };
 
         /// A send, ping or stop found a freed connection.
@@ -539,9 +541,25 @@ fn Fake(comptime ka: ?Keepalive) type {
         var freed: std.Io.Event = .unset;
         /// Runs on the reader at each `dial`.
         var on_dial: ?*const fn () void = null;
+        /// Two writes to one connection overlapped (#221): `stop` writes
+        /// nothing, so only the hub's own locking can cause it.
+        var overlap: std.atomic.Value(bool) = .init(false);
+        /// Armed: the next send holds its write open until `gate_release`,
+        /// after setting `gate_inside`.
+        var gate_armed: bool = false;
+        var gate_inside: std.Io.Event = .unset;
+        var gate_release: std.Io.Event = .unset;
+
+        fn beginWrite(c: *Conn) void {
+            if (c.writing.swap(true, .acq_rel)) overlap.store(true, .release);
+        }
 
         fn reset() void {
             used_freed.store(false, .release);
+            overlap.store(false, .release);
+            gate_armed = false;
+            gate_inside = .unset;
+            gate_release = .unset;
             freed = .unset;
             on_dial = null;
         }
@@ -564,11 +582,20 @@ fn Fake(comptime ka: ?Keepalive) type {
 
         pub fn send(c: *Conn, gpa: std.mem.Allocator, _: std.Io, on: bool, kind: Kind, name: []const u8) !void {
             if (!usable(c)) return error.Closed;
+            beginWrite(c);
+            defer c.writing.store(false, .release);
+            if (gate_armed) {
+                gate_armed = false;
+                gate_inside.set(c.client.io);
+                gate_release.waitUncancelable(c.client.io);
+            }
             try c.client.sent.print(gpa, "{c}{s}{s} ", .{ @as(u8, if (on) '+' else '-'), if (kind == .pattern) "p:" else "", name });
         }
 
         pub fn ping(c: *Conn) !void {
             if (!usable(c)) return error.Closed;
+            beginWrite(c);
+            defer c.writing.store(false, .release);
         }
 
         pub fn next(c: *Conn, _: std.mem.Allocator) !?Message(Kind) {
@@ -584,6 +611,8 @@ fn Fake(comptime ka: ?Keepalive) type {
 
         pub fn close(c: *Conn, gpa: std.mem.Allocator) void {
             const io = c.client.io;
+            // A real close may say goodbye: a write of its own.
+            beginWrite(c);
             c.magic = 0;
             gpa.destroy(c);
             freed.set(io);
@@ -821,4 +850,43 @@ test "watch hub: a LISTEN racing the reader's reconnect never uses the connectio
 test "watch hub: a keep-alive ping racing the reader's reconnect never uses the connection it frees (#198)" {
     if (comptime !features.postgres) return error.SkipZigTest;
     try raceRetire(.{ .interval = .fromNanoseconds(0), .wait = .fromSeconds(3600) }, false);
+}
+
+test "watch hub: a stop racing a send in flight never overlaps a write (#221)" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    const zio = @import("zio");
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const F = Fake(null);
+    const H = Hub(F);
+    F.reset();
+    defer F.reset();
+    var client: F.Client = .{ .gpa = gpa, .io = io };
+    defer client.sent.deinit(gpa);
+    const h = try H.create(&client);
+    defer h.destroy();
+    h.backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1) };
+    const tw = try TestWatch.init(gpa, io);
+    defer tw.deinit();
+    try h.add(tw.w, &.{"a"}, .channel);
+    defer h.remove(tw.w, &.{ "a", "b" }, .channel);
+    try h.ensureRunning();
+    client.reading[0].waitUncancelable(io);
+
+    // The LISTEN of "b" holds the write lock mid-write; the connection is
+    // lost (the reader retires it: stop, then the lock, then close).
+    F.gate_armed = true;
+    var sender = try io.concurrent(H.add, .{ h, tw.w, &.{"b"}, .channel });
+    F.gate_inside.waitUncancelable(io);
+    F.stop(client.conn.?);
+    F.gate_release.set(io);
+    try sender.await(io);
+    F.freed.waitUncancelable(io);
+    try std.testing.expect(!F.overlap.load(.acquire));
+    try std.testing.expect(!F.used_freed.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, client.sent.items, "+b") != null);
 }

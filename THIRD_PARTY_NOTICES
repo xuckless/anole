@@ -160,7 +160,8 @@ pg.zig (PostgreSQL client)
             results in PostgreSQL's text format; the bytes the socket
             accepted, so a failed call is run again only when none left;
             a description cache, so a call that skips the statement cache
-            takes one round trip after its first run)
+            takes one round trip after its first run; Listener.interrupt:
+            shutdown without Terminate, #221)
   Pinned:   commit 06ccba16b9f5fea10e735f2ad78dd93e641694cd of the fork
   Linked:   -Dpostgres=true
 
