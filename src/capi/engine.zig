@@ -463,6 +463,29 @@ pub fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     return rec;
 }
 
+/// Fills a record's variable part: each `put` copies `bytes` at the cursor
+/// and returns where they went (an empty `put` is the empty span).
+pub const Writer = struct {
+    rec: []u8,
+    at: usize,
+
+    pub fn put(w: *Writer, bytes: []const u8) abi.Span {
+        if (bytes.len == 0) return .{};
+        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
+        defer w.at += bytes.len;
+        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
+    }
+};
+
+/// What an area call refuses with; lib.zig answers it through `failure`.
+pub const failure = @import("failure.zig");
+pub const CallError = failure.CallError;
+
+/// A copy of `s` in `a`; empty gives the empty slice (`free` ignores it).
+pub fn dupeStr(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error![]const u8 {
+    return a.dupe(u8, s.slice());
+}
+
 /// An `ANOLE_EV_SENT` record for a body about to be borrowed, built by the
 /// call that borrows it (so `ANOLE_E_NOMEM` means nothing was taken); the
 /// handle is filled in when it is posted (`Exec.postSentRec`).

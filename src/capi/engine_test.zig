@@ -3065,4 +3065,35 @@ test {
     _ = @import("s3_test.zig");
     _ = @import("smtp_test.zig");
     _ = @import("lambda_test.zig");
+    _ = @import("failure.zig");
+}
+
+test "capi engine: Writer.put places bytes, an empty put is the empty span" {
+    var buf: [8]u8 = undefined;
+    var w: engine.Writer = .{ .rec = &buf, .at = 2 };
+    const rows = [_]struct { bytes: []const u8, off: u32, len: u32, at: usize }{
+        .{ .bytes = "", .off = 0, .len = 0, .at = 2 },
+        .{ .bytes = "abc", .off = 2, .len = 3, .at = 5 },
+        .{ .bytes = "", .off = 0, .len = 0, .at = 5 },
+        .{ .bytes = "xyz", .off = 5, .len = 3, .at = 8 },
+    };
+    for (rows) |r| {
+        const sp = w.put(r.bytes);
+        try std.testing.expectEqual(r.off, sp.off);
+        try std.testing.expectEqual(r.len, sp.len);
+        try std.testing.expectEqual(r.at, w.at);
+    }
+    try std.testing.expectEqualStrings("abcxyz", buf[2..8]);
+}
+
+test "capi engine: dupeStr copies, and an empty string allocates nothing" {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const empty = try engine.dupeStr(fa.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    fa.allocator().free(empty);
+    const src = "hello".*;
+    const copy = try engine.dupeStr(std.testing.allocator, abi.Str.of(&src));
+    defer std.testing.allocator.free(copy);
+    try std.testing.expectEqualStrings("hello", copy);
+    try std.testing.expect(copy.ptr != &src);
 }

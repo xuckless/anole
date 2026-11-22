@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const anole = @import("anole");
 const capi_options = @import("capi_options");
 const engine = anole.capi;
+const failure_mod = engine.failure;
 const abi = engine.abi;
 const Engine = engine.Engine;
 const Consumer = engine.Consumer;
@@ -117,6 +118,19 @@ fn genericName(code: i32) []const u8 {
         abi.E_SERVICE => "Service",
         else => "Unexpected",
     };
+}
+
+/// A failed area call's answer: its `Reply` (failure.zig) applied.
+fn failure(err: engine.CallError, comptime M: failure_mod.Messages) i32 {
+    return report(failure_mod.resolve(err, M, null));
+}
+
+fn report(r: failure_mod.Reply) i32 {
+    if (r.count_gone) if (live()) |e| {
+        _ = e.gone_count.fetchAdd(1, .monotonic);
+    };
+    const text = r.text orelse return failCode(r.code);
+    return named(r.code, r.name, 0, "{s}", .{text});
 }
 
 /// An error answer with the code's own text and name, so `anole_last_error`
@@ -1048,20 +1062,6 @@ fn natsOf(n: ?*const anyopaque) ?*nats_mod.Broker {
     return if (engine.global == b.engine) b else null;
 }
 
-fn natsFailure(err: nats_mod.CallError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a subject, header, size, flag, or a consumer of another server or other than the request's)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
-        error.Again => failCode(abi.E_AGAIN),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => failCode(abi.E_UNSUPPORTED),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the request, message or subscription it served is over", .{});
-        },
-    };
-}
-
 export fn anole_nats_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
     clearError();
     const e = engineOf(s) orelse return badPointer(s);
@@ -1083,7 +1083,7 @@ export fn anole_nats_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.Nat
     const b = natsOf(n) orelse return badPointer(n);
     const c = consumerOf(c_) orelse return badPointer(c_);
     const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
-    const busy = nats_mod.publish(b, c, out, flags) catch |err| return natsFailure(err);
+    const busy = nats_mod.publish(b, c, out, flags) catch |err| return failure(err, failure_mod.nats);
     return if (busy) abi.BUSY else abi.OK;
 }
 
@@ -1093,7 +1093,7 @@ export fn anole_nats_request(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.Nat
     const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
     const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
     const o: abi.NatsRequestOptions = if (opts) |p| readSized(abi.NatsRequestOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsRequestOptions) };
-    nats_mod.request(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    nats_mod.request(b, c, out, o, user_data) catch |err| return failure(err, failure_mod.nats);
     return abi.OK;
 }
 
@@ -1104,7 +1104,7 @@ export fn anole_nats_subscribe(n: ?*anyopaque, c_: ?*anyopaque, subject: Str, op
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.NatsSubscribeOptions = if (opts) |p| readSized(abi.NatsSubscribeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsSubscribeOptions) };
     if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_nats_subscribe");
-    dst.* = nats_mod.subscribe(b, c, subject.slice(), o, user_data) catch |err| return natsFailure(err);
+    dst.* = nats_mod.subscribe(b, c, subject.slice(), o, user_data) catch |err| return failure(err, failure_mod.nats);
     return abi.OK;
 }
 
@@ -1128,7 +1128,7 @@ export fn anole_nats_js_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.
     const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
     const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
     const o: abi.NatsJsPublishOptions = if (opts) |p| readSized(abi.NatsJsPublishOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsPublishOptions) };
-    nats_mod.jsPublish(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    nats_mod.jsPublish(b, c, out, o, user_data) catch |err| return failure(err, failure_mod.nats);
     return abi.OK;
 }
 
@@ -1139,7 +1139,7 @@ export fn anole_nats_js_consume(n: ?*anyopaque, c_: ?*anyopaque, stream: Str, co
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.NatsJsConsumeOptions = if (opts) |p| readSized(abi.NatsJsConsumeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsConsumeOptions) };
     if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_nats_js_consume");
-    dst.* = nats_mod.consume(b, c, stream.slice(), consumer.slice(), o, user_data) catch |err| return natsFailure(err);
+    dst.* = nats_mod.consume(b, c, stream.slice(), consumer.slice(), o, user_data) catch |err| return failure(err, failure_mod.nats);
     return abi.OK;
 }
 
@@ -1147,7 +1147,7 @@ export fn anole_nats_ack(m: u64, kind: u32, delay_ms: u32) i32 {
     clearError();
     if (badKind(m, .broker_msg)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
-    nats_mod.ack(e, m, kind, delay_ms) catch |err| return natsFailure(err);
+    nats_mod.ack(e, m, kind, delay_ms) catch |err| return failure(err, failure_mod.nats);
     return abi.OK;
 }
 
@@ -1158,20 +1158,6 @@ const kafka_mod = engine.kafka;
 fn kafkaOf(k: ?*const anyopaque) ?*kafka_mod.Broker {
     const b: *kafka_mod.Broker = @ptrCast(@alignCast(@constCast(k orelse return null)));
     return if (engine.global == b.engine) b else null;
-}
-
-fn kafkaFailure(err: kafka_mod.CallError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a topic, partition, flag, size, group or topic list, or a consumer of another server)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
-        error.Again => failCode(abi.E_AGAIN),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => failCode(abi.E_UNSUPPORTED),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the batch it served is over", .{});
-        },
-    };
 }
 
 export fn anole_kafka_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
@@ -1195,7 +1181,7 @@ export fn anole_kafka_produce(k: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.Ka
     const b = kafkaOf(k) orelse return badPointer(k);
     const c = consumerOf(c_) orelse return badPointer(c_);
     const out: abi.KafkaOut = readSized(abi.KafkaOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
-    const busy = kafka_mod.produce(b, c, out, user_data) catch |err| return kafkaFailure(err);
+    const busy = kafka_mod.produce(b, c, out, user_data) catch |err| return failure(err, failure_mod.kafka);
     return if (busy) abi.BUSY else abi.OK;
 }
 
@@ -1206,7 +1192,7 @@ export fn anole_kafka_subscribe(k: ?*anyopaque, c_: ?*anyopaque, opts: ?*const a
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.KafkaSubscribeOptions = readSized(abi.KafkaSubscribeOptions, opts orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
     if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_kafka_subscribe");
-    dst.* = kafka_mod.subscribe(b, c, o, user_data) catch |err| return kafkaFailure(err);
+    dst.* = kafka_mod.subscribe(b, c, o, user_data) catch |err| return failure(err, failure_mod.kafka);
     return abi.OK;
 }
 
@@ -1221,7 +1207,7 @@ export fn anole_kafka_batch_retry(b: u64, delay_ms: u32) i32 {
     clearError();
     if (badKind(b, .kafka_batch)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
-    kafka_mod.batchRetry(e, b, delay_ms) catch |err| return kafkaFailure(err);
+    kafka_mod.batchRetry(e, b, delay_ms) catch |err| return failure(err, failure_mod.kafka);
     return abi.OK;
 }
 
@@ -1236,7 +1222,7 @@ export fn anole_kafka_flush(k: ?*anyopaque, c_: ?*anyopaque, user_data: u64) i32
     clearError();
     const b = kafkaOf(k) orelse return badPointer(k);
     const c = consumerOf(c_) orelse return badPointer(c_);
-    kafka_mod.flush(b, c, user_data) catch |err| return kafkaFailure(err);
+    kafka_mod.flush(b, c, user_data) catch |err| return failure(err, failure_mod.kafka);
     return abi.OK;
 }
 
@@ -1270,24 +1256,11 @@ fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, param
     const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbOptions) };
     if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY | abi.DB_F_RETRY) != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
-    db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
+    db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return failure(err, failure_mod.db);
     return abi.OK;
 }
 
 /// A query or transaction call's refusal as its answer.
-fn dbFailure(err: db_mod.QueryError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a value type, an option this call does not take, a consumer of another server or other than the request's, or a request handle of another kind)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "this database or build has no transactions (SQLite and PostgreSQL only)", .{}),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the request or transaction it served is over", .{});
-        },
-    };
-}
-
 export fn anole_db_query(d: ?*anyopaque, c: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
     return dbSubmit(.query, d, c, sql, params, nparams, opts, user_data);
 }
@@ -1313,7 +1286,7 @@ export fn anole_db_begin(d_: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.DbT
     if (o.flags & ~abi.DB_TX_READ_ONLY != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_tx_options.reserved must be 0", .{});
     if (o.isolation > abi.DB_ISOLATION_SERIALIZABLE) return named(abi.E_INVALID, "Invalid", 0, "anole_db_tx_options.isolation is not an ANOLE_DB_ISOLATION_* value", .{});
-    db_mod.begin(d, c, o, user_data) catch |err| return dbFailure(err);
+    db_mod.begin(d, c, o, user_data) catch |err| return failure(err, failure_mod.db);
     return abi.OK;
 }
 
@@ -1326,7 +1299,7 @@ fn dbTxCall(what: db_mod.TxWhat, tx: u64, sql: Str, params: ?[*]const abi.DbValu
     if (o.flags & ~abi.DB_F_NO_PREPARE != 0) return named(abi.E_INVALID, "UnknownFlag", 0, "inside a transaction only ANOLE_DB_F_NO_PREPARE applies", .{});
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
     const e = live() orelse return failCode(abi.E_GONE);
-    db_mod.txSubmit(e, tx, what, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
+    db_mod.txSubmit(e, tx, what, sql.slice(), ps, o, user_data) catch |err| return failure(err, failure_mod.db);
     return abi.OK;
 }
 
@@ -1342,7 +1315,7 @@ fn dbTxFinish(what: db_mod.TxWhat, tx: u64, user_data: u64) i32 {
     clearError();
     if (badKind(tx, .db_tx)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
-    db_mod.txFinish(e, tx, what, user_data) catch |err| return dbFailure(err);
+    db_mod.txFinish(e, tx, what, user_data) catch |err| return failure(err, failure_mod.db);
     return abi.OK;
 }
 
@@ -1463,19 +1436,6 @@ export fn anole_net_udp_find(s: ?*anyopaque, listener: Str, out: ?*u64) i32 {
 
 const jobs_mod = engine.jobs;
 
-fn jobsFailure(err: jobs_mod.CallError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a job's kind, JSON, size or flag, a queue or kind the configuration or another worker does not allow, a transaction on another database than the jobs store)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open (workers: before the start only), or no executor feeds this consumer", .{}),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"jobs\", or jobs are not built in (-Djobs)", .{}),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the job, request or transaction it served is over", .{});
-        },
-    };
-}
-
 /// The configuration's job queue (`anole_jobs *`): the engine's own state,
 /// valid until `anole_server_destroy`. `ANOLE_E_UNSUPPORTED` when the
 /// configuration has no "jobs".
@@ -1501,7 +1461,7 @@ export fn anole_jobs_enqueue(j: ?*anyopaque, c_: ?*anyopaque, jobs: ?[*]const ab
     const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
     if (c == null and o.tx == 0 and o.req == 0) return failCode(abi.E_INVALID);
     const list = (jobs orelse return failCode(abi.E_INVALID))[0..njobs];
-    jobs_mod.enqueue(e, c, list, o, user_data) catch |err| return jobsFailure(err);
+    jobs_mod.enqueue(e, c, list, o, user_data) catch |err| return failure(err, failure_mod.jobs);
     return abi.OK;
 }
 
@@ -1511,7 +1471,7 @@ export fn anole_jobs_work(j: ?*anyopaque, c_: ?*anyopaque, o: ?*const abi.JobsWo
     const c = consumerOf(c_) orelse return badPointer(c_);
     const dst = out orelse return failCode(abi.E_INVALID);
     const opt: abi.JobsWorkOptions = if (o) |p| (readSized(abi.JobsWorkOptions, p) catch |err| return sizedFailure(err)) else .{ .size = @sizeOf(abi.JobsWorkOptions) };
-    dst.* = jobs_mod.work(e, c, opt, user_data) catch |err| return jobsFailure(err);
+    dst.* = jobs_mod.work(e, c, opt, user_data) catch |err| return failure(err, failure_mod.jobs);
     return abi.OK;
 }
 
@@ -1526,7 +1486,7 @@ export fn anole_job_finish(job: u64, outcome: u32, delay_ms: u32, err_text: Str)
     clearError();
     if (badKind(job, .job)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
-    jobs_mod.finish(e, job, outcome, delay_ms, err_text.slice()) catch |err| return jobsFailure(err);
+    jobs_mod.finish(e, job, outcome, delay_ms, err_text.slice()) catch |err| return failure(err, failure_mod.jobs);
     return abi.OK;
 }
 
@@ -1534,7 +1494,7 @@ export fn anole_job_complete_in(job: u64, tx: u64, user_data: u64) i32 {
     clearError();
     if (badKind(job, .job) or badKind(tx, .db_tx)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
-    jobs_mod.completeIn(e, job, tx, user_data) catch |err| return jobsFailure(err);
+    jobs_mod.completeIn(e, job, tx, user_data) catch |err| return failure(err, failure_mod.jobs);
     return abi.OK;
 }
 
@@ -1542,24 +1502,11 @@ export fn anole_jobs_admin(j: ?*anyopaque, c_: ?*anyopaque, request: Str, user_d
     clearError();
     const e = jobsOf(j) orelse return badPointer(j);
     const c = consumerOf(c_) orelse return badPointer(c_);
-    jobs_mod.admin(e, c, request.slice(), user_data) catch |err| return jobsFailure(err);
+    jobs_mod.admin(e, c, request.slice(), user_data) catch |err| return failure(err, failure_mod.jobs);
     return abi.OK;
 }
 
 const webhooks_mod = engine.webhooks;
-
-fn webhooksFailure(err: webhooks_mod.CallError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a type, a size field, data_json that is not JSON, or a consumer of another server)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is draining or stopped, the transaction is not open, or no executor feeds this consumer", .{}),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"webhooks\" (it needs \"jobs\"), or -Dwebhooks is off", .{}),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the transaction it named is over", .{});
-        },
-    };
-}
 
 /// The `anole_jobs *` of `anole_jobs_get` is the address of the engine's
 /// jobs state.
@@ -1574,7 +1521,7 @@ export fn anole_webhooks_publish(j: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi
     const e = jobsEngineOf(j) orelse return badPointer(j);
     const c = consumerOf(c_) orelse return badPointer(c_);
     const out: abi.WebhookOut = readSized(abi.WebhookOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
-    webhooks_mod.publish(e, c, out, user_data) catch |err| return webhooksFailure(err);
+    webhooks_mod.publish(e, c, out, user_data) catch |err| return failure(err, failure_mod.webhooks);
     return abi.OK;
 }
 
@@ -1582,7 +1529,7 @@ export fn anole_webhooks_watch(j: ?*anyopaque, c_: ?*anyopaque, user_data: u64) 
     clearError();
     const e = jobsEngineOf(j) orelse return badPointer(j);
     const c = consumerOf(c_) orelse return badPointer(c_);
-    webhooks_mod.watch(e, c, user_data) catch |err| return webhooksFailure(err);
+    webhooks_mod.watch(e, c, user_data) catch |err| return failure(err, failure_mod.webhooks);
     return abi.OK;
 }
 
@@ -1739,16 +1686,6 @@ export fn anole_s3_index(p: ?*const anyopaque) u32 {
 }
 
 /// A call's refusal as its answer.
-fn s3Failure(err: s3_mod.QueryError) i32 {
-    return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a key of 0 or over 1024 bytes, an option this call does not take, a consumer of another server or other than the request's, or a request handle of another kind)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Gone => failCode(abi.E_GONE),
-        error.Unsupported => failCode(abi.E_UNSUPPORTED),
-    };
-}
-
 fn s3Consumer(c_: ?*anyopaque) error{Bad}!?*Consumer {
     return if (c_ == null) null else (consumerOf(c_) orelse return error.Bad);
 }
@@ -1763,7 +1700,7 @@ fn s3GetCall(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3GetO
     const o: abi.S3GetOptions = if (opts) |q| readSized(abi.S3GetOptions, q) catch |err| return sizedFailure(err) else .{};
     const allowed: u32 = if (head) abi.S3_F_NO_RETRY else s3_get_flags & ~(abi.S3_F_PASS_NOT_FOUND | abi.S3_F_REPORT);
     if (o.flags & ~allowed != 0) return unknownFlag();
-    s3_mod.get(st, c, key, o, user_data, head) catch |err| return s3Failure(err);
+    s3_mod.get(st, c, key, o, user_data, head) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1789,7 +1726,7 @@ export fn anole_s3_serve(p: ?*anyopaque, r: u64, key: Str, opts: ?*const abi.S3G
     const st = s3Of(p) orelse return badPointer(p);
     const o: abi.S3GetOptions = if (opts) |q| readSized(abi.S3GetOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~(abi.S3_F_RANGE | abi.S3_F_NO_RETRY | abi.S3_F_PASS_NOT_FOUND | abi.S3_F_REPORT) != 0) return unknownFlag();
-    s3_mod.serve(st, r, key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.serve(st, r, key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1800,7 +1737,7 @@ export fn anole_s3_put(p: ?*anyopaque, c_: ?*anyopaque, key: Str, data: ?*const 
     const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY) != 0) return unknownFlag();
-    s3_mod.put(st, c, key, b, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.put(st, c, key, b, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1810,7 +1747,7 @@ export fn anole_s3_put_body(p: ?*anyopaque, r: u64, key: Str, opts: ?*const abi.
     const st = s3Of(p) orelse return badPointer(p);
     const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY) != 0) return unknownFlag();
-    s3_mod.putBody(st, r, key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.putBody(st, r, key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1820,7 +1757,7 @@ export fn anole_s3_upload_open(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: 
     const c = s3Consumer(c_) catch return badPointer(c_);
     const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY | abi.S3_F_LENGTH) != 0) return unknownFlag();
-    s3_mod.uploadOpen(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.uploadOpen(st, c, key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1849,7 +1786,7 @@ export fn anole_s3_delete(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*con
     const c = s3Consumer(c_) catch return badPointer(c_);
     const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
-    s3_mod.delete(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.delete(st, c, key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1860,7 +1797,7 @@ export fn anole_s3_delete_many(p: ?*anyopaque, c_: ?*anyopaque, keys: ?[*]const 
     const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
     const list: []const Str = if (n == 0) &.{} else (keys orelse return failCode(abi.E_INVALID))[0..n];
-    s3_mod.deleteMany(st, c, list, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.deleteMany(st, c, list, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1871,7 +1808,7 @@ export fn anole_s3_list(p: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.S3Lis
     const o: abi.S3ListOptions = if (opts) |q| readSized(abi.S3ListOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_s3_list_options.reserved must be 0", .{});
-    s3_mod.listObjects(st, c, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.listObjects(st, c, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1881,7 +1818,7 @@ export fn anole_s3_copy(p: ?*anyopaque, c_: ?*anyopaque, src_bucket: Str, src_ke
     const c = s3Consumer(c_) catch return badPointer(c_);
     const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY | abi.S3_F_REPLACE_METADATA) != 0) return unknownFlag();
-    s3_mod.copy(st, c, src_bucket, src_key, dst_key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.copy(st, c, src_bucket, src_key, dst_key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1909,7 +1846,7 @@ export fn anole_s3_multipart_create(p: ?*anyopaque, c_: ?*anyopaque, key: Str, o
     const c = s3Consumer(c_) catch return badPointer(c_);
     const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
-    s3_mod.multipartCreate(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.multipartCreate(st, c, key, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1920,7 +1857,7 @@ export fn anole_s3_multipart_complete(p: ?*anyopaque, c_: ?*anyopaque, key: Str,
     const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
     const list: []const abi.S3Part = if (nparts == 0) &.{} else (parts orelse return failCode(abi.E_INVALID))[0..nparts];
-    s3_mod.multipartComplete(st, c, key, upload_id, list, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.multipartComplete(st, c, key, upload_id, list, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1930,7 +1867,7 @@ export fn anole_s3_multipart_abort(p: ?*anyopaque, c_: ?*anyopaque, key: Str, up
     const c = s3Consumer(c_) catch return badPointer(c_);
     const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
     if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
-    s3_mod.multipartAbort(st, c, key, upload_id, o, user_data) catch |err| return s3Failure(err);
+    s3_mod.multipartAbort(st, c, key, upload_id, o, user_data) catch |err| return failure(err, failure_mod.s3);
     return abi.OK;
 }
 
@@ -1943,20 +1880,8 @@ fn smtpOf(m: ?*const anyopaque) ?*smtp_mod.Mail {
     return if (engine.global == mail.engine) mail else null;
 }
 
-fn smtpFailure(err: smtp_mod.CallError, why: *const smtp_mod.Why) i32 {
-    return switch (err) {
-        error.Invalid => if (why.len > 0)
-            named(abi.E_INVALID, "Invalid", 0, "{s}", .{why.text()})
-        else
-            named(abi.E_INVALID, "Invalid", 0, "invalid argument (a flag, a size, or a consumer of another server or other than the request's)", .{}),
-        error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
-        error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => failCode(abi.E_UNSUPPORTED),
-        error.Gone => blk: {
-            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
-            break :blk named(abi.E_GONE, "Gone", 0, "the request it served is over", .{});
-        },
-    };
+fn smtpFailure(err: engine.CallError, why: *const smtp_mod.Why) i32 {
+    return report(failure_mod.resolve(err, failure_mod.smtp, if (why.len > 0) why.text() else null));
 }
 
 export fn anole_smtp_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {

@@ -325,7 +325,7 @@ pub fn destroy(e: *Engine) void {
 // ---------------------------------------------------------------------------
 // Results
 
-pub const QueryError = error{ Invalid, State, OutOfMemory, Gone, Unsupported };
+pub const CallError = engine.CallError;
 
 /// What goes into an `ANOLE_EV_S3_RESULT`.
 const Res = struct {
@@ -423,7 +423,7 @@ const Res = struct {
         if (total > max) return error.TooBig;
         const rec = engine.newRecord(total, .s3_result, r.handle) catch return error.OutOfMemory;
         const ev: *Ev = @ptrCast(rec.ptr);
-        var w: Writer = .{ .rec = rec, .at = bytes_off };
+        var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
         ev.user_data = r.user_data;
         ev.status = r.status;
         ev.http_status = r.http_status;
@@ -495,18 +495,6 @@ fn httpStatus(err: anyerror) u16 {
         else => 500,
     };
 }
-
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
 
 /// Queues `r` as a record, waiting for room in the ring: an answer must arrive.
 fn post(x: *Exec, r: *const Res) void {
@@ -672,7 +660,7 @@ const Call = struct {
 };
 
 /// A call for `st`, and the executor that runs it.
-fn startCall(st: *Store, c: ?*Consumer, req: u64, op: Op, user_data: u64) QueryError!struct { *Call, *Exec } {
+fn startCall(st: *Store, c: ?*Consumer, req: u64, op: Op, user_data: u64) CallError!struct { *Call, *Exec } {
     const e = st.engine;
     if (c) |cc| if (cc.engine != e) return error.Invalid;
     switch (e.phase.load(.acquire)) {
@@ -694,34 +682,30 @@ fn startCall(st: *Store, c: ?*Consumer, req: u64, op: Op, user_data: u64) QueryE
     return .{ call, x };
 }
 
-fn dupe(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error![]const u8 {
-    return if (s.len == 0) "" else try a.dupe(u8, s.slice());
-}
-
-fn checkKey(key: abi.Str) QueryError!void {
+fn checkKey(key: abi.Str) CallError!void {
     if (key.len == 0 or key.len > 1024) return error.Invalid;
 }
 
 fn commonOptions(c: *Call, flags: u32, timeout_ms: u32, bucket: abi.Str) std.mem.Allocator.Error!void {
     c.flags = flags;
     c.timeout_ms = timeout_ms;
-    c.bucket = try dupe(c.arena.allocator(), bucket);
+    c.bucket = try engine.dupeStr(c.arena.allocator(), bucket);
 }
 
 /// `anole_s3_get` and `anole_s3_head`.
-pub fn get(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3GetOptions, user_data: u64, head: bool) QueryError!void {
+pub fn get(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3GetOptions, user_data: u64, head: bool) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, if (head) .head else .get, user_data);
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.version_id = try dupe(a, o.version_id);
+    call.key = try engine.dupeStr(a, key);
+    call.version_id = try engine.dupeStr(a, o.version_id);
     call.range_start = o.range_start;
     call.range_end = o.range_end;
-    call.if_none_match = try dupe(a, o.if_none_match);
-    call.if_match = try dupe(a, o.if_match);
+    call.if_none_match = try engine.dupeStr(a, o.if_none_match);
+    call.if_match = try engine.dupeStr(a, o.if_match);
     call.if_modified_since_ms = o.if_modified_since_ms;
     call.max_bytes = o.max_bytes;
     call.window = if (o.window == 0) 262144 else o.window;
@@ -729,7 +713,7 @@ pub fn get(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3GetOptions, user_da
 }
 
 /// `anole_s3_put`: `data` is copied.
-pub fn put(st: *Store, c: ?*Consumer, key: abi.Str, data: []const u8, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+pub fn put(st: *Store, c: ?*Consumer, key: abi.Str, data: []const u8, o: abi.S3PutOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .put, user_data);
@@ -739,26 +723,26 @@ pub fn put(st: *Store, c: ?*Consumer, key: abi.Str, data: []const u8, o: abi.S3P
     x.post(&call.cmd);
 }
 
-fn fillPut(call: *Call, key: abi.Str, o: abi.S3PutOptions) QueryError!void {
+fn fillPut(call: *Call, key: abi.Str, o: abi.S3PutOptions) CallError!void {
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.content_type = try dupe(a, o.content_type);
-    call.cache_control = try dupe(a, o.cache_control);
-    call.content_disposition = try dupe(a, o.content_disposition);
-    call.content_encoding = try dupe(a, o.content_encoding);
-    call.storage_class = try dupe(a, o.storage_class);
-    call.if_match = try dupe(a, o.if_match);
+    call.key = try engine.dupeStr(a, key);
+    call.content_type = try engine.dupeStr(a, o.content_type);
+    call.cache_control = try engine.dupeStr(a, o.cache_control);
+    call.content_disposition = try engine.dupeStr(a, o.content_disposition);
+    call.content_encoding = try engine.dupeStr(a, o.content_encoding);
+    call.storage_class = try engine.dupeStr(a, o.storage_class);
+    call.if_match = try engine.dupeStr(a, o.if_match);
     call.content_length = o.content_length;
     if (o.nmetadata > 0) {
         const list_ = (o.metadata orelse return error.Invalid)[0..o.nmetadata];
         const out = try a.alloc([2][]const u8, list_.len);
-        for (list_, out) |h, *dst| dst.* = .{ try dupe(a, h.name), try dupe(a, h.value) };
+        for (list_, out) |h, *dst| dst.* = .{ try engine.dupeStr(a, h.name), try engine.dupeStr(a, h.value) };
         call.metadata = out;
     }
 }
 
-pub fn uploadOpen(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+pub fn uploadOpen(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .upload_open, user_data);
@@ -767,7 +751,7 @@ pub fn uploadOpen(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, 
     x.post(&call.cmd);
 }
 
-pub fn multipartCreate(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+pub fn multipartCreate(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .multipart_create, user_data);
@@ -776,19 +760,19 @@ pub fn multipartCreate(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOpti
     x.post(&call.cmd);
 }
 
-pub fn delete(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+pub fn delete(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3Options, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .delete, user_data);
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.version_id = try dupe(a, o.version_id);
+    call.key = try engine.dupeStr(a, key);
+    call.version_id = try engine.dupeStr(a, o.version_id);
     x.post(&call.cmd);
 }
 
-pub fn deleteMany(st: *Store, c: ?*Consumer, keys: []const abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+pub fn deleteMany(st: *Store, c: ?*Consumer, keys: []const abi.Str, o: abi.S3Options, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     for (keys) |k| try checkKey(k);
     const call, const x = try startCall(st, c, o.req, .delete_many, user_data);
@@ -796,27 +780,27 @@ pub fn deleteMany(st: *Store, c: ?*Consumer, keys: []const abi.Str, o: abi.S3Opt
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
     const names = try a.alloc([]const u8, keys.len);
-    for (keys, names) |k, *dst| dst.* = try dupe(a, k);
+    for (keys, names) |k, *dst| dst.* = try engine.dupeStr(a, k);
     call.keys = names;
     x.post(&call.cmd);
 }
 
-pub fn listObjects(st: *Store, c: ?*Consumer, o: abi.S3ListOptions, user_data: u64) QueryError!void {
+pub fn listObjects(st: *Store, c: ?*Consumer, o: abi.S3ListOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     if (o.max_keys > 1000) return error.Invalid;
     const call, const x = try startCall(st, c, o.req, .list, user_data);
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.prefix = try dupe(a, o.prefix);
-    call.delimiter = try dupe(a, o.delimiter);
-    call.start_after = try dupe(a, o.start_after);
-    call.continuation = try dupe(a, o.continuation);
+    call.prefix = try engine.dupeStr(a, o.prefix);
+    call.delimiter = try engine.dupeStr(a, o.delimiter);
+    call.start_after = try engine.dupeStr(a, o.start_after);
+    call.continuation = try engine.dupeStr(a, o.continuation);
     call.max_keys = o.max_keys;
     x.post(&call.cmd);
 }
 
-pub fn copy(st: *Store, c: ?*Consumer, src_bucket: abi.Str, src_key: abi.Str, dst_key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+pub fn copy(st: *Store, c: ?*Consumer, src_bucket: abi.Str, src_key: abi.Str, dst_key: abi.Str, o: abi.S3PutOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(src_key);
     try checkKey(dst_key);
@@ -824,12 +808,12 @@ pub fn copy(st: *Store, c: ?*Consumer, src_bucket: abi.Str, src_key: abi.Str, ds
     errdefer call.free();
     try fillPut(call, dst_key, o);
     const a = call.arena.allocator();
-    call.src_key = try dupe(a, src_key);
-    call.src_bucket = try dupe(a, src_bucket);
+    call.src_key = try engine.dupeStr(a, src_key);
+    call.src_bucket = try engine.dupeStr(a, src_bucket);
     x.post(&call.cmd);
 }
 
-pub fn multipartComplete(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, parts: []const abi.S3Part, o: abi.S3Options, user_data: u64) QueryError!void {
+pub fn multipartComplete(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, parts: []const abi.S3Part, o: abi.S3Options, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     if (upload_id.len == 0 or parts.len == 0 or parts.len > 10000) return error.Invalid;
@@ -837,18 +821,18 @@ pub fn multipartComplete(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.upload_id = try dupe(a, upload_id);
+    call.key = try engine.dupeStr(a, key);
+    call.upload_id = try engine.dupeStr(a, upload_id);
     const list_ = try a.alloc(s3.Part, parts.len);
     for (parts, list_) |p, *dst| {
         if (p.number < 1 or p.number > 10000 or p.reserved != 0) return error.Invalid;
-        dst.* = .{ .number = @intCast(p.number), .etag = try dupe(a, p.etag) };
+        dst.* = .{ .number = @intCast(p.number), .etag = try engine.dupeStr(a, p.etag) };
     }
     call.parts = list_;
     x.post(&call.cmd);
 }
 
-pub fn multipartAbort(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+pub fn multipartAbort(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, o: abi.S3Options, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     if (upload_id.len == 0) return error.Invalid;
@@ -856,33 +840,33 @@ pub fn multipartAbort(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.St
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.upload_id = try dupe(a, upload_id);
+    call.key = try engine.dupeStr(a, key);
+    call.upload_id = try engine.dupeStr(a, upload_id);
     x.post(&call.cmd);
 }
 
 /// `anole_s3_serve`.
-pub fn serve(st: *Store, req: u64, key: abi.Str, o: abi.S3GetOptions, user_data: u64) QueryError!void {
+pub fn serve(st: *Store, req: u64, key: abi.Str, o: abi.S3GetOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, null, req, .serve, user_data);
     errdefer call.free();
     const a = call.arena.allocator();
     try commonOptions(call, o.flags, o.timeout_ms, o.bucket);
-    call.key = try dupe(a, key);
-    call.version_id = try dupe(a, o.version_id);
+    call.key = try engine.dupeStr(a, key);
+    call.version_id = try engine.dupeStr(a, o.version_id);
     call.range_start = o.range_start;
     call.range_end = o.range_end;
-    call.if_none_match = try dupe(a, o.if_none_match);
-    call.if_match = try dupe(a, o.if_match);
-    call.response_content_type = try dupe(a, o.response_content_type);
-    call.response_cache_control = try dupe(a, o.response_cache_control);
-    call.response_content_disposition = try dupe(a, o.response_content_disposition);
+    call.if_none_match = try engine.dupeStr(a, o.if_none_match);
+    call.if_match = try engine.dupeStr(a, o.if_match);
+    call.response_content_type = try engine.dupeStr(a, o.response_content_type);
+    call.response_cache_control = try engine.dupeStr(a, o.response_cache_control);
+    call.response_content_disposition = try engine.dupeStr(a, o.response_content_disposition);
     x.post(&call.cmd);
 }
 
 /// `anole_s3_put_body`.
-pub fn putBody(st: *Store, req: u64, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+pub fn putBody(st: *Store, req: u64, key: abi.Str, o: abi.S3PutOptions, user_data: u64) CallError!void {
     if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, null, req, .put_body, user_data);
@@ -1218,7 +1202,7 @@ fn postData(x: *Exec, d: *const Data) void {
     ev.status = d.status;
     ev.flags = if (d.fin) abi.S3_DATA_F_FIN else 0;
     ev.offset = d.offset;
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(abi.S3DataEvent) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(abi.S3DataEvent) };
     ev.data = w.put(d.data);
     ev.@"error" = w.put(d.message);
     x.postRecord(rec, true);

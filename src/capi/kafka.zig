@@ -96,7 +96,7 @@ pub const ExecState = struct {
     pub fn deinit(_: *ExecState) void {}
 };
 
-pub const CallError = error{ Invalid, State, Again, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 // ---------------------------------------------------------------------------
 // Opening
@@ -195,18 +195,6 @@ fn checkOpen(b: *Broker) CallError!void {
 // ---------------------------------------------------------------------------
 // Records
 
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
-
 /// An `ANOLE_EV_KAFKA_RECORDS` record: the records at `records_off`, their
 /// header spans after them, then the bytes.
 fn recordsRecord(handle: u64, user_data: u64, group: u64, topic: []const u8, partition: i32, high_watermark: i64, recs: []const KRec) ![]align(8) u8 {
@@ -223,7 +211,7 @@ fn recordsRecord(handle: u64, user_data: u64, group: u64, topic: []const u8, par
     const bytes_off = spans_off + nh * 2 * @sizeOf(abi.Span);
     const rec = try engine.newRecord(bytes_off + bytes, .kafka_records, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = bytes_off };
+    var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
     ev.user_data = user_data;
     ev.group = group;
     ev.topic = w.put(topic);
@@ -279,7 +267,7 @@ fn deliveryRecord(d: Delivery) ![]align(8) u8 {
     const Ev = abi.KafkaDeliveryEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + d.topic.len + d.message.len + d.code.len, .kafka_delivery, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = d.user_data;
     ev.status = d.status;
     ev.http_status = d.http_status;
@@ -301,7 +289,7 @@ fn assignRecord(typ: abi.EventType, handle: u64, user_data: u64, topics: []const
     const entries_off = @sizeOf(Ev);
     const rec = try engine.newRecord(entries_off + topics.len * @sizeOf(abi.KafkaPartition) + bytes, typ, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = entries_off + topics.len * @sizeOf(abi.KafkaPartition) };
+    var w: engine.Writer = .{ .rec = rec, .at = entries_off + topics.len * @sizeOf(abi.KafkaPartition) };
     ev.user_data = user_data;
     ev.entries_off = @intCast(entries_off);
     ev.nentries = @intCast(topics.len);
@@ -314,7 +302,7 @@ fn endRecord(handle: u64, user_data: u64, reason: u32, message: []const u8) ![]a
     const Ev = abi.BrokerEndEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + message.len, .kafka_group_end, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = user_data;
     ev.reason = reason;
     ev.@"error" = w.put(message);
