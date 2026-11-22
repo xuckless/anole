@@ -14,6 +14,14 @@
       "default": 0,
       "description": "Executor threads; 0 for one per CPU (cgroup-aware)."
     },
+    "io_engine": {
+      "enum": [
+        "auto",
+        "io_uring"
+      ],
+      "default": "auto",
+      "description": "The I/O engine: io_uring on Linux with epoll when the kernel refuses a ring (auto), or refuse to start without io_uring (io_uring; always refused off Linux)."
+    },
     "listeners": {
       "type": "array",
       "minItems": 1,
@@ -3269,6 +3277,13 @@
           "maximum": 65535,
           "default": 256,
           "description": "Statements each connection keeps prepared."
+        },
+        "describe_cache_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 64,
+          "description": "Statement descriptions each connection remembers for calls that skip the statement cache, which then take one round trip after their first run; 0: off."
         },
         "max_lifetime_ms": {
           "type": "integer",

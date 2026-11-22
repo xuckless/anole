@@ -171,6 +171,8 @@ fn checkZioOptions() void {
         "`.scheduling = .pinned` among your own zio options.");
 }
 
+pub const IoEngine = observe_runtime.IoEngine;
+
 /// zio's executor count (`.auto` or `.exact(n)`), which zio does not export
 /// by name.
 pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".param_types[1].?, "executors");
@@ -293,6 +295,10 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
+    /// The I/O engine. `.auto`: io_uring on Linux, epoll when the kernel
+    /// refuses a ring (the startup line says why). `.io_uring`: refuse to
+    /// start on epoll (and off Linux) with the cause named.
+    io_engine: IoEngine = .auto,
     /// The most stack a task (a connection, a stream, a socket) may grow
     /// to; past it the process crashes. Address space, not memory: a task
     /// holds only the pages it touches, and gives back those below where it
@@ -1285,6 +1291,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 },
             });
             errdefer rt.deinit();
+            if (observe_runtime.requireIoUring(opts.io_engine, observe_runtime.ioEngine(rt), observe_runtime.ioUringFallback(rt))) |cause| {
+                errors.logExplained(error.IoUringRequired, .{ .cause = cause });
+                return error.IoUringRequired;
+            }
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false, rt) catch "" else "";
             const rt_io = rt.io();
             server_on_thread = true;
@@ -4087,7 +4097,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         /// The I/O engine, once at startup; when io_uring was expected but
-        /// epoll runs, the likely cause (zio drops the real error).
+        /// epoll runs, the cause (the error zio kept from the ring's setup).
         fn logIoEngine(self: *const Self) void {
             const log = std.log.scoped(.anole);
             if (observe_runtime.ioUringFallback(self.rt)) |cause|

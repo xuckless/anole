@@ -104,6 +104,10 @@ pub const Context = struct {
     /// connection through it.
     pub fn newSession(self: *const Context, conn_ref: *c.ngtcp2_crypto_conn_ref) !*c.SSL {
         const ssl = c.SSL_new(self.ctx) orelse return error.OutOfMemory;
+        // Frees the SSL's handshake configuration once the handshake is
+        // done (as in dusty_tls.zig); the early-data context and the
+        // transport parameters are set before it starts.
+        c.SSL_set_shed_handshake_config(ssl, 1);
         // SSL_set_app_data is SSL_set_ex_data(ssl, 0, ...).
         _ = c.SSL_set_ex_data(ssl, 0, conn_ref);
         c.SSL_set_accept_state(ssl);
@@ -319,6 +323,9 @@ pub fn clientSession(conn_ref: *c.ngtcp2_crypto_conn_ref, options: ClientOptions
     }
     const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
     errdefer c.SSL_free(ssl);
+    // Shed the handshake configuration once the handshake is done; tickets
+    // arrive through the CTX's new-session callback, not the config.
+    c.SSL_set_shed_handshake_config(ssl, 1);
     _ = c.SSL_set_ex_data(ssl, 0, conn_ref);
     c.SSL_set_connect_state(ssl);
     // BoringSSL returns 0 on success here.

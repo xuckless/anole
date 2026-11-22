@@ -3,6 +3,15 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Changed
+
+- **PostgreSQL calls that skip the statement cache take one round trip after their first run** (`describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Needs the pg.zig fork's description cache. Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.
+
+- The startup line now names the real reason io_uring is off (the error zio kept from the ring's setup) instead of guessing from the kernel version; only an EPERM without `kernel.io_uring_disabled` is still "likely a seccomp profile".
+- New `io_engine` option (`.auto` or `.io_uring`, also `"io_engine"` in the C ABI config): `.io_uring` refuses to start on epoll, naming the cause.
+
 ## 0.6.0 (2026-11-16)
 
 The HTTP/2 takeover: the HTTP/2 server and client now run on Anole's own protocol core instead of nghttp2 (milestones M3 to M6). With it come the M4 performance work, a request arena without atomics, and the first green Windows CI job.

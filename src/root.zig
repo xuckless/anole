@@ -98,6 +98,7 @@ pub const Ca = @import("http/root.zig").Ca;
 pub const ClientAuth = ServerOptions.ClientAuth;
 /// A length of time: `.fromSeconds(30)`.
 pub const Duration = @import("server.zig").Duration;
+pub const IoEngine = @import("server.zig").IoEngine;
 /// Typed settings from a JSON or INI file, `.env` files and the
 /// environment: `try anole.config.load(Config, init, .{})`. docs/config.md.
 pub const config = @import("config/root.zig");

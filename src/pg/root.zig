@@ -47,7 +47,9 @@
 //! - Statements: each connection prepares a statement the first time it
 //!   runs it and keeps it (`statement_cache_size`), so later runs take one
 //!   round trip. Behind PgBouncer older than 1.21 in transaction mode set
-//!   `statement_cache_size = 0`, or `.prepare = false` per call.
+//!   `statement_cache_size = 0`, or `.prepare = false` per call. Calls that
+//!   skip the cache that way take one round trip too once they ran
+//!   (`describe_cache_size`).
 //! - Rows: a struct's fields take the columns by name (`AS` renames);
 //!   any integer type from int2/int4/int8 (checked for range), floats from
 //!   float4/float8/numeric, `bool`, `[]const u8` from text-like columns
@@ -113,6 +115,12 @@ pub const Options = struct {
     /// Statements each connection keeps prepared, by their SQL. 0 behind
     /// PgBouncer older than 1.21 in transaction mode.
     statement_cache_size: u16 = 256,
+    /// Statement descriptions (parameter and column types) each connection
+    /// remembers, by SQL, for calls that skip the statement cache
+    /// (`.prepare = false`, or `statement_cache_size = 0`): after its first
+    /// run such a call takes one round trip instead of two. Nothing stays
+    /// prepared on the server. 0: off.
+    describe_cache_size: u16 = 64,
     /// A connection older than this is closed instead of reused (so they
     /// move to a new primary after a failover). Null: no limit.
     max_lifetime: ?Duration = .fromSeconds(60 * 60),
@@ -648,6 +656,7 @@ pub const Client = struct {
                 .tls_direct = s.direct_tls,
                 .tls_config = tls_config,
                 .statement_cache_size = opts.statement_cache_size,
+                .describe_cache_size = opts.describe_cache_size,
             },
             .timeout = millis(opts.acquire_timeout),
             .connect_on_init_count = 0,

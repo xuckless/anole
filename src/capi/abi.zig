@@ -2064,6 +2064,7 @@ const base_error_names = [_][]const u8{
     "InvalidListenerName",
     "InvalidProxyNetwork",
     "InvalidValue",
+    "IoUringRequired",
     "KeyFileUnreadable",
     "KeyMismatch",
     "ListenersAlreadySet",

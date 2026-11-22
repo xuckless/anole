@@ -15,6 +15,7 @@ pub const ServerError = error{
     InvalidEnvironmentVariable,
     InvalidEnvFile,
     ProxyProtocolNoPeers,
+    IoUringRequired,
     // ---- p3/net ----
     NetNotBuilt,
     NetListenerNeedsPort,
@@ -313,6 +314,12 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll(".");
             try fix(w, "Length prefixes are 1, 2 or 4 bytes, a frame max 1 byte to 1 GiB, read_window 4 KiB to 64 KiB, batch 1 to 64, max_datagram up to 65507.");
         },
+        error.IoUringRequired => {
+            try w.writeAll("can't start with io_engine = io_uring: ");
+            try w.writeAll(ctx.cause orelse "io_uring is not available");
+            try w.writeAll(".");
+            try fix(w, "Set io_engine to auto to run on epoll, or let the process create an io_uring (kernel.io_uring_disabled, the container's seccomp profile).");
+        },
         error.NetHandlerContext => {
             try w.writeAll("can't serve a raw listener built for another server state type.");
             try fix(w, "Build the service with this server's Ctx (app.tcp and app.udp do).");
@@ -530,6 +537,12 @@ test "explain: every member of ServerError has text, and none holds a credential
         try std.testing.expect(std.mem.indexOf(u8, text, "\n  ") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "s3cret") == null);
     }
+}
+
+test "explain: IoUringRequired names the cause" {
+    var buf: [1024]u8 = undefined;
+    const text = explainBuf(&buf, error.IoUringRequired, .{ .cause = "io_uring is Linux-only" });
+    try std.testing.expect(std.mem.indexOf(u8, text, "io_uring is Linux-only") != null);
 }
 
 test "explain: the examples" {

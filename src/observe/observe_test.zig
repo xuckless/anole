@@ -470,18 +470,39 @@ test "tracing: OTEL_SERVICE_NAME from the process environment without .process" 
     try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
 }
 
-test "observe runtime: fallbackCause names the sysctl first, then an old kernel, then a refusal" {
+test "observe runtime: fallbackCause is told by zio's reason, the sysctl only splits EPERM" {
     const rtm = @import("runtime.zig");
-    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(null, .{ .major = 6, .minor = 12 }));
-    try std.testing.expectEqual(rtm.FallbackCause.disabled, rtm.fallbackCause(2, .{ .major = 6, .minor = 12 }));
-    try std.testing.expectEqual(rtm.FallbackCause.group_only, rtm.fallbackCause(1, .{ .major = 6, .minor = 12 }));
-    try std.testing.expectEqual(rtm.FallbackCause.kernel_too_old, rtm.fallbackCause(null, .{ .major = 5, .minor = 15 }));
-    try std.testing.expectEqual(rtm.FallbackCause.kernel_too_old, rtm.fallbackCause(0, .{ .major = 6, .minor = 0 }));
-    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(0, .{ .major = 6, .minor = 1 }));
-    try std.testing.expectEqual(rtm.FallbackCause.refused, rtm.fallbackCause(0, null));
-    try std.testing.expectEqual(@as(?rtm.Kernel, .{ .major = 5, .minor = 15 }), rtm.parseKernel("5.15.0-91-generic\n"));
-    try std.testing.expectEqual(@as(?rtm.Kernel, .{ .major = 6, .minor = 12 }), rtm.parseKernel("6.12.5-200.fc41.x86_64"));
-    try std.testing.expectEqual(@as(?rtm.Kernel, null), rtm.parseKernel("garbage"));
+    if (comptime rtm.Reason == void) return error.SkipZigTest;
+    if (comptime rtm.Reason != void) {
+        try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, null));
+        try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, 0));
+        try std.testing.expectEqual(rtm.FallbackCause.disabled, rtm.fallbackCause(.permission_denied, 2));
+        try std.testing.expectEqual(rtm.FallbackCause.group_only, rtm.fallbackCause(.permission_denied, 1));
+        try std.testing.expectEqual(rtm.FallbackCause.flags_refused, rtm.fallbackCause(.arguments_invalid, 2));
+        try std.testing.expectEqual(rtm.FallbackCause.no_io_uring, rtm.fallbackCause(.system_outdated, null));
+    }
+}
+
+test "observe runtime: causeText hedges only where the cause is a guess" {
+    const rtm = @import("runtime.zig");
+    for (std.enums.values(rtm.FallbackCause)) |cause| {
+        const text = rtm.causeText(cause);
+        try std.testing.expect(text.len > 0);
+        const hedged = std.mem.indexOf(u8, text, "likely") != null;
+        try std.testing.expectEqual(cause == .blocked, hedged);
+    }
+}
+
+test "observe runtime: requireIoUring refuses only a required io_uring that is not running" {
+    const rtm = @import("runtime.zig");
+    try std.testing.expectEqual(@as(?[]const u8, null), rtm.requireIoUring(.auto, "epoll", .blocked));
+    try std.testing.expectEqual(@as(?[]const u8, null), rtm.requireIoUring(.io_uring, "io_uring", null));
+    if (@import("builtin").os.tag == .linux) {
+        try std.testing.expectEqualStrings(rtm.causeText(.disabled), rtm.requireIoUring(.io_uring, "epoll", .disabled).?);
+        try std.testing.expect(rtm.requireIoUring(.io_uring, "epoll", null) != null);
+    } else {
+        try std.testing.expectEqualStrings("io_uring is Linux-only", rtm.requireIoUring(.io_uring, "kqueue", null).?);
+    }
 }
 
 test "observe runtime: ioEngine names the runtime's engine" {

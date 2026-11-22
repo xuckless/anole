@@ -68,9 +68,13 @@
         // On io_uring a datagram batch after a full one is received with a
         // direct recvmmsg, and with `fast_send` a batch is sent with a direct
         // sendmmsg before the ring (#106, 4652663).
+        // Plus S2 finish (anole-diag d7380db, fork only): a Stream write
+        // offered 8 or more slices gathers up to 64 iovecs (107c53f), and the
+        // io_uring setup error is kept behind the fallback to epoll,
+        // Loop.ioUringFallback() (#134, d7380db).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#3c863fc3f307015b78a2e9861ff2d23d912e1be9",
-            .hash = "zio-0.19.0-xHbVVKQ4MQD0Zp_ukQKtc_Rm5Bh2spEEialz-G-U9H-5",
+            .url = "git+https://github.com/xuckless/zio#d7380db551367a3ba82ce3fc9c030ab803c8781b",
+            .hash = "zio-0.19.0-xHbVVOBZMQCJVtpGMXcCeMX6kmEZVQZWRFfELn9ADiMh",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -190,10 +194,11 @@
         // reset on release (Pool.Reset: .always or .auto), parameters as a
         // slice of tagged unions and text results (the C ABI), and the
         // bytes the socket accepted (Conn.bytesSent: when a failed call
-        // may run again).
+        // may run again), and a describe cache for calls that skip the
+        // statement cache (describe_cache_size, #132).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#4abc2caf582dd9965340bd3e4cabcfbb5f74a054",
-            .hash = "pg-0.0.0-Wp_7gVtzCQChogRE8uzrNYv1eqywmg0Vc_7aM7sr6sGT",
+            .url = "git+https://github.com/xuckless/pg.zig#06ccba16b9f5fea10e735f2ad78dd93e641694cd",
+            .hash = "pg-0.0.0-Wp_7gYHzCQDpK_fIvPmBk04P2kdjEekmW-Pk1TpQqMM9",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON
