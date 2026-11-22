@@ -3522,9 +3522,14 @@ test "Server: a stop that reaches the accept loop while it logs a failed spawn s
     // Stop the server there: the cancel must stay pending through the log
     // line for the accept after it, or that accept never ends.
     var stopper = try io.concurrent(Run.stop, .{ &server_future, io });
-    defer stopper.await(io);
-    defer AcceptLogSwallow.gate.set(io);
-    try wait.expectStays(io, "the log line leaves the stop pending", &AcceptLogSwallow.swallowed, AcceptLogSwallow.kept, wait.short_window);
+    {
+        defer stopper.await(io);
+        defer AcceptLogSwallow.gate.set(io);
+        try wait.expectStays(io, "the log line leaves the stop pending", &AcceptLogSwallow.swallowed, AcceptLogSwallow.kept, wait.short_window);
+    }
+    // The connection no task took gave back its count and its slot, once.
+    try std.testing.expectEqual(0, server.busy.load(.acquire).count);
+    try std.testing.expectEqual(0, server.active_connections.load(.acquire));
 }
 
 test "Server: a slot freed on one listener reaches a connection waiting on another" {

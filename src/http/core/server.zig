@@ -1486,10 +1486,9 @@ pub fn Server(comptime Ctx: type) type {
             accepted_at: std.Io.Clock.Timestamp,
             /// Requests whose head was read, on every task so far.
             request_count: usize = 0,
-            /// In flight for the drain while no task holds the count: from
-            /// the upgrade that handed the connection to an `Adopter` until
-            /// it closes, as a handler looping over the socket would be.
-            counted: bool = false,
+            /// One of the server's in-flight counts (`Server.busy`), which
+            /// the drain waits to see go to zero (`Count`).
+            count: Count = .none,
             parked: park.Parked = .{ .vtable = &park_vtable },
 
             const park_vtable: park.VTable = .{ .wake = wake, .expire = expire, .close = close };
@@ -2440,6 +2439,7 @@ pub fn Server(comptime Ctx: type) type {
                 spawned catch |err| {
                     self.logProtected(.err, "Failed to spawn connection handler: {}", .{err});
                     if (task_row) |r| self.admission.releaseTask(self.io, r);
+                    // No Conn yet: the count is given by hand.
                     self.finishRequest();
                     self.releaseListenerSlot(l);
                     self.releaseConnectionSlot();
@@ -2657,6 +2657,33 @@ pub fn Server(comptime Ctx: type) type {
             if (was.count == 1) self.io.futexWake(Busy, &self.busy.raw, 1);
         }
 
+        /// Whether a `Conn` holds one of the server's in-flight counts
+        /// (`Server.busy`). Every transition is a row here; `giveCount` is
+        /// the one give and `waitForRequest` the one take, so add behaviour
+        /// as a row, not as a flag beside it.
+        ///
+        ///   state  event                          next   effect
+        ///   -      accept (Conn created)          held   taken by the accept loop,
+        ///                                                so a handshake is waited for
+        ///   none   arrival (`waitForRequest`)     held   busy.count += 1; drain on:
+        ///                                                give, 503, `.refused`
+        ///   none   wait / h2 start / close        none   -
+        ///   held   wait for the next request      none   finishRequest
+        ///   held   h2 engine start                none   finishRequest: the engine
+        ///                                                counts its open streams
+        ///   held   hand-over to an `Adopter`      held   - (in flight until it closes,
+        ///                                                parked or not, as a handler
+        ///                                                looping over the socket is)
+        ///   held   `closeConn`                    none   finishRequest, last
+        ///   held   arrival                        unreachable: every wait gives first
+        const Count = enum { none, held };
+
+        fn giveCount(self: *Self, count: *Count) void {
+            if (count.* == .none) return;
+            count.* = .none;
+            self.finishRequest();
+        }
+
         const RequestWait = enum {
             arrived,
             peer_gone,
@@ -2673,13 +2700,9 @@ pub fn Server(comptime Ctx: type) type {
         /// that follows it closes the socket cleanly. With `park_watch`, the
         /// shelf's driver ending the wait is the park delay passing,
         /// reported as `.idle` (`park.Watch`: no timer per wait).
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_watch: ?*park.Watch) !RequestWait {
-            // A task started for a parked connection is not counted yet.
-            if (busy.*) {
-                busy.* = false;
-                self.finishRequest();
-            }
-
+        fn waitForRequest(self: *Self, conn: *Conn, park_watch: ?*park.Watch) !RequestWait {
+            std.debug.assert(conn.count == .none);
+            const connection = &conn.connection;
             if (park_watch) |w| w.begin();
             connection.reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => {
@@ -2701,10 +2724,9 @@ pub fn Server(comptime Ctx: type) type {
             if (park_watch) |w| _ = w.end(false);
 
             const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            busy.* = true;
+            conn.count = .held;
             if (was.draining) {
-                busy.* = false;
-                self.finishRequest();
+                self.giveCount(&conn.count);
                 sendServiceUnavailable(connection.writer) catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
@@ -2723,6 +2745,7 @@ pub fn Server(comptime Ctx: type) type {
             var watch: Watch = .{};
             var future = self.io.concurrent(runConnection, .{ self, l, stream, &watch }) catch |err| {
                 log.warn("No task to watch the connection deadline: {}; refusing", .{err});
+                // No Conn yet: the count is given by hand.
                 self.finishRequest();
                 self.releaseConnectionSlot();
                 stream.close(self.io);
@@ -2867,12 +2890,9 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
-            // Counted since accept, so a handshake in progress is waited for
-            // like a request. Handed back and taken again in `waitForRequest`.
-            var busy = true;
-            defer if (busy) self.finishRequest();
-
             const conn = self.allocator.create(Conn) catch |err| {
+                // No Conn yet: the count is given by hand.
+                self.finishRequest();
                 self.releaseListenerSlot(l);
                 self.releaseConnectionSlot();
                 stream.close(self.io);
@@ -2886,11 +2906,14 @@ pub fn Server(comptime Ctx: type) type {
                 // The first request's deadlines run from here, handshake
                 // included.
                 .accepted_at = self.tickNow(),
+                // Counted since accept, so a handshake in progress is waited
+                // for like a request.
+                .count = .held,
             };
 
             var timer: Timer = .init(watch);
             timer.register(self.shelfHere());
-            const outcome = self.startConnection(conn, &timer, &busy) catch |err| {
+            const outcome = self.startConnection(conn, &timer) catch |err| {
                 timer.clear(self.io);
                 timer.unregister();
                 self.closeConn(conn);
@@ -2904,7 +2927,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Takes `conn` from accept through the PROXY protocol header and the
         /// TLS handshake to the protocol it speaks, and serves it until it
         /// closes or parks.
-        fn startConnection(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+        fn startConnection(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
             const l = conn.listener;
             const stream = conn.connection.stream;
 
@@ -2934,12 +2957,13 @@ pub fn Server(comptime Ctx: type) type {
                     connection.proxied_peer = proxied.source;
                     connection.proxied_secure = proxied.ssl;
                     connection.proxied_local = proxied.destination;
-                    if (l.config.raw) |raw| return self.startRaw(conn, raw, timer, busy);
+                    if (l.config.raw) |raw| return self.startRaw(conn, raw, timer);
                     connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
-                            try h2.Engine(Ctx).start(self, l.config, true, connection, busy);
-                            return self.serveRequests(conn, timer, busy);
+                            self.giveCount(&conn.count);
+                            try h2.Engine(Ctx).start(self, l.config, true, connection);
+                            return self.serveRequests(conn, timer);
                         };
                     }
                     // An HTTP/2-only listener, and ALPN did not agree on it.
@@ -2948,7 +2972,7 @@ pub fn Server(comptime Ctx: type) type {
                         try self.closeNotify(connection, timer);
                         return .close;
                     }
-                    return self.serveRequests(conn, timer, busy);
+                    return self.serveRequests(conn, timer);
                 }
             }
 
@@ -2956,9 +2980,9 @@ pub fn Server(comptime Ctx: type) type {
             connection.proxied_peer = proxied.source;
             connection.proxied_secure = proxied.ssl;
             connection.proxied_local = proxied.destination;
-            if (l.config.raw) |raw| return self.startRaw(conn, raw, timer, busy);
+            if (l.config.raw) |raw| return self.startRaw(conn, raw, timer);
             connection.write_pool = &self.request_buffers;
-            return self.serveRequests(conn, timer, busy);
+            return self.serveRequests(conn, timer);
         }
 
         /// The PROXY protocol header of `conn` (`Listener.proxy_protocol`),
@@ -3036,8 +3060,9 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Hands a ready connection of a raw listener (`Listener.raw`) to
         /// its protocol, which serves it from then on: in flight for the
-        /// drain until it closes, as an adopted WebSocket is.
-        fn startRaw(self: *Self, conn: *Conn, raw: *const Raw, timer: *Timer, busy: *bool) !Outcome {
+        /// drain until it closes, as an adopted WebSocket is (it keeps the
+        /// count it was accepted with, `Count`).
+        fn startRaw(self: *Self, conn: *Conn, raw: *const Raw, timer: *Timer) !Outcome {
             timer.clear(self.io);
             const info: RawInfo = .{
                 .listener = conn.listener.config,
@@ -3049,20 +3074,16 @@ pub fn Server(comptime Ctx: type) type {
             };
             const a = (try raw.start(raw, &conn.connection, &info)) orelse return .close;
             conn.connection.adopter = a;
-            // In flight until it closes, the connection's count rather than
-            // a task's.
-            conn.counted = busy.*;
-            busy.* = false;
-            return self.serveRequests(conn, timer, busy);
+            return self.serveRequests(conn, timer);
         }
 
         /// HTTP/1.x on `conn` until it closes or parks. A TLS connection that
         /// ends without failing sends close_notify.
-        fn serveRequests(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+        fn serveRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
             const outcome = if (conn.connection.adopter != null)
                 try self.serveAdopted(conn, timer)
             else
-                try self.handleRequests(conn, timer, busy);
+                try self.handleRequests(conn, timer);
             if (outcome == .close) try self.closeNotify(&conn.connection, timer);
             return outcome;
         }
@@ -3095,8 +3116,9 @@ pub fn Server(comptime Ctx: type) type {
         /// over from `handleRequests` (whose buffers the preface may sit
         /// in: the engine's first run moves it into its own). Out of line,
         /// so its frame is not part of the HTTP/1.x loop's (#223).
-        noinline fn startH2c(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
-            try h2.Engine(Ctx).start(self, conn.listener.config, false, &conn.connection, busy);
+        noinline fn startH2c(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
+            self.giveCount(&conn.count);
+            try h2.Engine(Ctx).start(self, conn.listener.config, false, &conn.connection);
             return self.serveAdopted(conn, timer);
         }
 
@@ -3105,14 +3127,9 @@ pub fn Server(comptime Ctx: type) type {
         /// closes or parks again.
         fn resumeConnection(self: *Self, conn: *Conn, task_row: ?*admission.Row) void {
             defer if (task_row) |r| self.admission.releaseTask(self.io, r);
-            // Not counted while parked: `waitForRequest` counts it again
-            // once a request arrives.
-            var busy = false;
-            defer if (busy) self.finishRequest();
-
             var timer: Timer = .init(null);
             timer.register(self.shelfHere());
-            const outcome = self.serveRequests(conn, &timer, &busy) catch |err| {
+            const outcome = self.serveRequests(conn, &timer) catch |err| {
                 timer.clear(self.io);
                 timer.unregister();
                 self.closeConn(conn);
@@ -3156,12 +3173,13 @@ pub fn Server(comptime Ctx: type) type {
             conn.connection.deinit();
             conn.connection.stream.close(self.io);
             if (conn.material) |m| m.release(self.allocator);
-            const counted = conn.counted;
+            // Given last, so a drain woken at zero finds the slots released.
+            var count = conn.count;
             const listener = conn.listener;
             self.allocator.destroy(conn);
             self.releaseListenerSlot(listener);
             self.releaseConnectionSlot();
-            if (counted) self.finishRequest();
+            self.giveCount(&count);
         }
 
         /// Whether the peer sent, or may still send, input that was not
@@ -3355,7 +3373,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Returns `.park` when the connection waited `timeout.idle_park`
         /// for its next request with nothing in flight, ready to park: its
         /// deadline set, its request buffers given back.
-        fn handleRequests(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+        fn handleRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
             const l = conn.listener;
             const connection = &conn.connection;
             const accepted_at = conn.accepted_at;
@@ -3462,10 +3480,13 @@ pub fn Server(comptime Ctx: type) type {
                     const park_after = if (watch_shelf != null) self.parkAfter(wait_timeout) else null;
                     const repark_now = if (repark_after) |n| conn.request_count >= n else false;
                     if (repark_now) repark_after = null;
+                    // Nothing in flight from here: the request just served
+                    // is done, and a connection that parks holds no count.
+                    self.giveCount(&conn.count);
                     var arrival: RequestWait = if (repark_now and park_after != null)
                         .idle
                     else
-                        try self.waitForRequest(connection, busy, if (park_after != null) &park_watch else null);
+                        try self.waitForRequest(conn, if (park_after != null) &park_watch else null);
                     if (arrival == .idle) {
                         const shelf = self.shelfHere();
                         if (shelf != null and !shelf.?.closed and connection.parkable()) {
@@ -3482,7 +3503,7 @@ pub fn Server(comptime Ctx: type) type {
                         }
                         // Something is in flight after all (a partial TLS
                         // record): the rest of the wait, on this task.
-                        arrival = try self.waitForRequest(connection, busy, null);
+                        arrival = try self.waitForRequest(conn, null);
                     }
                     switch (arrival) {
                         .arrived => {},
@@ -3503,7 +3524,7 @@ pub fn Server(comptime Ctx: type) type {
                     if (is_h2) {
                         timer.clear(self.io);
                         adopter_ran = true;
-                        return self.startH2c(conn, timer, busy);
+                        return self.startH2c(conn, timer);
                     }
                 }
                 // An HTTP/2-only cleartext listener: no preface, no service.
@@ -3790,10 +3811,8 @@ pub fn Server(comptime Ctx: type) type {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
                     if (connection.adopter != null) {
-                        // In flight until it closes, the connection's count
-                        // rather than a task's.
-                        conn.counted = busy.*;
-                        busy.* = false;
+                        // The count stays held: in flight until it closes
+                        // (`Count`).
                         // The adopter keeps nothing of the request's
                         // (`Response.adopt`), so its buffers go back before
                         // the first run, rather than when the socket first
@@ -4137,6 +4156,54 @@ test "Server: pipelined no_wait requests that are all buffered are answered in o
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqualStrings("aca", &bodies);
     try std.testing.expectEqual(@as(usize, 0), rest.len);
+}
+
+test "Server: a connection gives back its in-flight count once, however it ends" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
+    const io = std.testing.io;
+    const get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    // A client's SETTINGS (empty), then HEADERS on stream 1 with END_STREAM
+    // and END_HEADERS: :method GET, :scheme http, :path /, :authority
+    // localhost.
+    const h2_get = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x0e\x01\x05\x00\x00\x00\x01" ++ "\x82\x86\x84\x01\x09localhost";
+    // `feedConnection` checks the count is 0 and the slot given back after
+    // each; the rows are the ways a connection ends (`Count`).
+    const rows = [_]struct { name: []const u8, input: []const u8, h2: bool = false, draining: bool = false, starts: []const u8 }{
+        // Given at the wait before the second request's, taken again, and
+        // given at the wait that finds the end.
+        .{ .name = "keep-alive requests, then the end", .input = get ++ get, .starts = "HTTP/1.1 200 " },
+        // Held to the end: `closeConn` gives it.
+        .{ .name = "Connection: close", .input = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", .starts = "HTTP/1.1 200 " },
+        .{ .name = "a malformed head", .input = "NOT A REQUEST\r\n\r\n", .starts = "HTTP/1.1 400 " },
+        .{ .name = "the end before any byte", .input = "", .starts = "" },
+        // Taken at the arrival, given by the refusal, not again at close.
+        .{ .name = "the drain on at the first arrival", .input = get, .draining = true, .starts = "HTTP/1.1 503 " },
+        // Given before the engine starts; its streams count themselves.
+        .{ .name = "HTTP/2 with prior knowledge", .input = h2_get, .h2 = true, .starts = "\x00\x00" },
+    };
+    for (rows) |row| {
+        if (row.h2 and !build_options.use_http2) continue;
+        const listener: @import("config.zig").Listener = .{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = row.h2 };
+        var server = Server(void).init(std.testing.allocator, io, .{ .listeners = &.{listener} }, {});
+        defer server.deinit();
+        server.router.get("/", struct {
+            fn ok(_: *Request, res: *Response) !void {
+                res.body = "ok";
+            }
+        }.ok);
+        if (row.draining) _ = server.busy.fetchOr(.{ .draining = true }, .release);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(std.testing.allocator);
+        feedConnection(io, &server, &listener, row.input, &out) catch |err| {
+            std.debug.print("row: {s}\n", .{row.name});
+            return err;
+        };
+        std.testing.expect(std.mem.startsWith(u8, out.items, row.starts)) catch |err| {
+            std.debug.print("row: {s}, got: {s}\n", .{ row.name, out.items[0..@min(out.items.len, 40)] });
+            return err;
+        };
+    }
 }
 
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {

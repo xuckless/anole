@@ -2461,14 +2461,10 @@ pub fn Engine(comptime Ctx: type) type {
         /// Takes `connection`, initialized, over for HTTP/2: it becomes the
         /// server's `Adopter` (`connection.adopter`), which the caller then
         /// serves (`Server.serveAdopted`) until it closes or parks, and
-        /// releases once (`Adopter.release`). `busy` is the connection's
-        /// count in the server's in-flight requests, given back here: from
-        /// now on it counts while streams are open.
-        pub fn start(server: *Server, listener: *const Listener, secure: bool, connection: *Connection, busy: *bool) !void {
-            if (busy.*) {
-                busy.* = false;
-                server.finishRequest();
-            }
+        /// releases once (`Adopter.release`). The caller has given the
+        /// connection's in-flight count back (`Server.giveCount`): from now
+        /// on the engine counts while streams are open.
+        pub fn start(server: *Server, listener: *const Listener, secure: bool, connection: *Connection) !void {
             const io = server.io;
             const h = server.config.http2;
             const conn = try server.allocator.create(Conn);
@@ -2520,8 +2516,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// then released: for the tests and the test listener
         /// (`test_server.zig`), which run the engine on a connection of
         /// their own.
-        pub fn serve(server: *Server, listener: *const Listener, secure: bool, connection: *Connection, busy: *bool) !void {
-            try start(server, listener, secure, connection, busy);
+        pub fn serve(server: *Server, listener: *const Listener, secure: bool, connection: *Connection) !void {
+            try start(server, listener, secure, connection);
             const a = connection.adopter.?;
             defer {
                 connection.adopter = null;
