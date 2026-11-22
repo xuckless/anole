@@ -542,6 +542,12 @@ fn drainInFlight(secure: bool, answer_pings: bool) !void {
     try std.testing.expectEqual(200, rs.status);
     try std.testing.expectEqual("held but whole".len, rs.body_len);
     c.untilClosed();
+    // The stream's count and the drain's are both given back.
+    try wait.waitUntil(f.io, "the server's in-flight count is back to 0", &f, struct {
+        fn zero(fx: *Fixture) bool {
+            return fx.server.busy.load(.acquire).count == 0;
+        }
+    }.zero);
 }
 
 test "h2 lifecycle: the drain sends the notice GOAWAY and a PING, then the final GOAWAY, and the stream in flight finishes" {

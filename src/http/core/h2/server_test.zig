@@ -79,7 +79,12 @@ const Client = struct {
     /// The server's SETTINGS_ENABLE_CONNECT_PROTOCOL, if it sent one.
     connect_protocol: ?u32 = null,
     ping_acks: u32 = 0,
+    /// The server's last PING that was no ACK.
+    server_ping: ?[8]u8 = null,
     goaway: ?ErrorCode = null,
+    /// The last GOAWAY's last stream ID, and how many came.
+    goaway_last: ?u31 = null,
+    goaways: u32 = 0,
     /// WINDOW_UPDATEs for what arrives, as it arrives.
     auto_window: bool = true,
 
@@ -232,8 +237,14 @@ const Client = struct {
             },
             .ping => if (h.flags & F.ack != 0) {
                 c.ping_acks += 1;
+            } else {
+                c.server_ping = payload[0..8].*;
             },
-            .goaway => c.goaway = @fromBackingInt(std.mem.readInt(u32, payload[4..8], .big)),
+            .goaway => {
+                c.goaway = @fromBackingInt(std.mem.readInt(u32, payload[4..8], .big));
+                c.goaway_last = @truncate(std.mem.readInt(u32, payload[0..4], .big));
+                c.goaways += 1;
+            },
             .rst_stream => if (c.resps.get(h.stream_id)) |resp| {
                 resp.rst = @fromBackingInt(std.mem.readInt(u32, payload[0..4], .big));
             },
@@ -324,8 +335,14 @@ const Fixture = struct {
     served: std.atomic.Value(bool),
 
     fn start(fx: *Fixture, gpa: Allocator, io: std.Io, cfg: config.ServerConfig) !void {
-        fx.io = io;
         fx.server = Server.init(gpa, io, cfg, {});
+        try fx.connect(gpa, io);
+    }
+
+    /// The connection and its `serve`, on `fx.server` as the caller
+    /// set it up.
+    fn connect(fx: *Fixture, gpa: Allocator, io: std.Io) !void {
+        fx.io = io;
         Handlers.route(&fx.server);
         fx.tcp = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{});
         const client_end = try fx.tcp.socket.address.connect(io, .{ .mode = .stream });
@@ -1589,6 +1606,123 @@ test "h2 engine: ReqBody, the request body: every state x event cell, and its pr
         try expectEqual(row.done, row.b.done());
         try expectEqual(row.dropping, row.b.dropping());
     }
+}
+
+test "h2 engine: Writer, the flush token: every state x event cell, take and held" {
+    const W = engine.Writer;
+    const rows = [_]struct { from: W, ev: W.Event, to: W }{
+        // take: only from idle; a refusal leaves the state.
+        .{ .from = .idle, .ev = .take, .to = .flushing },
+        .{ .from = .flushing, .ev = .take, .to = .flushing },
+        .{ .from = .flushing_unflushed, .ev = .take, .to = .flushing_unflushed },
+        .{ .from = .shut, .ev = .take, .to = .shut },
+        .{ .from = .idle, .ev = .wrote, .to = .idle },
+        .{ .from = .flushing, .ev = .wrote, .to = .flushing_unflushed },
+        .{ .from = .flushing_unflushed, .ev = .wrote, .to = .flushing_unflushed },
+        .{ .from = .shut, .ev = .wrote, .to = .shut },
+        .{ .from = .idle, .ev = .flushed, .to = .idle },
+        .{ .from = .flushing, .ev = .flushed, .to = .flushing },
+        .{ .from = .flushing_unflushed, .ev = .flushed, .to = .flushing },
+        .{ .from = .shut, .ev = .flushed, .to = .shut },
+        // release: unflushed bytes are flushed first.
+        .{ .from = .idle, .ev = .release, .to = .idle },
+        .{ .from = .flushing, .ev = .release, .to = .idle },
+        .{ .from = .flushing_unflushed, .ev = .release, .to = .flushing_unflushed },
+        .{ .from = .shut, .ev = .release, .to = .shut },
+        // shut_drained: right after release only.
+        .{ .from = .idle, .ev = .shut_drained, .to = .shut },
+        .{ .from = .flushing, .ev = .shut_drained, .to = .flushing },
+        .{ .from = .flushing_unflushed, .ev = .shut_drained, .to = .flushing_unflushed },
+        .{ .from = .shut, .ev = .shut_drained, .to = .shut },
+        // fail: from anywhere, for good.
+        .{ .from = .idle, .ev = .fail, .to = .shut },
+        .{ .from = .flushing, .ev = .fail, .to = .shut },
+        .{ .from = .flushing_unflushed, .ev = .fail, .to = .shut },
+        .{ .from = .shut, .ev = .fail, .to = .shut },
+    };
+    // Every cell has its row.
+    try expectEqual(std.enums.values(W).len * std.enums.values(W.Event).len, rows.len);
+    for (rows) |row| {
+        errdefer std.debug.print("{t} x {t}\n", .{ row.from, row.ev });
+        try expectEqual(row.to, row.from.next(row.ev));
+    }
+    const preds = [_]struct { w: W, held: bool, granted: bool }{
+        .{ .w = .idle, .held = false, .granted = true },
+        .{ .w = .flushing, .held = true, .granted = false },
+        .{ .w = .flushing_unflushed, .held = true, .granted = false },
+        .{ .w = .shut, .held = false, .granted = false },
+    };
+    for (preds) |row| {
+        errdefer std.debug.print("{t}\n", .{row.w});
+        try expectEqual(row.held, row.w.held());
+        var w = row.w;
+        try expectEqual(row.granted, w.take());
+        try expectEqual(row.w.next(.take), w);
+    }
+}
+
+test "h2 engine: Drain.Ask, the drain's request word: requests only rise" {
+    const D = engine.Drain;
+    const rows = [_]struct { start: D, raise: D, to: D }{
+        .{ .start = .none, .raise = .none, .to = .none },
+        .{ .start = .none, .raise = .notice, .to = .notice },
+        .{ .start = .none, .raise = .final, .to = .final },
+        .{ .start = .notice, .raise = .none, .to = .notice },
+        .{ .start = .notice, .raise = .notice, .to = .notice },
+        .{ .start = .notice, .raise = .final, .to = .final },
+        // A notice asked after the final is a no-op.
+        .{ .start = .final, .raise = .none, .to = .final },
+        .{ .start = .final, .raise = .notice, .to = .final },
+        .{ .start = .final, .raise = .final, .to = .final },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} raised to {t}\n", .{ row.start, row.raise });
+        var ask: D.Ask = .{};
+        try expectEqual(D.none, ask.get());
+        ask.raise(row.start);
+        try expectEqual(row.start, ask.get());
+        ask.raise(row.raise);
+        try expectEqual(row.to, ask.get());
+    }
+    const begun = [_]struct { d: D, begun: bool }{
+        .{ .d = .none, .begun = false },
+        .{ .d = .notice, .begun = true },
+        .{ .d = .final, .begun = true },
+    };
+    for (begun) |row| try expectEqual(row.begun, row.d.begun());
+}
+
+test "h2 engine: a connection that starts while the server drains begins its own drain, and gives its count back at its end" {
+    var fx: Fixture = undefined;
+    fx.server = Server.init(testing.allocator, testing.io, .{}, {});
+    // No Registry request: the reader sees the server drain at its start.
+    _ = fx.server.busy.fetchOr(.{ .draining = true }, .release);
+    try fx.connect(testing.allocator, testing.io);
+    defer fx.stop();
+    const c = &fx.client;
+    while (c.goaways == 0 or c.server_ping == null) try c.readOne();
+    try expectEqual(std.math.maxInt(u31), c.goaway_last.?);
+    try expectEqual(ErrorCode.no_error, c.goaway.?);
+    // The notice holds a count: the drain waits for this connection.
+    try expectEqual(1, fx.server.busy.load(.acquire).count);
+    // The PING's answer brings the final GOAWAY (no stream was taken), then
+    // the connection's end of its side.
+    try c.frameOut(.ping, F.ack, 0, &c.server_ping.?);
+    try c.flush();
+    while (true) c.readOne() catch |err| switch (err) {
+        error.EndOfStream => break,
+        else => return err,
+    };
+    try expectEqual(2, c.goaways);
+    try expectEqual(0, c.goaway_last.?);
+    // Our end too: the lingering close ends, then the teardown.
+    try c.stream.shutdown(testing.io, .send);
+    try wait.waitUntil(testing.io, "the connection's serve returned", &fx.served, struct {
+        fn f(served: *std.atomic.Value(bool)) bool {
+            return served.load(.acquire);
+        }
+    }.f);
+    try expectEqual(0, fx.server.busy.load(.acquire).count);
 }
 
 test "h2 engine: an RFC 8441 tunnel: ENABLE_CONNECT_PROTOCOL only when configured, its window, echo, a message past the cap, reset once finished" {
