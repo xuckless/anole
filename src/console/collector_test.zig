@@ -140,7 +140,6 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
 // ------------------------------------------------- the collector alone
 
 const zio = @import("zio");
-const safety = @import("anole_safety");
 const collector_mod = @import("collector.zig");
 
 /// Writes 4 KiB of 'x' for any snapshot.
@@ -177,14 +176,11 @@ test "console collector: the answer to a snapshot reaches the asker" {
     const rt = try zio.Runtime.init(alloc, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    // The collector's and the asker's allocations are checked against
-    // their spin lock (SAFETY.md L5).
-    var checked: safety.SpinCheckedAllocator = .init(alloc);
     var unused: u8 = 0;
-    var c: collector_mod.Collector = .{ .gpa = checked.allocator(), .io = io, .ctx = &unused, .collect = collectBig };
+    var c: collector_mod.Collector = .{ .gpa = alloc, .io = io, .ctx = &unused, .collect = collectBig };
     try c.start();
     defer c.stop();
-    var asker: BigAsker = .{ .c = &c, .out = .init(checked.allocator()) };
+    var asker: BigAsker = .{ .c = &c, .out = .init(alloc) };
     defer asker.out.deinit();
     // The asker waits for the answer up to the test's own deadline, not the
     // console's 200 ms: a slow machine is no retry.

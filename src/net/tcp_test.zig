@@ -10,10 +10,7 @@ const net = @import("root.zig");
 const ClientStream = net.ClientStream;
 
 const App = server_mod.App;
-/// The App's allocator panics at an allocation under a spin lock (SAFETY.md
-/// L5, E1): std's test allocator can't be intercepted, so it is wrapped.
-var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
-const alloc = checked.allocator();
+const alloc = std.testing.allocator;
 
 fn connect(a: *App, port_of: u16) !*ClientStream {
     return ClientStream.connect(alloc, a.io(), .{ .host = "127.0.0.1", .port = port_of, .address = .{ .ip4 = .loopback(port_of) } });

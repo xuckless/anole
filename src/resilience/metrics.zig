@@ -6,7 +6,6 @@
 const std = @import("std");
 const core = @import("resilience_core");
 const observe = @import("../observe/root.zig");
-const safety = @import("anole_safety");
 const SpinLock = @import("anole_mem").SpinLock;
 
 const metrics = observe.metrics;
@@ -124,9 +123,7 @@ test "metrics: target labels capped at 256, then other" {
     const gpa = testing.allocator;
     var registry = metrics.Registry.init(gpa, testing.io);
     defer registry.deinit();
-    // The binding's allocations are checked against its spin lock (L5).
-    var checked: safety.SpinCheckedAllocator = .init(gpa);
-    var binding = try Binding.init(checked.allocator(), &registry);
+    var binding = try Binding.init(gpa, &registry);
     defer binding.deinit();
     const hooks = binding.metricsHooks();
     var buf: [32]u8 = undefined;

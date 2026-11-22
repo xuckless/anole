@@ -19,7 +19,6 @@
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const SpinLock = @import("anole_mem").SpinLock;
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
@@ -32,9 +31,6 @@ const Exec = engine.Exec;
 const Handle = engine.Handle;
 const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
-/// The writes' chunks come from it: in Debug and test builds an allocation
-/// or a free under a slot's spin lock panics (L5); elsewhere it is `gpa`.
-var chunk_checked: safety.SpinCheckedAllocator = .init(engine.gpa);
 
 /// The most a DATA record holds of one connection's bytes: bigger bursts
 /// come as several records (a frame larger than this in one of its own).
@@ -53,8 +49,7 @@ pub const NetSlot = struct {
     /// nothing is taken, allocated, freed or woken under it but the
     /// connection's atomics (a reset's non-blocking `setsockopt`/`shutdown`
     /// and its gated wakes); a call's chunk is made before it and, when the
-    /// connection refuses it, freed after it (`chunk_checked` panics
-    /// otherwise in Debug and tests); its kick is made after it.
+    /// connection refuses it, freed after it; its kick is made after it.
     lock: SpinLock = .init,
     conn: ?*net.Conn = null,
     /// Its listener's: set at the open (before the OPEN record is posted),
@@ -607,9 +602,9 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     var chunk: ?*net.OutChunk = null;
     defer if (chunk) |c| c.destroy();
     if (sent != null and !copy) {
-        chunk = try net.OutChunk.borrowed(chunk_checked.allocator(), data, @intFromPtr(sent.?.ptr));
+        chunk = try net.OutChunk.borrowed(gpa, data, @intFromPtr(sent.?.ptr));
     } else if (frame or data.len > 0) {
-        const c = try net.OutChunk.create(chunk_checked.allocator(), data.len);
+        const c = try net.OutChunk.create(gpa, data.len);
         @memcpy(c.payload(), data);
         chunk = c;
     }

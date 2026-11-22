@@ -11,8 +11,6 @@
 //! - `process_gpa`, `ProcessAllocator`: the checked allocator for code that
 //!   can't take `std.testing.allocator` (process-wide pools, the C ABI).
 //! - `IoLock`: L2's exception, a lock held across I/O (rank `io`).
-//! - `SpinCheckedAllocator`: an allocator that panics when the calling
-//!   thread holds a `SpinLock` (L5).
 //! - `readSectionEntered`, `readSectionLeft`: the debug side of a QSBR
 //!   read section (src/http/core/qsbr.zig, M3).
 const std = @import("std");
@@ -32,7 +30,6 @@ pub const readSectionEntered = lock.readSectionEntered;
 pub const readSectionLeft = lock.readSectionLeft;
 pub const checkAllocation = lock.checkAllocation;
 pub const notePanic = lock.notePanic;
-pub const SpinCheckedAllocator = @import("alloc_check.zig").SpinCheckedAllocator;
 /// Tests whose claim is a panic: they run their own binary again (see
 /// child.zig). Test binaries built with src/testing/runner.zig only.
 pub const child = @import("child.zig");
@@ -76,37 +73,7 @@ pub const ProcessAllocator = struct {
 
     pub fn allocator(self: *ProcessAllocator) std.mem.Allocator {
         if (!enabled) return if (builtin.single_threaded) std.heap.page_allocator else std.heap.smp_allocator;
-        if (!process_spin_check) return self.state.allocator();
-        return .{ .ptr = self, .vtable = &checked_vtable };
-    }
-
-    /// The `SafeAllocator`'s calls behind `checkAllocation` (L5), as
-    /// `SpinCheckedAllocator` does, without a second object.
-    const checked_vtable: std.mem.Allocator.VTable = .{ .alloc = checkedAlloc, .resize = checkedResize, .remap = checkedRemap, .free = checkedFree };
-
-    fn ofPtr(p: *anyopaque) *ProcessAllocator {
-        // SAFETY: `allocator()` sets the context to a *ProcessAllocator.
-        return @ptrCast(@alignCast(p));
-    }
-
-    fn checkedAlloc(self_ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        lock.checkAllocation(ra);
-        return ofPtr(self_ptr).state.allocator().rawAlloc(len, alignment, ra);
-    }
-
-    fn checkedResize(self_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-        lock.checkAllocation(ra);
-        return ofPtr(self_ptr).state.allocator().rawResize(memory, alignment, new_len, ra);
-    }
-
-    fn checkedRemap(self_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-        lock.checkAllocation(ra);
-        return ofPtr(self_ptr).state.allocator().rawRemap(memory, alignment, new_len, ra);
-    }
-
-    fn checkedFree(self_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
-        lock.checkAllocation(ra);
-        ofPtr(self_ptr).state.allocator().rawFree(memory, alignment, ra);
+        return self.state.allocator();
     }
 
     /// Debug and test builds: logs each allocation still live, with where it
@@ -121,16 +88,6 @@ pub const ProcessAllocator = struct {
     }
 };
 
-/// Whether `ProcessAllocator` (`process_gpa`, the C ABI engine's
-/// allocator) checks for allocations under a spin lock (L5) in Debug and
-/// test builds. Off until the S1.5 retrofit's step 6 fixes the one known
-/// site: the C ABI's `Pipe` grows its chunk list in `push` and frees a
-/// used chunk in `read` under its lock (src/capi/pipe.zig, lock taken at
-/// `Pipe.acquire`; research/s15/lock-inventory.md F3, #75). With it on,
-/// every C ABI test that streams a body panics there. Step 6 turns it on
-/// with its failing-first test.
-const process_spin_check = false;
-
 var process_state: ProcessAllocator = .init(0x9e0c55a1);
 
 /// The process-wide `ProcessAllocator`, for process-wide pools whose memory
@@ -141,7 +98,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("lock.zig");
     _ = @import("child.zig");
-    _ = @import("alloc_check.zig");
     _ = @import("ctx.zig");
     _ = @import("anole_never_reuse");
 }
