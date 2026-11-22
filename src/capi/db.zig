@@ -139,7 +139,7 @@ pub fn endTied(x: *Exec, i: u32, cut: bool) void {
 pub fn slotLive(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
     if (sl.owner == .orphan) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
@@ -162,7 +162,7 @@ pub fn slotLive(x: *Exec, h: Handle) bool {
 fn stillOwed(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {

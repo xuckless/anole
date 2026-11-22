@@ -261,7 +261,7 @@ pub fn release(e: *Engine, hv: u64) AnswerError!void {
 pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const route: *const Route = @ptrCast(@alignCast(req.route.?.data.?));
     const e = route.engine;
-    const sr = route.sse.?;
+    const sr = route.kind.sse;
     const topics = e.sse_state.topics orelse return error.InternalServerError;
     if (e.abandon.load(.acquire)) {
         res.fail(.service_unavailable, "the server is stopping");
@@ -281,25 +281,25 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         res.fail(.service_unavailable, "too many subscribers");
         return;
     };
-    var up: engine.Upgrade = .{ .ws_slot = slot.index, .sse = true };
+    var up: engine.Upgrade = .{ .ws_slot = slot.index, .accept = .{ .sse = null } };
     engine.serveUpgrade(route, req, res, &up) catch |err| {
         x.sse.unreserve(slot);
         return err;
     };
-    if (!up.accepted) {
+    const chosen = up.accept.sse orelse {
         x.sse.unreserve(slot);
         return;
-    }
+    };
     // Accepted: the consumer holds the handle. If the stream cannot be
     // set up, it hears it end.
     const g = slot.gen();
     defer if (!slot.opened) retire(x, slot, g, abi.SSE_CLOSED_SERVER);
-    for (up.sse_topics) |t| try names.append(req.arena, t);
-    const hdrs = try req.arena.alloc([2][]const u8, up.headers.len);
-    for (up.headers, hdrs) |h, *out| out.* = .{ h.name, h.value };
+    for (chosen.topics) |t| try names.append(req.arena, t);
+    const hdrs = try req.arena.alloc([2][]const u8, chosen.headers.len);
+    for (chosen.headers, hdrs) |h, *out| out.* = .{ h.name, h.value };
     return topics.serve(req, res, .{
         .topics = names.items,
-        .last = @intCast(@min(if (up.sse_last > 0) up.sse_last else sr.last, std.math.maxInt(u16))),
+        .last = @intCast(@min(if (chosen.last > 0) chosen.last else sr.last, std.math.maxInt(u16))),
         .headers = hdrs,
         .context = slot,
         .on_open = onOpen,

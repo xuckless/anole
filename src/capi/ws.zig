@@ -207,13 +207,14 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const e = route.engine;
     const xi = placement.currentExecutor(req.io) orelse return error.InternalServerError;
     // The same path, plain requests: the consumer's other route.
-    if (route.plain) |plain| if (!websocket.isUpgrade(req)) return engine.serveConsumer(plain, req, res);
+    const w = route.kind.websocket;
+    if (w.plain) |plain| if (!websocket.isUpgrade(req)) return engine.serveConsumer(plain, req, res);
     if (e.execs[xi].consumer == null) {
         res.fail(.service_unavailable, "no consumer");
         return;
     }
-    if (route.ws_consumer and websocket.isUpgrade(req)) return serveAccepted(route, req, res, &e.execs[xi]);
-    return websocket.serveTable(req, res, route.ws.?, &table, @constCast(route));
+    if (w.consumer and websocket.isUpgrade(req)) return serveAccepted(route, req, res, &e.execs[xi]);
+    return websocket.serveTable(req, res, w.opts, &table, @constCast(route));
 }
 
 /// The state an accepted handshake carries to `onOpenAccepted`.
@@ -233,7 +234,7 @@ fn serveAccepted(route: *const Route, req: *dusty.Request, res: *dusty.Response,
         return;
     }
     // Decided natively, before the consumer hears of it.
-    if (!origin.allowed(req, route.ws.?.allowed_origins)) return error.Forbidden;
+    if (!origin.allowed(req, route.kind.websocket.opts.allowed_origins)) return error.Forbidden;
     // The server's admission gate (#129), once for the whole upgrade: the
     // consumer never hears of a refused one. `openSocket` sees the unit
     // held and moves it onto the socket; on every other way out it goes
@@ -259,23 +260,23 @@ fn serveAccepted(route: *const Route, req: *dusty.Request, res: *dusty.Response,
         return;
     };
     const g = slot.gen();
-    var up: engine.Upgrade = .{ .ws_slot = slot.index };
+    var up: engine.Upgrade = .{ .ws_slot = slot.index, .accept = .{ .ws = null } };
     engine.serveUpgrade(route, req, res, &up) catch |err| {
         x.ws.unreserve(slot);
         return err;
     };
-    if (!up.accepted) {
+    const chosen = up.accept.ws orelse {
         x.ws.unreserve(slot);
         return;
-    }
+    };
     // The socket is open from the consumer's side: if the handshake's
     // answer cannot be written, it hears a close with 1006.
     var acc: Accepted = .{ .route = route, .slot = slot, .gen = g };
     defer if (!acc.opened) failAccepted(x, slot, g);
-    var opts = route.ws.?;
-    const chosen = [1][]const u8{up.subprotocol};
-    opts.subprotocols = if (up.subprotocol.len > 0) &chosen else &.{};
-    opts.headers = up.headers;
+    var opts = route.kind.websocket.opts;
+    const subprotocol = [1][]const u8{chosen.subprotocol};
+    opts.subprotocols = if (chosen.subprotocol.len > 0) &subprotocol else &.{};
+    opts.headers = chosen.headers;
     return websocket.serveTable(req, res, opts, &accepted_table, &acc);
 }
 

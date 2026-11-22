@@ -2202,7 +2202,9 @@ test "capi: every ServerError and TlsLoadError name is an ABI error token" {
 
 /// A consumer for "accept": "consumer" routes. `/decide?accept`: accepts
 /// with the subprotocol "b" and a cookie and sends a message at once;
-/// `?refuse`: 401 with a body; `?silent`: holds the request until its 504.
+/// `?refuse`: 401 with a body; `?silent`: holds the request until its 504;
+/// `?bare`: accepts with no subprotocol and no headers; `?cross`: checks
+/// that an SSE accept is STATE, then answers 401.
 /// `/app` takes plain requests (route 11) and handshakes (route 12);
 /// `/plain` (route 13) holds its request for the test to answer.
 const WsDecider = struct {
@@ -2258,8 +2260,14 @@ const WsDecider = struct {
                     // arrive first, and the request handle is stale.
                     _ = try engine.ws.send(e, ws, abi.WS_TEXT, "first", false);
                     if (engine.respond(e, h, 200, &.{}, "", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                } else if (std.mem.eql(u8, query, "bare")) {
+                    _ = try engine.wsAccept(e, h, "", &.{});
                 } else if (std.mem.eql(u8, query, "refuse")) {
                     try engine.respond(e, h, 401, &.{.{ .name = .of("content-type"), .value = .of("text/plain") }}, "no thanks", false);
+                } else if (std.mem.eql(u8, query, "cross")) {
+                    try std.testing.expectError(error.State, engine.sseAccept(e, h, &.{}, &.{}, 0));
+                    // Nothing was taken: the handshake is still owed its answer.
+                    try engine.respond(e, h, 401, &.{}, "", false);
                 } else if (std.mem.eql(u8, query, "bad-subprotocol")) {
                     try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "zzz", &.{}));
                     try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "", &.{.{ .name = .of("Sec-WebSocket-Accept"), .value = .of("x") }}));
@@ -2452,6 +2460,30 @@ const WsDecideClaims = struct {
         try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
     }
 
+    /// No subprotocol and no extra headers: the 101 carries neither.
+    fn bare(a: *WsDecider, port: u16, io: std.Io) !void {
+        var buf: [256]u8 = undefined;
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?bare", "Sec-WebSocket-Protocol: a\r\n");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 101"));
+            try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Sec-WebSocket-Protocol") == null);
+            try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Set-Cookie") == null);
+            try c.send(0x8, &.{ 0x03, 0xe8 });
+            _ = try c.frame(&buf);
+        }
+        try waitAtLeast(io, &a.closes, 1);
+    }
+
+    /// WsDecider checks that anole_sse_accept is STATE, then answers 401.
+    fn cross(_: *WsDecider, port: u16, io: std.Io) !void {
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?cross", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
+    }
+
     /// WsDecider checks the INVALID answers, then answers 400.
     fn badArguments(_: *WsDecider, port: u16, io: std.Io) !void {
         var c: RawWs = undefined;
@@ -2606,6 +2638,16 @@ const WsDecideClaims = struct {
 test "capi engine: anole_ws_accept sends the chosen subprotocol and headers on the 101, a message sent right after the accept arrives first, no WS_OPEN, and the request handle is GONE" {
     if (comptime !features.websocket) return error.SkipZigTest;
     try wsDecideRun(WsDecideClaims.accept, 1, false);
+}
+
+test "capi engine: anole_ws_accept with no subprotocol and no headers sends a bare 101" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.bare, 1, false);
+}
+
+test "capi engine: anole_sse_accept on a WebSocket handshake is STATE, and the handshake is still owed its answer" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.cross, 1, false);
 }
 
 test "capi engine: a consumer's answer to a WebSocket handshake refuses it with its status" {

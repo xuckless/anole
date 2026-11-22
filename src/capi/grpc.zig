@@ -562,7 +562,7 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     _ = e.requests.fetchAdd(1, .monotonic);
     const gen = genOf(s.word.load(.monotonic));
     serving.setDeadline(call, timeout_ns, m.options.max_call_duration);
-    s.kind.store(@backingInt(Handle.Kind.grpc_call), .monotonic);
+    s.what.store(.grpc_call, .monotonic);
     s.req = r;
     s.flags = 0;
     s.remote_len = engine.remoteText(r, &s.remote);
