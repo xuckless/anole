@@ -65,6 +65,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const conn_mod = @import("conn.zig");
+const fields = @import("fields.zig");
 const hpack = @import("hpack.zig");
 const http = @import("../http.zig");
 const server_mod = @import("../server.zig");
@@ -875,22 +876,18 @@ pub fn Engine(comptime Ctx: type) type {
                 if (s.flags.in_trailers) return;
                 const arena = es.arena.allocator();
                 const v = arena.dupe(u8, value) catch return error.ResetStream;
-                if (name[0] == ':') {
-                    if (std.mem.eql(u8, name, ":method")) {
-                        es.method = v;
-                    } else if (std.mem.eql(u8, name, ":path")) {
-                        es.path = v;
-                    } else if (std.mem.eql(u8, name, ":authority")) {
-                        es.authority = v;
-                    } else if (std.mem.eql(u8, name, ":scheme")) {
-                        es.scheme = v;
-                    } else if (std.mem.eql(u8, name, ":protocol")) {
-                        es.protocol = v;
-                    }
-                    return;
-                }
-                // fields.zig has checked it (and holds the DATA to it).
-                if (std.mem.eql(u8, name, "content-length")) es.content_length = std.fmt.parseInt(u64, v, 10) catch null;
+                // The token names are the EStream field names.
+                if (fields.token(name)) |t| switch (t) {
+                    inline .method, .path, .authority, .scheme, .protocol => |p| {
+                        @field(es, @tagName(p)) = v;
+                        return;
+                    },
+                    // fields.zig has checked it (and holds the DATA to it).
+                    .content_length => es.content_length = std.fmt.parseInt(u64, v, 10) catch null,
+                    else => {},
+                };
+                // `:status` or an unknown pseudo-header (the core rejects both).
+                if (name[0] == ':') return;
                 const n = arena.dupe(u8, name) catch return error.ResetStream;
                 es.headers.append(arena, .{ .name = n, .value = v }) catch return error.ResetStream;
             }
@@ -3754,11 +3751,14 @@ pub fn Engine(comptime Ctx: type) type {
                 var has_length = false;
                 var it = headers.iterator();
                 while (it.next()) |entry| {
-                    // RFC 9113 §8.2.2: connection-specific fields are
-                    // malformed.
-                    if (isConnectionSpecific(entry.key)) continue;
-                    if (std.ascii.eqlIgnoreCase(entry.key, "content-length")) has_length = true;
-                    list[n] = .{ .name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources), .value = entry.value };
+                    const name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources);
+                    if (fields.token(name)) |t| {
+                        // RFC 9113 §8.2.2: connection-specific fields are
+                        // malformed.
+                        if (fields.connectionSpecific(t)) continue;
+                        has_length = has_length or t == .content_length;
+                    }
+                    list[n] = .{ .name = name, .value = entry.value };
                     n += 1;
                 }
                 if (!has_length and statusHasLength(status)) if (content_length) |len| {
@@ -4142,12 +4142,6 @@ pub fn Engine(comptime Ctx: type) type {
                 if (known.len == name.len and std.ascii.eqlIgnoreCase(known, name)) return known;
             }
             return std.ascii.allocLowerString(arena, name);
-        }
-
-        fn isConnectionSpecific(name: []const u8) bool {
-            const banned = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
-            for (banned) |b| if (std.ascii.eqlIgnoreCase(name, b)) return true;
-            return false;
         }
 
         fn statusHasLength(status: http.Status) bool {

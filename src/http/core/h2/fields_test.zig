@@ -189,6 +189,65 @@ test "h2 fields: te and the connection-specific fields" {
     }
 }
 
+test "h2 fields: token classifies the names the engine switches on" {
+    // The engine (server.zig) switches on these: the pseudo-headers by tag
+    // name, content-length, and the connection-specific set.
+    const rows = [_]struct { []const u8, ?fields.Token }{
+        .{ ":method", .method },
+        .{ ":path", .path },
+        .{ ":authority", .authority },
+        .{ ":scheme", .scheme },
+        .{ ":protocol", .protocol },
+        .{ "content-length", .content_length },
+        .{ ":status", .status },
+        .{ "host", .host },
+        .{ "te", .te },
+        .{ "priority", .priority },
+        .{ "connection", .connection },
+        .{ "keep-alive", .keep_alive },
+        .{ "proxy-connection", .proxy_connection },
+        .{ "transfer-encoding", .transfer_encoding },
+        .{ "upgrade", .upgrade },
+        .{ "x-custom", null },
+        .{ "user-agent", null },
+        .{ ":foo", null },
+        // Case-sensitive: a caller lowers first.
+        .{ "Content-Length", null },
+        .{ ":Method", null },
+        .{ "Connection", null },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("name {s}\n", .{row[0]});
+        try expectEqual(row[1], fields.token(row[0]));
+    }
+}
+
+test "h2 fields: connectionSpecific is the set the core rejects" {
+    const rows = [_]struct { []const u8, bool }{
+        .{ "connection", true },
+        .{ "keep-alive", true },
+        .{ "proxy-connection", true },
+        .{ "transfer-encoding", true },
+        .{ "upgrade", true },
+        .{ "content-length", false },
+        .{ "host", false },
+        .{ "te", false },
+        .{ ":method", false },
+        .{ "x-connection", false },
+        .{ "upgrade-insecure-requests", false },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("name {s}\n", .{row[0]});
+        const banned = if (fields.token(row[0])) |t| fields.connectionSpecific(t) else false;
+        try expectEqual(row[1], banned);
+        if (!row[1]) continue;
+        var req: Request = .{};
+        try expectEqual(Verdict.malformed, verdict(&req, row[0], "x"));
+        var resp: fields.Response = .{};
+        try expectEqual(Verdict.malformed, resp.field(row[0], "x"));
+    }
+}
+
 test "h2 fields: empty name" {
     // CVE-2019-9516 was a leak of 0-length names; nothing is allocated
     // here. PLAN §5.4: the request is malformed (a stream reset), in the

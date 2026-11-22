@@ -398,6 +398,9 @@ const Handlers = struct {
         s.router.addRouteWith(.post, "/nw/baseline", baseline, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/json", jsonItems, .{ .no_wait = true });
         s.router.get("/headers", headerCount);
+        s.router.get("/req", pseudo);
+        s.router.post("/req", pseudo);
+        s.router.get("/conn-names", connNames);
         s.router.get("/huge", huge);
         s.router.get("/huge/stream", hugeStream);
         s.router.get("/huge/bare", hugeBare);
@@ -456,6 +459,39 @@ const Handlers = struct {
         };
         try res.json(.{ .items = items, .count = n });
     }
+
+    /// What the request's pseudo-headers became: method, url, Host (from
+    /// `:authority`) and the body.
+    fn pseudo(req: *Request, res: *Response) !void {
+        const body = try req.body() orelse "";
+        try res.print(.text, "{s} {s} {s} {s}", .{ @tagName(req.method), req.url, req.headers.get("host") orelse "-", body });
+    }
+
+    /// The connection-specific names in three cases, and names to keep.
+    /// `headers.add` bypasses `Response.header`'s reserved-name refusal
+    /// (and its growing of the table, so the room is made first).
+    fn connNames(_: *Request, res: *Response) !void {
+        const room = conn_names_banned.len + conn_names_kept.len;
+        while (res.headers.keys.len < room) if (!res.headers.grow(res.arena, room)) return error.OutOfMemory;
+        for (conn_names_banned) |name| try res.headers.add(name, "x");
+        for (conn_names_kept) |f| try res.headers.add(f[0], f[2]);
+        res.body = "body";
+    }
+    const conn_names_banned = [_][]const u8{
+        "connection",        "CONNECTION",        "Connection",
+        "keep-alive",        "KEEP-ALIVE",        "Keep-Alive",
+        "proxy-connection",  "PROXY-CONNECTION",  "Proxy-Connection",
+        "transfer-encoding", "TRANSFER-ENCODING", "Transfer-Encoding",
+        "upgrade",           "UPGRADE",           "Upgrade",
+    };
+    /// {set as, sent as, value}.
+    const conn_names_kept = [_][3][]const u8{
+        .{ "X-Custom-Header", "x-custom-header", "1" },
+        .{ "ETag", "etag", "\"e\"" },
+        .{ "x-connection", "x-connection", "2" },
+        .{ "Upgrade-Insecure-Requests", "upgrade-insecure-requests", "3" },
+        .{ "Content-LENGTH", "content-length", "4" },
+    };
 
     /// The request's header count and its `cookie`.
     fn headerCount(req: *Request, res: *Response) !void {
@@ -746,6 +782,55 @@ test "h2 engine: POST body echoed, with and without content-length" {
     try expectEqualStrings("hello world", c.get(small).body.items);
     try expect(std.mem.eql(u8, body, c.get(unsized).body.items));
     try expectEqualStrings("whole in one read", c.get(inline_echo).body.items);
+}
+
+test "h2 engine: the request pseudo-headers reach the handler" {
+    // :protocol is the RFC 8441 tunnel row ("h2 engine: an RFC 8441 tunnel:
+    // ..." and src/websocket/h2_test.zig); :scheme is stored but nothing
+    // reads it, so no row can see it.
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const rows = [_]struct { method: []const u8, path: []const u8, extra: []const hpack.Field = &.{}, body: ?[]const u8 = null, want: []const u8 }{
+        .{ .method = "GET", .path = "/req", .want = "get /req localhost " },
+        .{ .method = "GET", .path = "/req?q=1&r=2", .want = "get /req?q=1&r=2 localhost " },
+        .{ .method = "POST", .path = "/req", .body = "", .want = "post /req localhost " },
+        .{ .method = "POST", .path = "/req", .extra = &.{.{ .name = "content-length", .value = "11" }}, .body = "hello world", .want = "post /req localhost hello world" },
+        .{ .method = "POST", .path = "/req", .body = "hello world", .want = "post /req localhost hello world" },
+    };
+    var ids: [rows.len]u31 = undefined;
+    for (rows, &ids) |row, *id| id.* = try c.requestWith(row.method, row.path, row.extra, row.body);
+    try c.untilAll();
+    for (rows, ids) |row, id| {
+        errdefer std.debug.print("{s} {s}\n", .{ row.method, row.path });
+        try expectEqual(200, c.get(id).status);
+        try expectEqualStrings(row.want, c.get(id).body.items);
+    }
+}
+
+test "h2 engine: connection-specific response fields are dropped in any case; names are lowered once; content-length is not doubled" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const r = try c.until(try c.request("GET", "/conn-names", null));
+    try expectEqual(200, r.status);
+    try expectEqualStrings("body", r.body.items);
+    for (r.headers.items) |f| for (Handlers.conn_names_banned) |name| {
+        errdefer std.debug.print("{s} sent\n", .{f.name});
+        try expect(!std.ascii.eqlIgnoreCase(f.name, name));
+    };
+    for (Handlers.conn_names_kept) |k| {
+        errdefer std.debug.print("{s}\n", .{k[0]});
+        var seen: usize = 0;
+        for (r.headers.items) |f| if (std.ascii.eqlIgnoreCase(f.name, k[1])) {
+            try expectEqualStrings(k[1], f.name);
+            try expectEqualStrings(k[2], f.value);
+            seen += 1;
+        };
+        try expectEqual(1, seen);
+    }
 }
 
 test "h2 engine: a noWait route is answered inline" {

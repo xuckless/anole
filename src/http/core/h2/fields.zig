@@ -255,8 +255,8 @@ fn parseStatus(s: []const u8) ?u16 {
 }
 
 /// The names the checks care about (nghttp2's generated lookup_token, cut
-/// down to them).
-const Token = enum {
+/// down to them). The engine (server.zig) switches on them too.
+pub const Token = enum {
     status,
     authority,
     method,
@@ -274,7 +274,10 @@ const Token = enum {
     priority,
 };
 
-fn token(name: []const u8) ?Token {
+/// Case-sensitive: request names arrive lowercase (RFC 9113 §8.2.1, an
+/// uppercase one is malformed), so a caller with any other name lowers it
+/// first.
+pub fn token(name: []const u8) ?Token {
     const eql = std.mem.eql;
     return switch (name.len) {
         2 => if (eql(u8, name, "te")) .te else null,
@@ -288,6 +291,16 @@ fn token(name: []const u8) ?Token {
         16 => if (eql(u8, name, "proxy-connection")) .proxy_connection else null,
         17 => if (eql(u8, name, "transfer-encoding")) .transfer_encoding else null,
         else => null,
+    };
+}
+
+/// RFC 9113 §8.2.2: the fields no HTTP/2 message may carry; the request and
+/// response checks above reject exactly these, the engine drops them from a
+/// response head.
+pub fn connectionSpecific(t: Token) bool {
+    return switch (t) {
+        .connection, .keep_alive, .proxy_connection, .transfer_encoding, .upgrade => true,
+        else => false,
     };
 }
 
