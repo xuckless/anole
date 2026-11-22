@@ -89,9 +89,9 @@ jobs:
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build the HTTP/3 test server and client
         timeout-minutes: 23
-        run: zig build h3-test-server h3-test-client -Doptimize=ReleaseFast --summary all
+        run: zig build h3-test-server h3-test-client h3-interop-server -Doptimize=ReleaseFast --summary all
       - name: Server and client against aioquic
-        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
+        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client ./zig-out/bin/h3-interop-server
       - name: Build examples/full
         run: zig build full -Doptimize=ReleaseFast --summary all
       - name: SIGUSR2 restarts with HTTP/3, under a stand-in for systemd's notify socket

@@ -109,6 +109,7 @@ test {
     _ = @import("server.zig");
     _ = @import("bridge.zig");
     _ = @import("net.zig");
+    _ = @import("client.zig");
     _ = @import("client_test.zig");
     _ = @import("steer.zig");
     _ = @import("percore_test.zig");

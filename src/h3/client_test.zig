@@ -408,6 +408,9 @@ const Fixture = struct {
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/slow", slowNoWait, .{ .no_wait = true });
+        // The task cap is resolved here, as a server that serves HTTP/3
+        // beside its own listeners does before it starts.
+        if (config.max_tasks != null) try http.prepareStatic();
         var bundle = try @import("../tls/testing.zig").bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
@@ -1090,11 +1093,11 @@ test "h3 server: long-header packets with a connection ID over 20 bytes are drop
     try std.testing.expectEqualStrings("hello over h3", body);
 }
 
-fn headersStatus(conn: *client.ClientConnection, gpa: std.mem.Allocator, extra: []const client.Header) !u16 {
+fn headersStatus(conn: *client.ClientConnection, gpa: std.mem.Allocator, path: []const u8, extra: []const client.Header) !u16 {
     var all: std.ArrayList(client.Header) = .empty;
     defer all.deinit(gpa);
     try all.appendSlice(gpa, &.{
-        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     });
     try all.appendSlice(gpa, extra);
@@ -1123,16 +1126,48 @@ test "h3 server: a request head past max_field_section_size or max_header_count 
     var names: [40][16]u8 = undefined;
     var big: [20]client.Header = undefined;
     for (&big, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-big-{d}", .{i}), .value = value };
-    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &big));
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, "/hello", &big));
 
     // Small, but more fields than request.max_header_count (32).
     var many: [40]client.Header = undefined;
     for (&many, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-many-{d}", .{i}), .value = "1" };
-    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &many));
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, "/hello", &many));
 
     // Just under both limits: served.
-    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, big[0..6]));
-    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, many[0..30]));
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, "/hello", big[0..6]));
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, "/hello", many[0..30]));
+}
+
+test "h3 server: a head past the limits on a no_wait route gets 431 inline, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const value = try gpa.alloc(u8, 8 * 1024);
+    defer gpa.free(value);
+    @memset(value, 'v');
+    var names: [40][16]u8 = undefined;
+    var big: [20]client.Header = undefined;
+    for (&big, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-big-{d}", .{i}), .value = value };
+    var many: [40]client.Header = undefined;
+    for (&many, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-many-{d}", .{i}), .value = "1" };
+    const rows = [_]struct { name: []const u8, extra: []const client.Header, want: u16 }{
+        .{ .name = "past max_field_section_size", .extra = &big, .want = 431 },
+        .{ .name = "past max_header_count", .extra = &many, .want = 431 },
+        .{ .name = "under both: served after them", .extra = many[0..30], .want = 200 },
+    };
+    const before = f.ep.stats.served_inline.load(.monotonic);
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        try std.testing.expectEqual(r.want, try headersStatus(conn, gpa, "/nw/hello", r.extra));
+    }
+    // All three ran on the endpoint task, the 431s without a handler.
+    try std.testing.expectEqual(before + rows.len, f.ep.stats.served_inline.load(.monotonic));
 }
 
 test "h3 client: a 90 KiB response head fails under the default max_header_list_size, and passes when it is raised" {
@@ -1304,6 +1339,55 @@ test "h3 server: requests the client cancels keep their stream credit until thei
     try std.testing.expect(holding_peak.load(.monotonic) <= 8);
 
     // The connection carries on.
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 server: a request past the task cap is rejected unprocessed, and its stream credit comes back" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .max_tasks = 3 }, .{});
+    defer f.stop(gpa, io);
+    hold_started.store(0, .monotonic);
+    holding_now.store(0, .monotonic);
+    holding_peak.store(0, .monotonic);
+    hold_gate = .unset;
+    defer hold_gate.set(io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // The cap's worth of handlers, all holding.
+    var held: [3]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (held[0..opened]) |st| st.release();
+    for (&held) |*st| {
+        st.* = try request(conn, "GET", "/hold", .{});
+        opened += 1;
+    }
+    try wait.waitEqual(io, "3 handlers holding", &holding_now, 3);
+
+    // Each request past it is refused as one the server never processed.
+    // Nine of them with three held is past the connection's 8 streams:
+    // each refused stream gives its credit back once QUIC closes it.
+    for (0..9) |_| {
+        const s = try request(conn, "GET", "/hello", .{});
+        defer s.release();
+        try std.testing.expectError(error.StreamReset, s.waitHead());
+        try std.testing.expect(s.unprocessed());
+        try std.testing.expectEqual(@as(?u64, @import("anole_nghttp3_c").NGHTTP3_H3_REQUEST_REJECTED), s.resetCode());
+    }
+    try std.testing.expectEqual(@as(u32, 3), hold_started.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 9), f.http.admission.refused_tasks.load(.monotonic));
+
+    // The held three answer, and the connection carries on.
+    hold_gate.set(io);
+    for (held) |st| {
+        try st.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), st.status);
+    }
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
@@ -3405,13 +3489,18 @@ const H3Park = struct {
 
     /// Runs `op` on the request's executor and waits for it.
     fn on(io: std.Io, op: Op) !void {
-        var group: std.Io.Group = .init;
         var result: anyerror!void = {};
-        try dusty.placement.concurrent(&group, io, .{ .executor = exec }, opTask, .{ op, &result });
-        try group.await(io);
+        try runOn(io, exec, opTask, .{ op, &result });
         return result;
     }
 };
+
+/// Runs `func` with `args` as a task on executor `exec` and waits for it.
+fn runOn(io: std.Io, exec: usize, comptime func: anytype, args: anytype) !void {
+    var group: std.Io.Group = .init;
+    try dusty.placement.concurrent(&group, io, .{ .executor = exec }, func, args);
+    try group.await(io);
+}
 
 /// Request streams the server still holds, on its one connection.
 fn serverStreams(ep: *Endpoint) usize {
@@ -3635,4 +3724,191 @@ test "parked h3: a no_wait handler that ends and releases its park before it ret
     try std.testing.expectEqualStrings("hello over h3", hello_body);
     try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
     try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
+}
+
+/// `no_wait` routes that detach their response (as the C ABI does): one
+/// finishes it inside the handler, one attaches it there and waits for its
+/// task to finish it, one leaves it to the test (`on`).
+const H3Detach = struct {
+    var slot: ?*dusty.Detached = null;
+    var exec: usize = 0;
+    var detached: std.Io.Event = .unset;
+    var attached_done: std.Io.Event = .unset;
+    var aborts: std.atomic.Value(u32) = .init(0);
+    var dummy: u8 = 0;
+
+    fn reset() void {
+        slot = null;
+        detached = .unset;
+        attached_done = .unset;
+        aborts.store(0, .monotonic);
+    }
+
+    fn onAbort(_: *anyopaque) void {
+        slot = null;
+        _ = aborts.fetchAdd(1, .monotonic);
+    }
+
+    fn detach(req: *dusty.Request, res: *dusty.Response) !*dusty.Detached {
+        exec = dusty.placement.currentExecutor(req.io) orelse 0;
+        return res.detach(req, .{ .abort = onAbort, .ctx = &dummy });
+    }
+
+    fn now(req: *dusty.Request, res: *dusty.Response) !void {
+        const d = try detach(req, res);
+        d.response.body = "now";
+        d.finish({});
+    }
+
+    fn later(req: *dusty.Request, res: *dusty.Response) !void {
+        slot = try detach(req, res);
+        detached.set(req.io);
+    }
+
+    /// The handler waits until the attached task has finished the
+    /// response: the response ends while `serve` still runs.
+    fn attachInside(req: *dusty.Request, res: *dusty.Response) !void {
+        attached_done = .unset;
+        const d = try detach(req, res);
+        try dusty.placement.concurrent(d.attach().?, req.io, .local, attachedTask, .{ d, req.io });
+        try attached_done.wait(req.io);
+    }
+
+    fn attachedTask(d: *dusty.Detached, io: std.Io) std.Io.Cancelable!void {
+        d.enter();
+        d.response.body = "attached";
+        d.finish({});
+        attached_done.set(io);
+    }
+
+    const Op = enum { finish, attach };
+
+    fn opTask(op: Op, io: std.Io) std.Io.Cancelable!void {
+        const d = slot.?;
+        slot = null;
+        switch (op) {
+            .finish => {
+                d.response.body = "later";
+                d.finish({});
+            },
+            .attach => dusty.placement.concurrent(d.attach().?, io, .local, attachedTask, .{ d, io }) catch |err| d.finish(err),
+        }
+    }
+
+    /// Ends the response left to the test, on the request's executor.
+    fn on(io: std.Io, op: Op) !void {
+        try runOn(io, exec, opTask, .{ op, io });
+    }
+};
+
+test "h3 server: a no_wait handler that detaches and finishes inside it lets go of the stream once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Detach.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/now", H3Detach.now, .{ .no_wait = true });
+    f.http.router.addRouteWith(.get, "/nw/attach", H3Detach.attachInside, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const rows = [_]struct { path: []const u8, body: []const u8 }{
+        .{ .path = "/nw/now", .body = "now" },
+        .{ .path = "/nw/attach", .body = "attached" },
+    };
+    for (rows) |r| for (0..3) |_| {
+        errdefer std.debug.print("row: {s}\n", .{r.path});
+        const body = try get(conn, r.path, gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings(r.body, body);
+    };
+    // A second release of a holder trips `Stream.release`'s assert; the
+    // streams after these are served as usual.
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+    try std.testing.expectEqual(@as(u32, 0), H3Detach.aborts.load(.monotonic));
+}
+
+test "h3 server: a detached no_wait response finished later, plain or attached, frees its stream and lets the connection end" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Detach.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/later", H3Detach.later, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+    var closed = false;
+    defer if (!closed) conn.close();
+
+    const rows = [_]struct { op: H3Detach.Op, body: []const u8 }{
+        .{ .op = .finish, .body = "later" },
+        .{ .op = .attach, .body = "attached" },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {t}\n", .{r.op});
+        H3Detach.detached = .unset;
+        const s = try request(conn, "GET", "/nw/later", .{});
+        try wait.waitEvent(io, "the handler detached", &H3Detach.detached);
+        try H3Detach.on(io, r.op);
+        const body = try finish(s, gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings(r.body, body);
+    }
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+    // The attached task was counted out: the connection's end waits for
+    // none.
+    conn.close();
+    closed = true;
+    try wait.waitUntil(io, "noConnections", f.ep, noConnections);
+    try std.testing.expectEqual(@as(u32, 0), H3Detach.aborts.load(.monotonic));
+}
+
+test "h3 server: a detached no_wait response never finished: a stream reset or the connection's end tells the owner once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const Gone = enum { stream_reset, connection_closed };
+    for ([_]Gone{ .stream_reset, .connection_closed }) |gone| {
+        errdefer std.debug.print("row: {t}\n", .{gone});
+        H3Detach.reset();
+        var f = try Fixture.start(gpa, io);
+        defer f.stop(gpa, io);
+        f.http.router.addRouteWith(.get, "/nw/later", H3Detach.later, .{ .no_wait = true });
+        const conn = try f.connect(gpa, io);
+        var closed = false;
+        defer if (!closed) conn.close();
+
+        const s = try request(conn, "GET", "/nw/later", .{});
+        try wait.waitEvent(io, "the handler detached", &H3Detach.detached);
+        switch (gone) {
+            .stream_reset => {
+                s.cancel();
+                s.release();
+            },
+            .connection_closed => {
+                s.release();
+                conn.close();
+                closed = true;
+            },
+        }
+        try wait.waitAtLeast(io, "the detached response's owner was told", &H3Detach.aborts, 1);
+        switch (gone) {
+            .stream_reset => {
+                try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
+                const hello_body = try get(conn, "/hello", gpa);
+                defer gpa.free(hello_body);
+                try std.testing.expectEqualStrings("hello over h3", hello_body);
+            },
+            .connection_closed => try wait.waitUntil(io, "noConnections", f.ep, noConnections),
+        }
+        try std.testing.expectEqual(@as(u32, 1), H3Detach.aborts.load(.monotonic));
+        try std.testing.expectEqual(@as(?*dusty.Detached, null), H3Detach.slot);
+    }
 }

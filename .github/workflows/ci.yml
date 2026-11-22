@@ -435,9 +435,9 @@ jobs:
       # Debug, so the debug allocator reports any leak at exit.
       - name: Build the HTTP/3 test server and client
         timeout-minutes: 17
-        run: zig build h3-test-server h3-test-client --summary all
+        run: zig build h3-test-server h3-test-client h3-interop-server --summary all
       - name: Server and client against aioquic
-        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
+        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client ./zig-out/bin/h3-interop-server
       - name: Build examples/full
         run: zig build full --summary all
       - name: SIGUSR2 restarts with HTTP/3, under a stand-in for systemd's notify socket

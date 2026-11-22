@@ -94,6 +94,113 @@ fn holdUntil(held: bool, until: u64, ts: u64) u64 {
     return if (held) until else ts + hold_ns;
 }
 
+/// A server connection's protocol life: open, the two-step drain (RFC
+/// 9114 §5.2) inside it, the closing and draining periods (RFC 9000
+/// §10.2), the end. Locked by the connection's mutex; changed only by
+/// `Conn.enter`. Every transition is a cell here: add behaviour as a row
+/// or a state, not as a branch beside `enter`.
+///
+/// | from \ event  | drain_notice(due) | drain_final | peer_close(end) | local_close(end) | end    |
+/// |---------------|-------------------|-------------|-----------------|------------------|--------|
+/// | open          | notice(due)       | -           | draining(end)   | closing(end)     | closed |
+/// | notice(due)   | -                 | final       | draining(end)   | closing(end)     | closed |
+/// | final         | -                 | -           | draining(end)   | closing(end)     | closed |
+/// | closing(end)  | -                 | -           | -               | -                | closed |
+/// | draining(end) | -                 | -           | -               | -                | closed |
+/// | closed        | -                 | -           | -               | -                | closed |
+///
+/// "-": no move, no wake, no kick. `due` is when the final GOAWAY goes,
+/// `end` when the period's three PTOs are over. `open`, `notice` and
+/// `final` are the open phase (`isOpen`): the drain is reachable only
+/// from `open`, and a peer or local close in it drops the drain.
+/// `(closing, peer_close)` is "-" on purpose: RFC 9000 §10.2.1 only lets
+/// a closing endpoint enter draining; it keeps answering with its own
+/// CONNECTION_CLOSE. `(closed, end)` moves (to itself): `finish` relies on
+/// the wake and the kick it brings for a connection already closed.
+const Life = union(enum(u8)) {
+    open,
+    notice: u64,
+    final,
+    closing: u64,
+    draining: u64,
+    closed,
+
+    const Tag = std.meta.Tag(Life);
+
+    const Event = union(enum) {
+        drain_notice: u64,
+        drain_final,
+        peer_close: u64,
+        local_close: u64,
+        end,
+    };
+
+    /// The table above.
+    fn next(from: Life, ev: Event) ?Life {
+        return switch (ev) {
+            .drain_notice => |due| if (from == .open) .{ .notice = due } else null,
+            .drain_final => if (from == .notice) .final else null,
+            .peer_close => |end| if (from.isOpen()) .{ .draining = end } else null,
+            .local_close => |end| if (from.isOpen()) .{ .closing = end } else null,
+            .end => .closed,
+        };
+    }
+
+    /// The open phase, drain included: one compare (the tag order).
+    fn isOpen(l: Life) bool {
+        return @backingInt(@as(Tag, l)) <= @backingInt(Tag.final);
+    }
+};
+
+/// Who tells a connection's streams of a move into a period or the end
+/// (`Conn.enter`): `enter` itself (`now`), the driver at its next service
+/// (`deferred`, `Conn.wake_pending`: the reader saw the peer's close, and
+/// what came just before it is still with the tasks it woke), or nobody
+/// (`none`: the drain's steps).
+const Wake = enum { now, deferred, none };
+
+/// Who holds a server connection: `accept` until it hands it to the
+/// driver, the driver until it retires it. Atomic (`Conn.seat`), as
+/// `kick` reads it from any thread.
+///
+/// | from \ event | handoff | retire  | give_up  |
+/// |--------------|---------|---------|----------|
+/// | accepting    | driven  | -       | given_up |
+/// | given_up     | -       | -       | -        |
+/// | driven       | -       | retired | -        |
+/// | retired      | -       | -       | -        |
+///
+/// "-": no change (retire in `accepting` and give_up in `driven` never
+/// happen: only a driven connection is retired, only an accepting one
+/// given up). The values make each question one instruction: bit 1 is
+/// "handed over" (kicks queue it, `connections_open` counts it), bit 0
+/// "over" (finishing: `service` and `finishAll` leave it alone).
+const Seat = enum(u8) {
+    accepting = 0,
+    given_up = 1,
+    driven = 2,
+    retired = 3,
+
+    const Event = enum { handoff, retire, give_up };
+
+    /// The table above.
+    fn next(from: Seat, ev: Event) Seat {
+        return switch (ev) {
+            .handoff => if (from == .accepting) .driven else from,
+            .retire => if (from == .driven) .retired else from,
+            .give_up => if (from == .accepting) .given_up else from,
+        };
+    }
+
+    fn handedOver(s: Seat) bool {
+        return @backingInt(s) >= @backingInt(Seat.driven);
+    }
+
+    fn over(s: Seat) bool {
+        return @backingInt(s) & 1 != 0;
+    }
+};
+
 /// The UDP socket buffers each endpoint asks for, both ways: room for
 /// bursts from many connections between two reads (aegon, goose and
 /// agensio ask for 4 MiB too). The system caps it (Linux: rmem_max and
@@ -1109,7 +1216,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// waited for in a task of their own, not here. On the driver only.
         fn retire(self: *Self, conn: *Conn) void {
             self.removeTimer(conn);
-            conn.retired = true;
+            conn.take(.retire);
             if (conn.tasks.load(.acquire) == 0) return conn.finish();
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
@@ -1119,7 +1226,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn closeNow(self: *Self, conn: *Conn) void {
             conn.abort();
             self.removeTimer(conn);
-            conn.retired = true;
+            conn.take(.retire);
             conn.finish();
         }
 
@@ -1134,7 +1241,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             while (list) |conn| {
                 list = conn.next_dirty;
                 conn.queued.store(false, .release);
-                if (!conn.retired and conn.heap_index == Conn.no_timer) self.closeNow(conn);
+                if (!conn.seat.load(.monotonic).over() and conn.heap_index == Conn.no_timer) self.closeNow(conn);
                 conn.unref();
             }
             while (self.timers.items.len > 0) self.closeNow(self.timers.items[0]);
@@ -1267,12 +1374,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             defer self.gpa.free(live);
             for (live) |conn| {
                 conn.lock();
-                switch (conn.state) {
-                    .closing, .draining => {
-                        conn.period_end = 0;
+                switch (conn.life) {
+                    .closing, .draining => |*end| {
+                        end.* = 0;
                         conn.kick();
                     },
-                    .open, .closed => {},
+                    .open, .notice, .final, .closed => {},
                 }
                 conn.unlock();
                 conn.unref();
@@ -1443,7 +1550,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // To the driver, which sends the handshake's packets and owns
             // the connection from now on.
-            conn.driven = true;
+            conn.take(.handoff);
             self.queue(conn);
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
             _ = self.stats.connections_open.fetchAdd(1, .monotonic);
@@ -1455,7 +1562,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn giveUp(self: *Self, conn: *Conn) void {
             if (conn.tasks.load(.acquire) == 0) return conn.destroy();
             if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .release);
-            conn.retired = true;
+            conn.take(.give_up);
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
 
@@ -1537,7 +1644,6 @@ pub fn Endpoint(comptime Ctx: type) type {
         const Conn = struct {
             ep: *Self,
             q: *c.ngtcp2_conn,
-            h3: ?*h.nghttp3_conn = null,
             ssl: *c.SSL,
             conn_ref: c.ngtcp2_crypto_conn_ref,
             scid: c.ngtcp2_cid,
@@ -1550,8 +1656,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// What all of the connection's send queues hold unacknowledged.
             budget: bridge.Budget,
             refs: std.atomic.Value(u32) = .init(1),
-            /// Handed to the driver (`accept`): kicks queue it from then on.
-            driven: bool = false,
+            /// Who holds it (`Seat`'s table): written by `accept` before
+            /// its handoff, then by the driver (`take`); read by `kick` on
+            /// any thread. With `wake_pending`, the only lifecycle word
+            /// not under the lock.
+            seat: std.atomic.Value(Seat) = .init(.accepting),
             /// In the endpoint's `dirty` list, linked through `next_dirty`.
             queued: std.atomic.Value(bool) = .init(false),
             next_dirty: ?*Conn = null,
@@ -1559,8 +1668,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// the driver's alone.
             heap_index: u32 = no_timer,
             timer_at: u64 = 0,
-            /// Over: out of the heap, and finishing (`Endpoint.retire`).
-            retired: bool = false,
             /// Request tasks running, and parked responses not released
             /// (`H3Parked`): while any, the connection ends on a finisher
             /// task.
@@ -1569,7 +1676,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `finish` waits for none (`parked_idle`). Locked.
             parked_open: u32 = 0,
             parked_idle: std.Io.Condition = .init,
-            state: State = .open,
+            /// Open, draining, closing, closed (`Life`'s table), with when
+            /// the final GOAWAY is due or the period ends. Locked; changed
+            /// only by `enter`.
+            life: Life = .open,
             /// ngtcp2's keep-alive is armed: a request stream is open.
             keep_alive_on: bool = false,
             last_error: c.ngtcp2_ccerr = undefined,
@@ -1577,10 +1687,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             close_pkt: []u8 = &.{},
             close_pkts_seen: u32 = 0,
             close_next_reply: u32 = 1,
-            /// When the closing or draining period ends.
-            period_end: u64 = 0,
             /// The peer closed the connection, and the streams have yet to
-            /// hear of it: the driver tells them (`wakeStreams`).
+            /// hear of it: set by `enter(.., .deferred)` on the reader,
+            /// swapped by the driver, which tells them (`wakeStreams`).
             wake_pending: std.atomic.Value(bool) = .init(false),
             /// The request streams. An array map: removing leaves no
             /// tombstones behind, which in a hash map with a stream opening
@@ -1616,16 +1725,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// guess is still tiny otherwise count that data lost and send
             /// it again in 1-RTT.
             hold_off: std.atomic.Value(bool) = .init(false),
-            drain: enum { none, notice, final } = .none,
-            /// The connection speaks "hq-interop", not HTTP/3.
-            hq: bool = false,
-            hq_streams: std.AutoArrayHashMapUnmanaged(i64, *HqStream) = .empty,
-            drain_at: u64 = 0,
+            /// Which protocol the connection speaks, decided once at the
+            /// 1-RTT tx key (`onRecvTxKey`); each protocol's state exists
+            /// only in its own case. Until then nobody is set up
+            /// (0-RTT data takes the HTTP/3 paths and finds no nghttp3).
+            proto: union(enum) {
+                handshaking,
+                h3: *h.nghttp3_conn,
+                /// "hq-interop": the request streams.
+                hq: std.AutoArrayHashMapUnmanaged(i64, *HqStream),
+            } = .handshaking,
             /// WebTransport's streams, sessions and datagrams, when the
             /// endpoint speaks it.
             wt: ?*webtransport.Core = null,
 
-            const State = enum { open, closing, draining, closed };
             const no_timer = std.math.maxInt(u32);
 
             fn create(ep: *Self, remote: Addr, local: ?std.Io.net.IpAddress, hd: *const c.ngtcp2_pkt_hd, ocid: ?*const c.ngtcp2_cid, token_type: c.ngtcp2_token_type) !*Conn {
@@ -1717,16 +1830,21 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Frees everything. Nothing may reach the connection anymore.
             fn destroy(conn: *Conn) void {
                 const gpa = conn.ep.gpa;
-                if (conn.driven) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
-                for (conn.hq_streams.values()) |hs| hs.free(gpa);
-                conn.hq_streams.deinit(gpa);
+                if (conn.seat.load(.monotonic).handedOver()) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
                 gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
                 for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 conn.ready.deinit(gpa);
                 conn.awaiting.deinit(gpa);
                 if (conn.wt) |w| w.destroy();
-                if (conn.h3) |hc| h.nghttp3_conn_del(hc);
+                switch (conn.proto) {
+                    .handshaking => {},
+                    .h3 => |hc| h.nghttp3_conn_del(hc),
+                    .hq => |*streams| {
+                        for (streams.values()) |hs| hs.free(gpa);
+                        streams.deinit(gpa);
+                    },
+                }
                 c.ngtcp2_conn_del(conn.q);
                 c.SSL_free(conn.ssl);
                 if (conn.close_pkt.len > 0) gpa.free(conn.close_pkt);
@@ -1753,7 +1871,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// the driver services the connection in its next round.
             fn kick(conn: *Conn) void {
                 conn.gen.notify(conn.ep.io);
-                if (conn.driven) conn.ep.queue(conn);
+                if (conn.seat.load(.monotonic).handedOver()) conn.ep.queue(conn);
+            }
+
+            /// The one writer of `seat`: `accept` before the handoff, the
+            /// driver after it.
+            fn take(conn: *Conn, ev: Seat.Event) void {
+                conn.seat.store(conn.seat.load(.monotonic).next(ev), .release);
             }
 
             /// Arms ngtcp2's keep-alive while a request stream is open, and
@@ -1761,7 +1885,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// SSE response outlives the idle timeout and an idle connection
             /// still closes at it. Locked.
             fn updateKeepAlive(conn: *Conn) void {
-                const want = conn.streams.count() > 0 and conn.state == .open;
+                const want = conn.streams.count() > 0 and conn.life.isOpen();
                 if (want == conn.keep_alive_on) return;
                 conn.keep_alive_on = want;
                 if (want) _ = conn.ep.stats.keep_alive_arms.fetchAdd(1, .monotonic);
@@ -1892,8 +2016,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Locked.
             fn readPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
-                switch (conn.state) {
-                    .open => {},
+                switch (conn.life) {
+                    .open, .notice, .final => {},
                     .closing => {
                         // Answer with the CONNECTION_CLOSE again, less and
                         // less often (RFC 9000 §10.2.1).
@@ -1934,14 +2058,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                             // tasks that earlier packets of this batch
                             // woke, so the streams hear of the end from
                             // the driver, after those have run, not here.
-                            conn.state = .draining;
-                            conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                            conn.wake_pending.store(true, .monotonic);
-                            conn.kick();
+                            _ = conn.enter(.{ .peer_close = conn.periodEnd() }, .deferred);
                             return;
                         },
                         c.NGTCP2_ERR_DROP_CONN => {
-                            conn.close(.closed);
+                            _ = conn.enter(.end, .now);
                             return;
                         },
                         c.NGTCP2_ERR_CRYPTO => if (conn.last_error.error_code == 0)
@@ -1963,7 +2084,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn service(conn: *Conn) void {
                 const ep = conn.ep;
                 const io = ep.io;
-                if (conn.retired) return;
+                if (conn.seat.load(.monotonic).over()) return;
                 while (true) {
                     if (conn.wake_pending.load(.monotonic)) {
                         conn.lock();
@@ -1982,35 +2103,37 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const flushed_at = conn.flush();
 
                     conn.lock();
-                    const state = conn.state;
+                    const life = conn.life;
                     // The flush's last clock read, when nothing went out
                     // after it, which is how a flush ends; else a fresh one.
                     const t = @max(flushed_at, c.ngtcp2_conn_get_timestamp(conn.q));
-                    var deadline: u64 = switch (state) {
+                    const deadline: u64 = switch (life) {
                         .open => c.ngtcp2_conn_get_expiry2(conn.q),
-                        .closing, .draining => conn.period_end,
-                        .closed => 0,
-                    };
-                    if (state == .open and conn.drain != .none) {
-                        deadline = @min(deadline, conn.drainStep(t));
-                        // The drain may have closed the connection, its
-                        // CONNECTION_CLOSE written at a later time than
-                        // `t`. ngtcp2 must never see time go back (it
-                        // asserts so, and its timers assume it), so `t` is
-                        // done with: start over.
-                        if (conn.state != .open) {
+                        .notice, .final => drain: {
+                            const expiry = c.ngtcp2_conn_get_expiry2(conn.q);
+                            const step = conn.drainStep(t);
+                            // The drain may have closed the connection, its
+                            // CONNECTION_CLOSE written at a later time than
+                            // `t`. ngtcp2 must never see time go back (it
+                            // asserts so, and its timers assume it), so `t`
+                            // is done with: start over.
+                            if (!conn.life.isOpen()) {
+                                conn.unlock();
+                                continue;
+                            }
+                            break :drain @min(expiry, step);
+                        },
+                        .closing, .draining => |end| end,
+                        .closed => {
                             conn.unlock();
-                            continue;
-                        }
-                    }
-                    if (state == .closed) {
-                        conn.unlock();
-                        return ep.retire(conn);
-                    }
+                            return ep.retire(conn);
+                        },
+                    };
                     if (deadline <= t) {
-                        switch (state) {
-                            .open => if (deadline == c.ngtcp2_conn_get_expiry2(conn.q)) conn.expire(t),
-                            else => conn.close(.closed),
+                        switch (life) {
+                            .open, .notice, .final => if (deadline == c.ngtcp2_conn_get_expiry2(conn.q)) conn.expire(t),
+                            .closing, .draining => _ = conn.enter(.end, .now),
+                            .closed => unreachable,
                         }
                         conn.unlock();
                         continue;
@@ -2036,7 +2159,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const ep = conn.ep;
                 while (true) {
                     conn.lock();
-                    if (conn.state != .open) {
+                    if (!conn.life.isOpen()) {
                         conn.unlock();
                         return now(ep.io);
                     }
@@ -2087,17 +2210,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// later. Then, once nghttp3 has no streams left, close.
             /// Returns when to look again. Locked.
             fn drainStep(conn: *Conn, t: u64) u64 {
-                const hc = conn.h3 orelse {
+                const hc = conn.h3() orelse {
                     conn.closeGracefully();
                     return t;
                 };
-                switch (conn.drain) {
-                    .none => return std.math.maxInt(u64),
-                    .notice => {
-                        if (t < conn.drain_at) return conn.drain_at;
+                switch (conn.life) {
+                    .notice => |due| {
+                        if (t < due) return due;
                         _ = h.nghttp3_conn_shutdown(hc);
-                        conn.drain = .final;
-                        conn.kick();
+                        _ = conn.enter(.drain_final, .none);
                         return t + 50 * std.time.ns_per_ms;
                     },
                     .final => {
@@ -2107,24 +2228,22 @@ pub fn Endpoint(comptime Ctx: type) type {
                         }
                         return t + 50 * std.time.ns_per_ms;
                     },
+                    .open, .closing, .draining, .closed => unreachable,
                 }
             }
 
             fn beginDrain(conn: *Conn) void {
                 conn.lock();
                 defer conn.unlock();
-                if (conn.state != .open or conn.drain != .none) return;
-                if (conn.h3) |hc| _ = h.nghttp3_conn_submit_shutdown_notice(hc);
-                conn.drain = .notice;
-                conn.drain_at = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                conn.kick();
+                if (!conn.enter(.{ .drain_notice = conn.periodEnd() }, .none)) return;
+                if (conn.h3()) |hc| _ = h.nghttp3_conn_submit_shutdown_notice(hc);
             }
 
             /// The final GOAWAY, sent, then CONNECTION_CLOSE: for a hand-over,
             /// which cannot wait for requests to finish.
             fn handOver(conn: *Conn) void {
                 conn.lock();
-                if (conn.state == .open) if (conn.h3) |hc| {
+                if (conn.life.isOpen()) if (conn.h3()) |hc| {
                     _ = h.nghttp3_conn_shutdown(hc);
                 };
                 conn.unlock();
@@ -2148,26 +2267,34 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             fn abortLocked(conn: *Conn) void {
-                if (conn.state == .open) {
+                if (conn.life.isOpen()) {
                     c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.NGHTTP3_H3_NO_ERROR, null, 0);
                     conn.fail();
                 }
-                conn.close(.closed);
+                _ = conn.enter(.end, .now);
             }
 
             /// The connection failed or ends: send CONNECTION_CLOSE and
             /// enter the closing period, or go quietly for an idle timeout.
             /// Locked.
             fn fail(conn: *Conn) void {
-                if (conn.state != .open) return;
-                if (conn.last_error.type == c.NGTCP2_CCERR_TYPE_IDLE_CLOSE) return conn.close(.closed);
-                if (c.ngtcp2_conn_in_draining_period2(conn.q) != 0) return conn.enterPeriod(.draining);
+                if (!conn.life.isOpen()) return;
+                if (conn.last_error.type == c.NGTCP2_CCERR_TYPE_IDLE_CLOSE) {
+                    _ = conn.enter(.end, .now);
+                    return;
+                }
+                if (c.ngtcp2_conn_in_draining_period2(conn.q) != 0) {
+                    _ = conn.enter(.{ .peer_close = conn.periodEnd() }, .now);
+                    return;
+                }
                 var ps: c.ngtcp2_path_storage = undefined;
                 c.ngtcp2_path_storage_zero(&ps);
                 var pi: c.ngtcp2_pkt_info = undefined;
                 var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
                 const n = ngtcp2.connWriteConnectionClose(conn.q, &ps.path, &pi, &buf, &conn.last_error, now(conn.ep.io));
-                conn.enterPeriod(.closing);
+                // Its clock read after the write, which read one first:
+                // ngtcp2 never sees time go back.
+                _ = conn.enter(.{ .local_close = conn.periodEnd() }, .now);
                 if (n > 0) {
                     conn.close_pkt = conn.ep.gpa.dupe(u8, buf[0..@intCast(n)]) catch &.{};
                     // On the path in use now, which a migration may have
@@ -2178,20 +2305,25 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
-            /// The closing or draining period: three PTOs (RFC 9000 §10.2).
+            /// The one place `life` changes (`Life`'s table): the move,
+            /// then the streams told (`wake`), then the kick. False when
+            /// the table has no move: nothing changes, nothing wakes.
             /// Locked.
-            fn enterPeriod(conn: *Conn, state: State) void {
-                conn.state = state;
-                conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                conn.wakeStreams();
+            fn enter(conn: *Conn, ev: Life.Event, wake: Wake) bool {
+                conn.life = conn.life.next(ev) orelse return false;
+                switch (wake) {
+                    .now => conn.wakeStreams(),
+                    .deferred => conn.wake_pending.store(true, .monotonic),
+                    .none => {},
+                }
                 conn.kick();
+                return true;
             }
 
-            /// Locked.
-            fn close(conn: *Conn, state: State) void {
-                conn.state = state;
-                conn.wakeStreams();
-                conn.kick();
+            /// When a period or drain step that starts now ends: three
+            /// PTOs (RFC 9000 §10.2). Locked.
+            fn periodEnd(conn: *Conn) u64 {
+                return now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
             }
 
             /// Every stream's handler sees the connection gone.
@@ -2211,13 +2343,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const protection = io.swapCancelProtection(.blocked);
                 defer _ = io.swapCancelProtection(protection);
                 conn.lock();
-                conn.close(.closed);
+                _ = conn.enter(.end, .now);
                 // Responses still detached have nobody to go to.
                 var i: usize = 0;
                 while (i < conn.streams.count()) {
                     const s = conn.streams.values()[i];
                     const before = conn.streams.count();
-                    if (s.detached != null or s.parked != null) {
+                    if (s.phase.owns()) {
                         s.reset = true;
                         s.wakeAll();
                         abortDetached(s);
@@ -2246,7 +2378,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Once 1-RTT keys are there: the control and QPACK streams.
             /// Locked (inside an ngtcp2 callback).
             fn setupHttp3(conn: *Conn) !void {
-                if (conn.h3 != null) return;
                 if (c.ngtcp2_conn_get_streams_uni_left2(conn.q) < 3) return error.Http3SetupFailed;
                 const options = &conn.ep.options;
                 const settings = http3Settings(options);
@@ -2275,11 +2406,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (c.ngtcp2_conn_open_uni_stream(conn.q, &enc, null) != 0) return error.Http3SetupFailed;
                 if (c.ngtcp2_conn_open_uni_stream(conn.q, &dec, null) != 0) return error.Http3SetupFailed;
                 if (h.nghttp3_conn_bind_qpack_streams(hc, enc, dec) != 0) return error.Http3SetupFailed;
-                conn.h3 = hc;
+                conn.proto = .{ .h3 = hc.? };
+            }
+
+            /// The nghttp3 connection, once HTTP/3 is set up.
+            fn h3(conn: *Conn) ?*h.nghttp3_conn {
+                return switch (conn.proto) {
+                    .h3 => |hc| hc,
+                    .handshaking, .hq => null,
+                };
             }
 
             fn side(conn: *Conn) bridge.Side {
-                return .{ .q = conn.q, .h3 = conn.h3, .last_error = &conn.last_error, .wt = conn.wt };
+                return .{ .q = conn.q, .h3 = conn.h3(), .last_error = &conn.last_error, .wt = conn.wt };
             }
 
             fn consume(conn: *Conn, stream_id: i64, n: u64) void {
@@ -2330,8 +2469,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn hqRecv(conn: *Conn, flags: u32, stream_id: i64, data: []const u8) c_int {
                 const gpa = conn.ep.gpa;
                 bridge.consume(conn.q, stream_id, data.len);
-                const hs = conn.hq_streams.get(stream_id) orelse return 0;
-                if (hs.ready) return 0;
+                const hs = conn.proto.hq.get(stream_id) orelse return 0;
+                if (hs.phase != .reading_request) return 0;
                 hs.request.appendSlice(gpa, data) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 const fin = flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0;
                 const line_end = std.mem.indexOfScalar(u8, hs.request.items, '\n');
@@ -2344,7 +2483,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     log.debug("hq-interop {s}: {t}", .{ line, err });
                     break :blk &.{};
                 };
-                hs.ready = true;
+                hs.phase = .sending;
                 conn.kick();
                 return 0;
             }
@@ -2369,11 +2508,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 while (true) {
                     var picked: ?*HqStream = null;
                     var stream_id: i64 = -1;
-                    while (next < conn.hq_streams.count()) : (next += 1) {
-                        const hs = conn.hq_streams.values()[next];
-                        if (hs.ready and !hs.fin_sent) {
+                    const streams = &conn.proto.hq;
+                    while (next < streams.count()) : (next += 1) {
+                        const hs = streams.values()[next];
+                        if (hs.phase == .sending) {
                             picked = hs;
-                            stream_id = conn.hq_streams.keys()[next];
+                            stream_id = streams.keys()[next];
                             break;
                         }
                     }
@@ -2391,7 +2531,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const n = ngtcp2.connWritevStream(conn.q, p, pi, dest[0..dest_len], &data_len, flags, stream_id, datav, ts);
                     if (picked) |hs| if (data_len >= 0) {
                         hs.sent += @intCast(data_len);
-                        if (hs.sent == hs.response.len) hs.fin_sent = true;
+                        if (hs.sent == hs.response.len) hs.phase = .done;
                     };
                     if (n < 0) switch (n) {
                         // This one waits for credit or is gone; try the next.
@@ -2415,8 +2555,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// A request's head is complete: give it a task. Locked.
             fn startStream(conn: *Conn, stream: *Stream) void {
-                stream.started = true;
-                stream.refs.handler = true;
+                stream.phase = stream.phase.next(.start);
+                stream.holders.insert(.handler);
                 // The flush waits for its answer (`Stream.unhold`).
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
@@ -2441,7 +2581,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                         log.debug("HTTP/3: stream {d} refused at the task cap", .{stream.id})
                     else
                         log.err("HTTP/3: no task for stream {d}", .{stream.id});
-                    stream.refs.handler = false;
+                    // The handler never started: its hold goes without a
+                    // free. QUIC still holds the stream (every caller runs
+                    // for one QUIC has not closed), so the lines below
+                    // touch a live stream and QUIC's close frees it.
+                    stream.holders.remove(.handler);
                     stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
@@ -2464,9 +2608,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// read (`onPacket`). Locked.
             fn queueInline(conn: *Conn, stream: *Stream) void {
                 conn.ready.append(conn.ep.gpa, stream) catch return conn.startStream(stream);
-                stream.started = true;
-                stream.refs.handler = true;
-                stream.inline_mode = true;
+                stream.holders.insert(.handler);
+                stream.phase = stream.phase.next(.queue);
             }
 
             /// After a packet: the `no_wait` requests whose body did not
@@ -2475,9 +2618,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn startAwaiting(conn: *Conn) void {
                 defer conn.awaiting.clearRetainingCapacity();
                 for (conn.awaiting.items) |stream| {
-                    if (!stream.await_body) continue;
-                    stream.await_body = false;
+                    // A stale entry: its body ended within the packet.
+                    if (stream.phase != .awaiting_body) continue;
                     if (stream.reset) {
+                        // Let go, so a later FIN cannot queue it.
+                        stream.phase = stream.phase.next(.start);
                         stream.release(.handler);
                         continue;
                     }
@@ -2493,8 +2638,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// from it until the peer acknowledges).
             response: []u8 = &.{},
             sent: usize = 0,
-            ready: bool = false,
-            fin_sent: bool = false,
+            phase: enum {
+                /// The request line is still arriving.
+                reading_request,
+                /// The file is loaded and goes out; the FIN rides the write
+                /// of its last byte (the only one, if it is empty).
+                sending,
+                /// All sent, FIN included; the file stays for resends.
+                done,
+            } = .reading_request,
 
             fn free(hs: *HqStream, gpa: std.mem.Allocator) void {
                 hs.request.deinit(gpa);
@@ -2542,7 +2694,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The request's content type says it carries messages (gRPC,
             /// gRPC-Web, Connect streaming): the larger send cap.
             message: bool = false,
-            started: bool = false,
+            /// Where the request runs: its head, an awaited body, the
+            /// endpoint task, or a task; then where a response that outlives
+            /// its handler is: detached (`dusty.Detached`, the request and
+            /// response live on in the stream's arena), attached, or parked
+            /// (`Response._park`: bursts from whichever task has something
+            /// to send, no task holding it in between, `H3Parked`).
+            /// Locked, but one read (`Phase`).
+            phase: Phase = .head,
             /// The request's head came in 0-RTT, before the handshake
             /// completed.
             early: bool = false,
@@ -2555,39 +2714,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `max_header_count`: the rest of it is not kept, and the
             /// request is answered 431 without reaching a handler.
             head_too_large: bool = false,
-            /// Who still holds the stream.
-            refs: struct { quic: bool = true, handler: bool = false, parked: bool = false } = .{},
+            /// Who still holds the stream (`Holder`); the last `release`
+            /// frees it.
+            holders: std.EnumSet(Holder) = .initOne(.quic),
             /// The connection's flush waits for this request's answer
             /// (`Conn.holding`), counted in receive round `round`. Only the
             /// stream's task changes it once the task runs.
             holds: bool = false,
             round: u32 = 0,
-            /// A `no_wait` route's request, run on the endpoint task
-            /// (`runInline`), which must never wait for the peer: its
-            /// response is queued past the stream's cap instead.
-            inline_mode: bool = false,
-            /// A `no_wait` route's request with its body still coming, in
-            /// `Conn.awaiting`.
-            await_body: bool = false,
-            /// The handler detached the response (`dusty.Detached`): the
-            /// request and response live on in the stream's arena, and the
-            /// handler's hold on the stream goes when it is finished or
-            /// aborted.
-            detached: ?*Exchange = null,
-            /// The response is parked (`Response._park`): bursts of body
-            /// from whichever task has something to send, no task holding
-            /// it in between (`H3Parked`).
-            parked: ?*H3Parked = null,
-            /// `serve` is still running this stream's handler (inline or on
-            /// its task), which holds the stream: an end of a detached or
-            /// parked response before it returns (a park that failed, or a
-            /// finish or release from inside the handler) leaves the
-            /// handler's hold to `serve`'s caller and sets
-            /// `ended_in_handler`, rather than letting go of a stream
-            /// `serve` still touches. Executor-local; `ended_in_handler`
-            /// is locked.
-            in_handler: bool = false,
-            ended_in_handler: bool = false,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2613,6 +2747,184 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// grew it past `arena_keep` into a node too big for malloc's
             /// slabs, an mmap and munmap per request.
             sink_buf: []u8 = &.{},
+
+            /// Who may still touch the stream; the set (`holders`) empty
+            /// means freed, by `release`, the one place a holder goes
+            /// (but startStream's spawn failure, which QUIC outlives).
+            /// QUIC holds it from creation to its close, the handler from
+            /// `startStream`/`queueInline`/an awaited body until `serve`
+            /// returns, a response that outlives the handler while its
+            /// phase `owns` it (detached, attached or parked; `move`).
+            ///
+            ///   {quic}                   + handler  -> {quic,handler}
+            ///   {quic}                   - quic     -> freed (credit +1)
+            ///   {quic,handler}           - quic     -> {handler} (a reset request
+            ///                                          keeps its credit until
+            ///                                          its handler ends)
+            ///   {quic,handler}           - handler  -> {quic}
+            ///   {quic,handler}           + response -> {quic,handler,response}
+            ///   {quic,handler,response}  - handler  -> {quic,response}
+            ///   {quic,handler,response}  - quic     -> {handler,response}
+            ///   {quic,handler,response}  - response -> {quic,handler} (ended
+            ///                                          inside the handler)
+            ///   {quic,response} | {handler,response}
+            ///                            - either   -> the other one stays
+            ///   {handler} | {response}   - it       -> freed
+            ///
+            /// Inserting a holder already in the set (queueInline, then
+            /// startStream from runInline) and removing one already gone
+            /// are no-ops. QUIC never comes back once gone, and a response
+            /// takes its hold only while the handler holds the stream.
+            const Holder = enum { quic, handler, response };
+
+            /// Where a request runs, from its head through its handler to
+            /// the end of a response that outlived the handler:
+            ///
+            ///   phase \ event  queue     await_body     start    returned  park    attach    end    abort  release
+            ///   head           endpoint  awaiting_body  started  -         -       -         -      -      -
+            ///   awaiting_body  endpoint  -              started  -         -       -         -      -      -
+            ///   endpoint       -         -              started  detached  parked  attached  ended  -      -
+            ///   started        -         -              -        -         parked  -         ended  -      -
+            ///   detached       -         -              -        -         -       attached  ended  ended  -
+            ///   attached       -         -              -        -         -       -         ended  -      -
+            ///   parked         -         -              -        -         -       -         -      -      ended
+            ///   ended          -         -              -        -         -       -         -      -      -
+            ///
+            /// The head: `queue`: a `no_wait` request is whole, in
+            /// `Conn.ready` (`queueInline`; FIN in the head block, or in the
+            /// same packet as the head). `await_body`: a `no_wait` head is
+            /// complete with its body still coming, in `Conn.awaiting`.
+            /// `start`: it never runs inline from here: `startStream` (a
+            /// task, or the task cap's or a failed spawn's
+            /// REQUEST_REJECTED), let go in `startAwaiting` on a reset, or
+            /// the budget full in `runInline`. `endpoint` is both queued and
+            /// running inline (`Conn.ready` membership tells them apart);
+            /// `started` covers a task, a refusal and a let-go (`holders`,
+            /// `reset` and `task` tell them apart). A later state never
+            /// re-enters the head (a let-go stream must not be queued by a
+            /// later FIN).
+            ///
+            /// The handler's end (`dusty.Detached`): `returned`: `serve`
+            /// is back with the response detached on the endpoint task, its
+            /// owner to `finish` it, moved by `runInline` under the lock it
+            /// takes for the handler's release (a task's handler only
+            /// parks: `-`, and `run` does not move it).
+            /// `park`: `detachedPark` (refused, `error.WriteFailed`, where
+            /// `-`: a response detached already cannot park). `attach`: the
+            /// response goes on from a task (`detachedAttach`; `Detached`
+            /// asserts it was detached, so only from these two). `end`:
+            /// `detachedEnd`'s finish of a response that is not parked (or
+            /// a park that failed); a parked one's end writes FIN and stays
+            /// parked until `release`. `abort`: `abortDetached`, the stream
+            /// or the connection gone while the owner has no task and has
+            /// not begun to finish (`d.state == .detached`, the owner's
+            /// side); an attached task is canceled with the group instead,
+            /// and a parked owner hears `peerGone` (`ParkedNotice`).
+            /// `release`: `H3Parked.release`. An end that comes while
+            /// `serve` still runs (a park that failed, a finish or a release
+            /// from inside the handler) is the same `ended`: the handler's
+            /// hold goes with `serve`'s caller, as for any answer.
+            ///
+            /// Holds: the response holds the stream (`.response`) exactly
+            /// while the phase `owns` it (detached, attached, parked):
+            /// taken on entering, dropped on leaving, in `move`. The
+            /// handler's hold is the runner's, let go when `serve` returns
+            /// (`runInline`, `run`), whatever the response does; no hold
+            /// passes from one to the other.
+            ///
+            /// Access: every move and every read is under the connection
+            /// lock, but one: `detachedEnd` picks the parked end before it
+            /// writes (the write takes the lock itself). That read is
+            /// stable: only this response's own `finish` moves a phase whose
+            /// owner has begun to finish (`abortDetached` skips it), and
+            /// everything here runs on the endpoint's executor. `serve`
+            /// takes the mode at its entry as a parameter (attach and park
+            /// change the phase under the handler). Every move is a cell
+            /// here, made through `next`; add a state or a row, not a flag
+            /// beside it. The inline phases come last: `inlineWrites` is
+            /// one compare.
+            const Phase = union(enum(u8)) {
+                head,
+                awaiting_body,
+                started,
+                attached,
+                parked: *H3Parked,
+                ended,
+                /// Queued or running inline: writes pass the cap.
+                endpoint,
+                /// Detached on the endpoint task: its writes too.
+                detached: *Exchange,
+
+                const Tag = @typeInfo(Phase).@"union".tag_type.?;
+
+                const Event = union(enum) {
+                    queue,
+                    await_body,
+                    start,
+                    returned: *Exchange,
+                    park: *H3Parked,
+                    attach,
+                    end,
+                    abort,
+                    release,
+                };
+
+                fn next(p: Phase, ev: Event) Phase {
+                    return switch (p) {
+                        .head => switch (ev) {
+                            .queue => .endpoint,
+                            .await_body => .awaiting_body,
+                            .start => .started,
+                            .returned, .park, .attach, .end, .abort, .release => p,
+                        },
+                        .awaiting_body => switch (ev) {
+                            .queue => .endpoint,
+                            .start => .started,
+                            .await_body, .returned, .park, .attach, .end, .abort, .release => p,
+                        },
+                        .endpoint => switch (ev) {
+                            .start => .started,
+                            .returned => |ex| .{ .detached = ex },
+                            .park => |hp| .{ .parked = hp },
+                            .attach => .attached,
+                            .end => .ended,
+                            .queue, .await_body, .abort, .release => p,
+                        },
+                        .started => switch (ev) {
+                            .park => |hp| .{ .parked = hp },
+                            .end => .ended,
+                            .queue, .await_body, .start, .returned, .attach, .abort, .release => p,
+                        },
+                        .detached => switch (ev) {
+                            .attach => .attached,
+                            .end, .abort => .ended,
+                            .queue, .await_body, .start, .returned, .park, .release => p,
+                        },
+                        .attached => switch (ev) {
+                            .end => .ended,
+                            .queue, .await_body, .start, .returned, .park, .attach, .abort, .release => p,
+                        },
+                        .parked => switch (ev) {
+                            .release => .ended,
+                            .queue, .await_body, .start, .returned, .park, .attach, .end, .abort => p,
+                        },
+                        .ended => p,
+                    };
+                }
+
+                /// The response holds the stream (`.response`).
+                fn owns(p: Phase) bool {
+                    return switch (p) {
+                        .detached, .attached, .parked => true,
+                        .head, .awaiting_body, .started, .ended, .endpoint => false,
+                    };
+                }
+
+                /// On the endpoint task: writes pass the stream's cap.
+                fn inlineWrites(p: Phase) bool {
+                    return @backingInt(@as(Tag, p)) >= @backingInt(Tag.endpoint);
+                }
+            };
 
             /// The request body's receive side:
             ///
@@ -2730,13 +3042,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Drops one holder; the last frees the stream. Locked.
-            fn release(s: *Stream, who: enum { quic, handler, parked }) void {
-                switch (who) {
-                    .quic => s.refs.quic = false,
-                    .handler => s.refs.handler = false,
-                    .parked => s.refs.parked = false,
-                }
-                if (s.refs.quic or s.refs.handler or s.refs.parked) return;
+            fn release(s: *Stream, who: Holder) void {
+                // Released once: a second would free the stream again.
+                std.debug.assert(s.holders.contains(who));
+                s.holders.remove(who);
+                if (s.holders.count() != 0) return;
                 const conn = s.conn;
                 if (conn.streams.swapRemove(s.id)) {
                     gauges.add(conn.ep.io, .h3_streams, -1);
@@ -2746,6 +3056,18 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // reset still counts while its handler runs.
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 s.free();
+            }
+
+            /// A handler-end move (`Phase.next`) with the response's hold:
+            /// taken on entering a phase that `owns` the stream, dropped on
+            /// leaving one, which may free the stream: the caller's last
+            /// use of it, and of what lives in its arena. Locked.
+            fn move(s: *Stream, ev: Phase.Event) void {
+                const owned = s.phase.owns();
+                s.phase = s.phase.next(ev);
+                const owns = s.phase.owns();
+                if (owns and !owned) s.holders.insert(.response);
+                if (owned and !owns) s.release(.response);
             }
 
             /// The flush need not wait for this request any longer: it has
@@ -2787,7 +3109,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // under way (or ending: `over` before its last
                     // `finishBurst`) on another task, which owns `task`
                     // now; after the end that task has cleared it.
-                    const burst_owns = if (s.parked) |p| p.notice.inBurst() or p.notice == .over else false;
+                    const burst_owns = switch (s.phase) {
+                        .parked => |p| p.notice.inBurst() or p.notice == .over,
+                        else => false,
+                    };
                     if (!burst_owns) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
@@ -2798,7 +3123,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (gone) return;
                 // A parked response (`.detached`, the only detach a task's
-                // handler may do) holds the stream itself (`refs.parked`):
+                // handler may do) holds the stream itself (`.response`):
                 // the handler's hold goes as for any other.
                 _ = s.serve(false) catch |err| return s.failed(err);
             }
@@ -2813,28 +3138,38 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // the budget, it goes to a task, whose writes wait on it.
                 // So the budget holds but for one inline body.
                 if (!gone and conn.budget.room() == 0) {
-                    s.inline_mode = false;
                     conn.startStream(s);
                     conn.unlock();
                     return;
                 }
                 conn.unlock();
+                var detached: ?*Exchange = null;
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
                     _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
-                    if (s.serve(true)) |served| {
-                        // Finished later; the stream is held till then.
-                        if (served == .detached) return;
-                    } else |err| s.failed(err) catch {
-                        // The endpoint task itself is canceled: it stops
-                        // reading once these requests are done.
-                        conn.ep.io.recancel();
+                    detached = s.serve(true) catch |err| blk: {
+                        s.failed(err) catch {
+                            // The endpoint task itself is canceled: it stops
+                            // reading once these requests are done.
+                            conn.ep.io.recancel();
+                        };
+                        break :blk null;
                     };
                 }
                 conn.lock();
+                // Detached: it becomes `detached` and holds the stream
+                // itself; over already (a park that failed, a finish or a
+                // release inside the handler) or parked, it is where it
+                // is. One lock with the handler's release: no yield since
+                // the handler returned.
+                if (detached) |ex| s.move(.{ .returned = ex });
+                // Read before the release, which may free the stream.
+                const owned = s.phase.owns();
                 s.release(.handler);
                 conn.unlock();
-                conn.kick();
+                // A response that outlives the handler holds the stream
+                // itself, and is kicked as it goes on.
+                if (!owned) conn.kick();
             }
 
             /// What a handler's error means for its stream.
@@ -2887,8 +3222,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `inline_mode`: on the endpoint task (a `no_wait` route),
             /// with no request timeout, whose timer would cancel that task;
             /// its response may be detached (`dusty.Detached`), and then the
-            /// stream is held until it is finished.
-            fn serve(s: *Stream, inline_mode: bool) !Served {
+            /// stream is held until it is finished. Returns the exchange of
+            /// a detached response, for the caller to move (`.returned`);
+            /// on a task, only a park detaches, and it has moved already.
+            fn serve(s: *Stream, inline_mode: bool) !?*Exchange {
                 const conn = s.conn;
                 const ep = conn.ep;
                 const server = ep.http;
@@ -2935,13 +3272,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const response = &ex.response;
                 response.* = try dusty.Response._initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
                 server.configureResponse(response);
-                var detached = false;
-                defer if (!detached) response.deinit();
+                // A detached response is its owner's (or over already, a
+                // park that failed having handled the error), whatever the
+                // handler returned: the stack copy is not freed here.
+                defer if (response.detached == null) response.deinit();
                 response._request = request;
                 request._response = response;
                 // On the endpoint task the response may detach; on its own
                 // task only to be parked (an event stream, `Response._park`).
-                ex.attached = false;
                 response._detach_engine = &detach_engine;
                 response._detach_ctx = ex;
                 response._detach_park_only = !inline_mode;
@@ -2949,20 +3287,20 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (s.head_too_large) {
                     response.status = .request_header_fields_too_large;
                     try response.write();
-                    return .done;
+                    return null;
                 }
                 if (s.method.len == 0 or s.path.len == 0) {
                     response.status = .bad_request;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 }
                 request.method = parseMethod(s.method) orelse {
                     response.status = .not_implemented;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 };
                 if (request.method == .connect) {
@@ -2971,7 +3309,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .not_implemented;
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     }
                     // An extended CONNECT (RFC 9220; nghttp3 has checked
@@ -3024,7 +3362,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             response.status = .bad_request;
                             {
                                 try response.write();
-                                return .done;
+                                return null;
                             }
                         }
                     } else request.headers.add("Host", s.authority) catch {
@@ -3041,7 +3379,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     response.status = .request_header_fields_too_large;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 }
                 request._applyEntityHeaders();
@@ -3052,7 +3390,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.body = "413 Content Too Large\n";
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     };
                 }
@@ -3075,45 +3413,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .expectation_failed;
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     }
                 }
 
-                // Executor-local, as everything that ends a detached or
-                // parked response runs on the endpoint's executor: set and
-                // cleared without the lock, read under it.
-                s.in_handler = true;
                 const dispatched = server.dispatch(request, response);
-                s.in_handler = false;
-                // A detached response is its owner's (or over already, a
-                // park that failed having handled the error), whatever the
-                // handler returned: the stack copy is not written or freed
-                // here.
-                if (response.detached) |d| {
-                    detached = true;
-                    conn.lock();
-                    defer conn.unlock();
-                    const ended = s.ended_in_handler;
-                    s.ended_in_handler = false;
-                    // Already over (a park that failed, or a finish or
-                    // release from inside the handler): `d` may be gone with
-                    // the exchange, and the handler's hold is the caller's
-                    // to let go, as for a response written in place.
-                    if (ended) return .done;
-                    // On a task the detach was a park: the park holds the
-                    // stream, and the task's hold goes as usual. Inline, the
-                    // detach keeps the handler's hold until it is finished.
-                    if (inline_mode) s.detached = exchangeOf(d);
-                    return .detached;
-                }
+                // Detached: not written here; the caller moves it.
+                if (response.detached) |d| return exchangeOf(d);
                 dispatched catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
                 try response.write();
-                return .done;
+                return null;
             }
 
             /// Every byte of the response body is queued and handed to
@@ -3150,7 +3464,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn resume_(s: *Stream) void {
                 if (!s.deferred) return;
                 s.deferred = false;
-                if (s.conn.h3) |hc| _ = h.nghttp3_conn_resume_stream(hc, s.id);
+                if (s.conn.h3()) |hc| _ = h.nghttp3_conn_resume_stream(hc, s.id);
             }
 
             /// Waits for `signal` to change after `seen`. Unlocked.
@@ -3191,12 +3505,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             response: dusty.Response,
             sink_state: StreamSink,
             body_reader: BodyReader,
-            /// Its response went on from a task (`detachedAttach`),
-            /// counted in `Conn.tasks`.
-            attached: bool,
         };
-
-        const Served = enum { done, detached };
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`dusty.Detached`).
@@ -3239,7 +3548,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex.request._body_held.release();
             const s = ex.sink_state.stream;
             const conn = s.conn;
-            if (s.parked != null) {
+            // Unlocked (`Phase`): only this finish moves a parked phase
+            // before the release, and the write below takes the lock.
+            if (s.phase == .parked) {
                 // The end of a parked response: FIN after what was queued
                 // (or the failure's reset). The park keeps the stream until
                 // the owner's `Parked.release`.
@@ -3247,9 +3558,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                     StreamSink.end(@ptrCast(&ex.sink_state), if (ex.response.trailers) |*t| t else null) catch {};
                 } else |err| s.failed(err) catch {};
                 ex.response.deinit();
-                conn.lock();
-                s.detached = null;
-                conn.unlock();
                 conn.kick();
                 return;
             }
@@ -3258,23 +3566,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             } else |err| s.failed(err) catch {};
             ex.response.deinit();
             conn.lock();
-            // Ended inside the handler (a park that failed, or a finish
-            // from inside it): `serve` sees it, and its caller lets go.
-            if (s.in_handler) s.ended_in_handler = true;
-            // A park that failed on a handler's task: that task still holds
-            // the stream and lets go when it ends.
-            if (ex.response._detach_park_only) {
-                conn.unlock();
-                conn.kick();
-                return;
-            }
-            s.detached = null;
-            if (s.recv != .done and !s.reset) conn.lingerRead(s);
-            if (!s.in_handler) s.release(.handler);
+            const was = s.phase;
+            // A park that failed on a handler's task: that task still runs
+            // and reads the rest of the body when it ends.
+            if (was != .started and s.recv != .done and !s.reset) conn.lingerRead(s);
+            // May free the stream, `ex` with it.
+            s.move(.end);
             conn.unlock();
             conn.kick();
             // Last: the driver may free the connection once no task runs.
-            if (ex.attached) _ = conn.tasks.fetchSub(1, .acq_rel);
+            if (was == .attached) _ = conn.tasks.fetchSub(1, .acq_rel);
         }
 
         /// The response goes on from a task, in the connection's group:
@@ -3292,9 +3593,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = s.conn;
             conn.lock();
             defer conn.unlock();
-            ex.attached = true;
+            // Taken back at its end (`detachedEnd`, from the phase).
             _ = conn.tasks.fetchAdd(1, .acq_rel);
-            s.inline_mode = false;
+            s.move(.attach);
             return spawn.into(&conn.group, conn.ep.io);
         }
 
@@ -3304,15 +3605,20 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// detached (not attached): the owner hears of it, and the stream
         /// is let go. Locked.
         fn abortDetached(s: *Stream) void {
-            if (s.parked) |p| return p.peerGone();
-            const ex = s.detached orelse return;
-            const d = ex.response.detached.?;
-            if (d.state != .detached) return;
-            s.detached = null;
-            d.abort();
-            ex.request._body_held.release();
-            ex.response.deinit();
-            s.release(.handler);
+            switch (s.phase) {
+                .parked => |p| p.peerGone(),
+                .detached => |ex| {
+                    const d = ex.response.detached.?;
+                    // Its owner has begun to finish it.
+                    if (d.state != .detached) return;
+                    d.abort();
+                    ex.request._body_held.release();
+                    ex.response.deinit();
+                    // May free the stream, `ex` with it.
+                    s.move(.abort);
+                },
+                .head, .awaiting_body, .started, .attached, .ended, .endpoint => {},
+            }
         }
 
         /// A parked response (`Response._park`; design-realtime §3.4): its
@@ -3329,10 +3635,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex: *Exchange,
             d: *dusty.Detached,
             owner: dusty.Parked.Owner,
-            /// Parked after the response was detached on the endpoint task
-            /// (a `no_wait` route, the C ABI's requests): the detach's hold
-            /// on the stream (`.handler`) is the park's to let go too.
-            holds_handler: bool,
             /// Under the connection's lock. The stream's own `reset`
             /// is checked next to it.
             notice: dusty.ParkedNotice = .idle,
@@ -3430,32 +3732,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = of(p);
                 const s = self.s;
                 const conn = s.conn;
-                const holds_handler = self.holds_handler;
                 self.ex.request._body_held.release();
                 self.ex.response.deinit();
                 conn.lock();
                 defer conn.unlock();
                 // Let go before it ended (the owner gave up on a stream the
                 // peer still has open): reset it, so QUIC closes it.
-                if (!s.send.hasEnded() and s.refs.quic) {
+                if (!s.send.hasEnded() and s.holders.contains(.quic)) {
                     s.reset = true;
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
-                } else if (s.recv != .done and !s.reset and s.refs.quic) {
+                } else if (s.recv != .done and !s.reset and s.holders.contains(.quic)) {
                     conn.lingerRead(s);
                 }
-                s.parked = null;
-                s.detached = null;
                 conn.parked_open -= 1;
                 _ = conn.tasks.fetchSub(1, .acq_rel);
-                // One release for both holds: the stream may be freed
-                // here, with `self` in its arena. Released from inside the
-                // handler, the handler's hold stays: `serve`'s caller lets
-                // go when it returns.
-                if (holds_handler) {
-                    if (s.in_handler) s.ended_in_handler = true else s.refs.handler = false;
-                }
-                s.release(.parked);
+                // May free the stream, `self` with it.
+                s.move(.release);
                 conn.kick();
                 if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.ep.io);
             }
@@ -3469,15 +3762,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             const s = ex.sink_state.stream;
             const conn = s.conn;
             const p = try ex.response.arena.create(H3Parked);
-            p.* = .{ .s = s, .ex = ex, .d = d, .owner = parked_owner, .holds_handler = !ex.response._detach_park_only };
+            p.* = .{ .s = s, .ex = ex, .d = d, .owner = parked_owner };
             conn.lock();
             defer conn.unlock();
             if (s.reset) return error.WriteFailed;
-            s.parked = p;
-            s.refs.parked = true;
             // Bursts run on tasks, which may wait for the peer: the stream's
             // cap applies (not a `no_wait` request's queue past it).
-            s.inline_mode = false;
+            s.move(.{ .park = p });
+            if (s.phase != .parked) return error.WriteFailed;
             // Its handler has answered as far as the flush is concerned.
             s.unhold();
             conn.parked_open += 1;
@@ -3628,7 +3920,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
-                const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
+                const hc = conn.h3() orelse return self.fail(error.ConnectionResetByPeer);
                 if (h.nghttp3_conn_submit_info(hc, s.id, &nva, nva.len) != 0) return self.fail(error.Unexpected);
                 conn.kick();
             }
@@ -3671,7 +3963,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = s.conn;
                 if (s.send.isSubmitted()) return;
                 if (s.reset) return self.fail(error.ConnectionResetByPeer);
-                const hc = conn.h3 orelse return self.fail(error.ConnectionResetByPeer);
+                const hc = conn.h3() orelse return self.fail(error.ConnectionResetByPeer);
                 const reader: h.nghttp3_data_reader = .{ .read_data = readData };
                 const rv = h.nghttp3_conn_submit_response(hc, s.id, s.response_nv.ptr, s.response_nv.len, &reader);
                 if (rv != 0) {
@@ -3744,8 +4036,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return err;
                     };
                     // Inline, the write passes the cap: no need to ask it.
-                    const cap = if (s.inline_mode) 0 else s.sendCap();
-                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, s.inline_mode) catch {
+                    const inline_write = s.phase.inlineWrites();
+                    const cap = if (inline_write) 0 else s.sendCap();
+                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, inline_write) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
@@ -3970,7 +4263,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, offset: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const bytes: []const u8 = if (len == 0) &.{} else data[0..len];
-            if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
+            if (conn.proto == .hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
             if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| {
@@ -4008,7 +4301,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onAcked(stream_id, len)) return 0;
-            const hc = conn.h3 orelse return 0;
+            const hc = conn.h3() orelse return 0;
             if (h.nghttp3_conn_add_ack_offset(hc, stream_id, len) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
@@ -4016,10 +4309,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onStreamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (c.ngtcp2_is_bidi_stream(stream_id) == 0) return 0;
-            if (conn.hq) {
+            if (conn.proto == .hq) {
                 const hs = conn.ep.gpa.create(HqStream) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 hs.* = .{};
-                conn.hq_streams.put(conn.ep.gpa, stream_id, hs) catch {
+                conn.proto.hq.put(conn.ep.gpa, stream_id, hs) catch {
                     conn.ep.gpa.destroy(hs);
                     return c.NGTCP2_ERR_CALLBACK_FAILURE;
                 };
@@ -4045,7 +4338,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             };
             const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
             if (rv != 0) return rv;
-            if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
+            switch (conn.proto) {
+                .hq => |*m| if (m.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa),
+                .handshaking, .h3 => {},
+            }
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
@@ -4070,14 +4366,17 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onReset(stream_id, code)) return 0;
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            if (conn.h3()) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
                 s.wakeAll();
                 s.cancelHandler();
                 if (s.wt_session) |session| session.onChannelEnd(.connection);
                 // A parked response's owner hears of it now.
-                if (s.parked) |p| p.peerGone();
+                switch (s.phase) {
+                    .parked => |p| p.peerGone(),
+                    else => {},
+                }
             }
             conn.kick();
             return 0;
@@ -4088,7 +4387,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// read no more of it either.
         fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            if (conn.h3()) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
@@ -4102,7 +4401,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.reset = true;
                 s.wakeAll();
                 if (code != h.NGHTTP3_H3_NO_ERROR) s.cancelHandler();
-                if (s.parked) |p| p.peerGone();
+                switch (s.phase) {
+                    .parked => |p| p.peerGone(),
+                    else => {},
+                }
             }
             conn.kick();
             return 0;
@@ -4132,16 +4434,16 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onExtendMaxRemoteStreamsBidi(_: ?*c.ngtcp2_conn, max_streams: u64, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            if (conn.h3) |hc| h.nghttp3_conn_set_max_client_streams_bidi(hc, max_streams);
+            if (conn.h3()) |hc| h.nghttp3_conn_set_max_client_streams_bidi(hc, max_streams);
             return 0;
         }
 
         fn onExtendMaxStreamData(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             // More credit: the driver writes again.
-            if (conn.hq) conn.kick();
+            if (conn.proto == .hq) conn.kick();
             if (conn.wt) |w| if (w.onUnblocked(stream_id)) return 0;
-            const hc = conn.h3 orelse return 0;
+            const hc = conn.h3() orelse return 0;
             if (h.nghttp3_conn_unblock_stream(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
@@ -4149,17 +4451,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvTxKey(_: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
             if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
             const conn = connOf(user_data);
-            if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
-                conn.hq = true;
-                return 0;
+            switch (conn.proto) {
+                .handshaking => if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
+                    conn.proto = .{ .hq = .empty };
+                } else conn.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE,
+                .h3, .hq => {},
             }
-            conn.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
         fn writePkt(_: ?*c.ngtcp2_conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, len: usize, ts: c.ngtcp2_tstamp, user_data: ?*anyopaque) callconv(.c) c.ngtcp2_ssize {
             const conn = connOf(user_data);
-            if (conn.hq) return conn.hqWritePacket(p, pi, dest, len, ts);
+            if (conn.proto == .hq) return conn.hqWritePacket(p, pi, dest, len, ts);
             return bridge.writePacket(conn.side(), p, pi, dest, len, ts);
         }
 
@@ -4244,7 +4547,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             // Trailers on a request are not passed on.
-            if (s.started or s.head_too_large) return 0;
+            if (s.phase != .head or s.head_too_large) return 0;
             const arena = s.arena.allocator();
             const v = h.nghttp3_rcbuf_get_buf(value);
             const n = h.nghttp3_rcbuf_get_buf(name);
@@ -4279,7 +4582,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3EndHeaders(_: ?*h.nghttp3_conn, _: i64, fin: c_int, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
-            if (s.started) return 0;
+            if (s.phase != .head) return 0;
             if (fin != 0) s.recv = .done;
             // On a server, 1-RTT data is only read once the handshake has
             // completed, so a head that ends before came in 0-RTT.
@@ -4289,9 +4592,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             } else if (s.recv == .done) {
                 conn.queueInline(s);
             } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
-                s.started = true;
-                s.refs.handler = true;
-                s.await_body = true;
+                s.holders.insert(.handler);
+                s.phase = s.phase.next(.await_body);
             } else |_| conn.startStream(s);
             return 0;
         }
@@ -4302,11 +4604,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             s.recv = .done;
             s.rx.notify(conn.ep.io);
             if (s.wt_session) |session| session.onChannelEnd(.peer);
-            if (s.await_body) {
-                // Whole within the packet: inline after all.
-                s.await_body = false;
-                conn.queueInline(s);
-            }
+            // Whole within the packet: inline after all.
+            if (s.phase == .awaiting_body) conn.queueInline(s);
             conn.kick();
             return 0;
         }
@@ -4335,7 +4634,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
-                    if (h.nghttp3_conn_submit_trailers(s.conn.h3, stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
+                    if (h.nghttp3_conn_submit_trailers(s.conn.h3(), stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
                         return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 }
                 return 0;
@@ -4352,7 +4651,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
-                    if (h.nghttp3_conn_submit_trailers(s.conn.h3, stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
+                    if (h.nghttp3_conn_submit_trailers(s.conn.h3(), stream_id, s.trailer_nv.ptr, s.trailer_nv.len) != 0)
                         return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 }
             }
@@ -4463,4 +4762,91 @@ test "send memory: the automatic limit, in blocks, rounded up" {
     const MiB: u64 = 1 << 20;
     // `cgroup.memoryQuarter`'s tests cover the formula.
     try std.testing.expectEqual(@as(i64, 16384), bridge.SendMemory.init(autoSendMemory(null, 256 * MiB)).limit.load(.monotonic));
+}
+
+test "h3 stream phase: every state x event cell, and what each phase writes and holds" {
+    const E = Endpoint(void);
+    const Phase = E.Stream.Phase;
+    const Tag = Phase.Tag;
+    const ex: *E.Exchange = @ptrFromInt(0x1000);
+    const hp: *E.H3Parked = @ptrFromInt(0x2000);
+    const events = [_]Phase.Event{ .queue, .await_body, .start, .{ .returned = ex }, .{ .park = hp }, .attach, .end, .abort, .release };
+    // One row a phase, in declaration order; `want` in the order of
+    // `events`. The cells' reasons are in `Phase`'s doc comment.
+    const rows = [_]struct { from: Phase, want: [events.len]Tag, inline_writes: bool, owns: bool }{
+        .{ .from = .head, .want = .{ .endpoint, .awaiting_body, .started, .head, .head, .head, .head, .head, .head }, .inline_writes = false, .owns = false },
+        .{ .from = .awaiting_body, .want = .{ .endpoint, .awaiting_body, .started, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body, .awaiting_body }, .inline_writes = false, .owns = false },
+        .{ .from = .started, .want = .{ .started, .started, .started, .started, .parked, .started, .ended, .started, .started }, .inline_writes = false, .owns = false },
+        .{ .from = .attached, .want = .{ .attached, .attached, .attached, .attached, .attached, .attached, .ended, .attached, .attached }, .inline_writes = false, .owns = true },
+        .{ .from = .{ .parked = hp }, .want = .{ .parked, .parked, .parked, .parked, .parked, .parked, .parked, .parked, .ended }, .inline_writes = false, .owns = true },
+        .{ .from = .ended, .want = .{ .ended, .ended, .ended, .ended, .ended, .ended, .ended, .ended, .ended }, .inline_writes = false, .owns = false },
+        .{ .from = .endpoint, .want = .{ .endpoint, .endpoint, .started, .detached, .parked, .attached, .ended, .endpoint, .endpoint }, .inline_writes = true, .owns = false },
+        .{ .from = .{ .detached = ex }, .want = .{ .detached, .detached, .detached, .detached, .detached, .attached, .ended, .ended, .detached }, .inline_writes = true, .owns = true },
+    };
+    try std.testing.expectEqual(std.enums.values(Tag).len, rows.len);
+    for (rows, 0..) |r, i| {
+        errdefer std.debug.print("phase: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(i, @backingInt(@as(Tag, r.from)));
+        try std.testing.expectEqual(r.inline_writes, r.from.inlineWrites());
+        try std.testing.expectEqual(r.owns, r.from.owns());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            const got = r.from.next(ev);
+            try std.testing.expectEqual(want, @as(Tag, got));
+            // A payload comes from the event, or stays.
+            switch (got) {
+                .detached => |p| try std.testing.expectEqual(ex, p),
+                .parked => |p| try std.testing.expectEqual(hp, p),
+                else => {},
+            }
+        }
+    }
+}
+test "h3 conn life: every state x event cell of the transition table" {
+    comptime std.debug.assert(@sizeOf(Life) == 16);
+    const due = 7;
+    const end = 9;
+    const events = [_]Life.Event{ .{ .drain_notice = due }, .drain_final, .{ .peer_close = end }, .{ .local_close = end }, .end };
+    // One row a state, in declaration order (`isOpen` is one compare on
+    // it); `want` in the order of `events`, null for "-".
+    const rows = [_]struct { from: Life, want: [events.len]?Life, open: bool }{
+        .{ .from = .open, .want = .{ .{ .notice = due }, null, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .{ .notice = 3 }, .want = .{ null, .final, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .final, .want = .{ null, null, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .{ .closing = 3 }, .want = .{ null, null, null, null, .closed }, .open = false },
+        .{ .from = .{ .draining = 3 }, .want = .{ null, null, null, null, .closed }, .open = false },
+        .{ .from = .closed, .want = .{ null, null, null, null, .closed }, .open = false },
+    };
+    try std.testing.expectEqual(std.enums.values(Life.Tag).len, rows.len);
+    for (rows, 0..) |r, i| {
+        errdefer std.debug.print("life: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(i, @backingInt(@as(Life.Tag, r.from)));
+        try std.testing.expectEqual(r.open, r.from.isOpen());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            // Payloads included: `due` and `end` come from the event.
+            try std.testing.expectEqual(want, r.from.next(ev));
+        }
+    }
+}
+
+test "h3 conn seat: every state x event cell, and what each seat answers" {
+    comptime std.debug.assert(@sizeOf(Seat) == 1);
+    const events = [_]Seat.Event{ .handoff, .retire, .give_up };
+    const rows = [_]struct { from: Seat, want: [events.len]Seat, handed_over: bool, over: bool }{
+        .{ .from = .accepting, .want = .{ .driven, .accepting, .given_up }, .handed_over = false, .over = false },
+        .{ .from = .given_up, .want = .{ .given_up, .given_up, .given_up }, .handed_over = false, .over = true },
+        .{ .from = .driven, .want = .{ .driven, .retired, .driven }, .handed_over = true, .over = false },
+        .{ .from = .retired, .want = .{ .retired, .retired, .retired }, .handed_over = true, .over = true },
+    };
+    try std.testing.expectEqual(std.enums.values(Seat).len, rows.len);
+    for (rows) |r| {
+        errdefer std.debug.print("seat: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(r.handed_over, r.from.handedOver());
+        try std.testing.expectEqual(r.over, r.from.over());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            try std.testing.expectEqual(want, r.from.next(ev));
+        }
+    }
 }
