@@ -381,6 +381,8 @@ const Handlers = struct {
         s.router.get("/headers", headerCount);
         s.router.get("/huge", huge);
         s.router.get("/huge/stream", hugeStream);
+        s.router.get("/huge/bare", hugeBare);
+        s.router.get("/huge/tunnel", hugeBare);
     }
 
     /// A head the HPACK block can't hold (over `max_headers_len`): its
@@ -396,6 +398,15 @@ const Handlers = struct {
         try out.interface.writeAll("never");
         try out.interface.flush();
         try out.end();
+    }
+    /// No body: the head goes out with the end, on HEADERS (`end`'s bare
+    /// path, or `endChain`'s on a tunnel). The end's error is dropped, as
+    /// `Tun`'s deferred end does.
+    fn hugeBare(_: *Request, res: *Response) !void {
+        try res.header("x-huge", &huge_value);
+        var buf: [64]u8 = undefined;
+        var out = try res.stream(&buf);
+        out.end() catch {};
     }
     // Huffman takes 'x' to 7 bits: still over the limit encoded.
     const huge_value: [96 * 1024]u8 = @splat('x');
@@ -1392,13 +1403,18 @@ test "h2 engine: a parked response released without ending is reset with CANCEL"
     try expectEqualStrings("hello", (try c.until(next)).body.items);
 }
 
-test "h2 engine: a response head that can't be submitted is reset with INTERNAL_ERROR, whole or streamed, and the connection carries on" {
+test "h2 engine: a response head that can't be submitted is reset with INTERNAL_ERROR, whole, streamed, bare or on a tunnel, and the connection carries on" {
     var fx: Fixture = undefined;
-    try fx.start(testing.allocator, testing.io, .{});
+    try fx.start(testing.allocator, testing.io, .{ .http2 = .{ .enable_connect_protocol = true } });
     defer fx.stop();
     const c = &fx.client;
-    for ([_][]const u8{ "/huge", "/huge/stream" }) |path| {
-        const id = try c.request("GET", path, null);
+    for ([_][]const u8{ "/huge", "/huge/stream", "/huge/bare", "/huge/tunnel" }) |path| {
+        const tunnel = std.mem.eql(u8, path, "/huge/tunnel");
+        const id = if (tunnel) blk: {
+            const t = try c.open("CONNECT", path, &.{.{ .name = ":protocol", .value = "websocket" }}, false);
+            try c.flush();
+            break :blk t;
+        } else try c.request("GET", path, null);
         const r = try c.until(id);
         errdefer std.debug.print("{s}\n", .{path});
         try expectEqual(0, r.status);
