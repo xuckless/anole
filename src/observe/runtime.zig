@@ -39,61 +39,72 @@ pub fn ioEngine(rt: *zio.Runtime) []const u8 {
     return @tagName(zio.ev.backend);
 }
 
-/// Why io_uring is probably off when zio fell back to epoll. zio drops the
-/// real error of `io_uring_setup`, so this is a guess from what Anole can
-/// read; `refused` is what is left (a seccomp profile, a security module or a
-/// kernel built without io_uring).
-pub const FallbackCause = enum { disabled, group_only, kernel_too_old, refused };
+/// `auto`: io_uring on Linux, epoll when the kernel refuses a ring (the
+/// startup line says why); `io_uring`: refuse to start on anything else.
+pub const IoEngine = enum { auto, io_uring };
 
-pub const Kernel = struct { major: u32, minor: u32 };
+/// zio's `FallbackReason` (EPERM, EINVAL, ENOSYS are the setup errors that
+/// fall back); `void` where zio's backend is not the Linux one.
+pub const Reason = if (builtin.os.tag == .linux and zio.ev.backend == .linux and @hasDecl(zio.ev.Loop, "ioUringFallback"))
+    @typeInfo(@typeInfo(@TypeOf(zio.ev.Loop.ioUringFallback)).@"fn".return_type.?).optional.child
+else
+    void;
 
-/// `io_uring_disabled` is `kernel.io_uring_disabled` (null: no such sysctl,
-/// before Linux 6.6); `kernel` is null when its release could not be read.
-/// zio asks for DEFER_TASKRUN, so a kernel before 6.1 refuses its ring.
-pub fn fallbackCause(io_uring_disabled: ?u8, kernel: ?Kernel) FallbackCause {
-    if (io_uring_disabled) |d| switch (d) {
-        2 => return .disabled,
-        1 => return .group_only,
-        else => {},
+/// Why io_uring is off. `blocked` is the one cause that is still a guess:
+/// EPERM with `kernel.io_uring_disabled` unset means a seccomp profile or a
+/// security module.
+pub const FallbackCause = enum { disabled, group_only, blocked, flags_refused, no_io_uring };
+
+/// `io_uring_disabled` is `kernel.io_uring_disabled` (null:
+/// no such sysctl, before Linux 6.6), told only for EPERM, where the sysctl
+/// is the one extra fact.
+pub fn fallbackCause(reason: Reason, io_uring_disabled: ?u8) FallbackCause {
+    return switch (reason) {
+        .arguments_invalid => .flags_refused,
+        .system_outdated => .no_io_uring,
+        .permission_denied => switch (io_uring_disabled orelse 0) {
+            2 => .disabled,
+            1 => .group_only,
+            else => .blocked,
+        },
     };
-    if (kernel) |k| if (k.major < 6 or (k.major == 6 and k.minor < 1)) return .kernel_too_old;
-    return .refused;
 }
 
-/// The cause as a log/`/config` phrase, worded as likely.
+/// The cause as a log/`/config` phrase.
 pub fn causeText(cause: FallbackCause) []const u8 {
     return switch (cause) {
-        .disabled => "likely kernel.io_uring_disabled=2",
-        .group_only => "likely kernel.io_uring_disabled=1 and this process is not in kernel.io_uring_group",
-        .kernel_too_old => "likely a kernel older than 6.1, which Anole's runtime needs for io_uring",
-        .refused => "likely io_uring_setup was refused by a seccomp profile (Docker's default blocks io_uring) or a security module",
+        .disabled => "kernel.io_uring_disabled=2",
+        .group_only => "kernel.io_uring_disabled=1 and this process is not in kernel.io_uring_group",
+        .blocked => "io_uring_setup was refused (EPERM), likely by a seccomp profile (Docker's default blocks io_uring) or a security module",
+        .flags_refused => "the kernel refused the ring's setup flags (Anole's runtime needs Linux 6.1 for DEFER_TASKRUN)",
+        .no_io_uring => "the kernel has no io_uring (or a filter answers ENOSYS)",
     };
 }
 
-/// "5.15.0-91-generic" -> 5.15.
-pub fn parseKernel(release: []const u8) ?Kernel {
-    var it = std.mem.splitScalar(u8, std.mem.trim(u8, release, " \n"), '.');
-    const major = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
-    const rest = it.next() orelse return null;
-    var end: usize = 0;
-    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
-    const minor = std.fmt.parseInt(u32, rest[0..end], 10) catch return null;
-    return .{ .major = major, .minor = minor };
-}
-
-/// The likely cause when `rt` wanted io_uring and runs on epoll (Linux, zio's
+/// Why `rt` runs on epoll although it wanted io_uring (Linux, zio's
 /// automatic choice); null when it runs on io_uring or never chose. Reads
-/// procfs: startup only.
+/// procfs for EPERM: startup only.
 pub fn ioUringFallback(rt: *zio.Runtime) ?FallbackCause {
     if (comptime builtin.os.tag != .linux or zio.ev.backend != .linux) return null;
-    if (!std.mem.eql(u8, ioEngine(rt), "epoll")) return null;
+    if (comptime !@hasDecl(zio.ev.Loop, "ioUringFallback")) return null;
+    if (rt.executors.items.len == 0) return null;
+    const reason = rt.executors.items[0].loop.ioUringFallback() orelse return null;
     var buf: [128]u8 = undefined;
     const disabled: ?u8 = if (os.readSmall("/proc/sys/kernel/io_uring_disabled", &buf)) |t|
         std.fmt.parseInt(u8, std.mem.trim(u8, t, " \n"), 10) catch null
     else
         null;
-    const kernel = if (os.readSmall("/proc/sys/kernel/osrelease", &buf)) |t| parseKernel(t) else null;
-    return fallbackCause(disabled, kernel);
+    return fallbackCause(reason, disabled);
+}
+
+/// The startup check behind `Options.io_engine`: with io_uring required, the
+/// text of why it is not what runs (null: all is well). `engine` is
+/// `ioEngine`'s answer; off Linux io_uring does not exist.
+pub fn requireIoUring(want: IoEngine, engine: []const u8, cause: ?FallbackCause) ?[]const u8 {
+    if (want == .auto or std.mem.eql(u8, engine, "io_uring")) return null;
+    if (builtin.os.tag != .linux) return "io_uring is Linux-only";
+    if (cause) |c| return causeText(c);
+    return "the runtime fell back to epoll";
 }
 
 /// `/config` lines for the runtime: the engine, and on a fallback the likely

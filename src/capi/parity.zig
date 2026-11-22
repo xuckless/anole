@@ -319,6 +319,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "errors", .json = "errors", .kind = .same },
     .{ .zig = "error_handler", .omitted = "a function: the language answers its own errors (`anole_fail`)" },
     .{ .zig = "executors", .json = "executors", .kind = .custom, .note = "0 is `.auto`, n is `.exact(n)`" },
+    .{ .zig = "io_engine", .json = "io_engine", .kind = .same },
     .{ .zig = "max_stack_size", .omitted = "stacks run Anole's native work only, never language handlers; the default fits the bundled code" },
     .{ .zig = "raise_fd_limit", .omitted = "always on under the ABI" },
     .{ .zig = "signals", .omitted = "the ANOLE_SERVER_SIGNALS flag of `anole_server_create`, not the JSON" },

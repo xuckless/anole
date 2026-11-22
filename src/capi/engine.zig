@@ -1518,6 +1518,7 @@ pub const Engine = struct {
         return .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
+            .io_engine = cfg.io_engine,
             .signals = e.signals,
             .raise_fd_limit = true,
             .environment = cfg.environment,

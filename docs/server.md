@@ -196,6 +196,7 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
 | `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
+| `io_engine` | `.auto` | `.auto`: io_uring on Linux, epoll when the kernel refuses a ring (the startup line names the cause). `.io_uring`: refuse to start on epoll, with the cause in the error; off Linux always refused. |
 | `max_stack_size` | 1 MiB (4 MiB on Windows) | The most stack a connection's coroutine may grow to. |
 | `raise_fd_limit` | true | Raise the soft open-file limit to the hard one at `init`; see [Many connections](#many-connections). |
 | `signals` | true | Whether `run` handles SIGINT, SIGTERM and SIGHUP. |
