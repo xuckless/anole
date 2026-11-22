@@ -43,18 +43,21 @@ pub fn ioEngine(rt: *zio.Runtime) []const u8 {
 /// startup line says why); `io_uring`: refuse to start on anything else.
 pub const IoEngine = enum { auto, io_uring };
 
-/// The `io_uring_setup` failure behind zio's fallback to epoll, as zio
-/// reports it (EPERM, EINVAL and ENOSYS are the ones that fall back).
-pub const Reason = enum { permission_denied, arguments_invalid, system_outdated };
+/// zio's `FallbackReason` (EPERM, EINVAL, ENOSYS are the setup errors that
+/// fall back); `void` where zio's backend is not the Linux one.
+pub const Reason = if (builtin.os.tag == .linux and zio.ev.backend == .linux and @hasDecl(zio.ev.Loop, "ioUringFallback"))
+    @typeInfo(@typeInfo(@TypeOf(zio.ev.Loop.ioUringFallback)).@"fn".return_type.?).optional.child
+else
+    void;
 
 /// Why io_uring is off. `blocked` is the one cause that is still a guess:
 /// EPERM with `kernel.io_uring_disabled` unset means a seccomp profile or a
 /// security module.
 pub const FallbackCause = enum { disabled, group_only, blocked, flags_refused, no_io_uring };
 
-/// `io_uring_disabled` is `kernel.io_uring_disabled` (null: no such sysctl,
-/// before Linux 6.6), told only for EPERM, where the sysctl is the one
-/// extra fact.
+/// `io_uring_disabled` is `kernel.io_uring_disabled` (null:
+/// no such sysctl, before Linux 6.6), told only for EPERM, where the sysctl
+/// is the one extra fact.
 pub fn fallbackCause(reason: Reason, io_uring_disabled: ?u8) FallbackCause {
     return switch (reason) {
         .arguments_invalid => .flags_refused,
@@ -85,11 +88,7 @@ pub fn ioUringFallback(rt: *zio.Runtime) ?FallbackCause {
     if (comptime builtin.os.tag != .linux or zio.ev.backend != .linux) return null;
     if (comptime !@hasDecl(zio.ev.Loop, "ioUringFallback")) return null;
     if (rt.executors.items.len == 0) return null;
-    const reason: Reason = switch (rt.executors.items[0].loop.ioUringFallback() orelse return null) {
-        .permission_denied => .permission_denied,
-        .arguments_invalid => .arguments_invalid,
-        .system_outdated => .system_outdated,
-    };
+    const reason = rt.executors.items[0].loop.ioUringFallback() orelse return null;
     var buf: [128]u8 = undefined;
     const disabled: ?u8 = if (os.readSmall("/proc/sys/kernel/io_uring_disabled", &buf)) |t|
         std.fmt.parseInt(u8, std.mem.trim(u8, t, " \n"), 10) catch null

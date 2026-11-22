@@ -472,12 +472,15 @@ test "tracing: OTEL_SERVICE_NAME from the process environment without .process" 
 
 test "observe runtime: fallbackCause is told by zio's reason, the sysctl only splits EPERM" {
     const rtm = @import("runtime.zig");
-    try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, null));
-    try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, 0));
-    try std.testing.expectEqual(rtm.FallbackCause.disabled, rtm.fallbackCause(.permission_denied, 2));
-    try std.testing.expectEqual(rtm.FallbackCause.group_only, rtm.fallbackCause(.permission_denied, 1));
-    try std.testing.expectEqual(rtm.FallbackCause.flags_refused, rtm.fallbackCause(.arguments_invalid, 2));
-    try std.testing.expectEqual(rtm.FallbackCause.no_io_uring, rtm.fallbackCause(.system_outdated, null));
+    if (comptime rtm.Reason == void) return error.SkipZigTest;
+    if (comptime rtm.Reason != void) {
+        try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, null));
+        try std.testing.expectEqual(rtm.FallbackCause.blocked, rtm.fallbackCause(.permission_denied, 0));
+        try std.testing.expectEqual(rtm.FallbackCause.disabled, rtm.fallbackCause(.permission_denied, 2));
+        try std.testing.expectEqual(rtm.FallbackCause.group_only, rtm.fallbackCause(.permission_denied, 1));
+        try std.testing.expectEqual(rtm.FallbackCause.flags_refused, rtm.fallbackCause(.arguments_invalid, 2));
+        try std.testing.expectEqual(rtm.FallbackCause.no_io_uring, rtm.fallbackCause(.system_outdated, null));
+    }
 }
 
 test "observe runtime: causeText hedges only where the cause is a guess" {

@@ -171,9 +171,10 @@ fn checkZioOptions() void {
         "`.scheduling = .pinned` among your own zio options.");
 }
 
+pub const IoEngine = observe_runtime.IoEngine;
+
 /// zio's executor count (`.auto` or `.exact(n)`), which zio does not export
 /// by name.
-pub const IoEngine = observe_runtime.IoEngine;
 pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".param_types[1].?, "executors");
 
 /// Set while an `anole.Server` is alive on this thread: its zio runtime
