@@ -37,7 +37,7 @@ pub const Collector = struct {
     out_seq: u32 = 0,
     out_ok: bool = false,
     /// One asker at a time (the console serves up to four clients).
-    // SAFETY: the usual lock rules do not fit this lock: only console OS threads take it
+    // SAFETY: L2/L5 do not fit this lock: only console OS threads take it
     // (never a zio task), and it is held across their blocking wait for the
     // runtime's answer (up to `wait_ms`) on `std.Options.debug_io`, by
     // design: one asker at a time. Waiters sleep-poll (1 ms).
