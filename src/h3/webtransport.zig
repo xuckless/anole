@@ -293,10 +293,10 @@ pub const Core = struct {
     /// open a stream that way wake. Locked.
     pub fn onStreamCredit(core: *Core, comptime dir: Session.Driver.Direction) void {
         const list = creditWaiters(core, dir);
-        while (list.popFirst()) |node| {
+        while (list.first) |node| {
             const s: *Session = @fieldParentPtr(creditNode(dir), node);
             if (std.debug.runtime_safety) std.debug.assert(core.sessions.get(s.id) == s);
-            @field(s, creditLinked(dir)) = false;
+            core.unlinkCredit(s, dir);
             s.ev.notify(core.io);
         }
     }
@@ -307,22 +307,26 @@ pub const Core = struct {
     fn creditNode(comptime dir: Session.Driver.Direction) []const u8 {
         return if (dir == .bidi) "bidi_node" else "uni_node";
     }
-    fn creditLinked(comptime dir: Session.Driver.Direction) []const u8 {
-        return if (dir == .bidi) "bidi_linked" else "uni_linked";
+    /// Whether `s` waits for stream credit of `dir`: the node answers,
+    /// since `linkCredit` is the only append and `unlinkCredit` the only
+    /// removal and clears it (Linux's list_del_init). Locked.
+    fn creditLinked(core: *Core, s: *Session, comptime dir: Session.Driver.Direction) bool {
+        const node = &@field(s, creditNode(dir));
+        return node.prev != null or node.next != null or creditWaiters(core, dir).first == node;
     }
 
     /// `s` waits for stream credit of `dir`; once at most. Locked.
     fn linkCredit(core: *Core, s: *Session, comptime dir: Session.Driver.Direction) void {
-        if (@field(s, creditLinked(dir))) return;
-        @field(s, creditLinked(dir)) = true;
+        if (core.creditLinked(s, dir)) return;
         creditWaiters(core, dir).append(&@field(s, creditNode(dir)));
     }
 
     /// `s` no longer waits for stream credit of `dir`. Locked.
     fn unlinkCredit(core: *Core, s: *Session, comptime dir: Session.Driver.Direction) void {
-        if (!@field(s, creditLinked(dir))) return;
-        @field(s, creditLinked(dir)) = false;
-        creditWaiters(core, dir).remove(&@field(s, creditNode(dir)));
+        if (!core.creditLinked(s, dir)) return;
+        const node = &@field(s, creditNode(dir));
+        creditWaiters(core, dir).remove(node);
+        node.* = .{};
     }
 
     /// Room for one more datagram to send; when there is none, the next
@@ -435,7 +439,7 @@ pub const Core = struct {
         const id: i64 = @intCast(session_id);
         s.session_id = id;
         if (core.sessions.get(id)) |session| {
-            if (session.state != .open) return s.disown(error_session_gone);
+            if (!session.life.isOpen()) return s.disown(error_session_gone);
             return session.deliver(s);
         }
         if (core.isGone(id)) return s.disown(error_session_gone);
@@ -458,7 +462,7 @@ pub const Core = struct {
         if (qsid.value >= 1 << 60) return;
         const session = core.sessions.get(@intCast(qsid.value * 4)) orelse return;
         const payload = data[qsid.len..];
-        if (session.state != .open or
+        if (!session.life.isOpen() or
             session.datagrams_in.len >= core.limits.datagrams_in or
             session.datagrams_in_bytes + payload.len > core.limits.datagrams_in_bytes) return;
         const copy = core.gpa.dupe(u8, payload) catch return;
@@ -558,7 +562,7 @@ pub const Core = struct {
         // nobody else will let go of it.
         if (!s.local and s.session == null) s.holders.remove(.user);
         if (!s.in_fin and s.recv_err == null and s.kind != .uni_out) s.recv_err = error.StreamReset;
-        if (!s.fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
+        if (s.send != .fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
         s.dequeue();
         s.wakeAll();
         s.maybeFree();
@@ -631,7 +635,7 @@ pub const Core = struct {
             var runs: [4][]const u8 = undefined;
             const count = s.out.unsent(&runs);
             const pending = s.out.pending();
-            const fin = s.send_closed and !s.fin_sent;
+            const fin = s.send == .closed;
             if (pending == 0 and !fin) {
                 s.dequeue();
                 continue;
@@ -645,7 +649,7 @@ pub const Core = struct {
             const n = ngtcp2.connWritevStream(core.q, p, pi, dest, &data_len, flags, s.id, vec[0..count], ts);
             if (data_len >= 0) {
                 s.out.advance(@intCast(data_len));
-                if (fin and s.out.allSent()) s.fin_sent = true;
+                if (fin and s.out.allSent()) s.send = .fin_sent;
             }
             if (n < 0) switch (n) {
                 c.NGTCP2_ERR_STREAM_DATA_BLOCKED => {
@@ -714,8 +718,9 @@ pub const Sched = struct {
 /// pieces of any size. Only the close and the drain are understood; others
 /// are skipped.
 pub const CapsuleParser = struct {
-    state: enum { kind, length, payload, skip, done } = .kind,
-    in_varint: bool = false,
+    /// `kind`/`length`: the field's first byte is next; `kind_rest`/
+    /// `length_rest`: its varint is in progress (`vleft` bytes to go).
+    state: enum { kind, kind_rest, length, length_rest, payload, skip, done } = .kind,
     vleft: u8 = 0,
     acc: u64 = 0,
     kind: u64 = 0,
@@ -740,20 +745,26 @@ pub const CapsuleParser = struct {
         while (i < bytes.len) {
             switch (p.state) {
                 .done => return .{ .used = bytes.len },
-                .kind, .length => {
+                .kind, .kind_rest, .length, .length_rest => {
                     const b = bytes[i];
                     i += 1;
-                    if (!p.in_varint) {
-                        p.in_varint = true;
-                        p.vleft = (@as(u8, 1) << @intCast(b >> 6)) - 1;
-                        p.acc = b & 0x3f;
-                    } else {
-                        p.acc = p.acc << 8 | b;
-                        p.vleft -= 1;
+                    switch (p.state) {
+                        .kind, .length => {
+                            p.vleft = (@as(u8, 1) << @intCast(b >> 6)) - 1;
+                            p.acc = b & 0x3f;
+                        },
+                        .kind_rest, .length_rest => {
+                            p.acc = p.acc << 8 | b;
+                            p.vleft -= 1;
+                        },
+                        .payload, .skip, .done => unreachable,
                     }
-                    if (p.vleft != 0) continue;
-                    p.in_varint = false;
-                    if (p.state == .kind) {
+                    const of_kind = p.state == .kind or p.state == .kind_rest;
+                    if (p.vleft != 0) {
+                        p.state = if (of_kind) .kind_rest else .length_rest;
+                        continue;
+                    }
+                    if (of_kind) {
                         p.kind = p.acc;
                         p.state = .length;
                         continue;
@@ -848,6 +859,53 @@ pub const Error = error{
     Canceled,
 };
 
+/// A session's life: one value under the connection's lock. The drain is
+/// part of it because `draining()` still answers true after a close that
+/// followed (or preceded) a drain; `detached` is the end, set by `detach`
+/// after `endLocked`. Every transition is a cell of `next`: add behaviour
+/// as a state or a cell, not as a branch at a call site.
+///
+///  life \ event    drain             end               detach
+///  open            draining          closed            detached
+///  draining        draining          closed_draining   detached
+///  closed          closed_draining   closed            detached
+///  closed_draining closed_draining   closed_draining   detached
+///  detached        detached          detached          detached
+const Life = enum(u8) {
+    open,
+    draining,
+    closed,
+    closed_draining,
+    detached,
+
+    const Event = enum { drain, end, detach };
+
+    fn next(l: Life, e: Event) Life {
+        return switch (e) {
+            .detach => .detached,
+            .drain => switch (l) {
+                .open, .draining => .draining,
+                .closed, .closed_draining => .closed_draining,
+                .detached => .detached,
+            },
+            .end => switch (l) {
+                .open, .closed => .closed,
+                .draining, .closed_draining => .closed_draining,
+                .detached => .detached,
+            },
+        };
+    }
+
+    /// Neither side has closed the session (open or draining).
+    fn isOpen(l: Life) bool {
+        return @backingInt(l) < @backingInt(Life.closed);
+    }
+
+    fn isDraining(l: Life) bool {
+        return l == .draining or l == .closed_draining;
+    }
+};
+
 /// A WebTransport session: streams both ways in either direction, and
 /// datagrams. Safe from any task of the runtime.
 pub const Session = struct {
@@ -859,27 +917,22 @@ pub const Session = struct {
     gauged: bool = false,
     channel: Channel,
     /// Under the connection's mutex:
-    state: enum { open, closed } = .open,
+    life: Life = .open,
     close_info: CloseInfo = .{ .code = 0, .reason = "", .by = .local },
     reason_buf: [max_close_message]u8 = undefined,
-    /// Either side has started to drain.
-    draining_flag: bool = false,
     incoming_bidi: std.Deque(*Stream) = .empty,
     incoming_uni: std.Deque(*Stream) = .empty,
     /// Every stream of the session that QUIC or a handler still holds.
     members: std.ArrayList(*Stream) = .empty,
     datagrams_in: std.Deque([]u8) = .empty,
     datagrams_in_bytes: usize = 0,
-    /// Unregistered from the core (`deinit`).
-    detached: bool = false,
     /// In the core's credit wait lists (`Core.uni_waiters`, `bidi_waiters`)
     /// while linked: from a `tryOpen` that found the limit reached until
-    /// the next credit of that direction or `detach`. Under the
-    /// connection's lock.
+    /// the next credit of that direction or `detach`. Cleared when
+    /// unlinked, so the node itself says whether it is linked
+    /// (`Core.creditLinked`). Under the connection's lock.
     uni_node: std.DoublyLinkedList.Node = .{},
     bidi_node: std.DoublyLinkedList.Node = .{},
-    uni_linked: bool = false,
-    bidi_linked: bool = false,
     /// Woken by what a waiting `acceptFrom`, `open`, `receiveDatagram` or
     /// `sendDatagram` looks at: a new stream, a datagram, the session's end,
     /// the drain, stream credit.
@@ -892,13 +945,18 @@ pub const Session = struct {
     /// Over the channel's writer: capsules from the handler and from the
     /// drain watch.
     write_mutex: std.Io.Mutex = .init,
-    /// The CONNECT stream's sending side is ended (or being ended). Under
-    /// the connection's lock.
-    ended: bool = false,
-    /// A capsule is being written: the channel ends after it
-    /// (`end_pending`). Under the connection's lock.
-    writing: bool = false,
-    end_pending: bool = false,
+    /// The CONNECT stream's sending side, under the connection's lock.
+    /// `writeCapsule` holds `write_mutex` while `.writing`, and `endChannel`
+    /// takes it first, so only `endChannelLocked` (a callback) meets a write.
+    ///
+    ///  send \ event     write        written          end (callback)      end (task)
+    ///  open             writing      -                hook true: ended,   ended
+    ///                                                 else open
+    ///  writing          -            open             end_after_write     -
+    ///  end_after_write  -            open, then end   end_after_write     -
+    ///                                (callback)
+    ///  ended            SessionClosed -               ended               ended
+    send: enum { open, writing, end_after_write, ended } = .open,
     /// The capsule reader of a client session.
     tasks: std.Io.Group = .init,
     drain_watch: DrainWatch = .{},
@@ -939,7 +997,7 @@ pub const Session = struct {
             const session = self.session;
             const host = session.core.host;
             host.lock();
-            session.draining_flag = true;
+            session.life = session.life.next(.drain);
             host.unlock();
             session.ev.notify(session.core.io);
             host.kick();
@@ -1021,12 +1079,13 @@ pub const Session = struct {
         const host = core.host;
         host.lock();
         defer host.unlock();
-        if (self.detached) return;
-        self.detached = true;
+        if (self.life == .detached) return;
         // The only way out of `core.sessions`: no credit reaches it after.
         core.unlinkCredit(self, .uni);
         core.unlinkCredit(self, .bidi);
+        // Before `.detached`: `endLocked` acts only on an open session.
         self.endLocked(.{ .code = 0, .reason = "", .by = .local });
+        self.life = self.life.next(.detach);
         _ = core.sessions.remove(self.id);
         core.markGone(self.id);
         // Those not accepted are among the members.
@@ -1067,8 +1126,8 @@ pub const Session = struct {
     /// The session is over, for `info`'s reason: every stream is reset
     /// both ways (WT_SESSION_GONE), and every waiter wakes. Locked.
     fn endLocked(self: *Session, info: CloseInfo) void {
-        if (self.state != .open) return;
-        self.state = .closed;
+        if (!self.life.isOpen()) return;
+        self.life = self.life.next(.end);
         const n = @min(info.reason.len, self.reason_buf.len);
         @memcpy(self.reason_buf[0..n], info.reason[0..n]);
         self.close_info = .{ .code = info.code, .reason = self.reason_buf[0..n], .by = info.by };
@@ -1090,7 +1149,7 @@ pub const Session = struct {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
-        return self.state == .open;
+        return self.life.isOpen();
     }
 
     /// How the session ended; null while it is open.
@@ -1098,7 +1157,7 @@ pub const Session = struct {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
-        return if (self.state == .open) null else self.close_info;
+        return if (self.life.isOpen()) null else self.close_info;
     }
 
     /// Whether either side has started to drain (the server is shutting
@@ -1107,7 +1166,7 @@ pub const Session = struct {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
-        return self.draining_flag;
+        return self.life.isDraining();
     }
 
     /// The next bidirectional stream the peer opens.
@@ -1228,7 +1287,9 @@ pub const Session = struct {
             const host = s.core.host;
             host.lock();
             defer host.unlock();
-            return if (dir == .bidi) s.bidi_linked else s.uni_linked;
+            return switch (dir) {
+                inline else => |d| s.core.creditLinked(s, d),
+            };
         }
         /// Tests only: how often a sender on the session's connection found
         /// the datagram queue full, and how often a datagram that went woke
@@ -1275,9 +1336,9 @@ pub const Session = struct {
     fn tryOpen(self: *Session, dir: Driver.Direction) (Error || error{OutOfMemory})!?*Stream {
         const core = self.core;
         core.host.lock();
-        if (self.state != .open or core.closed) {
+        if (!self.life.isOpen() or core.closed) {
             core.host.unlock();
-            return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
+            return if (!self.life.isOpen()) error.SessionClosed else error.ConnectionClosed;
         }
         var id: i64 = -1;
         const rv = if (dir == .bidi)
@@ -1345,9 +1406,9 @@ pub const Session = struct {
         const len = buf.len;
         const core = self.core;
         core.host.lock();
-        if (self.state != .open or core.closed) {
+        if (!self.life.isOpen() or core.closed) {
             core.host.unlock();
-            return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
+            return if (!self.life.isOpen()) error.SessionClosed else error.ConnectionClosed;
         }
         if (len > self.maxDatagramLocked()) {
             core.host.unlock();
@@ -1454,7 +1515,7 @@ pub const Session = struct {
                 core.gpa.free(d);
                 return buf[0..d.len];
             }
-            const still_open = self.state == .open;
+            const still_open = self.life.isOpen();
             core.host.unlock();
             if (!still_open) return error.SessionClosed;
             try self.ev.wait(core.io, seen);
@@ -1475,7 +1536,7 @@ pub const Session = struct {
                 core.host.unlock();
                 return d;
             }
-            const still_open = self.state == .open;
+            const still_open = self.life.isOpen();
             core.host.unlock();
             if (!still_open) return error.SessionClosed;
             try self.ev.wait(core.io, seen);
@@ -1535,7 +1596,7 @@ pub const Session = struct {
         const core = self.core;
         const message = reason[0..@min(reason.len, max_close_message)];
         core.host.lock();
-        if (self.state != .open) {
+        if (!self.life.isOpen()) {
             core.host.unlock();
             return;
         }
@@ -1561,18 +1622,23 @@ pub const Session = struct {
         self.write_mutex.lockUncancelable(self.core.io);
         defer self.write_mutex.unlock(self.core.io);
         host.lock();
-        if (self.ended) {
-            host.unlock();
-            return error.SessionClosed;
+        switch (self.send) {
+            .open => self.send = .writing,
+            .ended => {
+                host.unlock();
+                return error.SessionClosed;
+            },
+            .writing, .end_after_write => unreachable, // write_mutex
         }
-        self.writing = true;
         host.unlock();
         defer {
             host.lock();
-            self.writing = false;
-            if (self.end_pending) {
-                self.end_pending = false;
-                self.endChannelLocked();
+            const was = self.send;
+            self.send = .open;
+            switch (was) {
+                .writing => {},
+                .end_after_write => self.endChannelLocked(),
+                .open, .ended => unreachable,
             }
             host.unlock();
         }
@@ -1587,11 +1653,14 @@ pub const Session = struct {
         self.write_mutex.lockUncancelable(self.core.io);
         defer self.write_mutex.unlock(self.core.io);
         host.lock();
-        if (self.ended) {
-            host.unlock();
-            return;
+        switch (self.send) {
+            .open => self.send = .ended,
+            .ended => {
+                host.unlock();
+                return;
+            },
+            .writing, .end_after_write => unreachable, // write_mutex
         }
-        self.ended = true;
         host.unlock();
         self.channel.end_fn(self.channel.ctx);
     }
@@ -1601,14 +1670,15 @@ pub const Session = struct {
     /// stream when it is done) or the 200 has not gone out (the handler's
     /// `deinit` ends it). Locked.
     fn endChannelLocked(self: *Session) void {
-        if (self.ended) return;
-        if (self.writing) {
-            self.end_pending = true;
-            return;
+        switch (self.send) {
+            .ended => {},
+            .writing, .end_after_write => self.send = .end_after_write,
+            .open => {
+                const host = self.core.host;
+                const f = host.end_connect_fn orelse return;
+                if (f(host.ctx, self.id)) self.send = .ended;
+            },
         }
-        const host = self.core.host;
-        const f = host.end_connect_fn orelse return;
-        if (f(host.ctx, self.id)) self.ended = true;
     }
 
     /// The CONNECT stream's bytes (inline capsules): the parser takes them,
@@ -1626,7 +1696,7 @@ pub const Session = struct {
                     self.endChannelLocked();
                 },
                 .drain => {
-                    self.draining_flag = true;
+                    self.life = self.life.next(.drain);
                     self.ev.notify(self.core.io);
                     self.core.host.kick();
                 },
@@ -1670,7 +1740,7 @@ pub const Session = struct {
                     .drain => {
                         const host = self.core.host;
                         host.lock();
-                        self.draining_flag = true;
+                        self.life = self.life.next(.drain);
                         host.unlock();
                         self.ev.notify(self.core.io);
                         host.kick();
@@ -1745,8 +1815,14 @@ pub const Stream = struct {
 
     /// Sent until the peer acknowledges it, then dropped.
     out: bridge.SendQueue = .{},
-    send_closed: bool = false,
-    fin_sent: bool = false,
+    /// The sending side's end of stream, under the connection's lock:
+    ///  open     -> closed    closeSend (no send error): the FIN follows the queued bytes
+    ///  closed   -> closed    closeSend again
+    ///  closed   -> fin_sent  writeStream put the FIN in a packet, after the last byte
+    ///  fin_sent -> fin_sent  closeSend again; reset finds it done
+    /// A reset or an error is `send_err`, a separate value: `release` and
+    /// `closeSend` act only on `.open` with no `send_err`.
+    send: enum(u8) { open, closed, fin_sent } = .open,
     blocked: bool = false,
     send_err: ?Error = null,
     stop_code: ?u32 = null,
@@ -1835,7 +1911,7 @@ pub const Stream = struct {
     /// To the back of the queue if it has more to send, else out of it.
     fn rotate(s: *Stream) void {
         s.dequeue();
-        if (s.out.pending() > 0 or (s.send_closed and !s.fin_sent)) s.enqueue();
+        if (s.out.pending() > 0 or s.send == .closed) s.enqueue();
     }
 
     /// Data from the peer. Locked.
@@ -1976,8 +2052,8 @@ pub const Stream = struct {
         try s.writer_iface.flush();
         const host = s.core.host;
         host.lock();
-        if (!s.send_closed and s.send_err == null) {
-            s.send_closed = true;
+        if (s.send == .open and s.send_err == null) {
+            s.send = .closed;
             s.enqueue();
         }
         host.unlock();
@@ -1989,7 +2065,7 @@ pub const Stream = struct {
         const core = s.core;
         core.host.lock();
         defer core.host.unlock();
-        if (s.kind == .uni_in or s.send_err != null or s.fin_sent) return;
+        if (s.kind == .uni_in or s.send_err != null or s.send == .fin_sent) return;
         if (s.holders.contains(.quic) and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(code));
         s.send_err = error.StreamReset;
         s.dequeue();
@@ -2019,7 +2095,7 @@ pub const Stream = struct {
         core.host.lock();
         defer core.host.unlock();
         if (s.holders.contains(.quic) and !core.closed) {
-            if (s.kind != .uni_in and !s.send_closed and s.send_err == null) {
+            if (s.kind != .uni_in and s.send == .open and s.send_err == null) {
                 _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(0));
                 s.send_err = error.StreamReset;
                 s.dequeue();
@@ -2093,7 +2169,7 @@ pub const Stream = struct {
         const core = s.core;
         if (s.kind == .uni_in) return error.StreamReset;
         core.host.lock();
-        if (s.send_err != null or s.send_closed or core.closed) {
+        if (s.send_err != null or s.send != .open or core.closed) {
             const err = s.send_err orelse if (core.closed) error.ConnectionClosed else error.StreamReset;
             core.host.unlock();
             return err;
@@ -2168,7 +2244,7 @@ pub const Stream = struct {
         while (rest.len > 0) {
             const seen = s.tx.epoch();
             core.host.lock();
-            if (s.send_err != null or s.send_closed or core.closed) {
+            if (s.send_err != null or s.send != .open or core.closed) {
                 s.write_err = s.send_err orelse if (core.closed) error.ConnectionClosed else error.StreamReset;
                 core.host.unlock();
                 return error.WriteFailed;
@@ -2316,11 +2392,11 @@ test "WebTransport: stream credit wakes only the sessions waiting on its directi
         // Bidirectional credit wakes nobody.
         core.onStreamCredit(.bidi);
         try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
-        try std.testing.expect(waiting.uni_linked);
+        try std.testing.expect(core.creditLinked(waiting, .uni));
         // One-way credit wakes it alone, and only once.
         core.onStreamCredit(.uni);
         try std.testing.expectEqual(@as(usize, 1), Moved.count(sessions, epochs));
-        try std.testing.expect(!waiting.uni_linked);
+        try std.testing.expect(!core.creditLinked(waiting, .uni));
         try std.testing.expect(core.uni_waiters.first == null);
         core.onStreamCredit(.uni);
         try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
@@ -2331,6 +2407,250 @@ test "WebTransport: stream credit wakes only the sessions waiting on its directi
         core.onStreamCredit(.bidi);
         try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
         try std.testing.expect(core.bidi_waiters.first == null);
+        // Linked again after the unlink (its node was cleared), alone or
+        // first of three; the middle one unlinked leaves the others.
+        core.linkCredit(waiting, .bidi);
+        try std.testing.expectEqual(@as(usize, 1), core.bidi_waiters.len());
+        try std.testing.expect(core.creditLinked(waiting, .bidi));
+        if (n >= 3) {
+            core.linkCredit(&sessions[0], .bidi);
+            core.linkCredit(&sessions[1], .bidi);
+            core.unlinkCredit(&sessions[0], .bidi);
+            try std.testing.expect(!core.creditLinked(&sessions[0], .bidi));
+            try std.testing.expect(core.creditLinked(waiting, .bidi) and core.creditLinked(&sessions[1], .bidi));
+            try std.testing.expectEqual(@as(usize, 2), core.bidi_waiters.len());
+            core.unlinkCredit(&sessions[1], .bidi);
+        }
+        core.unlinkCredit(waiting, .bidi);
+        try std.testing.expect(core.bidi_waiters.first == null and !core.creditLinked(waiting, .bidi));
+    }
+}
+
+test "WebTransport: a session's life is one value, every state x event decided" {
+    const Row = struct { from: Life, event: Life.Event, to: Life };
+    const rows = [_]Row{
+        .{ .from = .open, .event = .drain, .to = .draining },
+        .{ .from = .open, .event = .end, .to = .closed },
+        .{ .from = .open, .event = .detach, .to = .detached },
+        .{ .from = .draining, .event = .drain, .to = .draining },
+        .{ .from = .draining, .event = .end, .to = .closed_draining },
+        .{ .from = .draining, .event = .detach, .to = .detached },
+        .{ .from = .closed, .event = .drain, .to = .closed_draining },
+        .{ .from = .closed, .event = .end, .to = .closed },
+        .{ .from = .closed, .event = .detach, .to = .detached },
+        .{ .from = .closed_draining, .event = .drain, .to = .closed_draining },
+        .{ .from = .closed_draining, .event = .end, .to = .closed_draining },
+        .{ .from = .closed_draining, .event = .detach, .to = .detached },
+        .{ .from = .detached, .event = .drain, .to = .detached },
+        .{ .from = .detached, .event = .end, .to = .detached },
+        .{ .from = .detached, .event = .detach, .to = .detached },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} + {t}\n", .{ row.from, row.event });
+        try std.testing.expectEqual(row.to, row.from.next(row.event));
+    }
+    const Answers = struct { life: Life, open: bool, draining: bool };
+    for ([_]Answers{
+        .{ .life = .open, .open = true, .draining = false },
+        .{ .life = .draining, .open = true, .draining = true },
+        .{ .life = .closed, .open = false, .draining = false },
+        .{ .life = .closed_draining, .open = false, .draining = true },
+        .{ .life = .detached, .open = false, .draining = false },
+    }) |a| {
+        errdefer std.debug.print("{t}\n", .{a.life});
+        try std.testing.expectEqual(a.open, a.life.isOpen());
+        try std.testing.expectEqual(a.draining, a.life.isDraining());
+    }
+}
+
+/// A Core with a host that does nothing, a real pool and budget: enough
+/// for a session's and a stream's bookkeeping without QUIC.
+const TestCore = struct {
+    pool: bridge.BlockPool,
+    budget: bridge.Budget,
+    dummy: u8 = 0,
+    core: Core,
+
+    const Noop = struct {
+        fn f(_: *anyopaque) void {}
+    };
+
+    fn init(t: *TestCore, end_connect_fn: ?*const fn (*anyopaque, i64) bool, ctx: ?*anyopaque) void {
+        t.pool = bridge.BlockPool.init(std.testing.allocator, 0);
+        t.budget = bridge.Budget.init(std.testing.io, 1 << 20);
+        t.core = .{
+            .gpa = std.testing.allocator,
+            .io = std.testing.io,
+            .q = undefined,
+            .host = .{ .ctx = ctx orelse &t.dummy, .gen = undefined, .pool = &t.pool, .budget = &t.budget, .end_connect_fn = end_connect_fn, .lock_fn = Noop.f, .unlock_fn = Noop.f, .kick_fn = Noop.f },
+            .server = true,
+            .limits = .{},
+        };
+    }
+
+    fn deinit(t: *TestCore) void {
+        t.core.sessions.deinit(std.testing.allocator);
+        t.pool.deinit();
+    }
+
+    /// A local stream QUIC does not hold (no ngtcp2 calls).
+    fn stream(t: *TestCore, kind: Stream.Kind) !*Stream {
+        const s = try Stream.create(&t.core, 0, kind, true);
+        s.holders = .initOne(.user);
+        return s;
+    }
+};
+
+test "WebTransport: a session ends once and detaches once, its streams reset and both credit waits unlinked" {
+    var t: TestCore = undefined;
+    t.init(null, null);
+    defer t.deinit();
+    const core = &t.core;
+    var session: Session = .{ .core = core, .id = 4, .channel = undefined };
+    try core.sessions.put(core.gpa, session.id, &session);
+    const s = try t.stream(.bidi);
+    s.session = &session;
+    try session.members.append(core.gpa, s);
+    core.linkCredit(&session, .uni);
+    core.linkCredit(&session, .bidi);
+
+    // The first end keeps its reason; a second does nothing.
+    session.endLocked(.{ .code = 7, .reason = "first", .by = .peer });
+    session.endLocked(.{ .code = 9, .reason = "second", .by = .local });
+    try std.testing.expectEqual(Life.closed, session.life);
+    try std.testing.expectEqual(@as(u32, 7), session.close_info.code);
+    try std.testing.expectEqualStrings("first", session.close_info.reason);
+    try std.testing.expectEqual(@as(?Error, error.SessionClosed), s.send_err);
+    try std.testing.expectEqual(@as(?Error, error.SessionClosed), s.recv_err);
+
+    session.detach();
+    session.detach();
+    try std.testing.expectEqual(Life.detached, session.life);
+    try std.testing.expectEqual(@as(u32, 7), session.close_info.code);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(i64, &core.gone, &.{4}));
+    try std.testing.expect(core.uni_waiters.first == null and core.bidi_waiters.first == null);
+    try std.testing.expect(!core.creditLinked(&session, .uni) and !core.creditLinked(&session, .bidi));
+    try std.testing.expect(core.sessions.get(4) == null);
+
+    // A session detached while open is reset by `detach` itself.
+    var open: Session = .{ .core = core, .id = 8, .channel = undefined };
+    try core.sessions.put(core.gpa, open.id, &open);
+    const s2 = try t.stream(.uni_out);
+    s2.holders = .initMany(&.{ .user, .quic });
+    s2.session = &open;
+    try open.members.append(core.gpa, s2);
+    core.closed = true; // no QUIC to reset through
+    open.detach();
+    try std.testing.expectEqual(Life.detached, open.life);
+    try std.testing.expectEqual(@as(?Error, error.SessionClosed), s2.send_err);
+    s2.free();
+}
+
+test "WebTransport: the CONNECT stream ends once, right after a capsule being written when a callback asks during it" {
+    const Fake = struct {
+        session: *Session = undefined,
+        /// What the end hook answers; null: no hook.
+        hook: ?bool,
+        /// Ends requested by a callback during the write.
+        requests: u8,
+        hook_calls: u8 = 0,
+        calls_mid_write: u8 = 0,
+        end_calls: u8 = 0,
+        written: usize = 0,
+        writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const f: *@This() = @fieldParentPtr("writer", w);
+            for (0..f.requests) |_| f.session.endChannelLocked();
+            f.calls_mid_write = f.hook_calls;
+            const n = std.Io.Writer.countSplat(data, splat);
+            f.written += n;
+            return n;
+        }
+        fn endHook(ctx: *anyopaque, _: i64) bool {
+            const f: *@This() = @ptrCast(@alignCast(ctx));
+            f.hook_calls += 1;
+            return f.hook.?;
+        }
+        fn end(ctx: *anyopaque) void {
+            const f: *@This() = @ptrCast(@alignCast(ctx));
+            f.end_calls += 1;
+        }
+    };
+    const Row = struct { name: []const u8, hook: ?bool, requests: u8, calls: u8, send: @FieldType(Session, "send") };
+    for ([_]Row{
+        .{ .name = "no end asked", .hook = true, .requests = 0, .calls = 0, .send = .open },
+        .{ .name = "asked once", .hook = true, .requests = 1, .calls = 1, .send = .ended },
+        .{ .name = "asked twice", .hook = true, .requests = 2, .calls = 1, .send = .ended },
+        .{ .name = "200 not out yet", .hook = false, .requests = 1, .calls = 1, .send = .open },
+        .{ .name = "no end hook", .hook = null, .requests = 1, .calls = 0, .send = .open },
+    }) |row| {
+        errdefer std.debug.print("{s}\n", .{row.name});
+        var fake: Fake = .{ .hook = row.hook, .requests = row.requests };
+        var t: TestCore = undefined;
+        t.init(if (row.hook != null) Fake.endHook else null, &fake);
+        defer t.deinit();
+        var session: Session = .{ .core = &t.core, .id = 0, .channel = .{ .reader = undefined, .writer = &fake.writer, .ctx = &fake, .end_fn = Fake.end } };
+        fake.session = &session;
+        try session.writeCapsule("capsule");
+        try std.testing.expectEqual(@as(u8, 0), fake.calls_mid_write);
+        try std.testing.expectEqual(row.calls, fake.hook_calls);
+        try std.testing.expectEqual(row.send, session.send);
+        // After: a capsule goes only while the stream is not ended, and
+        // the task's end ends it once unless the hook already did.
+        fake.requests = 0;
+        const before = fake.written;
+        if (row.send == .ended)
+            try std.testing.expectError(error.SessionClosed, session.writeCapsule("more"))
+        else
+            try session.writeCapsule("more");
+        try std.testing.expectEqual(before + @as(usize, if (row.send == .ended) 0 else 4), fake.written);
+        session.endChannel();
+        session.endChannel();
+        try std.testing.expectEqual(@as(@FieldType(Session, "send"), .ended), session.send);
+        try std.testing.expectEqual(@as(u8, if (row.send == .ended) 0 else 1), fake.end_calls);
+        // Asked again once ended: nothing.
+        session.endChannelLocked();
+        try std.testing.expectEqual(row.calls, fake.hook_calls);
+    }
+}
+
+test "WebTransport: a stream's sending side closes once and a reset after its FIN does nothing" {
+    const Send = @FieldType(Stream, "send");
+    const Op = enum { close_send, reset, rotate };
+    const Row = struct { name: []const u8, from: Send, err: ?Error = null, op: Op, send: Send, want_err: ?Error = null, queued: bool };
+    for ([_]Row{
+        .{ .name = "open, closeSend", .from = .open, .op = .close_send, .send = .closed, .queued = true },
+        .{ .name = "closed, closeSend", .from = .closed, .op = .close_send, .send = .closed, .queued = false },
+        .{ .name = "fin_sent, closeSend", .from = .fin_sent, .op = .close_send, .send = .fin_sent, .queued = false },
+        .{ .name = "send error, closeSend", .from = .open, .err = error.StreamStopped, .op = .close_send, .send = .open, .want_err = error.StreamStopped, .queued = false },
+        .{ .name = "open, reset", .from = .open, .op = .reset, .send = .open, .want_err = error.StreamReset, .queued = false },
+        .{ .name = "closed, reset", .from = .closed, .op = .reset, .send = .closed, .want_err = error.StreamReset, .queued = false },
+        .{ .name = "fin_sent, reset", .from = .fin_sent, .op = .reset, .send = .fin_sent, .queued = false },
+        .{ .name = "open, rotate", .from = .open, .op = .rotate, .send = .open, .queued = false },
+        .{ .name = "closed, rotate: the FIN is still to go", .from = .closed, .op = .rotate, .send = .closed, .queued = true },
+        .{ .name = "fin_sent, rotate", .from = .fin_sent, .op = .rotate, .send = .fin_sent, .queued = false },
+    }) |row| {
+        errdefer std.debug.print("{s}\n", .{row.name});
+        var t: TestCore = undefined;
+        t.init(null, null);
+        defer t.deinit();
+        const s = try t.stream(.bidi);
+        defer s.free();
+        defer s.dequeue();
+        s.send = row.from;
+        s.send_err = row.err;
+        switch (row.op) {
+            .close_send => try s.closeSend(),
+            .reset => s.reset(0),
+            .rotate => s.rotate(),
+        }
+        try std.testing.expectEqual(row.send, s.send);
+        try std.testing.expectEqual(row.want_err, s.send_err);
+        try std.testing.expectEqual(row.queued, s.queued);
+        // Only an open side takes bytes.
+        const wrote = s.tryWrite("x");
+        if (row.send == .open and row.want_err == null) _ = try wrote else try std.testing.expectError(row.want_err orelse error.StreamReset, wrote);
     }
 }
 
@@ -2553,6 +2873,32 @@ test "CapsuleParser: a close split at every byte, a drain, an unknown capsule sk
     out.clearRetainingCapacity();
     try parseAll(makeCapsule(&tmp, capsule_close, "ab"), 1, &out, gpa);
     try std.testing.expectEqualStrings("M;", out.items);
+
+    // Types and lengths of 2, 4 and 8 bytes (lengths not minimally
+    // encoded too), split at every byte: the same events, and between
+    // capsules the parser waits for the next type.
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(gpa);
+    try wide.appendSlice(gpa, makeCapsule(&tmp, 0x1234, "two"));
+    try wide.appendSlice(gpa, makeCapsule(&tmp, 0x12345678, "four"));
+    try wide.appendSlice(gpa, makeCapsule(&tmp, 1 << 40, "eight"));
+    try wide.appendSlice(gpa, &.{ 0x80, 0, 0, 0, 0x80, 0, 0, 2, 'h', 'i' });
+    try wide.appendSlice(gpa, &.{ 0x41, 0x00, 0xc0, 0, 0, 0, 0, 0, 0, 1, 'x' });
+    var idle: CapsuleParser = .{};
+    try std.testing.expectEqual(wide.items.len, idle.feed(wide.items).used);
+    try std.testing.expectEqual(@as(@FieldType(CapsuleParser, "state"), .kind), idle.state);
+    try wide.appendSlice(gpa, makeCapsule(&tmp, capsule_drain, ""));
+    var close7: [4 + 3]u8 = undefined;
+    std.mem.writeInt(u32, close7[0..4], 7, .big);
+    @memcpy(close7[4..], "end");
+    try wide.appendSlice(gpa, &.{ 0x68, 0x43, 0xc0, 0, 0, 0, 0, 0, 0, 7 });
+    try wide.appendSlice(gpa, &close7);
+    for (1..wide.items.len + 1) |step| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        try parseAll(wide.items, step, &got, gpa);
+        try std.testing.expectEqualStrings("D;C7:end;", got.items);
+    }
 }
 
 test "fuzz: WebTransport capsules" {
