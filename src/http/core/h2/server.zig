@@ -1054,10 +1054,23 @@ pub fn Engine(comptime Ctx: type) type {
             /// holds. With a mutex nothing yields (zio steals, or
             /// std.Io.Threaded) and it stays held.
             fn spawn(conn: *Conn, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) std.Io.ConcurrentError!void {
-                if (!conn.lock_.free) return placement.concurrent(conn.group, conn.io, .local, func, args);
+                const Direct = struct {
+                    args: @TypeOf(args),
+                    fn into(t: @This(), group: *std.Io.Group, io: std.Io) std.Io.ConcurrentError!void {
+                        return placement.concurrent(group, io, .local, func, t.args);
+                    }
+                };
+                return conn.spawnWith(Direct{ .args = args });
+            }
+
+            /// `spawn`'s lock rule for any `spawner` with `into(group,
+            /// io)`: a direct one (`spawn`) or a detached owner's
+            /// (`detachedAttach`).
+            inline fn spawnWith(conn: *Conn, spawner: anytype) std.Io.ConcurrentError!void {
+                if (!conn.lock_.free) return spawner.into(conn.group, conn.io);
                 conn.unlock();
                 defer conn.lock();
-                return placement.concurrent(conn.group, conn.io, .local, func, args);
+                return spawner.into(conn.group, conn.io);
             }
 
             /// After a read: the `no_wait` requests whose body did not end
@@ -2640,10 +2653,8 @@ pub fn Engine(comptime Ctx: type) type {
             // not race the join's end (`std.Io.Group.await`). What the
             // tasks still queue goes out with the flush below, and then the
             // lingering close is the only writer. A detached owner's
-            // `attach` is checked here too, but its owner spawns after the
-            // lock: safe where the connection's tasks share an executor
-            // (pinned zio: no yield between the two), not where they don't
-            // (std.Io.Threaded). The fix is a `Detached` attach that spawns under the lock.
+            // `attach` is checked and spawned under the same lock
+            // (`detachedAttach`), so it is refused from here.
             {
                 conn.lock();
                 defer conn.unlock();
@@ -3313,19 +3324,19 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// The response goes on from a task: its body writes may now wait
         /// for the peer, as a handler task's do.
-        fn detachedAttach(d: *Detached) ?*std.Io.Group {
+        fn detachedAttach(d: *Detached, spawn: Detached.Spawn) Detached.AttachError!void {
             const es = exchangeOf(d).sink_state.es;
             const conn = es.conn;
             conn.lock();
             defer conn.unlock();
-            if (conn.life == .tasks_closed) return null;
+            if (conn.life == .tasks_closed) return error.ConnectionClosed;
             es.dispatch = switch (es.dispatch) {
                 .running_inline => .running_tasked,
                 .detached_inline => |ex| .{ .detached_tasked = ex },
                 .running_tasked, .detached_tasked, .running_parked, .parked => es.dispatch,
                 .head, .queued_task, .inline_awaiting_body, .inline_ready, .running_ended, .done => unreachable,
             };
-            return conn.group;
+            return conn.spawnWith(spawn);
         }
 
         fn detachedEnter(d: *Detached) void {

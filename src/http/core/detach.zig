@@ -21,6 +21,7 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const hooks = @import("hooks.zig");
+const placement = @import("placement.zig");
 
 pub const Detached = struct {
     request: *Request,
@@ -64,12 +65,15 @@ pub const Detached = struct {
         /// executor.
         end: *const fn (d: *Detached, result: anyerror!void) void,
         /// The response will be written by a task from now on, which may
-        /// wait (for the peer, for more body). Returns the group to spawn
-        /// that task into, `.local` (the connection's, so the connection's
-        /// end cancels it), or null once the connection's tasks are over
-        /// (the owner then calls `finish` with an error). On the request's
-        /// executor.
-        attach: *const fn (d: *Detached) ?*std.Io.Group,
+        /// wait (for the peer, for more body). Under the connection's lock
+        /// (the lock rule of the engine's own spawns), refuses with
+        /// `error.ConnectionClosed` once the connection's tasks are over,
+        /// else runs `spawn` into the connection's group, so the
+        /// connection's end cancels the task: the check and the spawn are
+        /// one step, and no task joins a group already joined for the last
+        /// time. On an error the owner calls `finish` with an error. On the
+        /// request's executor.
+        attach: *const fn (d: *Detached, spawn: Spawn) AttachError!void,
         /// First thing in the attached task: the engine notes the task, to
         /// cancel it when the peer resets the stream.
         enter: *const fn (d: *Detached) void,
@@ -80,6 +84,19 @@ pub const Detached = struct {
         /// until the `Parked`'s `release`. On the request's executor.
         park: ?*const fn (d: *Detached, owner: @import("parked.zig").Parked.Owner) error{ OutOfMemory, WriteFailed }!*@import("parked.zig").Parked = null,
     };
+
+    /// What the engine runs under its lock to start the attached task: the
+    /// owner's `placement.concurrent` into `group`, `.local`. Lives on the
+    /// stack of `attach`'s caller for the call only.
+    pub const Spawn = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, group: *std.Io.Group, io: std.Io) std.Io.ConcurrentError!void,
+
+        pub fn into(s: Spawn, group: *std.Io.Group, io: std.Io) std.Io.ConcurrentError!void {
+            return s.run(s.ctx, group, io);
+        }
+    };
+    pub const AttachError = error{ConnectionClosed} || std.Io.ConcurrentError;
 
     /// The detacher's side.
     pub const Owner = struct {
@@ -113,14 +130,23 @@ pub const Detached = struct {
         d.engine.end(d, result);
     }
 
-    /// The response needs a task (a streamed body, a file): returns the
-    /// group to spawn it into, `.local`. The task calls `enter` first and
-    /// `finish` last. Null when the connection can take no more tasks: the
-    /// caller calls `finish` (with an error) itself.
-    pub fn attach(d: *Detached) ?*std.Io.Group {
+    /// The response needs a task (a streamed body, a file): the engine
+    /// spawns `func(args)` on the connection's group, `.local`, under its
+    /// lock. The task calls `enter` first and `finish` last. On an error
+    /// (the connection's tasks are over, or no task could start) nothing
+    /// was spawned and the caller calls `finish` (with an error) itself.
+    pub fn attach(d: *Detached, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) AttachError!void {
         std.debug.assert(d.state == .detached);
         d.state = .attached;
-        return d.engine.attach(d);
+        const Task = struct {
+            args: @TypeOf(args),
+            fn run(ctx: *anyopaque, group: *std.Io.Group, io: std.Io) std.Io.ConcurrentError!void {
+                const t: *@This() = @ptrCast(@alignCast(ctx));
+                return placement.concurrent(group, io, .local, func, t.args);
+            }
+        };
+        var t: Task = .{ .args = args };
+        return d.engine.attach(d, .{ .ctx = &t, .run = Task.run });
     }
 
     /// First thing in the task `attach` was for.

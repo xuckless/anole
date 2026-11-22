@@ -1027,8 +1027,7 @@ pub fn finishDetached(x: *Exec, si: u32) void {
     const call = s.grpc.call;
     if (stateOf(w) == .streaming) {
         // A task writes the stream; the deadline stays watched.
-        const spawned = if (d.attach()) |group| placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) else error.ConnectionClosed;
-        spawned catch {
+        d.attach(attachedTask, .{ x, si, gen }) catch {
             x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);
             d.finish(error.ConnectionResetByPeer);
             x.release(si);

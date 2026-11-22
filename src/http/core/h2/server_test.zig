@@ -12,7 +12,6 @@ const config = @import("../config.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const DeadlineReader = @import("../server/test_socket.zig").DeadlineReader;
-const placement = @import("../placement.zig");
 const block_cache = @import("../block_cache.zig");
 const Detached = @import("../detach.zig").Detached;
 const Parked = @import("../parked.zig").Parked;
@@ -22,6 +21,7 @@ const testing = std.testing;
 const expect = testing.expect;
 const expectEqual = testing.expectEqual;
 const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
 const Allocator = std.mem.Allocator;
 const ErrorCode = frame.ErrorCode;
 const Server = server_mod.Server(void);
@@ -1310,8 +1310,7 @@ test "h2 engine: a detached response finished later from another task; an attach
     const seen2 = Det.count.load(.acquire);
     const streamed = try c.request("GET", "/nw/detach", null);
     const d2 = try Det.take(seen2);
-    const group = d2.attach().?;
-    try placement.concurrent(group, testing.io, .local, Det.attached, .{d2});
+    try d2.attach(Det.attached, .{d2});
     const r2 = try c.until(streamed);
     try expect(std.mem.eql(u8, want, r2.body.items));
     try wait.waitAtLeast(testing.io, "the attached task ended", &Det.attached_done, done + 1);
@@ -1831,7 +1830,7 @@ test "h2 engine: teardown with detached, parked and attached streams outstanding
     const seen11 = Det.count.load(.acquire);
     const streamed = try c.request("GET", "/nw/detach", null);
     const d = try Det.take(seen11);
-    try placement.concurrent(d.attach().?, testing.io, .local, Det.attached, .{d});
+    try d.attach(Det.attached, .{d});
     while (c.get(streamed).body.items.len < 65535) try c.readOne();
     // A connection error: every stream is over.
     try c.frameOut(.ping, 0, streamed, "12345678");
@@ -1883,6 +1882,54 @@ test "h2 engine: the drain reaching a closing connection starts no task in its j
     // The client hangs up: the close, then the teardown.
     fx.stop();
     try expectEqual(2, Late.calls);
+    try expectEqual(late, engine.test_late_flushers.load(.acquire));
+}
+
+/// A detached owner whose `attach` reaches the engine only once the
+/// connection's tasks are joined (`engine.test_after_join`): refused, and
+/// it finishes the response itself.
+const LateAttach = struct {
+    var d: ?*Detached = null;
+    var result: ?Detached.AttachError!void = null;
+    fn attach() void {
+        const det = d orelse return;
+        d = null;
+        // Back to where `attach` starts; the close skipped the abort.
+        det.state = .detached;
+        result = det.attach(Det.attached, .{det});
+        det.finish(error.ConnectionResetByPeer);
+    }
+};
+
+test "h2 engine: an attach after the connection's tasks are joined is refused and spawns nothing" {
+    // std.Io.Threaded, #225: the owner is inside `attach` (`.attached`, so
+    // the close's abort skips it) while the close runs on the connection's
+    // thread, and the engine's side runs right after the group's last
+    // join; a task spawned there would outlive the connection.
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    const seen = Det.count.load(.acquire);
+    {
+        errdefer fx.stop();
+        _ = try fx.client.request("GET", "/nw/detach", null);
+        const d = try Det.take(seen);
+        d.state = .attached;
+        LateAttach.d = d;
+    }
+    LateAttach.result = null;
+    engine.test_after_join = LateAttach.attach;
+    defer {
+        engine.test_after_join = null;
+        LateAttach.d = null;
+    }
+    const done = Det.attached_done.load(.acquire);
+    const aborts = Det.aborts.load(.acquire);
+    const late = engine.test_late_flushers.load(.acquire);
+    // The client hangs up: the close, then the teardown.
+    fx.stop();
+    try expectError(error.ConnectionClosed, LateAttach.result.?);
+    try expectEqual(done, Det.attached_done.load(.acquire));
+    try expectEqual(aborts, Det.aborts.load(.acquire));
     try expectEqual(late, engine.test_late_flushers.load(.acquire));
 }
 
