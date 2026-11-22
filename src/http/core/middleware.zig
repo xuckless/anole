@@ -46,7 +46,7 @@ pub fn Middleware(comptime Ctx: type) type {
         /// `pub fn noWait(self) bool` when it depends on the value. Routes
         /// registered `no_wait` take only such middleware.
         no_wait: bool = false,
-        /// `@typeName` of the middleware, for messages.
+        /// `@typeName` of the middleware, for messages and the console.
         name: []const u8 = "",
         /// What the middleware tells the OpenAPI document: a pointer to
         /// Anole's own record of its `pub const openapi` (set by

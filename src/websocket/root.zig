@@ -938,6 +938,8 @@ const H1Callbacks = struct {
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
+        // A plain GET has no connection to adopt (anole.testing has none at all).
+        if (!isUpgrade(req)) return null;
         const gpa = res._conn.?.allocator;
         const self = try gpa.create(H1Callbacks);
         errdefer gpa.destroy(self);

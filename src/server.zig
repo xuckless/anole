@@ -5429,6 +5429,22 @@ test "console: a connector type is not reported as PostgreSQL for a piece of its
     try std.testing.expect(c.describe == null);
 }
 
+test "console: a Connector's describe goes through consoleInfo (real target, no login)" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const client = try redis_mod.Client.init(gpa, rt.io(), .{ .url = "redis://bob:hunter2@127.0.0.1:6380/2", .environ = .empty });
+    defer client.deinit();
+    const c = Server(void).Connector.of(redis_mod.Client, client);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try c.describe.?(c.context, c.name, &w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.find(u8, out, "\"target\":\"127.0.0.1:6380/2\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, "hunter2") == null);
+}
+
 test "console: each database and service connector keeps its /db system name" {
     const S = Server(void);
     const Name = struct {

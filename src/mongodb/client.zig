@@ -223,6 +223,8 @@ pub const Client = struct {
     options: Options,
     /// `Options.name`, resolved.
     name: []const u8,
+    /// The seed list as `host:port,host:port`, for the console; no login.
+    target: []const u8 = "",
     /// `Options.max_connections`, resolved.
     max_connections: u32,
     errors: shared.ErrorMap,
@@ -312,6 +314,7 @@ pub const Client = struct {
 
         var seeds: std.ArrayList([]const u8) = .empty;
         for (cs.hosts) |h| try seeds.append(arena, try sdam.formatAddress(arena, h.name, h.port, h.kind == .unix));
+        self.target = try std.mem.join(arena, ",", seeds.items);
         self.direct = cs.boolean("directConnection") orelse false;
         self.topology = try sdam.Topology.init(gpa, .{ .seeds = seeds.items, .set_name = cs.string("replicaSet"), .direct = self.direct });
         errdefer self.topology.deinit();
@@ -930,6 +933,41 @@ pub const Client = struct {
                 };
             };
         }
+    }
+
+    /// The console's `/db` entry: each executor's pool, summed over the
+    /// servers that have not left the topology. `max` is 0 when any of
+    /// them has no limit. On a task of the runtime: the server list is
+    /// copied under the client's lock, which is released before the pool
+    /// locks are taken (as `closeIdle` does).
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        const io = self.io;
+        try internal.writeConsoleHead(w, console_system, self.name, self.target);
+        self.mutex.lockUncancelable(io);
+        const servers = self.gpa.dupe(*Server, self.servers.items) catch {
+            self.mutex.unlock(io);
+            return w.writeByte(']');
+        };
+        self.mutex.unlock(io);
+        defer self.gpa.free(servers);
+        for (self.sessions.pools, 0..) |_, i| {
+            var sum: internal.PoolStat = .{ .max = 0, .open = 0, .idle = 0 };
+            var unlimited = false;
+            for (servers) |s| {
+                if (s.retired.load(.acquire)) continue;
+                const p = &s.pools.pools[i];
+                p.mutex.lockUncancelable(io);
+                const stat: internal.PoolStat = .{ .max = p.max, .open = p.total, .idle = p.idle.items.len };
+                p.mutex.unlock(io);
+                unlimited = unlimited or stat.max == 0;
+                sum.max += stat.max;
+                sum.open += stat.open;
+                sum.idle += stat.idle;
+            }
+            if (unlimited) sum.max = 0;
+            try internal.writePool(w, i, sum);
+        }
+        try w.writeByte(']');
     }
 
     /// Closes the idle pooled connections of every server and executor;

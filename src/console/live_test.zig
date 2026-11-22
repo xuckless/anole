@@ -44,6 +44,11 @@ fn note(req: *http.Request, res: *http.Response) !void {
     try res.json(.{ .id = got });
 }
 
+/// The body of the routes the cache rows use.
+fn plain(_: *http.Request, res: *http.Response) !void {
+    try res.json(.{ .ok = true });
+}
+
 /// GET /boom: an unhandled error, a 500.
 fn boom(_: *http.Request, _: *http.Response) !void {
     return error.Boom;
@@ -426,6 +431,23 @@ const Check = struct {
         try std.testing.expectEqualStrings("GET", notes_route.method);
         try std.testing.expectEqualStrings("http", notes_route.kind);
         try std.testing.expectEqual(ok.i, notes_route.i);
+        const cached_rows = [_]struct { pattern: []const u8, want: bool }{
+            .{ .pattern = "/cached", .want = true },
+            .{ .pattern = "/with", .want = true },
+            .{ .pattern = "/g/x", .want = true },
+            .{ .pattern = "/two", .want = true },
+            .{ .pattern = "/mid", .want = true },
+            .{ .pattern = "/notes/:id", .want = false },
+            .{ .pattern = "/lobby", .want = false },
+            .{ .pattern = "/live", .want = false },
+        };
+        for (cached_rows) |row| {
+            const e = routeEntry(rd, row.pattern) orelse return error.NoRoute;
+            std.testing.expectEqual(row.want, e.cached) catch |err| {
+                std.debug.print("route {s}: cached\n", .{row.pattern});
+                return err;
+            };
+        }
         try std.testing.expectEqualStrings("ws", (routeEntry(rd, "/lobby") orelse return error.NoRoute).kind);
         try std.testing.expectEqualStrings("http", (routeEntry(rd, "/live") orelse return error.NoRoute).kind);
 
@@ -476,6 +498,14 @@ test "console live: an attached console gets each panel's data from a real app (
     app.use(anole.observe.AccessLog.init(.{ .format = .text }));
     app.get("/notes/:id", note);
     app.get("/boom", boom);
+    // /routes `cached` follows the route's chain (globals above, then these).
+    app.get("/cached", anole.cached(.{}, plain));
+    const pages = app.responseCache(.{});
+    app.with(.{pages}).get("/with", plain);
+    app.group("/g", .{pages}).get("/x", plain);
+    app.with(.{ pages, app.responseCache(.{}) }).get("/two", plain);
+    // A cache with another middleware after it: the chain is searched, not its tail.
+    app.with(.{ pages, anole.middleware.RequestId.init(.{}) }).get("/mid", plain);
     app.ws("/lobby", lobby);
     const live = try app.sseTopics(.{ .heartbeat = null });
     app.sse("/live", live, .{ .topics = &.{"news"} });

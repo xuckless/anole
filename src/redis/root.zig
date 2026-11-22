@@ -470,6 +470,26 @@ pub const Client = struct {
     /// (an allocation).
     pubsub_hub_mutex: std.Io.Mutex = .init,
 
+    /// The console's `/db` entry, with each executor's pool. The target
+    /// is the host and database, never the login. On a task of the
+    /// runtime: each pool's lock is held for three field copies.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        const st = self.settings;
+        var tbuf: [320]u8 = undefined;
+        const target = if (st.unix_path) |u|
+            std.fmt.bufPrint(&tbuf, "unix:{s}/{d}", .{ u, st.database }) catch u
+        else
+            std.fmt.bufPrint(&tbuf, "{s}:{d}/{d}", .{ st.host, st.port, st.database }) catch st.host;
+        try internal.writeConsoleHead(w, console_system, self.name, target);
+        for (self.pools.pools, 0..) |*p, i| {
+            p.mutex.lockUncancelable(self.io);
+            const stat: internal.PoolStat = .{ .max = p.max, .open = p.open, .idle = p.idle_len };
+            p.mutex.unlock(self.io);
+            try internal.writePool(w, i, stat);
+        }
+        try w.writeByte(']');
+    }
+
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
@@ -3083,6 +3103,78 @@ test "redis: a pool per executor" {
     try testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
     // Each executor's pool has a share of one, and opened it.
     try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
+}
+
+test "redis: consoleInfo gives the target without the login, one pool per executor, JSON-escaped name" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const rows = [_]struct {
+        name: []const u8,
+        url: []const u8,
+        client_name: ?[]const u8 = null,
+        want_name: []const u8 = "redis",
+        target: []const u8,
+        absent: []const []const u8 = &.{},
+    }{
+        .{ .name = "tcp and database", .url = "redis://127.0.0.1:6380/2", .target = "127.0.0.1:6380/2" },
+        .{ .name = "unix socket", .url = "unix:///run/redis.sock?db=3", .target = "unix:/run/redis.sock/3" },
+        .{ .name = "password and user never shown", .url = "redis://bob:hunter2@cache.internal:6379/0", .target = "cache.internal:6379/0", .absent = &.{ "bob", "hunter2" } },
+        .{ .name = "custom name with a quote", .url = "redis://127.0.0.1:6379", .client_name = "ca\"che", .want_name = "ca\"che", .target = "127.0.0.1:6379/0" },
+    };
+    for (rows) |row| {
+        const client = try Client.init(gpa, io, .{ .url = row.url, .name = row.client_name, .environ = .empty });
+        defer client.deinit();
+        var parsed = internal.expectConsoleInfo(client, .{
+            .system = "redis",
+            .name = row.want_name,
+            .target = row.target,
+            .pools = 2,
+            .absent = row.absent,
+        }) catch |err| {
+            std.debug.print("row: {s}\n", .{row.name});
+            return err;
+        };
+        parsed.deinit();
+    }
+}
+
+test "redis: consoleInfo counts follow the pool" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const client = try Client.init(gpa, io, .{ .url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()}), .environ = .empty, .max_connections = 3 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    var target_buf: [32]u8 = undefined;
+    // (open, idle, in_use) before and after one call: the connection is
+    // dialed, used and left idle.
+    const before = [_]i64{ 0, 0, 0 };
+    const after = [_]i64{ 1, 1, 0 };
+    for ([_][3]i64{ before, after }, 0..) |want, step| {
+        if (step == 1) _ = try client.incr(&c, "n");
+        var parsed = try internal.expectConsoleInfo(client, .{ .system = "redis", .name = "redis", .target = try std.fmt.bufPrint(&target_buf, "127.0.0.1:{d}/0", .{fake.port()}), .pools = 1 });
+        defer parsed.deinit();
+        const p = parsed.value.object.get("pools").?.array.items[0].object;
+        try testing.expectEqual(@as(i64, 3), p.get("max").?.integer);
+        try testing.expectEqual(want[0], p.get("open").?.integer);
+        try testing.expectEqual(want[1], p.get("idle").?.integer);
+        try testing.expectEqual(want[2], p.get("in_use").?.integer);
+    }
 }
 
 test "redis: coalesced and cached reads, invalidation" {
