@@ -472,6 +472,12 @@ jobs:
         with:
           version: 0.17.0
           cache-key: quic-interop
+      # The runner's traces go through pyshark, which calls
+      # asyncio.get_event_loop() and fails on Python 3.14 (the image's
+      # python3 since 2026-11): pin the interpreter its venv is made from.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
@@ -523,6 +529,12 @@ jobs:
         with:
           version: 0.17.0
           cache-key: webtransport-interop
+      # The runner's traces go through pyshark, which calls
+      # asyncio.get_event_loop() and fails on Python 3.14 (the image's
+      # python3 since 2026-11): pin the interpreter its venv is made from.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
