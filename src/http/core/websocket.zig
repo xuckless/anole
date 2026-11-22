@@ -2782,7 +2782,7 @@ test "WebSocket: a compressed frame is handed over in place, still compressed" {
     try std.testing.expect(within(msg.data, &frames));
 }
 
-test "WebSocket: a message handed over in place is intact after the next receive, even where the unread frame was moved over it" {
+test "WebSocket: after a window rewind over a message handed over in place, the next frame reads whole" {
     var frames = maskedFrame(0x1, "first") ++ maskedFrame(0x1, "second") ++ maskedFrame(0x1, "and a third, longer one");
     var reader: std.Io.Reader = undefined;
     var out_buf: [16]u8 = undefined;
