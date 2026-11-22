@@ -1005,6 +1005,187 @@ test "dusty's client over HTTP/2: h2c_hosts speak cleartext HTTP/2 with prior kn
     try std.testing.expectEqual(@as(u8, 1), response.version().major);
 }
 
+/// The core's client on an h2c server (prior knowledge, no TLS), with
+/// `url` for its paths.
+const DustyH2c = struct {
+    srv: Running,
+    client: dusty.Client,
+    url_buf: [64]u8 = undefined,
+
+    fn start(gpa: std.mem.Allocator, io: std.Io) !*DustyH2c {
+        const f = try gpa.create(DustyH2c);
+        errdefer gpa.destroy(f);
+        f.* = .{ .srv = try startH2c(gpa, io), .client = dusty.Client.init(gpa, io, .{ .h2c_hosts = &.{"127.0.0.1"} }) };
+        return f;
+    }
+
+    fn stop(f: *DustyH2c, gpa: std.mem.Allocator, io: std.Io) void {
+        f.client.deinit();
+        f.srv.stop(gpa, io);
+        gpa.destroy(f);
+    }
+
+    fn url(f: *DustyH2c, scheme: []const u8, path: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(&f.url_buf, "{s}://127.0.0.1:{d}{s}", .{ scheme, f.srv.port(), path });
+    }
+
+    fn dials(f: *const DustyH2c) u64 {
+        return f.client.dials.load(.monotonic);
+    }
+
+    fn origins(f: *DustyH2c) usize {
+        return f.client.pool().origins.len();
+    }
+
+    fn idle(f: *DustyH2c) usize {
+        return f.client.pool().idle_len;
+    }
+
+    /// A GET /hello held open with its body unread.
+    fn hold(f: *DustyH2c) !dusty.ClientResponse {
+        return f.client.fetch(try f.url("http", "/hello"), .{ .stream = true });
+    }
+
+    /// Lets go of a held response; its `defer`red `deinit` then does nothing.
+    fn let(response: *dusty.ClientResponse) void {
+        response.deinit();
+        response.owner = null;
+    }
+};
+
+test "dusty's client over HTTP/2: the carrier goes back to idle exactly when its last request lets go" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2c.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    var first = try f.hold();
+    defer first.deinit();
+    var second = try f.hold();
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), f.origins());
+    try std.testing.expectEqual(@as(usize, 0), f.idle());
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+    DustyH2c.let(&first);
+    try std.testing.expectEqual(@as(usize, 1), f.origins());
+    try std.testing.expectEqual(@as(usize, 0), f.idle());
+    DustyH2c.let(&second);
+    try std.testing.expectEqual(@as(usize, 0), f.origins());
+    try std.testing.expectEqual(@as(usize, 1), f.idle());
+    // From idle it carries requests again: no new dial.
+    var third = try f.client.fetch(try f.url("http", "/hello"), .{});
+    defer third.deinit();
+    try std.testing.expectEqual(@as(u8, 2), third.version().major);
+    try std.testing.expectEqualStrings("hello over h2", (try third.body()).?);
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+}
+
+test "dusty's client over HTTP/2: a broken session takes no new requests at once, its others finish, and it is closed, not pooled" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2c.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    var first = try f.hold();
+    defer first.deinit();
+    var second = try f.hold();
+    defer second.deinit();
+    // As a request that saw the connection fail leaves its handle.
+    first.owner.?.closing = true;
+    DustyH2c.let(&first);
+    try std.testing.expectEqual(@as(usize, 0), f.origins());
+    try std.testing.expectEqual(@as(usize, 0), f.idle());
+    try std.testing.expectEqualStrings("hello over h2", (try second.body()).?);
+    {
+        var fresh = try f.client.fetch(try f.url("http", "/hello"), .{});
+        defer fresh.deinit();
+        try std.testing.expectEqualStrings("hello over h2", (try fresh.body()).?);
+        try std.testing.expectEqual(@as(u64, 2), f.dials());
+    }
+    try std.testing.expectEqual(@as(usize, 1), f.idle());
+    // The broken one's last request: its carrier is closed (the testing
+    // allocator sees it and its origin freed once), the new one stays.
+    DustyH2c.let(&second);
+    try std.testing.expectEqual(@as(usize, 1), f.idle());
+    try std.testing.expectEqual(@as(usize, 0), f.origins());
+}
+
+test "dusty's client over HTTP/2: a WebSocket upgrade passes the pooled h2 connection by and leaves it pooled" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2c.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    {
+        var response = try f.client.fetch(try f.url("http", "/hello"), .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    }
+    try std.testing.expectEqual(@as(usize, 1), f.idle());
+    // No WebSocket route there: the HTTP/1.1 dial made for it is refused.
+    try std.testing.expectError(error.WebSocketUpgradeFailed, f.client.connectWebSocket(try f.url("ws", "/hello"), .{}));
+    try std.testing.expectEqual(@as(u64, 2), f.dials());
+    try std.testing.expectEqual(@as(usize, 1), f.idle());
+    var response = try f.client.fetch(try f.url("http", "/hello"), .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expectEqual(@as(u64, 2), f.dials());
+}
+
+test "dusty's client over HTTP/2: a refused POST goes again once on the same connection, whatever its method" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{});
+    defer listener.deinit(io);
+    // An h2c server that refuses the first request (RST_STREAM
+    // REFUSED_STREAM on stream 1) and answers the next (stream 3) with
+    // `:status 200` and nothing else.
+    const Peer = struct {
+        fn run(pio: std.Io, l: *std.Io.net.Server) !void {
+            const s = try l.accept(pio);
+            defer s.close(pio);
+            var rbuf: [16 * 1024]u8 = undefined;
+            var wbuf: [256]u8 = undefined;
+            var r = s.reader(pio, &rbuf);
+            var w = s.writer(pio, &wbuf);
+            try w.interface.writeAll(&frame(4, 0, 0, ""));
+            try w.interface.flush();
+            _ = try r.interface.take(24); // the client's preface
+            var headers: u32 = 0;
+            while (true) {
+                // Until the client goes.
+                const head = r.interface.takeArray(9) catch return;
+                try r.interface.discardAll(std.mem.readInt(u24, head[0..3], .big));
+                if (head[3] != 1) continue;
+                headers += 1;
+                const reply: []const u8 = if (headers == 1) &frame(3, 0, 1, &.{ 0, 0, 0, 7 }) else &frame(1, 0x5, 3, &.{0x88});
+                try w.interface.writeAll(reply);
+                try w.interface.flush();
+            }
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{ io, &listener });
+    defer peer.cancel(io) catch {};
+
+    var client = dusty.Client.init(gpa, io, .{ .h2c_hosts = &.{"127.0.0.1"} });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+    var response = try client.fetch(url, .{ .method = .post, .body = "once" });
+    defer response.deinit();
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expectEqual(@as(u64, 1), client.dials.load(.monotonic));
+}
+
 /// A scripted HTTP/2 server for the client: the test feeds the frames the
 /// client reads (`send`), and what the client writes is thrown away. The
 /// client runs on it through `adopt`, over a loopback socket pair that
