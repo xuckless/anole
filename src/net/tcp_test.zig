@@ -3,7 +3,6 @@
 //! latency or a short timing window.
 const std = @import("std");
 const wait = @import("anole_test_wait");
-const safety = @import("anole_safety");
 const features = @import("build_options");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
@@ -1572,7 +1571,7 @@ test "net tcp: a task waiting in waitWritable when the connection is released an
     LateWaiter.waiter_hold = .{ .point = .waiter_woken };
     tcp.test_write_waits.store(0, .monotonic);
     // Every allocation its own pages, made inaccessible when freed.
-    var app = try App.init(safety.never_reuse_allocator, .{ .executors = .exact(1) });
+    var app = try App.init(@import("anole_test_hooks").never_reuse.allocator, .{ .executors = .exact(1) });
     defer app.deinit();
     defer tcp.test_hold.store(null, .release);
     LateWaiter.io = app.io();

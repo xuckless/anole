@@ -8,7 +8,6 @@ const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const io_gate = @import("../io_gate.zig");
-const safety = @import("anole_safety");
 const abi = engine.abi;
 const features = anole.features;
 const zio = anole.zio;

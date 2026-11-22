@@ -1037,10 +1037,7 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 /// Where request frames are read and inflated, to be freed as soon as
 /// they are decoded into the call's arena (the client's too).
-pub const scratch = if (@import("builtin").is_test)
-    std.testing.allocator
-else
-    @import("anole_safety").process_gpa;
+pub const scratch = if (@import("builtin").is_test) std.testing.allocator else std.heap.smp_allocator;
 
 /// What a request message counts against `max_received_bytes` beyond its
 /// size: decoding allocates even for an empty one.

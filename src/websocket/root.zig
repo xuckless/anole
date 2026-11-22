@@ -69,7 +69,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const placement = dusty.placement;
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec").server;
@@ -645,7 +644,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
                 // HTTP/1.1; over HTTP/2 and HTTP/3 the process's, the
                 // stream having no allocator of its own here. Freed by
                 // `Socket.deinit`.
-                d.* = .init(accepted.config, options.deflate, if (h2) safety.process_gpa else res._conn.?.allocator);
+                d.* = .init(accepted.config, options.deflate, if (h2) std.heap.smp_allocator else res._conn.?.allocator);
                 deflate = d;
             }
         }
@@ -1279,8 +1278,7 @@ const UpgradedWindow = struct {
 const read_block_len = 16 * 1024 + 512;
 
 /// The blocks `ReadWindow` reads into, kept per thread for reuse, and
-/// beyond `cap` given back to `safety.process_gpa` (`smp_allocator` in
-/// release builds; never reused in tests). None of the HTTP core's pools fits:
+/// beyond `cap` given back to `std.heap.smp_allocator`. None of the HTTP core's pools fits:
 /// its write buffers are `response.write_buffer_size` long (configurable,
 /// 16384 by default: no room for a frame's tail ahead of a whole record),
 /// `block_cache` serves past 32 KiB, and the TLS module's ciphertext
@@ -1303,7 +1301,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else @import("anole_mem").allocUninit(safety.process_gpa, read_block_len) catch return null;
+        } else @import("anole_mem").allocUninit(std.heap.smp_allocator, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1317,9 +1315,9 @@ const read_blocks = struct {
             return;
         }
         // rawFree, not `free`: `free` fills the block with `undefined`
-        // first, 0xAA in ReleaseSafe, and process_gpa is Zig code, so the
-        // store isn't dropped as dead (C1). Poisoned above anyway.
-        safety.process_gpa.rawFree(b, .@"1", @returnAddress());
+        // first, 0xAA in ReleaseSafe, and the allocator is Zig code, so the
+        // store isn't dropped as dead (C1).
+        std.heap.smp_allocator.rawFree(b, .@"1", @returnAddress());
     }
 };
 
@@ -1981,6 +1979,14 @@ test "websocket: a read block from an empty pool is new and counted while held" 
     try std.testing.expectEqual(read_block_len, b.len);
     try std.testing.expectEqual(held + 1, _readBlocksHeld());
     read_blocks.give(b);
+    try std.testing.expectEqual(held, _readBlocksHeld());
+
+    // Past the cap, a given block is freed instead of pooled.
+    var more: [read_blocks.cap + 1][]u8 = undefined;
+    for (&more) |*m| m.* = read_blocks.take().?;
+    try std.testing.expectEqual(held + more.len, _readBlocksHeld());
+    for (more) |m| read_blocks.give(m);
+    try std.testing.expectEqual(read_blocks.cap, read_blocks.free_len);
     try std.testing.expectEqual(held, _readBlocksHeld());
 }
 

@@ -38,7 +38,6 @@ const events = @import("../events.zig");
 const incoming = @import("incoming.zig");
 const dialer = @import("connect.zig");
 const time = @import("time.zig");
-const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 
 /// Why a connection ends.
