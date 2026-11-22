@@ -716,7 +716,7 @@ const Driver = struct {
     signal: placement.Signal = .{},
     /// Every wake of this driver, and of its connections' tasks, from off
     /// its executor goes through it (T5); closed when `run` ends.
-    gate: safety.IoGate = .{},
+    gate: @import("../io_gate.zig").IoGate = .{},
     /// Its connections' kick slots (its executor only).
     slots: KickSlots = .{},
 

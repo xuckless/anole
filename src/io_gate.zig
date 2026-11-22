@@ -1,4 +1,4 @@
-//! SAFETY.md T5: a thread that may outlive the runtime (a C ABI consumer,
+//! A thread that may outlive the runtime (a C ABI consumer,
 //! an application thread) wakes runtime tasks only through an `IoGate`.
 //!
 //! Guards the runtime's wakes made from threads that are not the runtime's
@@ -12,7 +12,10 @@
 //! so the raw TCP/UDP drivers use the same gate.
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("root.zig");
+
+/// Tests: runs inside every `IoGate` once it is entered, before the wake
+/// itself, so a test can hold one thread there.
+pub var test_hook: ?*const fn () void = null;
 
 pub const IoGate = struct {
     word: std.atomic.Value(u32) = .init(0),
@@ -28,7 +31,7 @@ pub const IoGate = struct {
             if (cur & closed != 0) return false;
             cur = g.word.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic) orelse break;
         }
-        if (comptime builtin.is_test) if (root.io_gate_test_hook) |f| f();
+        if (comptime builtin.is_test) if (test_hook) |f| f();
         return true;
     }
 
@@ -92,4 +95,22 @@ test "io_gate: a closed gate lets no wake in, and close waits for the one inside
     t.join();
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(!g.enter());
+}
+
+var hook_calls: u32 = 0;
+fn countHook() void {
+    hook_calls += 1;
+}
+
+test "io_gate: the test hook runs once per successful enter, never on a closed gate" {
+    hook_calls = 0;
+    test_hook = &countHook;
+    defer test_hook = null;
+    var g: IoGate = .{};
+    try std.testing.expect(g.enter());
+    try std.testing.expectEqual(@as(u32, 1), hook_calls);
+    g.leave();
+    g.close();
+    try std.testing.expect(!g.enter());
+    try std.testing.expectEqual(@as(u32, 1), hook_calls);
 }

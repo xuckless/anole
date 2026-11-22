@@ -7,6 +7,7 @@ const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const io_gate = @import("../io_gate.zig");
 const safety = @import("anole_safety");
 const abi = engine.abi;
 const features = anole.features;
@@ -1392,7 +1393,7 @@ test "capi engine: a reload from another thread holds the server's stop until it
 }
 
 /// Holds one thread's wake inside an executor's `IoGate`
-/// (`safety.io_gate_test_hook`) until the test lets it go; other threads pass.
+/// (`io_gate.test_hook`) until the test lets it go; other threads pass.
 const WakeHold = struct {
     var thread: std.atomic.Value(std.Thread.Id) = .init(0);
     var entered: std.Io.Event = .unset;
@@ -1426,8 +1427,8 @@ test "capi engine: a wake from a consumer thread under way holds the server's st
     const tio = engine.threadedIo();
     WakeHold.entered = .unset;
     WakeHold.go = .unset;
-    safety.io_gate_test_hook = &WakeHold.hook;
-    defer safety.io_gate_test_hook = null;
+    io_gate.test_hook = &WakeHold.hook;
+    defer io_gate.test_hook = null;
     const t = try std.Thread.spawn(.{}, WakeHold.wake, .{e});
     // The wake is inside the gate, about to call into the runtime.
     WakeHold.entered.waitUncancelable(tio);

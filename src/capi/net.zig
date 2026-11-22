@@ -136,7 +136,7 @@ pub const UdpState = struct {
     /// The calls from consumer threads inside the group (T5): closed at the
     /// stop, which waits for those inside. A send queues its batch inside
     /// it (the batch's one allocation included): short, never a wait.
-    gate: safety.IoGate = .{},
+    gate: @import("../io_gate.zig").IoGate = .{},
 
     fn enter(u: *UdpState) ?*net.UdpGroup {
         if (!u.gate.enter()) return null;

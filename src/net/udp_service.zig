@@ -772,7 +772,7 @@ pub const UdpGroup = struct {
     senders: std.Io.Group = .init,
     /// Every wake of a sender from off its executor goes through it (T5);
     /// closed at the end of `run`, once the senders have ended.
-    gate: safety.IoGate = .{},
+    gate: @import("../io_gate.zig").IoGate = .{},
     handed_over: std.atomic.Value(bool) = .init(false),
     /// The Prometheus series, set before serving when the app has metrics.
     series: ?*net_metrics.UdpSeries = null,

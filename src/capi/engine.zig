@@ -498,9 +498,9 @@ const DeadlineList = struct {
 
 /// Guards the runtime's wakes made from threads that are not the runtime's
 /// (SAFETY.md T5): one per executor, on the line its inbox already shares
-/// with consumers. It lives in `safety` (src/safety/io_gate.zig); its test
-/// hook is `safety.io_gate_test_hook`.
-pub const IoGate = safety.IoGate;
+/// with consumers. It lives in src/io_gate.zig; its test hook is
+/// `io_gate.test_hook`.
+pub const IoGate = @import("../io_gate.zig").IoGate;
 
 pub const Exec = struct {
     engine: *Engine,
