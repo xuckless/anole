@@ -274,9 +274,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   both on (check.sh has no switch for them: `zig build test
   -Dscheduling=pinned -Ddebug_held_locks=true -Ddebug_cancel=true`).
   And `quiescent_state` (fork only, never offered upstream; user,
-  2026-10-28): a quiescent-state counter per executor, on a cache line of
+  2026-10-28; idle in Anole since S3, which deleted its only consumer,
+  src/http/core/qsbr.zig, and no longer enables it; the patch is dropped at
+  the next zio merge): a quiescent-state counter per executor, on a cache line of
   its own, and a grace-period number in the runtime, which
-  src/http/core/qsbr.zig's reclamation waits on
+  an external reclamation scheme could wait on
   (`Runtime.quiescentSnapshot`, `Runtime.quiescentPassed`). A scheduler
   pass (`getNextTask`) loads the number and the executor's counter and
   stores only when a grace period has started since its last pass; the
@@ -289,8 +291,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   earlier writers through its release sequence). Run the suite with
   `./check.sh --scheduling pinned --quiescent-state` and once with Anole's
   whole set (`zig build test -Dscheduling=pinned -Dfast_accept=true
-  -Ddiagnostics=true -Ddebug_held_locks=true -Ddebug_cancel=true
-  -Dquiescent_state=true`). Under ReleaseSafe two diag tests that look for
+  -Ddiagnostics=true -Ddebug_held_locks=true -Ddebug_cancel=true`). Under ReleaseSafe two diag tests that look for
   function names in stack traces fail (inlining), on baf4e5f as well.
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with

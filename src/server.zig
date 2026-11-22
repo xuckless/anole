@@ -153,11 +153,9 @@ const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
 /// queue, so new connections, parked ones waking and new HTTP/2 streams are
 /// not left behind thousands of busy connections. `fast_send`: a write the
 /// socket takes at once (most responses) is sent directly, without parking
-/// the task for the event loop. `quiescent_state`: each
-/// executor reports its scheduler passes, so the HTTP core's `qsbr` cells
-/// are read without a lock on the executors (SAFETY.md L7). `debug_held_locks`, in
+/// the task for the event loop. `debug_held_locks`, in
 /// Debug: a task that suspends while it holds a lock panics (SAFETY.md L2).
-pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .quiescent_state = true, .debug_held_locks = @import("builtin").mode == .debug };
+pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_held_locks = @import("builtin").mode == .debug };
 
 /// Anole's own build of zio is pinned by default (build.zig), so a program
 /// that declares no `zio_options` gets it; one that declares them must not

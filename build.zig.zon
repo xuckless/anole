@@ -34,11 +34,8 @@
         // the test runner fails a test (C3), and no report for a cancel an
         // AutoCancel consumed as its timeout (812eac3), and a report hook
         // (`held_locks.report`, baf4e5f) through which src/safety names
-        // where each held lock was taken; and `quiescent_state` (c21be0b,
-        // its ordering notes in d4b3ba6, fork only): a quiescent-state
-        // counter per executor and a grace-period number
-        // (`Runtime.quiescentSnapshot`/`quiescentPassed`) for
-        // src/http/core/qsbr.zig's reclamation. Pinned on the fork's
+        // where each held lock was taken. The fork also has `quiescent_state` (c21be0b, fork only), which
+        // Anole no longer enables. Pinned on the fork's
         // `anole-diag` branch (d4b3ba6, `anole` + four commits): in
         // Debug and test builds, `diagnostics` also keeps a live-task list
         // per executor and a registry of runtimes for `zio.dumpTasks`, which
