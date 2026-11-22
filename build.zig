@@ -1420,6 +1420,13 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&bench.step);
     }
 
+    // Hashes the files of the release steps (cli-dist, capi-dist).
+    const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/anole/sums.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+
     // capi: libanole, the C ABI (include/anole.h) as a static and a shared
     // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
     {
@@ -1432,7 +1439,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
             }),
         });
-        const lib = capiLibrary(b, symbols_tool, stack, features, target, optimize, b.option(bool, "strip", "capi: no debug information in libanole (capi-dist always strips)"), capi_step);
+        const lib = capiLibrary(b, symbols_tool, stack, features, target, optimize, b.option(bool, "strip", "capi: no debug information in libanole and, since the modules are shared, in everything else built from this target (capi-dist always strips its own stacks)"), capi_step);
         const capi_mod = lib.mod;
         const os = target.result.os.tag;
         const shared_lib = lib.shared;
@@ -1471,25 +1478,34 @@ pub fn build(b: *std.Build) void {
             .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "libanole-x86_64-macos.a" },
             .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "libanole-aarch64-macos.a" },
         };
-        const capi_dist_names = comptime blk: {
-            var names: []const u8 = "";
-            for (capi_dist_targets) |dt| names = names ++ dt.name ++ ", ";
-            break :blk names;
-        };
-        const capi_dist = b.step("capi-dist", "Build " ++ capi_dist_names ++ "anole.h, anole.abi.json, anole.schema.json and SHA256SUMS-libanole into zig-out/capi-dist");
-        var capi_dist_files: [capi_dist_targets.len + 3]DistFile = undefined;
-        var capi_dist_n: usize = 0;
-        for (capi_dist_targets) |dt| {
-            const dist_target = b.resolveTargetQuery(dt.query);
-            const dist_stack = TargetStack.init(b, features, dist_target, .ReleaseSafe) orelse continue;
-            const dist_lib = capiLibrary(b, symbols_tool, dist_stack, features, dist_target, .ReleaseSafe, true, capi_dist);
-            capi_dist_files[capi_dist_n] = .{ .name = dt.name, .path = dist_lib.static.?.getEmittedBin() };
-            capi_dist_n += 1;
+        // Only the root build: a consumer never runs it and would pay four target stacks.
+        if (b.isRoot()) {
+            const capi_dist_names = comptime blk: {
+                var names: []const u8 = "";
+                for (capi_dist_targets) |dt| names = names ++ dt.name ++ ", ";
+                break :blk names;
+            };
+            const capi_dist = b.step("capi-dist", "Build " ++ capi_dist_names ++ "anole.h, anole.abi.json, anole.schema.json and SHA256SUMS-libanole into zig-out/capi-dist");
+            var capi_dist_files: [capi_dist_targets.len + 3]DistFile = undefined;
+            var capi_dist_n: usize = 0;
+            for (capi_dist_targets) |dt| {
+                const dist_target = b.resolveTargetQuery(dt.query);
+                // Dependencies are cached by target and optimize mode: a second stack for the
+                // main build's own pair would share and rewire its modules.
+                if (dist_target.query.eql(target.query) and optimize == .safe) {
+                    capi_dist.dependOn(&b.addFail("capi-dist: the build's own -Dtarget/-Doptimize equals a dist row; run it without them").step);
+                    continue;
+                }
+                const dist_stack = TargetStack.init(b, features, dist_target, .ReleaseSafe) orelse continue;
+                const dist_lib = capiLibrary(b, symbols_tool, dist_stack, features, dist_target, .ReleaseSafe, true, capi_dist);
+                capi_dist_files[capi_dist_n] = .{ .name = dt.name, .path = dist_lib.static.?.getEmittedBin() };
+                capi_dist_n += 1;
+            }
+            capi_dist_files[capi_dist_n] = .{ .name = "anole.h", .path = b.path("include/anole.h") };
+            capi_dist_files[capi_dist_n + 1] = .{ .name = "anole.abi.json", .path = abi_json_out };
+            capi_dist_files[capi_dist_n + 2] = .{ .name = "anole.schema.json", .path = b.path("include/anole.schema.json") };
+            distFiles(b, sums_exe, capi_dist, "capi-dist", "SHA256SUMS-libanole", capi_dist_files[0 .. capi_dist_n + 3]);
         }
-        capi_dist_files[capi_dist_n] = .{ .name = "anole.h", .path = b.path("include/anole.h") };
-        capi_dist_files[capi_dist_n + 1] = .{ .name = "anole.abi.json", .path = abi_json_out };
-        capi_dist_files[capi_dist_n + 2] = .{ .name = "anole.schema.json", .path = b.path("include/anole.schema.json") };
-        distFiles(b, capi_dist, "capi-dist", "SHA256SUMS-libanole", capi_dist_files[0 .. capi_dist_n + 3]);
         const abi_json_update = b.addUpdateSourceFiles();
         abi_json_update.addCopyFileToSource(abi_json_out, "include/anole.abi.json");
         b.step("capi-abi-json", "Regenerate include/anole.abi.json from src/capi/abi.zig").dependOn(&abi_json_update.step);
@@ -1932,7 +1948,7 @@ pub fn build(b: *std.Build) void {
             const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe, true) });
             file.* = .{ .name = dt.name, .path = exe.getEmittedBin() };
         }
-        distFiles(b, dist, "dist", "SHA256SUMS", &files);
+        distFiles(b, sums_exe, dist, "dist", "SHA256SUMS", &files);
     }
 
     // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop
@@ -2810,7 +2826,10 @@ fn capiLibrary(
     }
     // The strip flag is per module and every C library is its own compile:
     // one walk over everything the module links sets it on all of them.
-    const inputs = linkedInputs(b, capi_mod, strip == true);
+    const linked = linkedInputs(b, capi_mod);
+    if (strip == true) for (linked.modules) |m| {
+        m.strip = true;
+    };
     const os = target.result.os.tag;
     if (os != .linux and !os.isDarwin()) {
         // COFF cannot merge objects into one, and a DLL exports only what is
@@ -2830,7 +2849,7 @@ fn capiLibrary(
     const lib_obj = hide.addOutputFileArg("anole.o");
     // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the tool
     // takes back from the inputs (tools/capi_symbols.zig).
-    if (os.isDarwin()) for (inputs) |input| hide.addFileArg(input);
+    if (os.isDarwin()) for (linked.inputs) |input| hide.addFileArg(input);
     const static = b.addLibrary(.{
         .name = "anole",
         .linkage = .static,
@@ -2861,12 +2880,7 @@ const DistFile = struct { name: []const u8, path: std.Build.LazyPath };
 /// Installs `files` into zig-out/<dir> and a checksums file `sums_name` over
 /// them, in the order given. The sums are over copies named as installed, so
 /// the basenames match the release assets.
-fn distFiles(b: *std.Build, step: *std.Build.Step, dir: []const u8, sums_name: []const u8, files: []const DistFile) void {
-    const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
-        .root_source_file = b.path("tools/anole/sums.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    }) });
+fn distFiles(b: *std.Build, sums_exe: *std.Build.Step.Compile, step: *std.Build.Step, dir: []const u8, sums_name: []const u8, files: []const DistFile) void {
     const sums = b.addRunArtifact(sums_exe);
     const sums_out = sums.addOutputFileArg(sums_name);
     const named = b.addWriteFiles();
@@ -2878,24 +2892,25 @@ fn distFiles(b: *std.Build, step: *std.Build.Step, dir: []const u8, sums_name: [
 }
 
 /// Every static library and object a module links, through the modules it
-/// imports and the libraries those link (for tools/capi_symbols.zig). With
-/// `strip`, every module met on the way loses its debug information.
-fn linkedInputs(b: *std.Build, root: *std.Build.Module, strip: bool) []const std.Build.LazyPath {
+/// imports and the libraries those link (for tools/capi_symbols.zig), and
+/// every module met on the way.
+fn linkedInputs(b: *std.Build, root: *std.Build.Module) struct { inputs: []const std.Build.LazyPath, modules: []const *std.Build.Module } {
     var out: std.ArrayList(std.Build.LazyPath) = .empty;
+    var mods: std.ArrayList(*std.Build.Module) = .empty;
     var seen: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
     var todo: std.ArrayList(*std.Build.Module) = .empty;
     todo.append(b.allocator, root) catch @panic("OOM");
-    while (todo.pop()) |top| for (top.getGraph().modules) |m| for (blk: {
-        if (strip) m.strip = true;
-        break :blk m.link_objects.items;
-    }) |lo| switch (lo) {
-        .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
-        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
-            if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
-            out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
-            todo.append(b.allocator, c.root_module) catch @panic("OOM");
-        },
-        else => {},
+    while (todo.pop()) |top| for (top.getGraph().modules) |m| {
+        mods.append(b.allocator, m) catch @panic("OOM");
+        for (m.link_objects.items) |lo| switch (lo) {
+            .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
+            .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+                if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
+                out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
+                todo.append(b.allocator, c.root_module) catch @panic("OOM");
+            },
+            else => {},
+        };
     };
-    return out.items;
+    return .{ .inputs = out.items, .modules = mods.items };
 }
