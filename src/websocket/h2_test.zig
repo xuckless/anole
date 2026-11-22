@@ -1166,7 +1166,7 @@ test "WebSocket over HTTP/2 on the new engine: a send from a task on another exe
         }
     }.ran);
 
-    const hops = dusty.h2_core_for_tests.server.test_hops.load(.acquire);
+    const hops = dusty.h2_core_for_tests.server.probe.at(.hops).load(.acquire);
     var back: [256]u8 = undefined;
     var op: wsc.Opcode = undefined;
     for (0..3) |_| {
@@ -1174,7 +1174,7 @@ test "WebSocket over HTTP/2 on the new engine: a send from a task on another exe
         try std.testing.expectEqualStrings("sent", try b.nextFrame(&op, &back));
         try std.testing.expectEqualStrings("from another connection", try a.nextFrame(&op, &back));
     }
-    try std.testing.expect(dusty.h2_core_for_tests.server.test_hops.load(.acquire) >= hops + 3);
+    try std.testing.expect(dusty.h2_core_for_tests.server.probe.at(.hops).load(.acquire) >= hops + 3);
 }
 
 const HeldSend = enum(u8) { pending, canceled, not_canceled, send_succeeded };
@@ -1231,17 +1231,17 @@ test "WebSocket over HTTP/2 on the new engine: a send canceled while its hop is 
 
     const server_core = dusty.h2_core_for_tests.server;
     var hold: std.Io.Event = .unset;
-    server_core.test_hop_hold.store(&hold, .release);
-    defer server_core.test_hop_hold.store(null, .release);
+    server_core.probe.hop_hold.store(&hold, .release);
+    defer server_core.probe.hop_hold.store(null, .release);
     held_task.store(null, .release);
     held_outcome.store(@backingInt(HeldSend.pending), .release);
-    const hops = server_core.test_hops.load(.acquire);
+    const hops = server_core.probe.at(.hops).load(.acquire);
 
     try b.sendFrame(.text, "go");
     try b.sendQueued();
     try test_wait.waitUntil(io, "the send hopped", hops, struct {
-        fn hopped(before: u32) bool {
-            return dusty.h2_core_for_tests.server.test_hops.load(.acquire) > before;
+        fn hopped(before: usize) bool {
+            return dusty.h2_core_for_tests.server.probe.at(.hops).load(.acquire) > before;
         }
     }.hopped);
     // `held_task` is stored before the send, so it is set once the hop is.

@@ -3278,17 +3278,24 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         /// The response goes on from a task, in the connection's group:
-        /// its body writes may now wait for the peer.
-        fn detachedAttach(d: *dusty.Detached) ?*std.Io.Group {
+        /// its body writes may now wait for the peer. Spawned under the
+        /// lock `finish` aborts every still-detached response under before
+        /// it cancels the group, so an attach always comes before that and
+        /// its task is joined by the cancel: never refused, even once the
+        /// state is `.closed` (refusing there would leave the owner outside
+        /// the group while `finish` frees the connection). Counted first:
+        /// on a spawn error `detachedEnd` undoes it when the owner's
+        /// `finish` ends the request.
+        fn detachedAttach(d: *dusty.Detached, spawn: dusty.Detached.Spawn) dusty.Detached.AttachError!void {
             const ex = exchangeOf(d);
             const s = ex.sink_state.stream;
             const conn = s.conn;
-            ex.attached = true;
-            _ = conn.tasks.fetchAdd(1, .acq_rel);
             conn.lock();
             defer conn.unlock();
+            ex.attached = true;
+            _ = conn.tasks.fetchAdd(1, .acq_rel);
             s.inline_mode = false;
-            return &conn.group;
+            return spawn.into(&conn.group, conn.ep.io);
         }
 
         fn detachedEnter(_: *dusty.Detached) void {}
