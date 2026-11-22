@@ -470,6 +470,8 @@ pub const Middleware = struct {
 
     limiter: Limiter,
     options: Options,
+    /// `options.policy()`, resolved once by `init`.
+    policy: Policy,
 
     /// `init`'s options: the policy (`limit` per `window`, up to
     /// `burst` at once), what requests are counted by, and what a failing
@@ -524,7 +526,7 @@ pub const Middleware = struct {
             "ratelimit.Middleware: .scope = {d} is taken by the automatic scopes (2^31 and up); give a scope below 2^31 (2147483648), or none for one of its own",
             .{options.scope.?},
         );
-        return .{ .limiter = limiter, .options = resolved };
+        return .{ .limiter = limiter, .options = resolved, .policy = resolved.policy() };
     }
 
     /// The scope `init` gives a middleware with `options`.
@@ -550,7 +552,7 @@ pub const Middleware = struct {
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;
         const key = self.options.key(req, &key_buf);
-        const r = self.limiter.take(key, 1, self.options.policy()) catch |err| switch (self.options.on_error) {
+        const r = self.limiter.take(key, 1, self.policy) catch |err| switch (self.options.on_error) {
             .allow => {
                 std.log.scoped(.anole_ratelimit).warn("limiter failed, request let through: {t}", .{err});
                 return next.call();
@@ -900,6 +902,18 @@ test "ratelimit.Middleware.init: each middleware gets its own scope, .scope over
     try std.testing.expect(first.options.policy().scope != second.options.policy().scope);
     try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
     try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
+}
+
+test "ratelimit.Middleware.init: the stored policy is what the options describe" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    const given = Middleware.init(l.limiter(), .{ .limit = 5, .window = .fromMilliseconds(1000), .burst = 9, .scope = 7 });
+    try std.testing.expectEqualDeep(given.options.policy(), given.policy);
+    try std.testing.expectEqual(@as(u32, 7), given.policy.scope);
+    const automatic = Middleware.init(l.limiter(), .{});
+    try std.testing.expectEqualDeep(automatic.options.policy(), automatic.policy);
+    try std.testing.expect(automatic.policy.scope >= Middleware.first_automatic_scope);
+    try std.testing.expectEqual(@as(u32, 100), automatic.policy.limit);
 }
 
 test "ratelimit.Middleware.init: an automatic scope and a given one are never equal; 2^31 and up is refused" {
