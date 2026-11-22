@@ -379,7 +379,26 @@ const Handlers = struct {
         s.router.addRouteWith(.post, "/nw/baseline", baseline, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/json", jsonItems, .{ .no_wait = true });
         s.router.get("/headers", headerCount);
+        s.router.get("/huge", huge);
+        s.router.get("/huge/stream", hugeStream);
     }
+
+    /// A head the HPACK block can't hold (over `max_headers_len`): its
+    /// submit fails.
+    fn huge(_: *Request, res: *Response) !void {
+        try res.header("x-huge", &huge_value);
+        res.body = "never";
+    }
+    fn hugeStream(_: *Request, res: *Response) !void {
+        try res.header("x-huge", &huge_value);
+        var buf: [64]u8 = undefined;
+        var out = try res.stream(&buf);
+        try out.interface.writeAll("never");
+        try out.interface.flush();
+        try out.end();
+    }
+    // Huffman takes 'x' to 7 bits: still over the limit encoded.
+    const huge_value: [96 * 1024]u8 = @splat('x');
 
     /// HttpArena's baseline: the sum of `a`, `b` and a small body.
     fn baseline(req: *Request, res: *Response) !void {
@@ -1353,6 +1372,78 @@ test "h2 engine: a parked response ended by its owner" {
     try expect(r.rst == null);
     try expectEqualStrings("data: only\n\n", r.body.items);
     try expectEqual(gone, Park.gone.load(.acquire));
+}
+
+test "h2 engine: a parked response released without ending is reset with CANCEL" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const seen = Park.count.load(.acquire);
+    const id = try c.request("GET", "/park", null);
+    const p = try Park.take(seen);
+    try Park.burst(p, "only");
+    p.release();
+    const r = try c.until(id);
+    try expectEqual(200, r.status);
+    try expect(!r.ended);
+    try expectEqual(ErrorCode.cancel, r.rst.?);
+    const next = try c.request("GET", "/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+}
+
+test "h2 engine: a response head that can't be submitted is reset with INTERNAL_ERROR, whole or streamed, and the connection carries on" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    for ([_][]const u8{ "/huge", "/huge/stream" }) |path| {
+        const id = try c.request("GET", path, null);
+        const r = try c.until(id);
+        errdefer std.debug.print("{s}\n", .{path});
+        try expectEqual(0, r.status);
+        try expectEqual(ErrorCode.internal_error, r.rst.?);
+        try expectEqual(0, r.data_frames);
+        const next = try c.request("GET", "/hello", null);
+        try expectEqualStrings("hello", (try c.until(next)).body.items);
+    }
+}
+
+test "h2 engine: Resp, the response side: every state x event cell, and its predicates" {
+    const R = engine.Resp;
+    const rows = [_]struct { from: R, ev: R.Event, to: R }{
+        .{ .from = .none, .ev = .head, .to = .head_sent },
+        .{ .from = .none, .ev = .end, .to = .ended },
+        .{ .from = .none, .ev = .wait, .to = .none },
+        .{ .from = .none, .ev = .drained, .to = .none },
+        .{ .from = .head_sent, .ev = .head, .to = .head_sent },
+        .{ .from = .head_sent, .ev = .end, .to = .ended },
+        .{ .from = .head_sent, .ev = .wait, .to = .head_sent },
+        .{ .from = .head_sent, .ev = .drained, .to = .head_sent },
+        .{ .from = .ended, .ev = .head, .to = .ended },
+        .{ .from = .ended, .ev = .end, .to = .ended },
+        .{ .from = .ended, .ev = .wait, .to = .waiting },
+        .{ .from = .ended, .ev = .drained, .to = .ended },
+        .{ .from = .waiting, .ev = .head, .to = .waiting },
+        .{ .from = .waiting, .ev = .end, .to = .waiting },
+        .{ .from = .waiting, .ev = .wait, .to = .waiting },
+        .{ .from = .waiting, .ev = .drained, .to = .ended },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} x {t}\n", .{ row.from, row.ev });
+        try expectEqual(row.to, row.from.next(row.ev));
+    }
+    const preds = [_]struct { r: R, ended: bool, head_out: bool }{
+        .{ .r = .none, .ended = false, .head_out = false },
+        .{ .r = .head_sent, .ended = false, .head_out = true },
+        .{ .r = .ended, .ended = true, .head_out = true },
+        .{ .r = .waiting, .ended = true, .head_out = true },
+    };
+    for (preds) |row| {
+        errdefer std.debug.print("{t}\n", .{row.r});
+        try expectEqual(row.ended, row.r.isEnded());
+        try expectEqual(row.head_out, row.r.headOut());
+    }
 }
 
 test "h2 engine: an RFC 8441 tunnel: ENABLE_CONNECT_PROTOCOL only when configured, its window, echo, a message past the cap, reset once finished" {

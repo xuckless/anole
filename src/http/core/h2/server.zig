@@ -216,6 +216,77 @@ threadlocal var scratch_block: []align(16) u8 = &.{};
 
 const Field = struct { name: []const u8, value: []const u8 };
 
+/// An `EStream`'s response side, one value. Every change is a row here:
+/// add a phase or an event as a row of `next`, never as a flag beside it.
+///
+///   state      head        end      wait        drained
+///   none       head_sent   ended    none        none
+///   head_sent  head_sent   ended    head_sent   head_sent
+///   ended      ended       ended    waiting     ended
+///   waiting    waiting     waiting  waiting     ended
+///
+/// head:    the final head (no END_STREAM) is in `proto` (`submitHeadOnce`;
+///          a 1xx `interim` is no event).
+/// end:     the last frame is about to be submitted (`complete`, `end`,
+///          `endChain`). Before the submit: END_STREAM on a stream whose
+///          peer half is closed closes it inside the call, and
+///          `onStreamClose` must see a normal end.
+/// wait:    the handler is done, the end is whole, but its last frames may
+///          wait for the peer's credit: counted in `Conn.send_waits`, with
+///          a send deadline (`finishHandler`).
+/// drained: those frames are out, or never will be (`Conn.sendDone`).
+///
+/// `head` and `end` in ended/waiting are not reached (a response ends
+/// once, before its handler is done); a late one keeps `waiting`, so
+/// `send_waits` stays right. `wait` outside `ended` is a no-op (a handler
+/// that returned without ending is reset, not waited for), and so is
+/// `drained` outside `waiting`. A submit that fails is no event: the value
+/// saved before it is put back. A reset is no phase either: the
+/// stream-level `EStream.reset` is read by the request side too, and an
+/// ended response that is reset must still read as ended (`cancelHandler`,
+/// `onStreamClose`). The values make `isEnded` one compare.
+pub const Resp = enum(u8) {
+    none = 0,
+    head_sent = 1,
+    ended = 2,
+    waiting = 3,
+
+    pub const Event = enum { head, end, wait, drained };
+
+    /// The table above.
+    pub fn next(r: Resp, ev: Event) Resp {
+        return switch (r) {
+            .none => switch (ev) {
+                .head => .head_sent,
+                .end => .ended,
+                .wait, .drained => .none,
+            },
+            .head_sent => switch (ev) {
+                .head, .wait, .drained => .head_sent,
+                .end => .ended,
+            },
+            .ended => switch (ev) {
+                .head, .end, .drained => .ended,
+                .wait => .waiting,
+            },
+            .waiting => switch (ev) {
+                .head, .end, .wait => .waiting,
+                .drained => .ended,
+            },
+        };
+    }
+
+    /// The last frame is submitted (or being submitted).
+    pub fn isEnded(r: Resp) bool {
+        return @backingInt(r) >= @backingInt(Resp.ended);
+    }
+
+    /// The final head went to `proto`.
+    pub fn headOut(r: Resp) bool {
+        return r != .none;
+    }
+};
+
 pub fn Engine(comptime Ctx: type) type {
     return struct {
         const Server = server_mod.Server(Ctx);
@@ -463,7 +534,7 @@ pub fn Engine(comptime Ctx: type) type {
             node: std.DoublyLinkedList.Node = .{},
 
             /// Finished responses whose last frames wait for the peer's
-            /// credit (`EStream.send_wait`), and whether a task waits for
+            /// credit (`Resp.waiting`), and whether a task waits for
             /// their send deadlines (`waitSends`), woken on `send_wake`.
             send_waits: usize = 0,
             send_waiter: bool = false,
@@ -654,7 +725,7 @@ pub fn Engine(comptime Ctx: type) type {
                 es.cs = null;
                 s.user = null;
                 conn.sendDone(es);
-                if (code != .no_error or !es.ended) es.reset = true;
+                if (code != .no_error or !es.resp.isEnded()) es.reset = true;
                 if (es.reset and es.body.len > 0) {
                     // Never read: the connection's credit goes back.
                     conn.proto.consumed(null, es.body.len) catch {};
@@ -815,15 +886,15 @@ pub fn Engine(comptime Ctx: type) type {
                     // A handler that returned without ending its response
                     // (it never does: `serveStream` writes it) would leave
                     // the peer waiting.
-                    if (!es.ended and !es.reset) {
+                    if (!es.resp.isEnded() and !es.reset) {
                         es.reset = true;
                         conn.proto.reset(s, .internal_error) catch {};
                     } else if (!es.body_done and !es.reset) conn.startDiscard(es, s);
                     // Its last frames may wait for the peer's credit: they
                     // get a send deadline (`waitSends`) unless they go out
                     // with this write.
-                    if (es.ended and !es.reset and !es.send_wait and es.cs != null and s.canSend()) {
-                        es.send_wait = true;
+                    if (es.resp == .ended and !es.reset and es.cs != null and s.canSend()) {
+                        es.resp = es.resp.next(.wait);
                         conn.send_waits += 1;
                     }
                 }
@@ -869,8 +940,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// `es`'s last frames are out (or never will be). Under the
             /// lock.
             fn sendDone(conn: *Conn, es: *EStream) void {
-                if (!es.send_wait) return;
-                es.send_wait = false;
+                if (es.resp != .waiting) return;
+                es.resp = es.resp.next(.drained);
                 conn.send_waits -= 1;
                 if (conn.send_waits == 0 and conn.send_waiter) conn.send_wake.notify(conn.io);
             }
@@ -903,10 +974,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer if (comptime is_test) {
                     _ = test_freed.fetchAdd(1, .release);
                 };
-                if (es.room_waiting) {
-                    conn.room_waiters.remove(&es.room_node);
-                    es.room_waiting = false;
-                }
+                if (es.room_waiting) conn.unwatchRoom(es);
                 if (es.body.len > 0 and !conn.closing) conn.proto.consumed(null, es.body.len) catch {};
                 conn.sendDone(es);
                 conn.live.remove(&es.node);
@@ -1173,7 +1241,7 @@ pub fn Engine(comptime Ctx: type) type {
                 while (it) |node| {
                     it = node.next;
                     const es: *EStream = @fieldParentPtr("node", node);
-                    if (!es.send_wait) continue;
+                    if (es.resp != .waiting) continue;
                     const s = es.cs orelse {
                         conn.sendDone(es);
                         continue;
@@ -1220,7 +1288,7 @@ pub fn Engine(comptime Ctx: type) type {
                         while (it) |node| {
                             it = node.next;
                             const es: *EStream = @fieldParentPtr("node", node);
-                            if (!es.send_wait) continue;
+                            if (es.resp != .waiting) continue;
                             const s = es.cs orelse {
                                 conn.sendDone(es);
                                 continue;
@@ -1428,9 +1496,9 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.flushing = false;
                 conn.unflushed = false;
                 conn.connection.releaseWriteBuffer();
-                while (conn.room_waiters.popFirst()) |node| {
+                while (conn.room_waiters.first) |node| {
                     const es: *EStream = @fieldParentPtr("room_node", node);
-                    es.room_waiting = false;
+                    conn.unwatchRoom(es);
                     es.room.notify(conn.io);
                 }
             }
@@ -1460,8 +1528,7 @@ pub fn Engine(comptime Ctx: type) type {
                         continue;
                     }
                     if (!conn.roomFree(es)) continue;
-                    conn.room_waiters.remove(node);
-                    es.room_waiting = false;
+                    conn.unwatchRoom(es);
                     es.room.notify(conn.io);
                 }
             }
@@ -1474,11 +1541,16 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.room_waiters.append(&es.room_node);
             }
 
+            /// Takes `es` out of `room_waiters`; it is in. With
+            /// `watchRoom`, the only writers of `room_waiting`. Under the
+            /// lock.
+            fn unwatchRoom(conn: *Conn, es: *EStream) void {
+                conn.room_waiters.remove(&es.room_node);
+                es.room_waiting = false;
+            }
+
             fn wakeRoom(conn: *Conn, es: *EStream) void {
-                if (es.room_waiting) {
-                    conn.room_waiters.remove(&es.room_node);
-                    es.room_waiting = false;
-                }
+                if (es.room_waiting) conn.unwatchRoom(es);
                 es.room.notify(conn.io);
             }
 
@@ -1647,21 +1719,16 @@ pub fn Engine(comptime Ctx: type) type {
                 };
                 if (es.reset or conn.send_shut or conn.proto.dead or conn.chainReclaim(es)) es.room.notify(conn.io);
                 const idle = es.chain.first == null;
-                if ((idle or es.reset) and !es.reset_due) {
-                    es.room_waiting = false;
-                    conn.room_waiters.remove(&es.room_node);
-                }
+                if ((idle or es.reset) and !es.reset_due) conn.unwatchRoom(es);
                 if (es.reset_due) {
                     if (es.reset) {
                         es.reset_due = false;
-                        es.room_waiting = false;
-                        conn.room_waiters.remove(&es.room_node);
+                        conn.unwatchRoom(es);
                         return;
                     }
                     // Last: the reset may free `es`, list node and all.
                     if (s.state == .half_closed_local) {
-                        es.room_waiting = false;
-                        conn.room_waiters.remove(&es.room_node);
+                        conn.unwatchRoom(es);
                         conn.tunnelReset(es, s);
                     }
                 }
@@ -1837,10 +1904,9 @@ pub fn Engine(comptime Ctx: type) type {
             start_node: std.DoublyLinkedList.Node = .{},
             /// Counted in `Conn.open_streams` (a handler was started).
             counted: bool = false,
-            /// Its response is whole but its last frames are not framed
-            /// yet (`Conn.send_waits`), and when it is reset if they still
-            /// aren't (awake clock, ns; 0 until the flusher sets it).
-            send_wait: bool = false,
+            /// When a `.waiting` response is reset if its last frames are
+            /// still not framed (awake clock, ns; 0 until the flusher sets
+            /// it).
             send_deadline: i64 = 0,
 
             // The request head.
@@ -1881,9 +1947,7 @@ pub fn Engine(comptime Ctx: type) type {
             canceled: bool = false,
 
             // The response.
-            /// Its last frame is submitted.
-            ended: bool = false,
-            head_sent: bool = false,
+            resp: Resp = .none,
             status: http.Status = .ok,
             resp_fields: []hpack.Field = &.{},
             /// A streamed body's blocks: the writer fills `blocks[cur]`.
@@ -1967,7 +2031,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// error.Canceled. Under the lock, which the task takes to
             /// clear `task` before it ends.
             fn cancelHandler(es: *EStream) void {
-                if (es.ended or !es.handler_hold) return;
+                if (es.resp.isEnded() or !es.handler_hold) return;
                 if (es.task) |task| {
                     es.canceled = true;
                     placement.cancelTask(task);
@@ -3069,7 +3133,7 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     // Let go before it ended (the owner gave up on a stream
                     // the peer still has open): reset it.
-                    if (!es.ended and !es.reset) {
+                    if (!es.resp.isEnded() and !es.reset) {
                         es.reset = true;
                         if (es.cs) |s| conn.proto.reset(s, .cancel) catch {};
                     }
@@ -3276,11 +3340,10 @@ pub fn Engine(comptime Ctx: type) type {
                 // Before the submit: an END_STREAM on a stream whose peer
                 // half is closed closes it inside the call, and
                 // `onStreamClose` must see a normal end, not a reset.
-                es.head_sent = true;
-                es.ended = true;
+                const before = es.resp;
+                es.resp = before.next(.end);
                 conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, bare) catch |err| {
-                    es.head_sent = false;
-                    es.ended = false;
+                    es.resp = before;
                     return self.submitFailed(err);
                 };
                 if (bare) return;
@@ -3359,9 +3422,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// The head with no END_STREAM, once. Under the lock.
             fn submitHeadOnce(self: *StreamSink, s: *PStream) std.Io.Writer.Error!void {
                 const es = self.es;
-                if (es.head_sent) return;
+                if (es.resp.headOut()) return;
                 es.conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, false) catch |err| return self.submitFailed(err);
-                es.head_sent = true;
+                es.resp = es.resp.next(.head);
             }
 
             /// Submits what the writer holds as one DATA part (by
@@ -3381,7 +3444,7 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                     if (es.reset) return self.fail(error.ConnectionResetByPeer);
-                    const head_new = !es.head_sent;
+                    const head_new = !es.resp.headOut();
                     try self.submitHeadOnce(s);
                     if (n == 0) {
                         if (!head_new) return;
@@ -3429,10 +3492,7 @@ pub fn Engine(comptime Ctx: type) type {
                             self.writer.buffer = b.mem;
                             return;
                         }
-                        if (!es.room_waiting) {
-                            es.room_waiting = true;
-                            conn.room_waiters.append(&es.room_node);
-                        }
+                        conn.watchRoom(es);
                     }
                     es.room.wait(conn.io, seen) catch {
                         conn.io.recancel();
@@ -3519,17 +3579,19 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                 if (es.reset) return self.fail(error.ConnectionResetByPeer);
-                // Before the submits, as in `complete`: the last one may
-                // close the stream inside the call.
-                es.ended = true;
-                errdefer es.ended = false;
-                if (!es.head_sent and part.len == 0 and trailer_fields == null) {
-                    es.head_sent = true;
-                    errdefer es.head_sent = false;
+                // The head first (no END_STREAM: it cannot close the
+                // stream), then `.ended` before the submits, as in
+                // `complete`: the last one may close the stream inside the
+                // call. A failure puts the phase from before the end back.
+                const bare = !es.resp.headOut() and part.len == 0 and trailer_fields == null;
+                if (!bare) try self.submitHeadOnce(s);
+                const before = es.resp;
+                es.resp = before.next(.end);
+                errdefer es.resp = before;
+                if (bare) {
                     conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, true) catch |err| return self.submitFailed(err);
                     return;
                 }
-                try self.submitHeadOnce(s);
                 // An empty end joins the DATA still queued (Conn.submitData).
                 if (part.len > 0 or trailer_fields == null)
                     conn.proto.submitData(s, part, trailer_fields == null) catch |err| return self.submitFailed(err);
@@ -3665,15 +3727,16 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                 if (es.reset) return self.fail(error.ConnectionResetByPeer);
-                es.ended = true;
-                errdefer es.ended = false;
-                if (!es.head_sent and trailer_fields == null) {
-                    es.head_sent = true;
-                    errdefer es.head_sent = false;
+                // As in `end`: the head first, then `.ended`.
+                const bare = !es.resp.headOut() and trailer_fields == null;
+                if (!bare) try self.submitHeadOnce(s);
+                const before = es.resp;
+                es.resp = before.next(.end);
+                errdefer es.resp = before;
+                if (bare) {
                     conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, true) catch |err| return self.submitFailed(err);
                     return;
                 }
-                try self.submitHeadOnce(s);
                 conn.chainSubmit(es, s) catch |err| return self.submitFailed(err);
                 if (trailer_fields) |t| {
                     conn.proto.submitTrailers(s, t) catch |err| return self.submitFailed(err);
