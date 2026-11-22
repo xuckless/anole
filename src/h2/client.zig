@@ -191,23 +191,11 @@ pub const ClientConnection = struct {
     proto: Proto = undefined,
     // SAFETY: set by `start`, before `proto` can call it.
     handler: Handler = undefined,
-    /// `proto` is freed (`close`).
-    proto_gone: bool = false,
-    /// The connection is going or gone: no new streams. A GOAWAY sets it,
-    /// and the streams it covers carry on.
-    closing: bool = false,
+    /// Where the connection is (`Phase`). Under `mutex`.
+    phase: Phase = .open,
     /// The last stream ID the server's GOAWAY says it may have processed;
     /// above it, a stream never ran (`Stream.unprocessed`).
     goaway_last_id: i32 = std.math.maxInt(i32),
-    /// The connection is over: the reader has ended or a write failed.
-    /// From here nothing calls into `proto` but the writer (draining it)
-    /// and `close`, so no callback can reach a stream any more.
-    dead: bool = false,
-    /// The writer writes what `proto` holds, then shuts the socket down and
-    /// ends: `close`, or the reader is done.
-    shut: bool = false,
-    /// Why it went, when it failed.
-    failure: ?anyerror = null,
     /// Wakes the writer: output was queued.
     write_wake: Signal = .{},
     /// Wakes the request and body-writer waits: a stream closed, the
@@ -224,6 +212,60 @@ pub const ClientConnection = struct {
     test_writes: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
 
     const has_tls = options.tls;
+
+    /// Where the connection is: one value, moved only by `next` and only
+    /// forward (the declaration order is the order; a later phase is never
+    /// left). Every transition is a cell below: add behaviour as a phase or
+    /// an event here, not as a flag beside `phase`.
+    ///
+    /// | phase \ event | retire   | close    | end  | freed |
+    /// |---------------|----------|----------|------|-------|
+    /// | open          | draining | shutting | dead | -     |
+    /// | draining      | -        | shutting | dead | -     |
+    /// | shutting      | -        | -        | dead | -     |
+    /// | dead          | -        | -        | -    | freed |
+    /// | freed         | -        | -        | -    | -     |
+    ///
+    /// "-": unchanged. `retire`: the server's GOAWAY or the stream ids ran
+    /// out; `close`: `close`; `end`: the reader ended, a write failed or the
+    /// writer ran out of memory; `freed`: `close` deinitialised `proto`.
+    /// `freed` before `dead` cannot happen (`close` awaits the tasks, and
+    /// the reader's last act is `end`), so those cells keep the phase.
+    pub const Phase = enum(u8) {
+        /// New streams are taken.
+        open = 0,
+        /// No new streams; the existing ones carry on.
+        draining = 1,
+        /// `close` was called: the writer writes what `proto` holds, shuts
+        /// the socket down and ends; the reader still runs.
+        shutting = 2,
+        /// The reader has ended or a write failed: the public paths make no
+        /// more calls into `proto` (the writer drains it, `close` frees it;
+        /// after a write failure the reader may still feed it until the
+        /// socket shutdown ends its read, which reaches no released
+        /// stream). The writer drains and ends.
+        dead = 3,
+        /// `proto` is freed.
+        freed = 4,
+
+        pub const Event = enum { retire, close, end, freed };
+
+        pub fn next(p: Phase, ev: Event) Phase {
+            const to: Phase = switch (ev) {
+                .retire => .draining,
+                .close => .shutting,
+                .end => .dead,
+                // Only from dead (see the table).
+                .freed => if (p == .dead) .freed else p,
+            };
+            return if (to.reached(p)) to else p;
+        }
+
+        /// Whether `p` is `at` or later.
+        pub fn reached(p: Phase, at: Phase) bool {
+            return @backingInt(p) >= @backingInt(at);
+        }
+    };
 
     const Owned = struct {
         read_buf: [32 * 1024]u8 = undefined, // SAFETY: a buffer, written before it is read
@@ -381,9 +423,8 @@ pub const ClientConnection = struct {
             defer self.unlock();
             // Also after the server's GOAWAY, whose streams may still be
             // open.
-            if (!self.dead) self.proto.goaway(.no_error, "") catch {};
-            self.closing = true;
-            self.shut = true;
+            if (!self.phase.reached(.dead)) self.proto.goaway(.no_error, "") catch {};
+            self.phase = self.phase.next(.close);
         }
         self.kickWriter();
         // The tasks have ended either way; a cancel is the caller's to see.
@@ -398,7 +439,7 @@ pub const ClientConnection = struct {
                 stream.ps = null;
             }
             self.proto.deinit();
-            self.proto_gone = true;
+            self.phase = self.phase.next(.freed);
             // Nothing writes any more: what waited for the writer goes.
             while (self.retiring.popFirst()) |node| {
                 const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node)); // SAFETY: `retire_node` is that field of a live container, so the parent is aligned
@@ -422,12 +463,12 @@ pub const ClientConnection = struct {
         self.gpa.destroy(self);
     }
 
-    /// Whether new requests may still go out: no GOAWAY, no failure, no
-    /// `close`.
+    /// Whether new requests may still go out (`Phase.open`): no GOAWAY, no
+    /// failure, no `close`.
     pub fn isOpen(self: *ClientConnection) bool {
         self.lock();
         defer self.unlock();
-        return !self.closing;
+        return self.phase == .open;
     }
 
     fn lock(self: *ClientConnection) void {
@@ -484,7 +525,7 @@ pub const ClientConnection = struct {
             {
                 self.lock();
                 defer self.unlock();
-                if (self.closing or self.dead) return error.ConnectionClosed;
+                if (self.phase != .open) return error.ConnectionClosed;
                 if (self.proto.submitRequest(fields, end_stream, stream)) |ps| {
                     stream.ps = ps;
                     stream.id = ps.id;
@@ -502,7 +543,7 @@ pub const ClientConnection = struct {
                     error.GoawayReceived => return error.ConnectionClosed,
                     // A new connection is due (RFC 9113 §5.1.1).
                     error.StreamIdsExhausted => {
-                        self.closing = true;
+                        self.phase = self.phase.next(.retire);
                         return error.ConnectionClosed;
                     },
                     error.HeadersTooLarge, error.OutOfMemory => |e| return e,
@@ -518,24 +559,22 @@ pub const ClientConnection = struct {
     }
 
     fn readerLoop(self: *ClientConnection) std.Io.Cancelable!void {
-        const err = self.runReader();
+        // Every way the reader ends ends the connection the same way.
+        self.runReader() catch {};
         self.lock();
-        self.closing = true;
-        self.dead = true;
+        self.phase = self.phase.next(.end);
         // What the core holds (a GOAWAY after a connection error) still
         // goes out, but no more DATA is framed: `release` frees a stream
         // of a dead connection at once, while its unframed body (lent to
         // the core) is still queued.
         self.proto.kill();
-        self.shut = true;
-        if (self.failure == null) self.failure = err;
         self.unlock();
         self.failAll();
         self.kickWriter();
         self.progress.notify(self.io);
     }
 
-    fn runReader(self: *ClientConnection) anyerror {
+    fn runReader(self: *ClientConnection) anyerror!noreturn {
         while (true) {
             const buffered = self.r.buffered();
             if (buffered.len > 0) {
@@ -617,14 +656,11 @@ pub const ClientConnection = struct {
                 self.lock();
                 defer self.unlock();
                 const got = self.proto.pending(&vecs) catch {
-                    self.failure = self.failure orelse error.OutOfMemory;
-                    self.dead = true;
-                    self.closing = true;
-                    shut = true;
+                    self.phase = self.phase.next(.end);
                     break;
                 };
                 len = got.len;
-                shut = self.shut;
+                shut = self.phase.reached(.shutting);
             }
             if (len > 0) {
                 var n: usize = 0;
@@ -650,9 +686,7 @@ pub const ClientConnection = struct {
 
     fn writeFailed(self: *ClientConnection) void {
         self.lock();
-        self.closing = true;
-        self.dead = true;
-        if (self.failure == null) self.failure = error.ConnectionClosed;
+        self.phase = self.phase.next(.end);
         self.unlock();
         self.socket.shutdown(self.io, .both) catch {};
         self.progress.notify(self.io);
@@ -770,7 +804,7 @@ pub const ClientConnection = struct {
             const c = h.owner;
             // Streams above the last one taken never ran; the core closes
             // them. No new ones from here.
-            c.closing = true;
+            c.phase = c.phase.next(.retire);
             c.goaway_last_id = last_id;
         }
 
@@ -945,7 +979,7 @@ pub const Stream = struct {
     fn maybeFree(self: *Stream) void {
         if (!(self.user_done and self.protocol_done)) return;
         const conn = self.conn;
-        if (self.borrowed and !conn.proto_gone) {
+        if (self.borrowed and conn.phase != .freed) {
             const mark = conn.proto.out.mark();
             if (conn.proto.out.sent_total < mark) {
                 self.retire_mark = mark;
@@ -1060,7 +1094,7 @@ pub const Stream = struct {
         conn.lock();
         self.send_closed = true;
         // An empty end rides on the last DATA still queued.
-        if (self.ps) |ps| if (self.cause == null and !conn.dead) conn.proto.submitData(ps, &.{}, true) catch {};
+        if (self.ps) |ps| if (self.cause == null and !conn.phase.reached(.dead)) conn.proto.submitData(ps, &.{}, true) catch {};
         conn.unlock();
         conn.kickWriter();
     }
@@ -1081,7 +1115,7 @@ pub const Stream = struct {
         defer conn.unlock();
         // The cause first: the reset closes the stream inside the call.
         self.finishLocked(cause);
-        if (self.ps) |ps| if (!conn.dead) conn.proto.reset(ps, .cancel) catch {};
+        if (self.ps) |ps| if (!conn.phase.reached(.dead)) conn.proto.reset(ps, .cancel) catch {};
         conn.kickWriter();
     }
 
@@ -1091,7 +1125,7 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         // Also after a GOAWAY, which leaves the streams it covers open.
-        const open = self.ps != null and !conn.dead;
+        const open = self.ps != null and !conn.phase.reached(.dead);
         conn.unlock();
         if (open) self.cancel();
         conn.lock();
@@ -1101,7 +1135,7 @@ pub const Stream = struct {
         // A stream the core never got, or one a dead connection left
         // behind, has no close to wait for; the core must not hand it out
         // again.
-        if (!self.protocol_done and (self.ps == null or conn.dead)) {
+        if (!self.protocol_done and (self.ps == null or conn.phase.reached(.dead))) {
             if (self.ps) |ps| ps.user = null;
             self.ps = null;
             self.protocol_done = true;
@@ -1123,7 +1157,7 @@ pub const Stream = struct {
             if (n == 0) break;
             dropped += n;
         }
-        if (dropped == 0 or conn.dead or conn.proto_gone) return;
+        if (dropped == 0 or conn.phase.reached(.dead)) return;
         conn.proto.consumed(self.ps, dropped) catch {};
         conn.kickWriter();
     }
@@ -1161,7 +1195,7 @@ pub const Stream = struct {
         // is closed (`ps` null: its whole response may have come before
         // this read): else every response read late keeps its size of it,
         // and the connection stops carrying DATA once that adds up (#149).
-        if (!conn.dead) conn.proto.consumed(self.ps, n) catch {};
+        if (!conn.phase.reached(.dead)) conn.proto.consumed(self.ps, n) catch {};
         conn.unlock();
         conn.kickWriter();
         return n;
@@ -1181,7 +1215,7 @@ pub const Stream = struct {
                 self.write_err = self.cause orelse error.StreamReset;
                 return error.WriteFailed;
             };
-            if (self.cause != null or conn.dead) {
+            if (self.cause != null or conn.phase.reached(.dead)) {
                 self.write_err = self.cause orelse error.ConnectionClosed;
                 return error.WriteFailed;
             }
@@ -1215,8 +1249,8 @@ pub const Stream = struct {
                 self.waiting_room = false;
                 // The stream or the connection is gone: the block may still
                 // be lent to `out`, so it is never handed back to write into.
-                if (self.ps == null or conn.dead) {
-                    self.write_err = self.cause orelse if (conn.dead) error.ConnectionClosed else error.StreamReset;
+                if (self.ps == null or conn.phase.reached(.dead)) {
+                    self.write_err = self.cause orelse if (conn.phase.reached(.dead)) error.ConnectionClosed else error.StreamReset;
                     return error.WriteFailed;
                 }
                 if (self.roomFree()) {

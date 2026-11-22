@@ -233,6 +233,31 @@ test "h2 client: 20 concurrent streams share one connection" {
     try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
 }
 
+test "h2 client: the connection's phase moves only by its table, and only forward" {
+    const P = h2.ClientConnection.Phase;
+    const Row = struct { from: P, retire: P, close: P, end: P, freed: P };
+    // The table in `Phase`'s doc comment, cell for cell.
+    const rows = [_]Row{
+        .{ .from = .open, .retire = .draining, .close = .shutting, .end = .dead, .freed = .open },
+        .{ .from = .draining, .retire = .draining, .close = .shutting, .end = .dead, .freed = .draining },
+        .{ .from = .shutting, .retire = .shutting, .close = .shutting, .end = .dead, .freed = .shutting },
+        .{ .from = .dead, .retire = .dead, .close = .dead, .end = .dead, .freed = .freed },
+        .{ .from = .freed, .retire = .freed, .close = .freed, .end = .freed, .freed = .freed },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("from {t}\n", .{r.from});
+        try std.testing.expectEqual(r.retire, r.from.next(.retire));
+        try std.testing.expectEqual(r.close, r.from.next(.close));
+        try std.testing.expectEqual(r.end, r.from.next(.end));
+        try std.testing.expectEqual(r.freed, r.from.next(.freed));
+    }
+    // `reached`: the declaration order.
+    for (std.enums.values(P)) |p| for (std.enums.values(P)) |at| {
+        try std.testing.expectEqual(@backingInt(p) >= @backingInt(at), p.reached(at));
+    };
+    try std.testing.expect(P.freed.reached(.dead) and !P.shutting.reached(.dead) and P.open.reached(.open));
+}
+
 /// The core has closed the stream: its whole response is in.
 fn streamClosed(s: *h2.Stream) bool {
     s.conn.mutex.lockUncancelable(s.conn.io);
@@ -997,7 +1022,7 @@ const Scripted = struct {
                 if (c.p.taken.load(.acquire) == c.p.given.load(.acquire)) return true;
                 c.conn.mutex.lockUncancelable(c.p.io);
                 defer c.conn.mutex.unlock(c.p.io);
-                return c.conn.dead;
+                return c.conn.phase.reached(.dead);
             }
         };
         try wait.waitUntil(self.io, "the client read every frame sent, or ended its session", C{ .p = self, .conn = conn }, C.f);
