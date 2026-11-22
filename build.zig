@@ -1085,7 +1085,7 @@ pub fn build(b: *std.Build) void {
         // core's zio stub: its tests run on std.testing.io, and the real
         // zio's timers need a zio task.
         const core_test_mod = struct {
-            fn make(bb: *std.Build, full: *std.Build.Module, wait: *std.Build.Module, t: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+            fn make(bb: *std.Build, full: *std.Build.Module, wait: *std.Build.Module, never_reuse: *std.Build.Module, t: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
                 const m = bb.createModule(.{
                     .root_source_file = full.root_source_file.?,
                     .target = t,
@@ -1096,12 +1096,15 @@ pub fn build(b: *std.Build) void {
                 while (imports.next()) |e| m.addImport(e.key_ptr.*, e.value_ptr.*);
                 const zio_stub = bb.createModule(.{ .root_source_file = bb.path("src/http/core/zio_stub.zig"), .target = t, .optimize = opt });
                 m.addImport("zio", zio_stub);
-                const stub_safety = Core.safetyModule(bb, zio_stub, t, opt);
+                const stub_safety = Core.safetyModule(bb, zio_stub, never_reuse, t, opt);
                 m.addImport("anole_safety", stub_safety);
                 // resilience_core imports anole_safety too: on the stub, or
                 // src/safety/root.zig would be in two modules.
                 m.addImport("resilience_core", bb.createModule(.{ .root_source_file = bb.path("src/resilience/core.zig"), .target = t, .optimize = opt, .imports = &.{.{ .name = "anole_safety", .module = stub_safety }} }));
                 m.addImport("anole_test_wait", wait);
+                // The core's runner backs std.testing.allocator with it; the
+                // same instance as the hooks module's and the safety's.
+                m.addImport("anole_never_reuse", never_reuse);
                 // And the stub HTTP/2 client: Anole's would import these
                 // sources a second time.
                 m.addAnonymousImport("h2_client", .{ .root_source_file = bb.path("src/http/core/h2_client_stub.zig") });
@@ -1110,7 +1113,7 @@ pub fn build(b: *std.Build) void {
                 return m;
             }
         }.make;
-        const test_mod = core_test_mod(b, core_full, core.test_wait, target, optimize);
+        const test_mod = core_test_mod(b, core_full, core.test_wait, core.never_reuse, target, optimize);
         // The core's test runner (some tests log at err on purpose).
         const core_tests = b.addTest(.{
             .name = "core-test",
@@ -1168,7 +1171,7 @@ pub fn build(b: *std.Build) void {
         if (core.dusty_by[0][0][0][0][0]) |core_bare| {
             const bare_tests = b.addTest(.{
                 .name = "core-test-bare",
-                .root_module = core_test_mod(b, core_bare, core.test_wait, target, optimize),
+                .root_module = core_test_mod(b, core_bare, core.test_wait, core.never_reuse, target, optimize),
                 .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
                 .use_llvm = use_llvm,
             });
@@ -2197,6 +2200,9 @@ const Core = struct {
     /// src/safety (SAFETY.md's debug-build checks) over that zio:
     /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
     safety: *std.Build.Module,
+    /// src/testing/never_reuse.zig: `anole_never_reuse` in `safety`, the test
+    /// hooks and the HTTP core's tests.
+    never_reuse: *std.Build.Module,
     /// src/testing/wait.zig (TESTING.md D1/D2/D6), `anole_test_wait` in every
     /// HTTP core instance and in anole; only test code uses it.
     test_wait: *std.Build.Module,
@@ -2245,7 +2251,11 @@ const Core = struct {
         // ReleaseSafe test binary checks suspensions as it counts locks.
         const debug = optimize == .debug;
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
-        const safety = safetyModule(b, zio_mod, target, optimize);
+        // The test allocator's backing allocator: one instance for anole_safety,
+        // the hooks module and the core's runner (a file is in one module per
+        // compilation).
+        const never_reuse = neverReuseModule(b, target, optimize);
+        const safety = safetyModule(b, zio_mod, never_reuse, target, optimize);
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -2261,7 +2271,7 @@ const Core = struct {
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
         const test_wait = testWaitModule(b, target, optimize);
-        var core: Core = .{ .safety = safety, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
+        var core: Core = .{ .safety = safety, .never_reuse = never_reuse, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(@splat(null))))), .h2_client_by = @splat(@splat(@splat(@splat(@splat(null))))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2344,7 +2354,7 @@ const Core = struct {
 
     /// src/safety over `zio_mod` (the real zio, or the core's stub for its
     /// own tests).
-    fn safetyModule(b: *std.Build, zio_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    fn safetyModule(b: *std.Build, zio_mod: *std.Build.Module, never_reuse: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
         return b.createModule(.{
             .root_source_file = b.path("src/safety/root.zig"),
             .target = target,
@@ -2352,7 +2362,7 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "zio", .module = zio_mod },
-                .{ .name = "anole_never_reuse", .module = neverReuseModule(b, target, optimize) },
+                .{ .name = "anole_never_reuse", .module = never_reuse },
             },
         });
     }
