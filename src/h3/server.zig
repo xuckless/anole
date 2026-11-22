@@ -2659,7 +2659,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             ///
             /// The handler's end (`dusty.Detached`): `returned`: `serve`
             /// is back with the response detached on the endpoint task, its
-            /// owner to `finish` it (a task's handler only parks: `-`).
+            /// owner to `finish` it, moved by `runInline` under the lock it
+            /// takes for the handler's release (a task's handler only
+            /// parks: `-`, and `run` does not move it).
             /// `park`: `detachedPark` (refused, `error.WriteFailed`, where
             /// `-`: a response detached already cannot park). `attach`: the
             /// response goes on from a task (`detachedAttach`; `Detached`
@@ -2894,6 +2896,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Drops one holder; the last frees the stream. Locked.
             fn release(s: *Stream, who: Holder) void {
+                // Released once: a second would free the stream again.
+                std.debug.assert(s.holders.contains(who));
                 s.holders.remove(who);
                 if (s.holders.count() != 0) return;
                 const conn = s.conn;
@@ -2992,25 +2996,33 @@ pub fn Endpoint(comptime Ctx: type) type {
                     return;
                 }
                 conn.unlock();
-                var served: Served = .done;
+                var detached: ?*Exchange = null;
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
                     _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
-                    served = s.serve(true) catch |err| blk: {
+                    detached = s.serve(true) catch |err| blk: {
                         s.failed(err) catch {
                             // The endpoint task itself is canceled: it stops
                             // reading once these requests are done.
                             conn.ep.io.recancel();
                         };
-                        break :blk .done;
+                        break :blk null;
                     };
                 }
                 conn.lock();
+                // Detached: it becomes `detached` and holds the stream
+                // itself; over already (a park that failed, a finish or a
+                // release inside the handler) or parked, it is where it
+                // is. One lock with the handler's release: no yield since
+                // the handler returned.
+                if (detached) |ex| s.move(.{ .returned = ex });
+                // Read before the release, which may free the stream.
+                const owned = s.phase.owns();
                 s.release(.handler);
                 conn.unlock();
                 // A response that outlives the handler holds the stream
                 // itself, and is kicked as it goes on.
-                if (served == .done) conn.kick();
+                if (!owned) conn.kick();
             }
 
             /// What a handler's error means for its stream.
@@ -3063,8 +3075,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `inline_mode`: on the endpoint task (a `no_wait` route),
             /// with no request timeout, whose timer would cancel that task;
             /// its response may be detached (`dusty.Detached`), and then the
-            /// stream is held until it is finished.
-            fn serve(s: *Stream, inline_mode: bool) !Served {
+            /// stream is held until it is finished. Returns the exchange of
+            /// a detached response, for the caller to move (`.returned`);
+            /// on a task, only a park detaches, and it has moved already.
+            fn serve(s: *Stream, inline_mode: bool) !?*Exchange {
                 const conn = s.conn;
                 const ep = conn.ep;
                 const server = ep.http;
@@ -3126,20 +3140,20 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (s.head_too_large) {
                     response.status = .request_header_fields_too_large;
                     try response.write();
-                    return .done;
+                    return null;
                 }
                 if (s.method.len == 0 or s.path.len == 0) {
                     response.status = .bad_request;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 }
                 request.method = parseMethod(s.method) orelse {
                     response.status = .not_implemented;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 };
                 if (request.method == .connect) {
@@ -3148,7 +3162,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .not_implemented;
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     }
                     // An extended CONNECT (RFC 9220; nghttp3 has checked
@@ -3201,7 +3215,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             response.status = .bad_request;
                             {
                                 try response.write();
-                                return .done;
+                                return null;
                             }
                         }
                     } else request.headers.add("Host", s.authority) catch {
@@ -3218,7 +3232,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     response.status = .request_header_fields_too_large;
                     {
                         try response.write();
-                        return .done;
+                        return null;
                     }
                 }
                 request._applyEntityHeaders();
@@ -3229,7 +3243,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.body = "413 Content Too Large\n";
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     };
                 }
@@ -3252,29 +3266,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .expectation_failed;
                         {
                             try response.write();
-                            return .done;
+                            return null;
                         }
                     }
                 }
 
                 const dispatched = server.dispatch(request, response);
-                // Detached: not written here. Still on the endpoint task, it
-                // becomes `detached` and holds the stream itself; over
-                // already (a park that failed, a finish or a release inside
-                // the handler) or a task's park, it is where it is.
-                if (response.detached) |d| {
-                    conn.lock();
-                    defer conn.unlock();
-                    s.move(.{ .returned = exchangeOf(d) });
-                    return if (s.phase.owns()) .detached else .done;
-                }
+                // Detached: not written here; the caller moves it.
+                if (response.detached) |d| return exchangeOf(d);
                 dispatched catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
                 try response.write();
-                return .done;
+                return null;
             }
 
             /// Every byte of the response body is queued and handed to
@@ -3353,10 +3359,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             sink_state: StreamSink,
             body_reader: BodyReader,
         };
-
-        /// `detached`: the response outlives the handler and holds the
-        /// stream itself (`Phase.owns`).
-        const Served = enum { done, detached };
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`dusty.Detached`).

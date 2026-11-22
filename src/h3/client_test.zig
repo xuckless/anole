@@ -3824,7 +3824,8 @@ test "h3 server: a no_wait handler that detaches and finishes inside it lets go 
         defer gpa.free(body);
         try std.testing.expectEqualStrings(r.body, body);
     };
-    // A double release would have broken the stream count.
+    // A second release of a holder trips `Stream.release`'s assert; the
+    // streams after these are served as usual.
     const hello_body = try get(conn, "/hello", gpa);
     defer gpa.free(hello_body);
     try std.testing.expectEqualStrings("hello over h3", hello_body);
