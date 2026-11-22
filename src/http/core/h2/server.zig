@@ -312,13 +312,13 @@ pub const Resp = enum(u8) {
 /// discards outside `receiving` are not reached (`finishHandler` checks
 /// `done` first) and change nothing. A tunnel whose reset went out, or
 /// whose peer ended first, is `dropped`: its reset can't be due once the
-/// peer's half is closed. The values make `done` and `dropping` one compare.
+/// peer's half is closed.
 pub const ReqBody = enum(u8) {
-    receiving = 0,
-    discarding = 1,
-    tunnel_closing = 2,
-    dropped = 3,
-    complete = 4,
+    receiving,
+    discarding,
+    tunnel_closing,
+    dropped,
+    complete,
 
     pub const Event = enum { end, discard, discard_tunnel };
 
@@ -340,12 +340,18 @@ pub const ReqBody = enum(u8) {
 
     /// No more body comes.
     pub fn done(b: ReqBody) bool {
-        return @backingInt(b) >= @backingInt(ReqBody.dropped);
+        return switch (b) {
+            .dropped, .complete => true,
+            .receiving, .discarding, .tunnel_closing => false,
+        };
     }
 
     /// The handler is done with the body: what comes is dropped.
     pub fn dropping(b: ReqBody) bool {
-        return @backingInt(b) -% 1 < @backingInt(ReqBody.dropped);
+        return switch (b) {
+            .discarding, .tunnel_closing, .dropped => true,
+            .receiving, .complete => false,
+        };
     }
 };
 
