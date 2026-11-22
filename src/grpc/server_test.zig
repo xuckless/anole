@@ -339,7 +339,7 @@ fn withEngineEchoServer(comptime body: fn (*EchoEnv) anyerror!void) !void {
 test "gRPC on the new HTTP/2 engine: unary answered whole (no streaming body writer), server and client streams" {
     try withEngineEchoServer(struct {
         fn run(env: *EchoEnv) !void {
-            const bodies = &dusty.h2_core_for_tests.server.test_sink_bodies;
+            const bodies = dusty.h2_core_for_tests.server.probe.at(.sink_bodies);
             const before = bodies.load(.monotonic);
             for ([_][]const u8{ "hello", "", "bin-trailer" }) |message| {
                 const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = message }}, &.{});
@@ -425,7 +425,7 @@ test "gRPC: the four call modes and trailing metadata over h2 (raw core client)"
 test "gRPC: a unary call over h2 is answered whole, never through a streaming body writer" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
-            const bodies = dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic);
+            const bodies = dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic);
             for ([_][]const u8{ "hello", "", "bin-trailer" }) |message| {
                 const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = message }}, &.{});
                 defer cl.deinit();
@@ -441,12 +441,12 @@ test "gRPC: a unary call over h2 is answered whole, never through a streaming bo
                 defer cl.deinit();
                 try std.testing.expectEqual(@as(?u32, @backingInt(grpc.Code.not_found)), cl.grpc_status);
             }
-            try std.testing.expectEqual(bodies, dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic));
+            try std.testing.expectEqual(bodies, dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic));
             // A server stream still streams.
             const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/ServerStream", &.{.{ .message = "tick", .repeat = 2 }}, &.{});
             defer cl.deinit();
             try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
-            try std.testing.expect(dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic) > bodies);
+            try std.testing.expect(dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic) > bodies);
         }
     }.run);
 }

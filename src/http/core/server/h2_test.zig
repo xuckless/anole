@@ -728,7 +728,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             // mark; the next frees what sat unused since. Three rounds hold two
             // trims after the burst, whichever idle check the first one lands on.
             for (0..3) |_| {
-                _ = E.mod.test_trim_epoch.fetchAdd(1, .monotonic);
+                _ = E.mod.probe.at(.trim_epoch).fetchAdd(1, .monotonic);
                 const id = try client.request("GET", "/hello", null);
                 try client.run();
                 try std.testing.expectEqualStrings("hello", client.get(id).body.items);
@@ -1654,12 +1654,12 @@ test "HTTP/2: a server serves h2 by default" {
     var fx: harness.Fixture(harness.Desc(.anole)) = undefined;
     try fx.start(io);
     defer fx.stop(io);
-    const reads = anole_h2.test_reads.load(.monotonic);
+    const reads = anole_h2.probe.at(.reads).load(.monotonic);
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     defer client.deinit();
     const id = try client.request("GET", "/hello", null);
     try client.run();
     try std.testing.expectEqualStrings("hello", client.get(id).body.items);
-    try std.testing.expect(anole_h2.test_reads.load(.monotonic) > reads);
+    try std.testing.expect(anole_h2.probe.at(.reads).load(.monotonic) > reads);
 }

@@ -754,14 +754,14 @@ test "h2 engine: a noWait route is answered inline" {
     defer fx.stop();
     const c = &fx.client;
     // The handshake's frames are all out by now.
-    const spawned = engine.test_spawned.load(.acquire);
-    const flushers = engine.test_flushers.load(.acquire);
+    const spawned = engine.probe.at(.spawned).load(.acquire);
+    const flushers = engine.probe.at(.flushers).load(.acquire);
     const writes = server_mod.Connection.TestSocketWrites.get();
     const id = try c.request("GET", "/nw/hello", null);
     const r = try c.until(id);
     try expectEqualStrings("hello", r.body.items);
-    try expectEqual(spawned, engine.test_spawned.load(.acquire));
-    try expectEqual(flushers, engine.test_flushers.load(.acquire));
+    try expectEqual(spawned, engine.probe.at(.spawned).load(.acquire));
+    try expectEqual(flushers, engine.probe.at(.flushers).load(.acquire));
     // The head and the body in one write, from the reader.
     try expectEqual(writes + 1, server_mod.Connection.TestSocketWrites.get());
 }
@@ -771,15 +771,15 @@ test "h2 engine: a tasked route runs on its own task; a noWait request whose bod
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    var spawned = engine.test_spawned.load(.acquire);
+    var spawned = engine.probe.at(.spawned).load(.acquire);
     const id = try c.request("GET", "/users/7", null);
     try expectEqualStrings("user 7", (try c.until(id)).body.items);
-    try expectEqual(spawned + 1, engine.test_spawned.load(.acquire));
+    try expectEqual(spawned + 1, engine.probe.at(.spawned).load(.acquire));
 
-    spawned = engine.test_spawned.load(.acquire);
+    spawned = engine.probe.at(.spawned).load(.acquire);
     const late = try c.open("POST", "/nw/echo", &.{}, false);
     try c.flush();
-    try wait.waitAtLeast(testing.io, "the request waiting for its body got a task", &engine.test_spawned, spawned + 1);
+    try wait.waitAtLeast(testing.io, "the request waiting for its body got a task", engine.probe.at(.spawned), spawned + 1);
     try c.sendBody(late, "came later", true);
     try expectEqualStrings("came later", (try c.until(late)).body.items);
 }
@@ -789,8 +789,8 @@ test "h2 engine: a noWait request reset before its body ends never runs, and its
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    const spawned = engine.test_spawned.load(.acquire);
-    const freed = engine.test_freed.load(.acquire);
+    const spawned = engine.probe.at(.spawned).load(.acquire);
+    const freed = engine.probe.at(.freed).load(.acquire);
     // The HEADERS and the reset in one read: the stream waiting for its
     // body is let go after it, with no task.
     const id = try c.open("POST", "/nw/echo", &.{}, false);
@@ -798,12 +798,12 @@ test "h2 engine: a noWait request reset before its body ends never runs, and its
     try c.ping("awaiting".*);
     try c.flush();
     while (c.ping_acks == 0) try c.readOne();
-    try wait.waitAtLeast(testing.io, "the reset stream was freed", &engine.test_freed, freed + 1);
-    try expectEqual(spawned, engine.test_spawned.load(.acquire));
+    try wait.waitAtLeast(testing.io, "the reset stream was freed", engine.probe.at(.freed), freed + 1);
+    try expectEqual(spawned, engine.probe.at(.spawned).load(.acquire));
     const next = try c.request("GET", "/nw/hello", null);
     try expectEqualStrings("hello", (try c.until(next)).body.items);
-    try wait.waitAtLeast(testing.io, "the next stream was freed", &engine.test_freed, freed + 2);
-    try expectEqual(freed + 2, engine.test_freed.load(.acquire));
+    try wait.waitAtLeast(testing.io, "the next stream was freed", engine.probe.at(.freed), freed + 2);
+    try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
 }
 
 test "h2 engine: a streamed body larger than the window" {
@@ -813,13 +813,13 @@ test "h2 engine: a streamed body larger than the window" {
     const c = &fx.client;
     const want = try bigBody();
     defer testing.allocator.free(want);
-    const blocks = engine.test_blocks.load(.acquire);
+    const blocks = engine.probe.at(.blocks).load(.acquire);
     const id = try c.request("GET", "/big", null);
     const r = try c.until(id);
     try expectEqual(200, r.status);
     try expect(std.mem.eql(u8, want, r.body.items));
     // On a task: two blocks, reused while the other one is written.
-    try expectEqual(blocks + 2, engine.test_blocks.load(.acquire));
+    try expectEqual(blocks + 2, engine.probe.at(.blocks).load(.acquire));
     // On the reader too, where blocks are never waited for.
     const inl = try c.request("GET", "/nw/big", null);
     try expect(std.mem.eql(u8, want, (try c.until(inl)).body.items));
@@ -832,18 +832,18 @@ test "h2 engine: a small streamed body takes one block, and its end rides on its
     const c = &fx.client;
     // On the reader: the last flush takes no second block, and the end
     // that follows it joins the queued DATA (one frame).
-    var blocks = engine.test_blocks.load(.acquire);
+    var blocks = engine.probe.at(.blocks).load(.acquire);
     const inl = try c.request("POST", "/nw/echo", "tiny");
     const r = try c.until(inl);
     try expectEqualStrings("tiny", r.body.items);
     try expectEqual(1, r.data_frames);
-    try expectEqual(blocks + 1, engine.test_blocks.load(.acquire));
+    try expectEqual(blocks + 1, engine.probe.at(.blocks).load(.acquire));
     // On a task the same block count (the flusher may frame the DATA
     // before the end comes, so not the frame count).
-    blocks = engine.test_blocks.load(.acquire);
+    blocks = engine.probe.at(.blocks).load(.acquire);
     const tasked = try c.request("POST", "/echo", "tiny");
     try expectEqualStrings("tiny", (try c.until(tasked)).body.items);
-    try expectEqual(blocks + 1, engine.test_blocks.load(.acquire));
+    try expectEqual(blocks + 1, engine.probe.at(.blocks).load(.acquire));
 }
 
 test "h2 budget: a read's many small responses go out in at most one write each" {
@@ -851,9 +851,9 @@ test "h2 budget: a read's many small responses go out in at most one write each"
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    const reads = engine.test_reads.load(.acquire);
+    const reads = engine.probe.at(.reads).load(.acquire);
     const writes = server_mod.Connection.TestSocketWrites.get();
-    const flushers = engine.test_flushers.load(.acquire);
+    const flushers = engine.probe.at(.flushers).load(.acquire);
     var ids: [100]u31 = undefined;
     for (&ids) |*id| id.* = try c.open("GET", "/nw/hello", &.{}, true);
     try c.flush();
@@ -861,8 +861,8 @@ test "h2 budget: a read's many small responses go out in at most one write each"
     for (ids) |id| try expectEqualStrings("hello", c.get(id).body.items);
     // Far less than a write buffer of output per read: one write each at
     // most (the reads that carry only WINDOW_UPDATEs write nothing).
-    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads);
-    try expectEqual(flushers, engine.test_flushers.load(.acquire));
+    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.probe.at(.reads).load(.acquire) - reads);
+    try expectEqual(flushers, engine.probe.at(.flushers).load(.acquire));
 }
 
 test "h2 engine: a round of 32 responses with borrowed bodies takes a few socket writes" {
@@ -870,7 +870,7 @@ test "h2 engine: a round of 32 responses with borrowed bodies takes a few socket
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    const reads = engine.test_reads.load(.acquire);
+    const reads = engine.probe.at(.reads).load(.acquire);
     const writes = server_mod.Connection.TestSocketWrites.get();
     var ids: [32]u31 = undefined;
     for (&ids) |*id| id.* = try c.open("GET", "/nw/kb", &.{}, true);
@@ -886,7 +886,7 @@ test "h2 engine: a round of 32 responses with borrowed bodies takes a few socket
     // response. A bound, not the count: how the requests split into reads
     // varies.
     const segments = 2 * ids.len;
-    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads + (segments + 6) / 7);
+    try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.probe.at(.reads).load(.acquire) - reads + (segments + 6) / 7);
 }
 
 test "h2 engine: a response with no body on a stream the peer has ended is no reset" {
@@ -957,8 +957,8 @@ test "h2 engine: a stream woken between a connection error and the close fails i
     c.auto_window = false;
     const failed = Handlers.big_failed.load(.acquire);
     Hook.done_before = Handlers.big_done.load(.acquire);
-    engine.test_on_conn_error = Hook.onError;
-    defer engine.test_on_conn_error = null;
+    engine.probe.on_conn_error = Hook.onError;
+    defer engine.probe.on_conn_error = null;
     const id = try c.request("GET", "/big", null);
     const r = c.get(id);
     while (r.body.items.len < 65535) try c.readOne();
@@ -1043,8 +1043,8 @@ test "h2 engine: many concurrent streams on one connection" {
 test "h2 engine: past out_high new HEADERS are refused while a PING is still ACKed" {
     // Any owned byte unwritten is past it: a PING's ACK queued ahead of a
     // request in the same read.
-    engine.test_out_high = 0;
-    defer engine.test_out_high = null;
+    engine.probe.out_high = 0;
+    defer engine.probe.out_high = null;
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
@@ -1068,7 +1068,7 @@ test "h2 engine: one writer at a time" {
     Handlers.held_gate.reset();
     defer Handlers.held_gate.reset();
     const entered = Handlers.held_entered.load(.acquire);
-    engine.test_max_writers.store(0, .release);
+    engine.probe.at(.max_writers).store(0, .release);
     var ids: [64]u31 = undefined;
     for (&ids) |*id| id.* = try c.open("GET", "/held", &.{}, true);
     try c.flush();
@@ -1077,7 +1077,7 @@ test "h2 engine: one writer at a time" {
     Handlers.held_gate.set(testing.io);
     try c.untilAll();
     for (ids) |id| try expectEqualStrings("held", c.get(id).body.items);
-    try expectEqual(1, engine.test_max_writers.load(.acquire));
+    try expectEqual(1, engine.probe.at(.max_writers).load(.acquire));
 }
 
 test "h2 engine: Out is released at the first read after a trim interval that finds the connection idle" {
@@ -1086,12 +1086,12 @@ test "h2 engine: Out is released at the first read after a trim interval that fi
     defer fx.stop();
     const c = &fx.client;
     // The handshake's frames took a block.
-    const releases = engine.test_out_releases.load(.acquire);
+    const releases = engine.probe.at(.out_releases).load(.acquire);
     // A trim interval passes; the next read finds the connection idle.
-    _ = engine.test_trim_epoch.fetchAdd(1, .release);
+    _ = engine.probe.at(.trim_epoch).fetchAdd(1, .release);
     try c.ping("idle....".*);
     try c.flush();
-    try wait.waitAtLeast(testing.io, "the idle connection released its output blocks", &engine.test_out_releases, releases + 1);
+    try wait.waitAtLeast(testing.io, "the idle connection released its output blocks", engine.probe.at(.out_releases), releases + 1);
     try expect(fx.connection.write_held == null);
     try expectEqual(0, fx.connection.writer.buffer.len);
     // And takes them again for the next response.
@@ -1109,12 +1109,12 @@ test "h2 engine: a finished response the peer never takes is reset at its send d
     // A stream window of zero: the head may go, never the body.
     try c.settingsWindow(0);
     try c.flush();
-    const resets = engine.test_send_resets.load(.acquire);
+    const resets = engine.probe.at(.send_resets).load(.acquire);
     const id = try c.request("GET", "/hello", null);
     const r = try c.until(id);
     try expectEqual(200, r.status);
     try expectEqual(ErrorCode.cancel, r.rst.?);
-    try expect(engine.test_send_resets.load(.acquire) > resets);
+    try expect(engine.probe.at(.send_resets).load(.acquire) > resets);
     // Only that stream: a bodyless answer still goes out.
     const head = try c.request("HEAD", "/hello", null);
     try expectEqual(200, (try c.until(head)).status);
@@ -1255,7 +1255,7 @@ test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" 
     // takes the worst case on purpose: with the server's send windows shut,
     // every response is queued (its HEADERS out, its DATA held) before any
     // DATA is framed, all 100 streams and their Pending nodes alive at once.
-    var freed = engine.test_freed.load(.acquire);
+    var freed = engine.probe.at(.freed).load(.acquire);
     try c.settingsWindow(0);
     var warm: [100]u31 = undefined;
     for (&warm, 0..) |*id, i| id.* = try c.open("GET", if (i % 2 == 0) "/users/1" else "/nw/hello", &.{}, true);
@@ -1269,15 +1269,15 @@ test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" 
     // Every stream of a burst is let go before the next one starts, so the
     // next one has the spares of all 100 (a stream outlives its response
     // by the flusher's `advance`, which may come after the client read it).
-    try wait.waitAtLeast(testing.io, "the server let the warm-up's streams go", &engine.test_freed, freed + 100);
+    try wait.waitAtLeast(testing.io, "the server let the warm-up's streams go", engine.probe.at(.freed), freed + 100);
     for (0..2) |round| {
         var ids: [100]u31 = undefined;
         const before = counting.count.load(.monotonic);
-        freed = engine.test_freed.load(.acquire);
+        freed = engine.probe.at(.freed).load(.acquire);
         for (&ids, 0..) |*id, i| id.* = try c.open("GET", if (i % 2 == 0) "/users/1" else "/nw/hello", &.{}, true);
         try c.flush();
         try c.untilAll();
-        try wait.waitAtLeast(testing.io, "the server let the burst's streams go", &engine.test_freed, freed + 100);
+        try wait.waitAtLeast(testing.io, "the server let the burst's streams go", engine.probe.at(.freed), freed + 100);
         for (ids, 0..) |id, i| try expectEqualStrings(if (i % 2 == 0) "user 1" else "hello", c.get(id).body.items);
         if (round == 1) try expectEqual(before, counting.count.load(.monotonic));
     }
@@ -1470,7 +1470,7 @@ test "h2 engine: a response finished or released inside its handler is let go on
     };
     for (rows) |row| {
         errdefer std.debug.print("{s}\n", .{row.path});
-        const freed = engine.test_freed.load(.acquire);
+        const freed = engine.probe.at(.freed).load(.acquire);
         const id = try c.request("GET", row.path, null);
         const r = try c.until(id);
         try expectEqual(200, r.status);
@@ -1478,8 +1478,8 @@ test "h2 engine: a response finished or released inside its handler is let go on
         try expectEqual(row.rst, r.rst);
         const next = try c.request("GET", "/hello", null);
         try expectEqualStrings("hello", (try c.until(next)).body.items);
-        try wait.waitAtLeast(testing.io, "both streams were freed", &engine.test_freed, freed + 2);
-        try expectEqual(freed + 2, engine.test_freed.load(.acquire));
+        try wait.waitAtLeast(testing.io, "both streams were freed", engine.probe.at(.freed), freed + 2);
+        try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
     }
 }
 
@@ -1774,7 +1774,7 @@ test "h2 engine: a tunnel's small sends queued meanwhile go out as one DATA run 
     try fx.start(testing.allocator, testing.io, .{ .http2 = .{ .enable_connect_protocol = true } });
     defer fx.stop();
     const c = &fx.client;
-    const blocks = engine.test_chain_blocks.load(.acquire);
+    const blocks = engine.probe.at(.chain_blocks).load(.acquire);
     const id = try c.open("CONNECT", "/tunnel", &.{.{ .name = ":protocol", .value = "websocket" }}, false);
     try c.flush();
     const r = c.get(id);
@@ -1803,7 +1803,7 @@ test "h2 engine: a tunnel's small sends queued meanwhile go out as one DATA run 
         if (round == 0) try expect(r.data_frames - frames <= 12);
         for (r.body.items[before..], 0..) |b, k| try expectEqual(@as(u8, @truncate(k)), b);
         // All written: no block is kept while the tunnel idles.
-        try wait.waitEqual(testing.io, "the chain's blocks let go", &engine.test_chain_blocks, blocks);
+        try wait.waitEqual(testing.io, "the chain's blocks let go", engine.probe.at(.chain_blocks), blocks);
     }
     try c.sendBody(id, "end", false);
     while (r.rst == null) try c.readOne();
@@ -1848,7 +1848,7 @@ test "h2 engine: teardown with detached, parked and attached streams outstanding
 }
 
 /// The drain asking a connection whose tasks are all joined: from the
-/// close's last join and from the teardown (`engine.test_after_join`).
+/// close's last join and from the teardown (`engine.probe.after_join`).
 const Late = struct {
     var server: ?*Server = null;
     var calls: u32 = 0;
@@ -1873,20 +1873,20 @@ test "h2 engine: the drain reaching a closing connection starts no task in its j
     }
     Late.server = &fx.server;
     Late.calls = 0;
-    engine.test_after_join = Late.drain;
+    engine.probe.after_join = Late.drain;
     defer {
-        engine.test_after_join = null;
+        engine.probe.after_join = null;
         Late.server = null;
     }
-    const late = engine.test_late_flushers.load(.acquire);
+    const late = engine.probe.at(.late_flushers).load(.acquire);
     // The client hangs up: the close, then the teardown.
     fx.stop();
     try expectEqual(2, Late.calls);
-    try expectEqual(late, engine.test_late_flushers.load(.acquire));
+    try expectEqual(late, engine.probe.at(.late_flushers).load(.acquire));
 }
 
 /// A detached owner whose `attach` reaches the engine only once the
-/// connection's tasks are joined (`engine.test_after_join`): refused, and
+/// connection's tasks are joined (`engine.probe.after_join`): refused, and
 /// it finishes the response itself.
 const LateAttach = struct {
     var d: ?*Detached = null;
@@ -1917,20 +1917,20 @@ test "h2 engine: an attach after the connection's tasks are joined is refused an
         LateAttach.d = d;
     }
     LateAttach.result = null;
-    engine.test_after_join = LateAttach.attach;
+    engine.probe.after_join = LateAttach.attach;
     defer {
-        engine.test_after_join = null;
+        engine.probe.after_join = null;
         LateAttach.d = null;
     }
     const done = Det.attached_done.load(.acquire);
     const aborts = Det.aborts.load(.acquire);
-    const late = engine.test_late_flushers.load(.acquire);
+    const late = engine.probe.at(.late_flushers).load(.acquire);
     // The client hangs up: the close, then the teardown.
     fx.stop();
     try expectError(error.ConnectionClosed, LateAttach.result.?);
     try expectEqual(done, Det.attached_done.load(.acquire));
     try expectEqual(aborts, Det.aborts.load(.acquire));
-    try expectEqual(late, engine.test_late_flushers.load(.acquire));
+    try expectEqual(late, engine.probe.at(.late_flushers).load(.acquire));
 }
 
 test "h2 engine: a response ended before its request starts no send-deadline waiter" {
@@ -1941,14 +1941,14 @@ test "h2 engine: a response ended before its request starts no send-deadline wai
     try fx.start(testing.allocator, testing.io, .{});
     defer fx.stop();
     const c = &fx.client;
-    const waiters = engine.test_send_waiters.load(.acquire);
+    const waiters = engine.probe.at(.send_waiters).load(.acquire);
     const id = try c.open("POST", "/hello", &.{}, false);
     try c.flush();
     try expect((try c.until(id)).ended);
     // A round trip after it: the token holder that wrote it has let go.
     const next = try c.request("GET", "/hello", null);
     try expectEqualStrings("hello", (try c.until(next)).body.items);
-    try expectEqual(waiters, engine.test_send_waiters.load(.acquire));
+    try expectEqual(waiters, engine.probe.at(.send_waiters).load(.acquire));
 }
 
 test "h2 engine: an ordinary exchange takes under 2 KiB of its stream's arena; a spare keeps one node of the limit and allocates nothing again" {
@@ -1978,8 +1978,8 @@ test "h2 engine: an ordinary exchange takes under 2 KiB of its stream's arena; a
         const id = try c.requestWith(sh.method, sh.path, fields, sh.body);
         try expect(std.mem.startsWith(u8, (try c.until(id)).body.items, sh.want));
         try awaitArenaHigh();
-        try expect(engine.test_arena_high.load(.monotonic) <= 2 * 1024 - 4 * @sizeOf(usize));
-        try expectEqual(engine.arena_retain_limit, engine.test_arena_kept.load(.monotonic));
+        try expect(engine.probe.at(.arena_high).load(.monotonic) <= 2 * 1024 - 4 * @sizeOf(usize));
+        try expectEqual(engine.arena_retain_limit, engine.probe.at(.arena_kept).load(.monotonic));
     }
     // Ordinary or within the node, a request on the spare allocates
     // nothing; one past it spills and the spare is back to one node of the
@@ -1991,16 +1991,16 @@ test "h2 engine: an ordinary exchange takes under 2 KiB of its stream's arena; a
             const id = try c.requestWith("GET", path, fields, null);
             try expectEqual(200, (try c.until(id)).status);
             try awaitArenaHigh();
-            try expectEqual(engine.arena_retain_limit, engine.test_arena_kept.load(.monotonic));
-            if (engine.test_arena_high.load(.monotonic) <= engine.arena_retain_limit)
+            try expectEqual(engine.arena_retain_limit, engine.probe.at(.arena_kept).load(.monotonic));
+            if (engine.probe.at(.arena_high).load(.monotonic) <= engine.arena_retain_limit)
                 try expectEqual(before, counting.count.load(.monotonic));
         }
     }
 }
 
 fn resetArenaProbes() void {
-    engine.test_arena_high.store(0, .monotonic);
-    engine.test_arena_kept.store(0, .release);
+    engine.probe.at(.arena_high).store(0, .monotonic);
+    engine.probe.at(.arena_kept).store(0, .release);
 }
 
 /// The stream of the last answered request is let go just after its
@@ -2008,7 +2008,7 @@ fn resetArenaProbes() void {
 fn awaitArenaHigh() !void {
     try wait.waitUntil(testing.io, "the last stream went back to the spares", {}, struct {
         fn f(_: void) bool {
-            return engine.test_arena_kept.load(.acquire) > 0;
+            return engine.probe.at(.arena_kept).load(.acquire) > 0;
         }
     }.f);
 }

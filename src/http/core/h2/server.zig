@@ -144,71 +144,133 @@ const tunnel_outbox_max = 1024 * 1024;
 
 const is_test = builtin.is_test;
 
-/// Tests only: handler tasks spawned (`spawnTasked`).
-pub var test_spawned: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: flusher tasks spawned.
-pub var test_flushers: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: tasks inside a write now, and the most ever at once.
-pub var test_writers_in: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_max_writers: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: `out` released by an idle connection.
-pub var test_out_releases: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: streams kept for `out`'s borrowed bytes past their close,
-/// then let go once written.
-pub var test_retired: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: reads the reader fed to `Conn.recv`.
-pub var test_reads: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: response blocks allocated (`StreamSink`).
-pub var test_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: in place of `limits.Limits.out_high`.
-pub var test_out_high: if (is_test) ?usize else void = if (is_test) null else {};
-/// Tests only: the trim epoch, in place of `Server.trim_epoch`.
-pub var test_trim_epoch: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: whether the last connection served ran lock-free.
-pub var test_lock_free: if (is_test) std.atomic.Value(bool) else void = if (is_test) .init(false) else {};
-/// Tests only: streaming body writers handed out (`StreamSink.body`; grpc/server_test.zig reads it).
-pub var test_sink_bodies: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: chain blocks alive (tunnels, parked responses).
-pub var test_chain_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: sends that hopped to the connection's executor.
-pub var test_hops: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: when set, a hopped send waits on it (cancelably) on the
-/// connection's executor before it runs, to hold the hop open.
-pub var test_hop_hold: if (is_test) std.atomic.Value(?*std.Io.Event) else void = if (is_test) .init(null) else {};
-/// Tests only: writes cut at `timeout.write`.
-pub var test_write_timeouts: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: finished responses reset at their send deadline.
-pub var test_send_resets: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: idle waits that could not park for a partial frame.
-pub var test_park_refused_partial: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: connections parked, and read buffers held now.
-pub var test_parks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_read_buffers: if (is_test) std.atomic.Value(i32) else void = if (is_test) .init(0) else {};
-/// Tests only: readers the drain bell woke, and connections closed at
-/// their keep-alive deadline.
-pub var test_drain_wakes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_keepalive_closes: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: called once the connection's group is joined for the last
-/// time (`closeRun`'s join, the teardown's cancel), where nothing may
-/// join it any more; and the flushers asked for after that point.
-pub var test_after_join: if (is_test) ?*const fn () void else void = if (is_test) null else {};
-pub var test_late_flushers: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: called on the reader once a read ended in a connection
-/// error, with the lock let go and before the GOAWAY's flush, with the
-/// connection (`Engine.testWakeRooms` takes it): the moment a stream task
-/// on another thread may look at its stream before `closeRun`.
-pub var test_on_conn_error: if (is_test) ?*const fn (*anyopaque) void else void = if (is_test) null else {};
-/// Tests only: send-deadline waiters started (`waitSends`), and send
-/// sides shut at a connection's end (`shutDrained`, `lingeringClose`).
-pub var test_send_waiters: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-pub var test_send_shuts: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: the most arena one stream's exchange used (bytes handed
-/// out over its nodes), read before its reset (`maybeFree`).
-pub var test_arena_high: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
-/// Tests only: streams let go (`maybeFree`), to the spares or freed.
-pub var test_freed: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
-/// Tests only: the arena the last stream put back to the spares kept.
-pub var test_arena_kept: if (is_test) std.atomic.Value(usize) else void = if (is_test) .init(0) else {};
+/// What a test counts or hooks in the engine. Process-global, shared by every
+/// test as the old `test_*` variables were (tests compare deltas).
+pub const Counter = enum {
+    /// Handler tasks spawned (`spawnTasked`).
+    spawned,
+    /// Flusher tasks spawned.
+    flushers,
+    /// Tasks inside a write now, and the most ever at once.
+    writers_in,
+    max_writers,
+    /// `out` released by an idle connection.
+    out_releases,
+    /// Reads the reader fed to `Conn.recv`.
+    reads,
+    /// Response blocks allocated (`StreamSink`).
+    blocks,
+    /// The trim epoch, in place of `Server.trim_epoch`.
+    trim_epoch,
+    /// Streaming body writers handed out (`StreamSink.body`).
+    sink_bodies,
+    /// Chain blocks alive (tunnels, parked responses).
+    chain_blocks,
+    /// Sends that hopped to the connection's executor.
+    hops,
+    /// Writes cut at `timeout.write`.
+    write_timeouts,
+    /// Finished responses reset at their send deadline.
+    send_resets,
+    /// Idle waits that could not park for a partial frame.
+    park_refused_partial,
+    /// Connections parked, and read buffers held now.
+    parks,
+    read_buffers,
+    /// Connections closed at their keep-alive deadline.
+    keepalive_closes,
+    /// Flushers asked for after the connection's group was joined.
+    late_flushers,
+    /// Send-deadline waiters started (`waitSends`), and send sides shut at a
+    /// connection's end (`shutDrained`, `lingeringClose`).
+    send_waiters,
+    send_shuts,
+    /// The most arena one stream's exchange used, read before its reset.
+    arena_high,
+    /// Streams let go (`maybeFree`), to the spares or freed.
+    freed,
+    /// The arena the last stream put back to the spares kept.
+    arena_kept,
+};
+
+/// Tests only: the counters and the hooks tests set. A release build has
+/// `NoProbe`, whose methods compile to nothing.
+pub const Probe = struct {
+    counts: std.EnumArray(Counter, std.atomic.Value(usize)) = .initFill(.init(0)),
+    /// Called once the connection's group is joined for the last time
+    /// (`closeRun`'s join, the teardown's cancel), where nothing may join it
+    /// any more.
+    after_join: ?*const fn () void = null,
+    /// Called on the reader once a read ended in a connection error, with
+    /// the lock let go and before the GOAWAY's flush, with the connection
+    /// (`Engine.testWakeRooms` takes it).
+    on_conn_error: ?*const fn (*anyopaque) void = null,
+    /// In place of `limits.Limits.out_high`.
+    out_high: ?usize = null,
+    /// When set, a hopped send waits on it (cancelably) on the connection's
+    /// executor before it runs, to hold the hop open.
+    hop_hold: std.atomic.Value(?*std.Io.Event) = .init(null),
+    /// Whether the last connection served ran lock-free.
+    lock_free: std.atomic.Value(bool) = .init(false),
+
+    pub fn at(p: *Probe, c: Counter) *std.atomic.Value(usize) {
+        return p.counts.getPtr(c);
+    }
+    pub inline fn bump(p: *Probe, c: Counter) void {
+        _ = p.add(c, 1);
+    }
+    /// The new value.
+    pub inline fn add(p: *Probe, c: Counter, n: usize) usize {
+        return p.at(c).fetchAdd(n, .acq_rel) + n;
+    }
+    pub inline fn sub(p: *Probe, c: Counter, n: usize) void {
+        _ = p.at(c).fetchSub(n, .acq_rel);
+    }
+    pub inline fn max(p: *Probe, c: Counter, n: usize) void {
+        _ = p.at(c).fetchMax(n, .acq_rel);
+    }
+    pub inline fn store(p: *Probe, c: Counter, n: usize) void {
+        p.at(c).store(n, .release);
+    }
+    /// `conn` is past its last join: marks it, then runs the hook.
+    pub inline fn afterJoin(p: *Probe, conn: anytype) void {
+        conn.test_joined = true;
+        if (p.after_join) |hook| hook();
+    }
+    pub inline fn onConnError(p: *Probe, conn: anytype) void {
+        if (p.on_conn_error) |hook| hook(conn);
+    }
+    pub inline fn outHigh(p: *Probe, limits: anytype) void {
+        if (p.out_high) |v| limits.out_high = v;
+    }
+    pub inline fn holdHop(p: *Probe, io: std.Io) std.Io.Cancelable!void {
+        if (p.hop_hold.load(.acquire)) |ev| try ev.wait(io);
+    }
+    pub inline fn setLockFree(p: *Probe, free: bool) void {
+        p.lock_free.store(free, .monotonic);
+    }
+};
+
+const NoProbe = struct {
+    pub inline fn bump(_: NoProbe, _: Counter) void {}
+    pub inline fn add(_: NoProbe, _: Counter, _: usize) usize {
+        return 0;
+    }
+    pub inline fn sub(_: NoProbe, _: Counter, _: usize) void {}
+    pub inline fn max(_: NoProbe, _: Counter, _: usize) void {}
+    pub inline fn store(_: NoProbe, _: Counter, _: usize) void {}
+    pub inline fn afterJoin(_: NoProbe, _: anytype) void {}
+    pub inline fn onConnError(_: NoProbe, _: anytype) void {}
+    pub inline fn outHigh(_: NoProbe, _: anytype) void {}
+    pub inline fn holdHop(_: NoProbe, _: std.Io) std.Io.Cancelable!void {}
+    pub inline fn setLockFree(_: NoProbe, _: bool) void {}
+};
+
+pub var probe: if (is_test) Probe else NoProbe = .{};
+
+comptime {
+    if (!is_test) std.debug.assert(@sizeOf(@TypeOf(probe)) == 0);
+}
 
 /// The HPACK scratch `Conn.recv` decodes into, one per executor (recv never
 /// yields), from the block cache and never given back.
@@ -750,7 +812,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn trimEpoch(conn: *Conn) u32 {
-                if (comptime is_test) return test_trim_epoch.load(.monotonic);
+                if (comptime is_test) return @truncate(probe.at(.trim_epoch).load(.monotonic));
                 return conn.server.trim_epoch.load(.monotonic);
             }
 
@@ -767,7 +829,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.proto.trimSpares(min_spare_streams);
                 if (!conn.writer.held() and conn.open_streams == 0 and conn.proto.out.idle() and conn.proto.out.blocks.items.len > 0) {
                     conn.proto.out.release();
-                    if (comptime is_test) _ = test_out_releases.fetchAdd(1, .monotonic);
+                    probe.bump(.out_releases);
                 }
             }
 
@@ -1042,7 +1104,7 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.handlerNeverRan(es);
                     return;
                 };
-                if (comptime is_test) _ = test_spawned.fetchAdd(1, .monotonic);
+                probe.bump(.spawned);
             }
 
             /// `placement.concurrent` into the connection's group, under
@@ -1210,9 +1272,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// arena trimmed, or to the allocator. Under the lock.
             fn maybeFree(conn: *Conn, es: *EStream) void {
                 if (es.held()) return;
-                defer if (comptime is_test) {
-                    _ = test_freed.fetchAdd(1, .release);
-                };
+                defer probe.bump(.freed);
                 if (es.room_waiting) conn.unwatchRoom(es);
                 if (es.body.len > 0 and conn.life == .running) conn.proto.consumed(null, es.body.len) catch {};
                 conn.sendDone(es);
@@ -1232,11 +1292,11 @@ pub fn Engine(comptime Ctx: type) type {
                     var used: usize = 0;
                     var it = es.arena.used;
                     while (it) |n| : (it = n.next) used += n.end_index;
-                    _ = test_arena_high.fetchMax(used, .monotonic);
+                    probe.max(.arena_high, used);
                 }
                 if (conn.spares.items.len < conn.max_spares) {
                     _ = es.arena.reset(.{ .retain_with_limit = arena_retain_limit });
-                    if (is_test) test_arena_kept.store(es.arena.queryCapacity(), .release);
+                    if (is_test) probe.store(.arena_kept, es.arena.queryCapacity());
                     if (conn.spares.append(conn.allocator, es)) |_| return else |_| {}
                 }
                 es.destroy(conn.allocator);
@@ -1420,7 +1480,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn spawnFlusher(conn: *Conn, with_token: bool) bool {
                 if (conn.life == .tasks_closed) return false;
                 if (comptime is_test) if (conn.test_joined) {
-                    _ = test_late_flushers.fetchAdd(1, .monotonic);
+                    probe.bump(.late_flushers);
                     return false;
                 };
                 // One with the token runs on the slot its run holds
@@ -1434,10 +1494,8 @@ pub fn Engine(comptime Ctx: type) type {
                     log.err("HTTP/2: no task for the connection's output", .{});
                     return false;
                 };
-                if (comptime is_test) {
-                    _ = test_flushers.fetchAdd(1, .monotonic);
-                    if (!with_token) _ = test_send_waiters.fetchAdd(1, .monotonic);
-                }
+                probe.bump(.flushers);
+                if (!with_token) probe.bump(.send_waiters);
                 return true;
             }
 
@@ -1539,7 +1597,7 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                     if (reset > 0) {
                         log.debug("HTTP/2: {d} finished response(s) the peer took no credit for, reset at their send deadline", .{reset});
-                        if (comptime is_test) _ = test_send_resets.fetchAdd(reset, .monotonic);
+                        _ = probe.add(.send_resets, reset);
                         try conn.flush(.all, timer);
                     }
                     const until = earliest orelse continue;
@@ -1650,13 +1708,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// buffer fills). error.WriteFailed for a failure of the
             /// connection, error.Canceled when the calling task was.
             fn writeVecs(conn: *Conn, vecs: [][]const u8, timer: *Timer) (std.Io.Cancelable || error{WriteFailed})!void {
-                if (comptime is_test) {
-                    const in = test_writers_in.fetchAdd(1, .acq_rel) + 1;
-                    _ = test_max_writers.fetchMax(in, .acq_rel);
-                }
-                defer if (comptime is_test) {
-                    _ = test_writers_in.fetchSub(1, .acq_rel);
-                };
+                probe.max(.max_writers, probe.add(.writers_in, 1));
+                defer probe.sub(.writers_in, 1);
                 conn.connection.writer.writeVecAll(vecs) catch return conn.writeError(timer);
             }
 
@@ -1668,7 +1721,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const cause = conn.connection.getWriteError() orelse return error.WriteFailed;
                 if (cause == error.Canceled) {
                     if (!timer.fired()) return error.Canceled;
-                    if (comptime is_test) _ = test_write_timeouts.fetchAdd(1, .monotonic);
+                    probe.bump(.write_timeouts);
                     log.debug("HTTP/2: no write progress for timeout.write, closing the connection", .{});
                     return error.WriteFailed;
                 }
@@ -1701,7 +1754,7 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
-                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
+                probe.bump(.send_shuts);
             }
 
             /// Ends the reader's wait for input, as its deadline would, if
@@ -1737,7 +1790,6 @@ pub fn Engine(comptime Ctx: type) type {
                     if (es.retire_mark.? > sent) break;
                     _ = conn.retiring.popFirst();
                     es.retire_mark = null;
-                    if (comptime is_test) _ = test_retired.fetchAdd(1, .monotonic);
                     conn.maybeFree(es);
                 }
             }
@@ -1995,7 +2047,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // SAFETY: `mem` is aligned for and larger than a ChainBlock.
                 const b: *ChainBlock = @ptrCast(mem.ptr);
                 b.* = .{ .size = size };
-                if (comptime is_test) _ = test_chain_blocks.fetchAdd(1, .monotonic);
+                probe.bump(.chain_blocks);
                 return b;
             }
 
@@ -2003,7 +2055,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // SAFETY: `b` heads the allocation `create` made, `size` bytes.
                 const base: [*]align(@alignOf(ChainBlock)) u8 = @ptrCast(b);
                 gpa.free(base[0..b.size]);
-                if (comptime is_test) _ = test_chain_blocks.fetchSub(1, .monotonic);
+                probe.sub(.chain_blocks, 1);
             }
 
             fn data(b: *ChainBlock) []u8 {
@@ -2393,10 +2445,10 @@ pub fn Engine(comptime Ctx: type) type {
         };
 
         /// Tests only: what a write that completes does for the streams
-        /// waiting for room (`Conn.wakeRooms`), on `test_on_conn_error`'s
+        /// waiting for room (`Conn.wakeRooms`), on `Probe.on_conn_error`'s
         /// connection.
         pub fn testWakeRooms(ptr: *anyopaque) void {
-            // SAFETY: `test_on_conn_error` passes the Conn it was called for.
+            // SAFETY: `Probe.on_conn_error` passes the Conn it was called for.
             const conn: *Conn = @ptrCast(@alignCast(ptr));
             conn.lock();
             defer conn.unlock();
@@ -2444,7 +2496,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock_.free = true;
                 conn.lock_.owner = e;
             };
-            if (comptime is_test) test_lock_free.store(conn.lock_.free, .monotonic);
+            probe.setLockFree(conn.lock_.free);
             var opts: conn_mod.Options = .{
                 .max_concurrent_streams = h.max_concurrent_streams,
                 .initial_window = h.stream_window,
@@ -2460,9 +2512,7 @@ pub fn Engine(comptime Ctx: type) type {
             };
             // The stream table's hash seed (hash flooding).
             io.random(std.mem.asBytes(&opts.seed));
-            if (comptime is_test) if (test_out_high) |v| {
-                opts.limits.out_high = v;
-            };
+            probe.outHigh(&opts.limits);
             try conn.proto.initAt(server.allocator, conn, opts);
             if (comptime registered()) @field(server, Registry.field).add(conn);
             connection.adopter = &conn.adopter;
@@ -2507,13 +2557,13 @@ pub fn Engine(comptime Ctx: type) type {
             // SAFETY: the connection's address only picks a pool shard.
             const buffers = try server.request_buffers.acquire(@intFromPtr(connection));
             conn.buffers = buffers;
-            if (comptime is_test) _ = test_read_buffers.fetchAdd(1, .monotonic);
+            probe.bump(.read_buffers);
             defer {
                 // A park leaves nothing in it (`prepPark`).
                 connection.replaceReadBuffer(&.{});
                 conn.buffers = null;
                 server.request_buffers.release(buffers);
-                if (comptime is_test) _ = test_read_buffers.fetchSub(1, .monotonic);
+                probe.sub(.read_buffers, 1);
             }
             // Conn takes a frame other than DATA only once it is whole.
             if (buffers.read_buffer.len < 9 + 16384) {
@@ -2552,10 +2602,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.life = .tasks_closed;
             }
             conn.group.cancel(io);
-            if (comptime is_test) {
-                conn.test_joined = true;
-                if (test_after_join) |hook| hook();
-            }
+            probe.afterJoin(conn);
             {
                 conn.lock();
                 defer conn.unlock();
@@ -2619,7 +2666,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // Idle past `timeout.keepalive`: a GOAWAY first, as nginx,
                 // Go and h2o send on an idle close.
                 .keepalive => {
-                    if (comptime is_test) _ = test_keepalive_closes.fetchAdd(1, .monotonic);
+                    probe.bump(.keepalive_closes);
                     conn.lock();
                     defer conn.unlock();
                     if (conn.proto.goaway_sent == null) conn.proto.goaway(.no_error, "") catch {};
@@ -2663,10 +2710,7 @@ pub fn Engine(comptime Ctx: type) type {
             conn.group.await(conn.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };
-            if (comptime is_test) {
-                conn.test_joined = true;
-                if (test_after_join) |hook| hook();
-            }
+            probe.afterJoin(conn);
             conn.flush(.all, timer) catch return error.Canceled;
             if (linger) try lingeringClose(conn);
         }
@@ -2682,7 +2726,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// the wait to look again, and only a whole interval without one
         /// sends the next PING.
         fn probeHalfClose(conn: *Conn, timer: *Timer) error{Canceled}!void {
-            var probe = true;
+            var ping = true;
             while (true) {
                 const seen = conn.handler_done.epoch();
                 {
@@ -2690,12 +2734,12 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     if (!conn.handlersRunning()) return;
                     if (conn.writer == .shut) return conn.cancelStreams(true);
-                    if (probe) conn.proto.ping(probe_ping) catch {};
+                    if (ping) conn.proto.ping(probe_ping) catch {};
                 }
-                if (probe) conn.flush(.all, timer) catch return error.Canceled;
+                if (ping) conn.flush(.all, timer) catch return error.Canceled;
                 conn.handler_done.waitTimeout(conn.io, seen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } }) catch
                     return error.Canceled;
-                probe = conn.handler_done.epoch() == seen;
+                ping = conn.handler_done.epoch() == seen;
             }
         }
 
@@ -2749,7 +2793,7 @@ pub fn Engine(comptime Ctx: type) type {
                         const scratch = try conn.scratch();
                         const now = placement.tickNow(conn.io) orelse std.Io.Clock.awake.now(conn.io);
                         const result = conn.proto.recv(buffered, @intCast(@max(0, now.toSeconds())), scratch);
-                        if (comptime is_test) _ = test_reads.fetchAdd(1, .monotonic);
+                        probe.bump(.reads);
                         if (result) |_| {
                             if (conn.awaiting.items.len > 0) conn.startAwaiting();
                         } else |_| {}
@@ -2770,7 +2814,7 @@ pub fn Engine(comptime Ctx: type) type {
                         // A GOAWAY is queued: out it goes, then the
                         // lingering close.
                         error.ConnectionError => {
-                            if (comptime is_test) if (test_on_conn_error) |hook| hook(conn);
+                            probe.onConnError(conn);
                             try conn.flush(.all, timer);
                             return .dead;
                         },
@@ -2824,7 +2868,6 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.connection.clearReadError();
                         if (conn.keepaliveDue()) return .keepalive;
                         // The drain's bell: its requests at the top.
-                        if (comptime is_test) _ = test_drain_wakes.fetchAdd(1, .monotonic);
                         continue;
                     },
                     else => |e| return e,
@@ -2875,9 +2918,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.reader_wait = null;
             };
             if (reader.bufferedLen() == 0) return burst.waitInput();
-            if (comptime is_test) if (may_park) {
-                _ = test_park_refused_partial.fetchAdd(1, .monotonic);
-            };
+            if (may_park) probe.bump(.park_refused_partial);
             reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
                 error.ReadFailed => return conn.connection.getReadError() orelse error.Unexpected,
@@ -2897,7 +2938,7 @@ pub fn Engine(comptime Ctx: type) type {
             conn.lock();
             defer conn.unlock();
             if (connection.reader.bufferedLen() != 0 or !conn.proto.atFrameBoundary()) {
-                if (comptime is_test) _ = test_park_refused_partial.fetchAdd(1, .monotonic);
+                probe.bump(.park_refused_partial);
                 return false;
             }
             if (conn.live.first != null or conn.writer.held() or conn.send_waiter or conn.ready.items.len != 0 or conn.awaiting.items.len != 0) return false;
@@ -2913,7 +2954,7 @@ pub fn Engine(comptime Ctx: type) type {
             conn.ready.clearAndFree(conn.allocator);
             conn.awaiting.clearAndFree(conn.allocator);
             conn.adopter.deadline = conn.keepalive_at;
-            if (comptime is_test) _ = test_parks.fetchAdd(1, .monotonic);
+            probe.bump(.parks);
             return true;
         }
 
@@ -2943,7 +2984,7 @@ pub fn Engine(comptime Ctx: type) type {
                     error.Canceled => return error.Canceled,
                     else => {},
                 };
-                if (comptime is_test) _ = test_send_shuts.fetchAdd(1, .monotonic);
+                probe.bump(.send_shuts);
             }
             if (!timer.canBound()) return;
             timer.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
@@ -3745,7 +3786,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// block (`drain`), so a handler that never writes a body never
             /// pays for one.
             fn body(ptr: *anyopaque) *std.Io.Writer {
-                if (comptime is_test) _ = test_sink_bodies.fetchAdd(1, .monotonic);
+                probe.bump(.sink_bodies);
                 return &fromPtr(ptr).writer;
             }
 
@@ -3817,7 +3858,7 @@ pub fn Engine(comptime Ctx: type) type {
                             const b = &es.blocks[es.cur];
                             if (b.mem.len == 0) {
                                 b.mem = conn.allocator.alloc(u8, block_len) catch return self.fail(error.SystemResources);
-                                if (comptime is_test) _ = test_blocks.fetchAdd(1, .monotonic);
+                                probe.bump(.blocks);
                             }
                             self.writer.buffer = b.mem;
                             return;
@@ -3977,7 +4018,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// time (`LocalArena`): `appendParts` allocates from it there.
             fn onOwner(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool) std.Io.Writer.Error!void {
                 const conn = self.es.conn;
-                if (comptime is_test) _ = test_hops.fetchAdd(1, .monotonic);
+                probe.bump(.hops);
                 var group: std.Io.Group = .init;
                 var result: std.Io.Writer.Error!void = {};
                 placement.concurrent(&group, conn.io, .{ .executor = conn.lock_.owner }, ownerRun, .{ self, parts, max_pending, now, &result }) catch
@@ -3992,7 +4033,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn ownerRun(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool, result: *std.Io.Writer.Error!void) std.Io.Cancelable!void {
-                if (comptime is_test) if (test_hop_hold.load(.acquire)) |ev| try ev.wait(self.es.conn.io);
+                try probe.holdHop(self.es.conn.io);
                 const p = parts orelse return kickOut(self);
                 result.* = appendParts(self, p, max_pending, now);
             }
