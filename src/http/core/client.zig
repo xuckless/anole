@@ -3182,7 +3182,7 @@ test "Dials: every (key state, event) cell" {
     const Verdict = Dials.Verdict;
     const Row = struct {
         name: []const u8,
-        /// How the key got to its state; a failed dial ends like an h2 one.
+        /// How the key got to its state; a failed dial is `end(null)`, like an h2 one.
         setup: enum { fresh, dialing, ended_h2, ended_h1 },
         /// The state before the event, the verdict of `enter`, the state after it.
         before: Dials.KeyState,
@@ -3192,8 +3192,7 @@ test "Dials: every (key state, event) cell" {
     const rows = [_]Row{
         .{ .name = "idle enter leads", .setup = .fresh, .before = .idle, .enter = .lead, .after_enter = .dialing },
         .{ .name = "dialing enter waits", .setup = .dialing, .before = .dialing, .enter = .wait, .after_enter = .dialing },
-        .{ .name = "end h2 gives idle, the next leads", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
-        .{ .name = "end failed behaves like h2", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "end h2 or failed gives idle, the next leads", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
         .{ .name = "end h1 gives h1, enter dials directly", .setup = .ended_h1, .before = .h1, .enter = .direct, .after_enter = .h1 },
     };
     for (rows) |row| {

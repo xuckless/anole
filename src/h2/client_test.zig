@@ -964,7 +964,7 @@ test "dusty's client over HTTP/2: concurrent requests share one connection and o
     try std.testing.expect(f.dials() > dials_before);
 }
 
-test "dusty's client over HTTP/2: concurrent first requests to an HTTP/1.1-only origin are not serialised" {
+test "dusty's client over HTTP/2: concurrent first requests to an HTTP/1.1-only origin all dial and run" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
@@ -999,8 +999,9 @@ test "dusty's client over HTTP/2: concurrent first requests to an HTTP/1.1-only 
         group.cancel(io);
     }
     for (0..n) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &f.client, f.h1Port(), &ok });
-    // All eight in the handler at once: each had a connection of its own
-    // without waiting for another's dial to finish.
+    // End to end smoke: all eight dial, reach the handler at once and leave
+    // no ticket. It would also pass with serialised dials (each leader ends
+    // before its request is sent); the unit rows on Dials pin that property.
     try wait.waitAtLeast(io, "8 requests in the handler at once", &gate_arrivals, n);
     gate_open.set(io);
     try wait.waitAtLeast(io, "8 requests answered over HTTP/1.1", &ok, n);
