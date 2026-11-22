@@ -501,7 +501,8 @@ jobs:
         run: tests/interop/install-tshark.sh ~/tshark-debs
       - name: tests/interop/run.sh
         if: steps.tshark.outputs.available == 'true'
-        timeout-minutes: 20
+        # The full suite takes about 17 minutes on a hosted runner (2026-11-22).
+        timeout-minutes: 35
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
