@@ -185,6 +185,9 @@ pub var test_sink_bodies: if (is_test) std.atomic.Value(u32) else void = if (is_
 pub var test_chain_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: sends that hopped to the connection's executor.
 pub var test_hops: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
+/// Tests only: when set, a hopped send waits on it (cancelably) on the
+/// connection's executor before it runs, to hold the hop open.
+pub var test_hop_hold: if (is_test) ?*std.Io.Event else void = if (is_test) null else {};
 /// Tests only: writes cut at `timeout.write`.
 pub var test_write_timeouts: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: finished responses reset at their send deadline.
@@ -3615,6 +3618,8 @@ pub fn Engine(comptime Ctx: type) type {
                 placement.concurrent(&group, conn.io, .{ .executor = conn.lock_.owner }, ownerRun, .{ self, parts, max_pending, now, &result }) catch
                     return self.fail(error.SystemResources);
                 group.await(conn.io) catch {
+                    // The sender's cancel stays pending for its next wait.
+                    conn.io.recancel();
                     group.cancel(conn.io);
                     return self.fail(error.Canceled);
                 };
@@ -3622,6 +3627,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn ownerRun(self: *StreamSink, parts: ?[]const []const u8, max_pending: usize, now: bool, result: *std.Io.Writer.Error!void) std.Io.Cancelable!void {
+                if (comptime is_test) if (test_hop_hold) |ev| try ev.wait(self.es.conn.io);
                 const p = parts orelse return kickOut(self);
                 result.* = appendParts(self, p, max_pending, now);
             }

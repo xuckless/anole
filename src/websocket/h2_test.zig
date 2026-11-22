@@ -1177,6 +1177,81 @@ test "WebSocket over HTTP/2 on the new engine: a send from a task on another exe
     try std.testing.expect(dusty.h2_core_for_tests.server.test_hops.load(.acquire) >= hops + 3);
 }
 
+const HeldSend = enum(u8) { pending, canceled, not_canceled };
+var held_task: std.atomic.Value(?dusty.placement.Task) = .init(null);
+/// A `HeldSend`, as its integer (an atomic holds no enum).
+var held_outcome: std.atomic.Value(u8) = .init(@backingInt(HeldSend.pending));
+
+/// Sends to the parked socket while the test holds the hop open, then says
+/// whether the cancel it got during the hop is still pending.
+fn poke_held(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    _ = ws.receive() catch return;
+    const other = parked_socket.load(.acquire) orelse return error.NoParkedSocket;
+    held_task.store(dusty.placement.currentTask(req.io), .release);
+    other.send(.text, "never delivered") catch {};
+    const outcome: HeldSend = if (req.io.checkCancel()) .not_canceled else |_| .canceled;
+    held_outcome.store(@backingInt(outcome), .release);
+}
+
+test "WebSocket over HTTP/2 on the new engine: a send canceled while its hop is pending leaves the cancel pending" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .http2 = .{ .enable_connect_protocol = true } }, {});
+    defer server.deinit();
+    server.router.get("/park", park);
+    server.router.get("/poke", poke_held);
+    var serving: Serving = undefined;
+    try serving.start(&server);
+    defer serving.stop();
+
+    var a: Client = undefined;
+    try a.init(io, serving.address);
+    defer a.deinit();
+    a.path = "/park";
+    try a.open();
+    var b: Client = undefined;
+    try b.init(io, serving.address);
+    defer b.deinit();
+    b.path = "/poke";
+    try b.open();
+    try test_wait.waitUntil(io, "the parked handler ran", {}, struct {
+        fn ran(_: void) bool {
+            return parked_socket.load(.acquire) != null;
+        }
+    }.ran);
+
+    const server_core = dusty.h2_core_for_tests.server;
+    var hold: std.Io.Event = .unset;
+    server_core.test_hop_hold = &hold;
+    defer server_core.test_hop_hold = null;
+    held_task.store(null, .release);
+    held_outcome.store(@backingInt(HeldSend.pending), .release);
+    const hops = server_core.test_hops.load(.acquire);
+
+    try b.sendFrame(.text, "go");
+    try b.sendQueued();
+    try test_wait.waitUntil(io, "the send hopped", hops, struct {
+        fn hopped(before: u32) bool {
+            return dusty.h2_core_for_tests.server.test_hops.load(.acquire) > before;
+        }
+    }.hopped);
+    // `held_task` is stored before the send, so it is set once the hop is.
+    dusty.placement.cancelTask(held_task.load(.acquire).?);
+    try test_wait.waitUntil(io, "the sender saw the outcome", {}, struct {
+        fn done(_: void) bool {
+            return held_outcome.load(.acquire) != @backingInt(HeldSend.pending);
+        }
+    }.done);
+    try std.testing.expectEqual(@backingInt(HeldSend.canceled), held_outcome.load(.acquire));
+}
+
 const features = @import("build_options");
 
 /// Whether the last socket `deflateHandler` opened compresses outside the
