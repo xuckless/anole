@@ -796,9 +796,11 @@ test "h2 engine: a round of 32 responses with borrowed bodies takes a few socket
     // Each response is two segments (head and DATA header copied, the
     // body borrowed). A round too big for the write buffer goes out as
     // is, at most 8 iovecs per sendmsg, the buffered bytes among them
-    // (zio's `max_iovecs_len`, as std's): 7 writes for 32 responses in 3
-    // reads on Linux, 0.22 per response. A bound, not the count: how the
-    // requests split into reads varies.
+    // (std.Io.Threaded's `max_iovecs_len`: the core's tests run on
+    // std.testing.io; zio gathers up to 64, its `max_write_iovecs`, tested
+    // in zio): 7 writes for 32 responses in 3 reads on Linux, 0.22 per
+    // response. A bound, not the count: how the requests split into reads
+    // varies.
     const segments = 2 * ids.len;
     try expect(server_mod.Connection.TestSocketWrites.get() - writes <= engine.test_reads.load(.acquire) - reads + (segments + 6) / 7);
 }
