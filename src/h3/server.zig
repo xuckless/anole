@@ -2415,7 +2415,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// A request's head is complete: give it a task. Locked.
             fn startStream(conn: *Conn, stream: *Stream) void {
-                stream.started = true;
+                stream.phase = stream.phase.next(.start);
                 stream.holders.insert(.handler);
                 // The flush waits for its answer (`Stream.unhold`).
                 stream.round = conn.round.load(.monotonic);
@@ -2468,9 +2468,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// read (`onPacket`). Locked.
             fn queueInline(conn: *Conn, stream: *Stream) void {
                 conn.ready.append(conn.ep.gpa, stream) catch return conn.startStream(stream);
-                stream.started = true;
                 stream.holders.insert(.handler);
-                stream.inline_mode = true;
+                stream.phase = stream.phase.next(.queue);
             }
 
             /// After a packet: the `no_wait` requests whose body did not
@@ -2479,9 +2478,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn startAwaiting(conn: *Conn) void {
                 defer conn.awaiting.clearRetainingCapacity();
                 for (conn.awaiting.items) |stream| {
-                    if (!stream.await_body) continue;
-                    stream.await_body = false;
+                    // A stale entry: its body ended within the packet.
+                    if (stream.phase != .awaiting_body) continue;
                     if (stream.reset) {
+                        // Let go, so a later FIN cannot queue it.
+                        stream.phase = stream.phase.next(.start);
                         stream.release(.handler);
                         continue;
                     }
@@ -2546,7 +2547,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The request's content type says it carries messages (gRPC,
             /// gRPC-Web, Connect streaming): the larger send cap.
             message: bool = false,
-            started: bool = false,
+            /// Where the request runs: its head, an awaited body, the
+            /// endpoint task, or a task (`Phase`). Locked.
+            phase: Phase = .head,
             /// The request's head came in 0-RTT, before the handshake
             /// completed.
             early: bool = false,
@@ -2567,13 +2570,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// stream's task changes it once the task runs.
             holds: bool = false,
             round: u32 = 0,
-            /// A `no_wait` route's request, run on the endpoint task
-            /// (`runInline`), which must never wait for the peer: its
-            /// response is queued past the stream's cap instead.
-            inline_mode: bool = false,
-            /// A `no_wait` route's request with its body still coming, in
-            /// `Conn.awaiting`.
-            await_body: bool = false,
             /// The handler detached the response (`dusty.Detached`): the
             /// request and response live on in the stream's arena, and the
             /// handler's hold on the stream goes when it is finished or
@@ -2646,6 +2642,77 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// are no-ops. QUIC never comes back once gone, and a park
             /// needs the handler's hold.
             const Holder = enum { quic, handler, parked };
+
+            /// Where a request runs, from its head to its start:
+            ///
+            ///   phase \ event   queue      await_body     start
+            ///   head            endpoint   awaiting_body  started
+            ///   awaiting_body   endpoint   -              started
+            ///   endpoint        -          -              started
+            ///   started         -          -              -
+            ///
+            /// `queue`: a `no_wait` request is whole, in `Conn.ready`
+            /// (`queueInline`; FIN in the head block, or in the same packet
+            /// as the head). `await_body`: a `no_wait` head is complete with
+            /// its body still coming, in `Conn.awaiting`. `start`: it never
+            /// runs inline from here: `startStream` (a task, or the task
+            /// cap's or a failed spawn's REQUEST_REJECTED), let go in
+            /// `startAwaiting` on a reset, the budget full in `runInline`,
+            /// or an inline response attached or parked (its writes then
+            /// use the stream's cap). `endpoint` is both queued and running
+            /// inline (`Conn.ready` membership tells them apart); `started`
+            /// covers a task, a refusal and a let-go (`holders`, `reset`
+            /// and `task` tell them apart). The `-` cells are no-ops: a
+            /// later state never re-enters the head (a let-go stream must
+            /// not be queued by a later FIN), and a task's handler parking
+            /// is already `started`.
+            ///
+            /// The other events move nothing; their callers guard:
+            ///
+            ///   header field    kept in `head` unless `head_too_large` (a
+            ///                   fact, not a phase: `serve` answers 431 after
+            ///                   the start, inline or on a task); ignored
+            ///                   after (trailers)
+            ///   end of headers  only in `head`: `start` (not `no_wait`,
+            ///                   0-RTT, CONNECT, or a list append failed),
+            ///                   `queue` (whole) or `await_body`
+            ///   end of stream   `awaiting_body`: `queue`; others no move
+            ///   packet done     `awaiting_body`: on a reset `start` and let
+            ///                   go, else `startStream`; others skipped
+            ///   reset           no move (`reset`, read by the above and
+            ///                   by `runInline`)
+            ///   budget full     only from `endpoint` (`Conn.ready`): `start`
+            ///   attach / park   from `endpoint`: `start`; from `started`: -
+            ///
+            /// Every move and read is under the connection lock; `serve`
+            /// takes the mode at its entry as a parameter (attach and park
+            /// change the phase under the handler). Handler-end state
+            /// (`detached`, `parked`) is a second axis: a parked stream is
+            /// `started`, an unattached detached one `endpoint`. Every move
+            /// is a cell here, made through `next`; add a state or a row,
+            /// not a flag beside it.
+            const Phase = enum(u8) {
+                head,
+                awaiting_body,
+                endpoint,
+                started,
+
+                const Event = enum { queue, await_body, start };
+
+                fn next(p: Phase, ev: Event) Phase {
+                    return switch (ev) {
+                        .queue => switch (p) {
+                            .head, .awaiting_body => .endpoint,
+                            .endpoint, .started => p,
+                        },
+                        .await_body => switch (p) {
+                            .head => .awaiting_body,
+                            .awaiting_body, .endpoint, .started => p,
+                        },
+                        .start => .started,
+                    };
+                }
+            };
 
             /// The request body's receive side:
             ///
@@ -2842,7 +2909,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // the budget, it goes to a task, whose writes wait on it.
                 // So the budget holds but for one inline body.
                 if (!gone and conn.budget.room() == 0) {
-                    s.inline_mode = false;
                     conn.startStream(s);
                     conn.unlock();
                     return;
@@ -3316,7 +3382,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = conn.tasks.fetchAdd(1, .acq_rel);
             conn.lock();
             defer conn.unlock();
-            s.inline_mode = false;
+            s.phase = s.phase.next(.start);
             return &conn.group;
         }
 
@@ -3500,7 +3566,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             s.holders.insert(.parked);
             // Bursts run on tasks, which may wait for the peer: the stream's
             // cap applies (not a `no_wait` request's queue past it).
-            s.inline_mode = false;
+            s.phase = s.phase.next(.start);
             // Its handler has answered as far as the flush is concerned.
             s.unhold();
             conn.parked_open += 1;
@@ -3767,8 +3833,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return err;
                     };
                     // Inline, the write passes the cap: no need to ask it.
-                    const cap = if (s.inline_mode) 0 else s.sendCap();
-                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, s.inline_mode) catch {
+                    const inline_write = s.phase == .endpoint;
+                    const cap = if (inline_write) 0 else s.sendCap();
+                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, inline_write) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
@@ -4267,7 +4334,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             // Trailers on a request are not passed on.
-            if (s.started or s.head_too_large) return 0;
+            if (s.phase != .head or s.head_too_large) return 0;
             const arena = s.arena.allocator();
             const v = h.nghttp3_rcbuf_get_buf(value);
             const n = h.nghttp3_rcbuf_get_buf(name);
@@ -4302,7 +4369,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3EndHeaders(_: ?*h.nghttp3_conn, _: i64, fin: c_int, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
-            if (s.started) return 0;
+            if (s.phase != .head) return 0;
             if (fin != 0) s.recv = .done;
             // On a server, 1-RTT data is only read once the handshake has
             // completed, so a head that ends before came in 0-RTT.
@@ -4312,9 +4379,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             } else if (s.recv == .done) {
                 conn.queueInline(s);
             } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
-                s.started = true;
                 s.holders.insert(.handler);
-                s.await_body = true;
+                s.phase = s.phase.next(.await_body);
             } else |_| conn.startStream(s);
             return 0;
         }
@@ -4325,11 +4391,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             s.recv = .done;
             s.rx.notify(conn.ep.io);
             if (s.wt_session) |session| session.onChannelEnd(.peer);
-            if (s.await_body) {
-                // Whole within the packet: inline after all.
-                s.await_body = false;
-                conn.queueInline(s);
-            }
+            // Whole within the packet: inline after all.
+            if (s.phase == .awaiting_body) conn.queueInline(s);
             conn.kick();
             return 0;
         }
@@ -4486,4 +4549,26 @@ test "send memory: the automatic limit, in blocks, rounded up" {
     const MiB: u64 = 1 << 20;
     // `cgroup.memoryQuarter`'s tests cover the formula.
     try std.testing.expectEqual(@as(i64, 16384), bridge.SendMemory.init(autoSendMemory(null, 256 * MiB)).limit.load(.monotonic));
+}
+
+test "h3 stream phase: every state x event cell" {
+    const Phase = Endpoint(void).Stream.Phase;
+    const rows = [_]struct { name: []const u8, from: Phase, ev: Phase.Event, want: Phase }{
+        .{ .name = "no_wait, whole: inline", .from = .head, .ev = .queue, .want = .endpoint },
+        .{ .name = "no_wait, body coming: awaited", .from = .head, .ev = .await_body, .want = .awaiting_body },
+        .{ .name = "not no_wait: a task", .from = .head, .ev = .start, .want = .started },
+        .{ .name = "FIN within the packet: inline", .from = .awaiting_body, .ev = .queue, .want = .endpoint },
+        .{ .name = "the head ends once", .from = .awaiting_body, .ev = .await_body, .want = .awaiting_body },
+        .{ .name = "body after the packet: a task, or let go on a reset", .from = .awaiting_body, .ev = .start, .want = .started },
+        .{ .name = "never re-queued", .from = .endpoint, .ev = .queue, .want = .endpoint },
+        .{ .name = "inline never awaits", .from = .endpoint, .ev = .await_body, .want = .endpoint },
+        .{ .name = "budget full, attach or park: a task's cap", .from = .endpoint, .ev = .start, .want = .started },
+        .{ .name = "a let-go stream is never queued by a later FIN", .from = .started, .ev = .queue, .want = .started },
+        .{ .name = "a started stream never awaits", .from = .started, .ev = .await_body, .want = .started },
+        .{ .name = "a task's own park", .from = .started, .ev = .start, .want = .started },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        try std.testing.expectEqual(r.want, r.from.next(r.ev));
+    }
 }

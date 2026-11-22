@@ -1093,11 +1093,11 @@ test "h3 server: long-header packets with a connection ID over 20 bytes are drop
     try std.testing.expectEqualStrings("hello over h3", body);
 }
 
-fn headersStatus(conn: *client.ClientConnection, gpa: std.mem.Allocator, extra: []const client.Header) !u16 {
+fn headersStatus(conn: *client.ClientConnection, gpa: std.mem.Allocator, path: []const u8, extra: []const client.Header) !u16 {
     var all: std.ArrayList(client.Header) = .empty;
     defer all.deinit(gpa);
     try all.appendSlice(gpa, &.{
-        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     });
     try all.appendSlice(gpa, extra);
@@ -1126,16 +1126,48 @@ test "h3 server: a request head past max_field_section_size or max_header_count 
     var names: [40][16]u8 = undefined;
     var big: [20]client.Header = undefined;
     for (&big, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-big-{d}", .{i}), .value = value };
-    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &big));
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, "/hello", &big));
 
     // Small, but more fields than request.max_header_count (32).
     var many: [40]client.Header = undefined;
     for (&many, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-many-{d}", .{i}), .value = "1" };
-    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &many));
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, "/hello", &many));
 
     // Just under both limits: served.
-    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, big[0..6]));
-    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, many[0..30]));
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, "/hello", big[0..6]));
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, "/hello", many[0..30]));
+}
+
+test "h3 server: a head past the limits on a no_wait route gets 431 inline, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const value = try gpa.alloc(u8, 8 * 1024);
+    defer gpa.free(value);
+    @memset(value, 'v');
+    var names: [40][16]u8 = undefined;
+    var big: [20]client.Header = undefined;
+    for (&big, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-big-{d}", .{i}), .value = value };
+    var many: [40]client.Header = undefined;
+    for (&many, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-many-{d}", .{i}), .value = "1" };
+    const rows = [_]struct { name: []const u8, extra: []const client.Header, want: u16 }{
+        .{ .name = "past max_field_section_size", .extra = &big, .want = 431 },
+        .{ .name = "past max_header_count", .extra = &many, .want = 431 },
+        .{ .name = "under both: served after them", .extra = many[0..30], .want = 200 },
+    };
+    const before = f.ep.stats.served_inline.load(.monotonic);
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        try std.testing.expectEqual(r.want, try headersStatus(conn, gpa, "/nw/hello", r.extra));
+    }
+    // All three ran on the endpoint task, the 431s without a handler.
+    try std.testing.expectEqual(before + rows.len, f.ep.stats.served_inline.load(.monotonic));
 }
 
 test "h3 client: a 90 KiB response head fails under the default max_header_list_size, and passes when it is raised" {
