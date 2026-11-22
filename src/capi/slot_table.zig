@@ -164,3 +164,17 @@ test "accessors: live, stale generation, wrapped generation, handle kind and byt
     var s: Slot = .{ .word = .init(0), .exec = &x, .index = 3, .next_free = engine.no_slot };
     try std.testing.expectEqual(@as(u64, 5 | 4 << 28 | 3 << 33 | 2 << 56), T.handle(&s, 5));
 }
+
+test "slot sizes unchanged since 1e5e86c7 (64-bit)" {
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    const sizes = .{
+        .{ @import("ws.zig").WsSlot, 200 },
+        .{ @import("wt.zig").SessionSlot, 192 },
+        .{ @import("wt.zig").StreamSlot, 184 },
+        .{ @import("net.zig").NetSlot, 56 },
+        .{ @import("sse.zig").SseSlot, 88 },
+        .{ @import("s3.zig").TSlot, 72 },
+        .{ @import("db.zig").TxSlot, 128 },
+    };
+    inline for (sizes) |row| try std.testing.expectEqual(@as(usize, row[1]), @sizeOf(row[0]));
+}
