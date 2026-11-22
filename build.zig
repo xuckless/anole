@@ -899,7 +899,6 @@ pub fn build(b: *std.Build) void {
         b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
     }
 
-    // ---- p3/lambda ----
     // tools/lambda_zip.zig: the std-only zip writer of `zig build lambda`
     // (the addApp wiring comes with the rest of the adapter). Its tests are
     // part of `test`; `lambda-zip` builds the tool for the host.
@@ -920,7 +919,6 @@ pub fn build(b: *std.Build) void {
         });
         b.step("lambda-zip", "Build the zip writer used by zig build lambda (host tool)").dependOn(&b.addInstallArtifact(zip_tool, .{}).step);
     }
-    // ---- end p3/lambda ----
 
     // test-compile-errors: routes and calls the compiler must refuse, each a
     // tiny file in tests/compile_errors with the message it must give.
@@ -1044,7 +1042,6 @@ pub fn build(b: *std.Build) void {
         b.step("test-kafka", "Run the Kafka live tests (live with -Dkafka-test-url=host:port)").dependOn(&run_kafka_tests.step);
     }
 
-    // ---- p3/s3 ----
     // test-s3: the S3 client's tests alone ("s3: ..."), and the C ABI's
     // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
     // server (tests/s3/run.sh).
@@ -1054,7 +1051,6 @@ pub fn build(b: *std.Build) void {
         run_s3_tests.has_side_effects = s3_test_url != null;
         b.step("test-s3", "Run the S3 tests (live with -Ds3-test-url=http://...)").dependOn(&run_s3_tests.step);
     }
-    // ---- end p3/s3 ----
 
     // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
     // HTTP/3 detached answers, the configuration parser).
@@ -2697,14 +2693,12 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
         mod.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
     }
-    // ---- p3/lambda ----
     // The sample events the adapter's tests parse (tests/lambda/events).
     if (f.lambda and o.for_test) {
         const wf = b.addWriteFiles();
         _ = wf.addCopyDirectory(b.path("tests/lambda/events"), "events", .{});
         mod.addAnonymousImport("anole_lambda_events", .{ .root_source_file = wf.add("events.zig", "pub fn get(comptime name: []const u8) []const u8 {\n    return @embedFile(\"events/\" ++ name ++ \".json\");\n}\n") });
     }
-    // ---- end p3/lambda ----
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
         .target = o.target,

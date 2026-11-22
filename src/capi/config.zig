@@ -62,41 +62,29 @@ pub const Config = struct {
     /// Message brokers for `anole_nats_*`, opened at start.
     brokers: []const Broker = &.{},
 
-    // ---- p3/jobs ----
     /// The durable job queue for `anole_jobs_*` (-Djobs).
     jobs: ?Jobs = null,
-    // ---- end p3/jobs ----
 
-    // ---- p3/webhooks ----
     /// Webhooks out (-Dwebhooks; needs "jobs"): endpoints, signed deliveries
     /// run as jobs, retries and the delivery log. See `anole_webhooks_*`.
     webhooks: ?Webhooks = null,
-    // ---- end p3/webhooks ----
 
-    // ---- p3/realtime ----
     /// Server-sent events: the settings of the topics `anole_sse_publish`
     /// and the "sse" routes use.
     sse: Sse = .{},
     /// Database changes fed into topics, or read by consumers
     /// (`anole_watch_*`).
     watches: []const Watch = &.{},
-    // ---- end p3/realtime ----
 
-    // ---- p3/s3 ----
     /// S3-compatible object stores for `anole_s3_*`, opened at start.
     storage: []const Storage = &.{},
-    // ---- end p3/s3 ----
 
-    // ---- p3/smtp ----
     /// Mail servers for `anole_smtp_*`, opened at start.
     mail: []const Mail = &.{},
-    // ---- end p3/smtp ----
 
-    // ---- p3/lambda ----
     /// AWS Lambda (`"deployment": "lambda"`): where invocations come from
     /// and how answers go back. Ignored by other deployments.
     lambda: Lambda = .{},
-    // ---- end p3/lambda ----
 
     pub const Console = struct {
         /// The control socket. Null: on (off under deployment lambda, on
@@ -151,14 +139,12 @@ pub const Config = struct {
         /// else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
 
-        // ---- p3/net ----
         /// Raw TCP instead of HTTP: connections and their data go to the
         /// consumer as events. Needs a port or unix; not with http3.
         tcp: ?NetTcp = null,
         /// UDP instead of HTTP: datagrams go to the consumer in batches.
         /// Needs a port; not with tls, unix or proxy_protocol.
         udp: ?NetUdp = null,
-        // ---- end p3/net ----
     };
 
     pub const Tls = struct {
@@ -231,10 +217,8 @@ pub const Config = struct {
         /// the answer is ANOLE_E_TOOBIG.
         db_result_max: u32 = 16 << 20,
 
-        // ---- p3/realtime ----
         /// The largest event `anole_sse_publish` and `anole_sse_send` take.
         sse_max_event: u32 = 1 << 20,
-        // ---- end p3/realtime ----
     };
 
     /// `anole.ServerOptions.admission`, with times in milliseconds.
@@ -678,9 +662,7 @@ pub const Config = struct {
         jwt: Jwt,
         rate_limit: RateLimit,
 
-        // ---- p3/webhooks ----
         webhook_verify: WebhookVerify,
-        // ---- end p3/webhooks ----
     };
 
     pub const RequestId = struct {
@@ -787,11 +769,9 @@ pub const Config = struct {
         /// After the global ones.
         middleware: []const Middleware = &.{},
 
-        // ---- p3/realtime ----
         /// a server-sent events endpoint (GET): topics from the path's
         /// parameters, served natively, or decided by a consumer.
         sse: ?SseRoute = null,
-        // ---- end p3/realtime ----
     };
     pub const Fixed = struct {
         status: u16 = 200,
@@ -914,7 +894,6 @@ pub const Config = struct {
     };
 
     // Each area's own types.
-    // ---- p3/net (types) ----
     /// How a raw TCP listener cuts input into messages: exactly one of
     /// lines, length, varint (`anole.net.Framing`).
     pub const NetFraming = struct {
@@ -957,9 +936,7 @@ pub const Config = struct {
         receive_buffer: ?u32 = null,
         send_buffer: ?u32 = null,
     };
-    // ---- end p3/net (types) ----
 
-    // ---- p3/jobs (types) ----
     pub const Jobs = struct {
         /// A `databases[].name` (PostgreSQL, SQLite or Redis), or "memory".
         store: []const u8 = "memory",
@@ -1011,9 +988,7 @@ pub const Config = struct {
         attempts: u16 = 20,
         timeout_ms: u64 = 900_000,
     };
-    // ---- end p3/jobs (types) ----
 
-    // ---- p3/webhooks (types) ----
     pub const Webhooks = struct {
         /// The jobs queue deliveries run on.
         queue: []const u8 = "webhooks",
@@ -1080,9 +1055,7 @@ pub const Config = struct {
         pub const Algorithm = enum { sha1, sha256, sha512 };
         pub const Encoding = enum { hex, base64 };
     };
-    // ---- end p3/webhooks (types) ----
 
-    // ---- p3/realtime (types) ----
     pub const Sse = struct {
         /// A comment line to every subscriber idle this long; null: none.
         heartbeat_ms: ?u32 = 15_000,
@@ -1179,9 +1152,7 @@ pub const Config = struct {
         gap_message: ?[]const u8 = null,
     };
     pub const WatchReconnect = struct { base_ms: u32 = 100, max_ms: u32 = 5000 };
-    // ---- end p3/realtime (types) ----
 
-    // ---- p3/s3 (types) ----
     /// An object store (`anole.s3.Options` and the call defaults).
     pub const Storage = struct {
         /// What `anole_s3_find` looks it up by: unique, 1-255 bytes.
@@ -1245,9 +1216,7 @@ pub const Config = struct {
         max_object_bytes: u64 = 16 * 1024 * 1024,
         readiness: bool = false,
     };
-    // ---- end p3/s3 (types) ----
 
-    // ---- p3/smtp (types) ----
     pub const Mail = struct {
         /// What `anole_smtp_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
@@ -1310,9 +1279,7 @@ pub const Config = struct {
         /// Register a readiness check (/readyz): off by default.
         readiness: bool = false,
     };
-    // ---- end p3/smtp (types) ----
 
-    // ---- p3/lambda (types) ----
     /// `ServerOptions.lambda`, durations in milliseconds.
     pub const Lambda = struct {
         /// "host:port". Null: AWS_LAMBDA_RUNTIME_API.
@@ -1333,7 +1300,6 @@ pub const Config = struct {
         shutdown_timeout_ms: u32 = 400,
         flush_timeout_ms: u32 = 500,
     };
-    // ---- end p3/lambda (types) ----
 };
 
 pub const ClientAuth = enum { none, request, require };
@@ -1439,9 +1405,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
             http3_listeners += 1;
         }
-        // ---- p3/net ----
         if (l.tcp != null or l.udp != null) try checkNet(l, i, why);
-        // ---- end p3/net ----
         if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
             return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
         for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
@@ -1449,7 +1413,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
     if (cfg.grpc) |g| try checkGrpc(g, why);
-    // ---- p3/s3 (check) ----
     for (cfg.storage, 0..) |st, i| {
         if (st.name.len == 0 or st.name.len > 255) return fail(why, "storage[{d}].name: 1-255 bytes", .{i});
         for (cfg.storage[0..i]) |other| if (std.mem.eql(u8, st.name, other.name))
@@ -1470,7 +1433,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (c.endpoint) |e| if (!(std.mem.startsWith(u8, e, "http://") or std.mem.startsWith(u8, e, "https://")))
             return fail(why, "storage[{d}].s3.endpoint: an http:// or https:// URL", .{i});
     }
-    // ---- end p3/s3 (check) ----
     for (cfg.databases, 0..) |d, i| {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
@@ -1553,7 +1515,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             }
         }
     }
-    // ---- p3/smtp (validate) ----
     for (cfg.mail, 0..) |m, i| {
         if (comptime !features.smtp) return fail(why, "mail[{d}]: SMTP is not built in (-Dsmtp)", .{i});
         if (m.name.len == 0 or m.name.len > 255) return fail(why, "mail[{d}].name: 1-255 bytes", .{i});
@@ -1569,8 +1530,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             return fail(why, "mail[{d}].smtp: a password needs a username", .{i});
         if (m.retry.attempts == 0 or m.retry.attempts > 10) return fail(why, "mail[{d}].retry.attempts: 1-10", .{i});
     }
-    // ---- end p3/smtp (validate) ----
-    // ---- p3/lambda (validate) ----
     {
         const l = cfg.lambda;
         if (l.concurrency) |n| if (n == 0 or n > 4096) return fail(why, "lambda.concurrency: 1 to 4096", .{});
@@ -1579,7 +1538,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (l.base_path) |p| if (p.len == 0 or p[0] != '/') return fail(why, "lambda.base_path: a path starting with '/'", .{});
         if (l.shutdown_timeout_ms == 0) return fail(why, "lambda.shutdown_timeout_ms: at least 1", .{});
     }
-    // ---- end p3/lambda (validate) ----
     if (cfg.observe.health) |h| {
         if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
         for (h.checks, 0..) |name, i| {
@@ -1655,8 +1613,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     try checkRealtime(cfg, why);
 }
 
-// ---- p3/realtime (checks) ----
-
 /// The SSE settings, the "sse" routes and the "watches".
 fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
     const s = cfg.sse;
@@ -1725,11 +1681,9 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
         }
     }
 }
-// ---- end p3/realtime (checks) ----
 
 /// The client certificate and key of a database: files or text, a
 /// certificate with its key, and not with `insecure_skip_verify` and a CA.
-// ---- p3/net ----
 /// A raw listener's keys (design-net.md §6.2).
 fn checkNet(l: Config.Listener, i: usize, why: *std.Io.Writer) Problem!void {
     if (l.tcp != null and l.udp != null) return fail(why, "listeners[{d}]: tcp and udp together", .{i});
@@ -1781,7 +1735,6 @@ pub fn netFraming(f: ?Config.NetFraming) anole.net.Framing {
 pub fn netMs(ms: ?u32) ?std.Io.Duration {
     return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;
 }
-// ---- end p3/net ----
 
 fn checkClientCert(c: anytype, comptime root: []const u8, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
     const files = c.client_cert_file != null or c.client_key_file != null;

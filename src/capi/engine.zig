@@ -1323,9 +1323,7 @@ pub const Engine = struct {
     pub fn needsConsumer(e: *const Engine) bool {
         for (e.config.routes) |r| if (r.handler != null or r.websocket != null or r.webtransport != null) return true;
         if (e.config.grpc) |g| if (g.services.len > 0) return true;
-        // ---- p3/net ----
         for (e.config.listeners) |l| if (l.tcp != null or l.udp != null) return true;
-        // ---- end p3/net ----
         return false;
     }
 
@@ -1533,7 +1531,6 @@ pub const Engine = struct {
                 .max_routes = cfg.console.max_routes,
             },
             ._console_runtime = cfg.console.runtime,
-            // ---- p3/lambda ----
             .lambda = .{
                 .runtime_api = cfg.lambda.runtime_api,
                 .invoke_mode = cfg.lambda.invoke_mode,
@@ -1548,7 +1545,6 @@ pub const Engine = struct {
                 .shutdown_timeout = .fromMilliseconds(cfg.lambda.shutdown_timeout_ms),
                 .flush_timeout = .fromMilliseconds(cfg.lambda.flush_timeout_ms),
             },
-            // ---- end p3/lambda ----
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1628,10 +1624,8 @@ pub const Engine = struct {
                 .http3 = l.http3,
                 .proxy_protocol = l.proxy_protocol,
                 .proxy_protocol_from = l.proxy_protocol_from,
-                // ---- p3/net ----
                 .tcp = if (l.tcp) |t| try net.tcpService(e, a, t) else null,
                 .udp = if (l.udp) |u| try net.udpService(e, a, u) else null,
-                // ---- end p3/net ----
             };
             if (l.tls) |t| {
                 if (comptime features.tls != .boringssl) return error.Unsupported;
@@ -3484,9 +3478,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
                     const len = ev.len;
-                    // ---- p3/net ----
                     if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, len);
-                    // ---- end p3/net ----
                     if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                     freeRecord(rec);
                     x.ring.pop();
@@ -3537,9 +3529,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                 }
                 @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                 pos += ev.len;
-                // ---- p3/net ----
                 if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, ev.len);
-                // ---- end p3/net ----
                 if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                 x.ovf_head = linkOf(rec).*;
                 if (x.ovf_head == null) x.ovf_tail = null;

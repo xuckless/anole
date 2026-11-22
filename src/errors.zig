@@ -16,7 +16,6 @@ pub const ServerError = error{
     InvalidEnvFile,
     ProxyProtocolNoPeers,
     IoUringRequired,
-    // ---- p3/net ----
     NetNotBuilt,
     NetListenerNeedsPort,
     NetListenerHttp3,
@@ -26,14 +25,11 @@ pub const ServerError = error{
     UdpWithProxyProtocol,
     InvalidFraming,
     NetHandlerContext,
-    // ---- end p3/net ----
 
-    // ---- p3/lambda ----
     LambdaRuntimeApiMissing,
     LambdaNotBuilt,
     LambdaRuntimeApiFailed,
     SnapStartUnsupported,
-    // ---- end p3/lambda ----
 
     // The OpenAPI document (`app.openapi`, `zig build openapi`)
     OpenApiNameClash,
@@ -277,7 +273,6 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't turn on the PROXY protocol: no peer is allowed to send the header.");
             try fix(w, "Name the load balancers in proxy.trusted or the listener's proxy_protocol_from.");
         },
-        // ---- p3/net ----
         error.NetNotBuilt => {
             try w.writeAll("can't serve raw TCP or UDP: this build leaves it out.");
             try fix(w, "Build with -Dnet (on in the web and full profiles).");
@@ -324,9 +319,7 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't serve a raw listener built for another server state type.");
             try fix(w, "Build the service with this server's Ctx (app.tcp and app.udp do).");
         },
-        // ---- end p3/net ----
 
-        // ---- p3/lambda ----
         error.LambdaRuntimeApiMissing => {
             try w.writeAll("can't start in deployment \"lambda\": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, \"Running locally\").");
             try fix(w, "Run it on Lambda or under the Runtime Interface Emulator, set lambda.runtime_api, or use another deployment.");
@@ -343,7 +336,6 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't run under Lambda SnapStart: it is not supported yet (restored copies would share random-number state).");
             try fix(w, "Publish the function without SnapStart.");
         },
-        // ---- end p3/lambda ----
 
         error.NoProtocols => {
             try w.writeAll("can't start a listener that speaks neither HTTP/1.1 nor HTTP/2.");
