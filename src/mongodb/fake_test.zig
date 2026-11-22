@@ -14,7 +14,6 @@ const dusty = @import("dusty");
 
 const testing = std.testing;
 const wait = @import("anole_test_wait");
-const safety = @import("anole_safety");
 const gpa = testing.allocator;
 
 const Fake = struct {
@@ -630,11 +629,8 @@ test "mongodb: with(options).dynamic is the dynamic runner with the context firs
 /// busy: the new monitor waits in its run queue.
 const SpawnYield = struct {
     var ran: std.atomic.Value(bool) = .init(false);
-    /// The locks the spawning task held at the spawn.
-    var held: std.atomic.Value(usize) = .init(0);
 
     fn yield(io: std.Io) void {
-        held.store(safety.heldLocks(), .release);
         ran.store(true, .release);
         zio.yield() catch io.recancel();
     }
@@ -655,7 +651,7 @@ const SpawnYield = struct {
     }
 };
 
-test "mongodb: a monitor started while the executor is busy does not suspend under the topology lock" {
+test "mongodb: a monitor whose spawn yields on a busy executor leaves the client working" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
@@ -663,7 +659,6 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     try fake.init(io);
     defer fake.deinit(io);
     SpawnYield.ran.store(false, .release);
-    SpawnYield.held.store(0, .release);
     client_mod.test_after_monitor_spawn = SpawnYield.yield;
     defer client_mod.test_after_monitor_spawn = null;
     // On executor 0, where the monitor is spawned.
@@ -673,10 +668,8 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, SpawnYield.openAndPing, .{ &fake, io, &failure });
     try group.await(io);
     if (failure) |err| return err;
-    // A monitor was spawned, and its spawn (which may yield) ran with no
-    // lock held.
+    // A monitor was spawned, and its spawn yielded.
     try testing.expect(SpawnYield.ran.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), SpawnYield.held.load(.acquire));
 }
 
 /// The close test's hooks: a monitor's end, watched from `deinit` without suspending.

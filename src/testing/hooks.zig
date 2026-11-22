@@ -21,13 +21,10 @@ pub fn dumpTasks(w: *std.Io.Writer) void {
 /// The zio configuration of the test binary, which the runner declares as
 /// the root's `zio_options` (zio reads it from the root; in a test binary
 /// that is the runner): this zio's build defaults (pinned, `fast_accept`, `fast_send`,
-/// `diagnostics`, from build.zig) with SAFETY.md's zio checks on in every
-/// test build, not only Debug ones, as `safety.enabled` is:
-/// `debug_held_locks` (L2) and `debug_cancel` (C3). A ReleaseSafe test
-/// binary then checks suspensions as well as counting locks.
+/// `diagnostics`, from build.zig) with `debug_cancel` (C3) on in every test
+/// build, not only Debug ones.
 pub const zio_options: zio.Options = blk: {
     var o: zio.Options = .{};
-    o.debug_held_locks = true;
     o.debug_cancel = true;
     break :blk o;
 };

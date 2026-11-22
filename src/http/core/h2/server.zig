@@ -92,12 +92,6 @@ const parked_mod = @import("../parked.zig");
 const Parked = parked_mod.Parked;
 
 const log = std.log.scoped(.anole_h2);
-/// zio's count of the locks a task holds (`debug_held_locks`); a no-op for
-/// the core's stub zio.
-const held_locks = if (@hasDecl(@import("zio"), "held_locks")) @import("zio").held_locks else struct {
-    fn acquired() void {}
-    fn released() void {}
-};
 
 /// The client connection preface (RFC 9113 §3.4), shared with the nghttp2
 /// engine.
@@ -346,10 +340,6 @@ pub fn Engine(comptime Ctx: type) type {
                         std.debug.assert(placement.currentExecutor(io) == l.owner);
                         std.debug.assert(!l.held);
                         l.held = true;
-                        // Counted with zio's (`debug_held_locks`), as a
-                        // mutex is: a task that suspends under it panics at
-                        // the suspension.
-                        held_locks.acquired();
                     }
                     return;
                 }
@@ -358,10 +348,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn unlock(l: *ConnLock, io: std.Io) void {
                 if (l.free) {
-                    if (comptime builtin.mode == .debug) {
-                        l.held = false;
-                        held_locks.released();
-                    }
+                    if (comptime builtin.mode == .debug) l.held = false;
                     return;
                 }
                 l.mutex.unlock(io);

@@ -11,9 +11,7 @@
 //! printed only when it fails or
 //! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
 //! and a SIGABRT handler); a failed test names its error (the
-//! server-mode runner printed only the trace); and a run with
-//! ANOLE_TEST_CHILD set runs only the tests whose names contain it
-//! (src/safety/child.zig, for tests whose claim is a panic); ANOLE_TEST_SHARD
+//! server-mode runner printed only the trace); and ANOLE_TEST_SHARD
 //! runs one shard of the tests (`shard`) and ANOLE_TEST_DURATIONS records
 //! each test's duration (`durations`). The fuzzing
 //! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
@@ -976,15 +974,8 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     });
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
-    // ANOLE: a child run of one test (src/safety/child.zig): only the tests
-    // whose names contain ANOLE_TEST_CHILD.
-    // `getAlloc` maps the whole environment first, hence page_allocator
-    // and not the small `fba`.
-    const only: ?[]const u8 = init.environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_CHILD") catch null;
-
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
-        if (only) |o| if (std.mem.indexOf(u8, test_fn.name, o) == null) continue; // ANOLE
         if (std.mem.indexOfScalar(u32, shard.list(), @intCast(i)) == null) continue; // ANOLE
         testing.allocator_instance = .init(never_reuse.allocator, .{ // ANOLE
             .canary = 0xc3a701ba,

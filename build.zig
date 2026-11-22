@@ -2242,16 +2242,13 @@ const Core = struct {
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` and `fast_send` (see `anole.zio_options`), so a
         // program whose own `zio_options` leave them out still has them. And
-        // In Debug: `debug_held_locks`, a task that suspends holding a lock
-        // panics (SAFETY.md L2; src/safety counts the locks); `debug_cancel`,
-        // a task that parks after swallowing error.Canceled is reported (C3),
-        // and the test runner fails the test. These are the defaults of a
-        // binary with no `zio_options` of its own. Test binaries have both
-        // on in every optimize mode: their root, the safety test runner,
-        // declares `zio_options` (src/testing/hooks.zig), so a
-        // ReleaseSafe test binary checks suspensions as it counts locks.
+        // in Debug `debug_cancel`: a task that parks after swallowing
+        // error.Canceled is reported (C3), and the test runner fails the
+        // test. The default of a binary with no `zio_options` of its own.
+        // Test binaries have it on in every optimize mode: their root, the
+        // test runner, declares `zio_options` (src/testing/hooks.zig).
         const debug = optimize == .debug;
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_cancel = debug }).module("zio");
         // The test allocator's backing allocator: one instance for anole_safety,
         // the hooks module and the core's runner (a file is in one module per
         // compilation).

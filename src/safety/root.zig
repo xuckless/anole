@@ -2,37 +2,17 @@
 //! outside Debug and test builds: in ReleaseFast the types here are
 //! zero-sized and their functions empty.
 //!
-//! - `Mutex`, `SpinLock`, `Condition`: locks that count themselves for L2
-//!   (zio panics when a task suspends holding one) and check the global
-//!   order of L4.
 //! - `toCtx`, `fromCtx`: the callback-context casts of U3, type-checked.
 //! - `never_reuse_allocator`: the backing allocator of the test allocator,
 //!   which never hands out an address twice, so a use after free faults.
 //! - `process_gpa`, `ProcessAllocator`: the checked allocator for code that
 //!   can't take `std.testing.allocator` (process-wide pools, the C ABI).
-//! - `IoLock`: L2's exception, a lock held across I/O (rank `io`).
-//! - `readSectionEntered`, `readSectionLeft`: the debug side of a QSBR
-//!   read section (src/http/core/qsbr.zig, M3).
 const std = @import("std");
 const builtin = @import("builtin");
 
 /// Whether the checks are compiled in: Debug builds and test builds.
 pub const enabled = builtin.mode == .debug or builtin.is_test;
 
-const lock = @import("lock.zig");
-pub const Rank = lock.Rank;
-pub const Mutex = lock.Mutex;
-pub const SpinLock = lock.SpinLock;
-pub const Condition = lock.Condition;
-pub const IoLock = lock.IoLock;
-pub const heldLocks = lock.heldLocks;
-pub const readSectionEntered = lock.readSectionEntered;
-pub const readSectionLeft = lock.readSectionLeft;
-pub const checkAllocation = lock.checkAllocation;
-pub const notePanic = lock.notePanic;
-/// Tests whose claim is a panic: they run their own binary again (see
-/// child.zig). Test binaries built with src/testing/runner.zig only.
-pub const child = @import("child.zig");
 const ctx = @import("ctx.zig");
 pub const toCtx = ctx.toCtx;
 pub const fromCtx = ctx.fromCtx;
@@ -96,8 +76,6 @@ pub const process_gpa: std.mem.Allocator = process_state.allocator();
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("lock.zig");
-    _ = @import("child.zig");
     _ = @import("ctx.zig");
     _ = @import("anole_never_reuse");
 }

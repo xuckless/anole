@@ -25,7 +25,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const safety = @import("anole_safety");
 const zlib = @import("zlib");
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 const libdeflate_io = if (build_options.use_libdeflate) @import("libdeflate_io.zig") else struct {};
@@ -87,10 +86,8 @@ threadlocal var local: Local = .{};
 threadlocal var live_for_test: isize = 0;
 
 /// The encoders are shared by every task on the thread, so a taker holds
-/// them in a read section until `release` (SAFETY.md M3): a task that
-/// suspends first panics in debug builds, naming `site`.
-fn take(comptime which: std.meta.FieldEnum(Used), site: usize) void {
-    safety.readSectionEntered(site);
+/// them until `release` without suspending.
+fn take(comptime which: std.meta.FieldEnum(Used)) void {
     if (std.debug.runtime_safety) {
         std.debug.assert(!local.in_use); // an encoder held across a yield
         local.in_use = true;
@@ -109,7 +106,7 @@ pub fn zstd(z: *zstd_io.Compress, output: *std.Io.Writer, level: c_int, len: usi
         if (builtin.is_test) live_for_test += 1;
         break :blk ctx;
     };
-    take(.zstd, @returnAddress());
+    take(.zstd);
     errdefer release();
     try z.initWith(ctx, output, &.{}, .{ .level = level, .window_log = null, .pledged_size = len });
 }
@@ -120,13 +117,13 @@ pub fn zstd(z: *zstd_io.Compress, output: *std.Io.Writer, level: c_int, len: usi
 pub fn gzip(output: *std.Io.Writer) std.mem.Allocator.Error!*zlib.Compress {
     comptime std.debug.assert(build_options.use_zlib);
     if (local.gzip) |*g| {
-        take(.gzip, @returnAddress());
+        take(.gzip);
         g.reset(output);
         return g;
     }
     local.gzip = try zlib.Compress.init(block_cache.allocator, output, &.{}, .gzip, gzip_options);
     if (builtin.is_test) live_for_test += 1;
-    take(.gzip, @returnAddress());
+    take(.gzip);
     return &local.gzip.?;
 }
 
@@ -141,7 +138,7 @@ pub fn deflater() ?*Deflater {
         if (builtin.is_test) live_for_test += 1;
         break :blk d;
     };
-    take(.deflater, @returnAddress());
+    take(.deflater);
     return d;
 }
 
@@ -194,7 +191,6 @@ fn freeDeflater() void {
 /// grew past `max_zstd_context` and a scratch past `max_kept_scratch`.
 pub fn release() void {
     if (std.debug.runtime_safety) local.in_use = false;
-    safety.readSectionLeft(@returnAddress());
     if (build_options.use_zstd) if (local.zstd) |ctx| {
         if (zstd_io.contextSize(ctx) > max_zstd_context) freeZstd();
     };
