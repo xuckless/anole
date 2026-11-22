@@ -1,4 +1,4 @@
-//! The storage contract of the job queue (p3/jobs, design-jobs.md §3.3, §4):
+//! The storage contract of the job queue (design-jobs.md §3.3, §4):
 //! every state change after a claim is conditional on `(id, attempt,
 //! state = running)`, so a worker that lost its lease can never complete,
 //! fail or snooze the job. A backend implements `VTable`; `store_memory.zig`

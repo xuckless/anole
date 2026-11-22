@@ -1,6 +1,6 @@
 //! The job queue's client: enqueue, handlers, the runner (fetchers,
 //! heartbeat, maintenance, drain), cron and the admin calls
-//! (p3/jobs, design-jobs.md §3).
+//! (design-jobs.md §3).
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");

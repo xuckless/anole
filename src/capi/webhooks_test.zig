@@ -1,4 +1,4 @@
-//! C ABI tests for p3/webhooks, imported from engine_test.zig.
+//! C ABI tests for webhooks, imported from engine_test.zig.
 const std = @import("std");
 const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");

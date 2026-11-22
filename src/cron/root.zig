@@ -1,6 +1,6 @@
 //! Schedules (`-Djobs`): cron expressions and time zones, one runner per
 //! process or one per cluster through a lock; works without a jobs store
-//! (p3/jobs, design-jobs.md C1-C7).
+//! (design-jobs.md C1-C7).
 //!
 //!     const s = try anole.cron.Schedule.parse("0 3 * * *", null);
 //!     const next = s.next(now, &zone);

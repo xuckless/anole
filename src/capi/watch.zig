@@ -1,5 +1,5 @@
 //! `anole_watch_*`: watches over PostgreSQL LISTEN/NOTIFY, Redis pub/sub
-//! and streams and MongoDB change streams (p3/realtime, design-realtime.md).
+//! and streams and MongoDB change streams (design-realtime.md).
 //! Handle kind 15 (`anole_watch_sub`); events 116-118.
 //!
 //! The configuration's "watches" are made when the server opens (after the

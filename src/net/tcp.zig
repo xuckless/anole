@@ -1,4 +1,4 @@
-//! Raw TCP servers (p3/net, design-net.md §2.2 to §3): the application's own
+//! Raw TCP servers (design-net.md §2.2 to §3): the application's own
 //! protocol on Anole's listeners. The HTTP core's accept loops, connection
 //! cap, PROXY protocol, TLS and parking do the work up to a ready
 //! connection (`Listener.raw`); from there a `TcpConn` serves it, as the

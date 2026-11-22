@@ -1,4 +1,4 @@
-//! C ABI tests for p3/lambda (the `lambda` group), imported from
+//! C ABI tests for lambda (the `lambda` group), imported from
 //! engine_test.zig. The end-to-end cases at the end run against the fake
 //! Runtime API of src/lambda/fake_runtime_test.zig: a consumer route answered
 //! through Lambda, `timeout_us` following the invocation, and

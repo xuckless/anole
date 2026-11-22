@@ -1786,7 +1786,6 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
             if (r.limit == 0 or r.window_ms <= 0) return fail(why, "{s}[{d}].rate_limit: limit and window_ms must be positive", .{ where, i });
         },
         .compress => if (comptime !features.compression) return fail(why, "{s}[{d}].compress: compression is not built in (-Dcompression)", .{ where, i }),
-        // p3/webhooks
         .webhook_verify => |w| try @import("webhooks.zig").checkVerify(w, where, i, why),
         else => {},
     };
@@ -1891,7 +1890,6 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
                 .policy = .{ .limit = c.limit, .window = .fromMilliseconds(c.window_ms), .burst = c.burst },
             });
         },
-        // p3/webhooks
         .webhook_verify => |c| return @import("webhooks.zig").verifyMiddleware(app, arena, c),
     }
 }

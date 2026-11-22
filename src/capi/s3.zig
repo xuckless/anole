@@ -1,6 +1,6 @@
 //! `anole_s3_*`: the configuration's S3-compatible object stores
-//! ("storage"), used without blocking the caller (p3/s3,
-//! design-connectors.md section 5). Handle kind 16 (`anole_s3_transfer`);
+//! ("storage"), used without blocking the caller
+//! (design-connectors.md section 5). Handle kind 16 (`anole_s3_transfer`);
 //! events 124-125.
 //!
 //! A one-shot call (get, head, put, delete, list, copy, multipart) copies

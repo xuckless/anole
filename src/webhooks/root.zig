@@ -1,6 +1,6 @@
 //! Webhooks (`-Dwebhooks`): Standard Webhooks delivery to customer
 //! endpoints, run as jobs, and the `Verify` middleware for incoming ones
-//! (p3/webhooks, design-jobs.md phase W).
+//! (design-jobs.md phase W).
 //!
 //! Out: Anole keeps endpoints (owner, URL, event filter, secrets), messages
 //! and a delivery log in the jobs store; `publish` turns one event into one

@@ -165,7 +165,7 @@ pub const EventType = enum(u32) {
     s3_result = 124,
     s3_data = 125,
 
-    /// p3/smtp: the answer to anole_smtp_send.
+    /// The answer to anole_smtp_send.
     smtp_result = 126,
 };
 

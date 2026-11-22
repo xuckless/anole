@@ -1,4 +1,4 @@
--- The Redis/Valkey job store's scripts (p3/jobs, design-jobs.md §4.3). One
+-- The Redis/Valkey job store's scripts (design-jobs.md §4.3). One
 -- script, loaded with SCRIPT LOAD and called by EVALSHA:
 --   ARGV[1] = key prefix ("anole:"), ARGV[2] = the operation, ARGV[3..] = its arguments.
 -- Times are Unix milliseconds. Keys are built inside the script, which is

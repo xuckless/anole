@@ -1,5 +1,5 @@
 //! `anole_net_*`: raw TCP and UDP listeners whose connections and datagrams
-//! go to a consumer (p3/net, design-net.md §6.4). Handle kinds 10
+//! go to a consumer (design-net.md §6.4). Handle kinds 10
 //! (`anole_net_conn`) and 11 (`anole_net_udp`); events 96-100.
 //!
 //! The listeners are Anole's own (`anole.net`): the configuration's "tcp"

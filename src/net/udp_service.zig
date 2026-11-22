@@ -1,4 +1,4 @@
-//! Raw UDP servers (p3/net, design-net.md §2.6 and §4): datagram handlers
+//! Raw UDP servers (design-net.md §2.6 and §4): datagram handlers
 //! on Anole's runtime. One SO_REUSEPORT socket per executor on Linux (the
 //! kernel's 4-tuple hash keeps a peer on one socket, so per-peer state needs
 //! no lock), one elsewhere. Each socket has a reader task, which receives

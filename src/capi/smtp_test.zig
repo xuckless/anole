@@ -1,4 +1,4 @@
-//! C ABI tests for p3/smtp, imported from engine_test.zig: `anole_smtp_*`
+//! C ABI tests for smtp, imported from engine_test.zig: `anole_smtp_*`
 //! through the engine against `anole.smtp.testing.FakeServer`, driven
 //! through its Zig entry points as in engine_test.zig. Waits poll the
 //! consumer with generous bounds; no assertion is about time.

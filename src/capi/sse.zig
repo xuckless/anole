@@ -1,5 +1,5 @@
-//! `anole_sse_*`: server-sent event topics for consumers (p3/realtime,
-//! design-realtime.md §7). Handle kind 14 (`anole_sse`); events 112-113.
+//! `anole_sse_*`: server-sent event topics for consumers
+//! (design-realtime.md §7). Handle kind 14 (`anole_sse`); events 112-113.
 //!
 //! The topics are Anole's (`anole.sse.Topics`): a publish fans out on
 //! Anole's threads without entering the language, a subscriber's stream is

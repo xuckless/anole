@@ -338,7 +338,7 @@ pub const Slot = struct {
     ws_slot: u32 = no_slot,
     /// A server-sent events route the consumer decides
     /// (ANOLE_EV_SSE_SUBSCRIBE); `ws_slot` is then its SSE slot, and
-    /// `anole_sse_accept` stores the topics after the headers (p3/realtime).
+    /// `anole_sse_accept` stores the topics after the headers.
     sse_subscribe: bool = false,
     sse_last: u32 = 0,
     /// `anole_ws_accept`: the extra headers are stored as a response's are,
@@ -1062,7 +1062,7 @@ pub const Route = struct {
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
     /// A WebTransport endpoint's settings.
     wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
-    /// A server-sent events endpoint (p3/realtime): its topic templates.
+    /// A server-sent events endpoint: its topic templates.
     sse: ?SseRoute = null,
 };
 
@@ -1727,7 +1727,7 @@ pub const Engine = struct {
                     .kind = .ws,
                 });
             } else if (rc.sse) |sc| {
-                // p3/realtime: parked event streams; an idle subscriber holds
+                // Parked event streams; an idle subscriber holds
                 // no task. The consumer decides the subscription (or not).
                 const route = try a.create(Route);
                 route.* = .{

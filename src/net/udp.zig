@@ -560,7 +560,7 @@ pub const Udp = struct {
 
 const cmsg_align = std.Io.net.cmsg_align;
 const native_endian = @import("builtin").cpu.arch.endian();
-// HTTP/3's scope, as before the move; p3/net may give raw listeners their own.
+// HTTP/3's scope, as before the move; raw listeners may get their own.
 const log = std.log.scoped(.anole_h3);
 
 test "UDP: a send that a cancelation interrupts leaves it for the next cancelation point" {

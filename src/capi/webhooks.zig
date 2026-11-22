@@ -1,9 +1,9 @@
 //! `anole_webhooks_*`: webhooks out, delivered as jobs, and the
-//! `webhook_verify` middleware's configuration (p3/webhooks, design-jobs.md
+//! `webhook_verify` middleware's configuration (design-jobs.md
 //! phase W). Events 109-110.
 //!
 //! `open` builds `app.webhooks(...)` from the configuration's "webhooks"
-//! on the jobs client that p3/jobs opened. A publish copies the event and
+//! on the jobs client. A publish copies the event and
 //! becomes a command for one of the consumer's executors, whose task runs
 //! `Client.publishJson` and queues `ANOLE_EV_WEBHOOK_PUBLISHED`. With a
 //! transaction it is queued on the transaction (`TxWhat.webhook_publish`)
@@ -83,7 +83,7 @@ pub const ExecState = struct {
     }
 };
 
-/// The jobs client p3/jobs opened (null until that area is merged).
+/// The jobs client, null when the engine has none.
 fn jobsClient(e: *Engine) ?*anole.jobs.Client {
     if (comptime !features.jobs) return null;
     if (comptime !@hasField(@TypeOf(e.jobs_state), "client")) return null;

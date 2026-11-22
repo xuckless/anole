@@ -1,4 +1,4 @@
-//! C ABI tests for p3/jobs, imported from engine_test.zig: the configuration
+//! C ABI tests for jobs, imported from engine_test.zig: the configuration
 //! and its parity with `anole.jobs`, enqueueing, workers and their jobs,
 //! cancels, the admin operations. The engine is driven through its Zig entry
 //! points on the memory store. Waits poll the consumer with generous bounds;
