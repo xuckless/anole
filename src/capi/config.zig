@@ -14,6 +14,9 @@ const features = anole.features;
 pub const Config = struct {
     /// Executor threads: 0 for one per CPU (cgroup-aware).
     executors: u32 = 0,
+    /// "auto" (io_uring on Linux, epoll when the kernel refuses a ring) or
+    /// "io_uring" (refuse to start without it).
+    io_engine: anole.IoEngine = .auto,
     /// "development" or "production". Null: ANOLE_ENV, else production.
     environment: ?anole.Environment = null,
     /// What sits in front: "standalone", "behind_proxy", "anole_lb",
@@ -1978,6 +1981,16 @@ test "parse: an empty document gives one listener and request_ms 30000" {
     try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms.?);
 }
 
+test "parse: io_engine is auto unless the document says io_uring" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectEqual(anole.IoEngine.auto, (try parse(arena.allocator(), "{}", &why)).io_engine);
+    try std.testing.expectEqual(anole.IoEngine.auto, (try parse(arena.allocator(), "{\"io_engine\": \"auto\"}", &why)).io_engine);
+    try std.testing.expectEqual(anole.IoEngine.io_uring, (try parse(arena.allocator(), "{\"io_engine\": \"io_uring\"}", &why)).io_engine);
+}
+
 test "parse: a full document with routes, middleware and observe parses" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -2031,6 +2044,7 @@ test "parse: each refused document is error.Config with a reason" {
 
     const bad = [_][]const u8{
         "{\"nope\": 1}",
+        "{\"io_engine\": \"epoll\"}",
         "{\"routes\": [{\"path\": \"/x\"}]}",
         "{\"routes\": [{\"path\": \"/x\", \"handler\": 1, \"respond\": {}}]}",
         "{\"routes\": [{\"path\": \"x\", \"handler\": 1}]}",

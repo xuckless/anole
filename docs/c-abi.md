@@ -471,6 +471,7 @@ Bindings may switch on it; tokens are only ever added.
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
 | `InvalidEnvironmentVariable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`, `AWS_LAMBDA_*`, `ANOLE_LAMBDA_INVOKE_MODE`; `proxy_protocol` with an empty `proxy.trusted`) |
 | `LambdaRuntimeApiMissing`, `LambdaNotBuilt` | `ANOLE_E_CONFIG` | `anole_server_create` (`deployment` lambda with no Runtime API, or a build without `-Dlambda`) |
+| `IoUringRequired` | `ANOLE_E_CONFIG` | `anole_server_start` (`io_engine` "io_uring" on a runtime that fell back to epoll, or off Linux) |
 | `SnapStartUnsupported` | `ANOLE_E_CONFIG` | `anole_server_start` (a function published with SnapStart) |
 | `LambdaRuntimeApiFailed` | `ANOLE_E_SYSTEM` | `anole_server_start` / `anole_server_wait` (the Runtime API failed; Lambda starts a new environment) |
 | `NotSse`, `WrongWatchKind`, `UnknownWatch` | `ANOLE_E_STATE`, `ANOLE_E_STATE`, `ANOLE_E_INVALID` | `anole_sse_accept` on a request that is no SSE subscription; `anole_watch_ack` on a watch that is not a Redis stream group with manual acks; `anole_watch_find` |
@@ -750,6 +751,7 @@ none.
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
+| `io_engine` | `"auto"` | `io_engine` (`"auto"` or `"io_uring"`; the latter fails the start when io_uring is not what runs) |
 | `databases[].timeout_ms` | 30000 | the connectors' `timeout` (0 is null: none); also a transaction's bound when its `timeout_ms` is 0 |
 | `databases[].mongodb.max_connections`, `databases[].sqlite.ping_timeout_ms` | null (100), 2000 | `mongodb.Options.max_connections`, `sqlite.Options.ping_timeout` |
 | `lambda.*` | see [Lambda](#lambda) | `lambda.*` (durations as `_ms`) |
