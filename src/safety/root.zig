@@ -2,8 +2,6 @@
 //! outside Debug and test builds: in ReleaseFast the types here are
 //! zero-sized and their functions empty.
 //!
-//! - `Teardown`: the alive -> closing -> dead state of M5.
-//! - `Owner`: the executor an object belongs to (T3).
 //! - `Mutex`, `SpinLock`, `Condition`: locks that count themselves for L2
 //!   (zio panics when a task suspends holding one) and check the global
 //!   order of L4.
@@ -23,8 +21,6 @@ const builtin = @import("builtin");
 /// Whether the checks are compiled in: Debug builds and test builds.
 pub const enabled = builtin.mode == .debug or builtin.is_test;
 
-pub const Teardown = @import("teardown.zig").Teardown;
-pub const Owner = @import("owner.zig").Owner;
 const lock = @import("lock.zig");
 pub const Rank = lock.Rank;
 pub const Mutex = lock.Mutex;
@@ -143,8 +139,6 @@ pub const process_gpa: std.mem.Allocator = process_state.allocator();
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("teardown.zig");
-    _ = @import("owner.zig");
     _ = @import("lock.zig");
     _ = @import("child.zig");
     _ = @import("alloc_check.zig");

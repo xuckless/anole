@@ -9,7 +9,6 @@
 //! I/O lock only keeps accidental sharing safe.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const testHold = @import("test_hold.zig").testHold;
 const protocol = @import("protocol.zig");
 const sasl = @import("sasl.zig");
@@ -253,7 +252,6 @@ pub const Cluster = struct {
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    teardown: safety.Teardown = .init,
     /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
     /// waits, calls out or takes another lock while it is held.
     mutex: std.Io.Mutex = .init,
@@ -286,7 +284,6 @@ pub const Cluster = struct {
     }
 
     pub fn deinit(self: *Cluster) void {
-        self.teardown.begin();
         self.closing.store(true, .release);
         // No round holds the turn: every caller is joined.
         if (self.meta_conn) |c| c.close();
@@ -301,7 +298,6 @@ pub const Cluster = struct {
         self.topics.deinit(self.gpa);
         for (self.bootstrap) |s| self.gpa.free(s);
         self.gpa.free(self.bootstrap);
-        self.teardown.end();
         self.gpa.destroy(self);
     }
 

@@ -9,7 +9,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const low = @import("udp.zig");
 const sessions_mod = @import("sessions.zig");
 const handoff = @import("../handoff.zig");
@@ -322,8 +321,6 @@ pub const UdpSocket = struct {
     last_dropped: ?u32 = null,
     table: ?SessionNode = null,
 
-    /// The executor its tasks run on (T3): `go` and the sender check it.
-    owner: safety.Owner = .none,
     // Sends from any task or thread: no lock.
     /// Batches to send; owner: the sender, which seals it when it ends.
     pending: push_list.PushList = .{},
@@ -461,7 +458,6 @@ pub const UdpSocket = struct {
     /// executor). Canceled at the stop.
     pub fn go(s: *UdpSocket, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) error{ OutOfMemory, Closed }!void {
         if (s.closed.load(.acquire)) return error.Closed;
-        s.owner.check(s.group.io);
         placement.concurrent(&s.tasks, s.group.io, .local, func, args) catch return error.OutOfMemory;
     }
 
@@ -499,8 +495,6 @@ pub const UdpSocket = struct {
     fn reader(s: *UdpSocket) std.Io.Cancelable!void {
         const g = s.group;
         const io = g.io;
-        // The reader and the sender run on this socket's executor.
-        s.owner = .here(io);
         const o = &g.service.options;
         const table = g.service.table;
         defer {
@@ -673,7 +667,6 @@ pub const UdpSocket = struct {
 
     fn sender(s: *UdpSocket) std.Io.Cancelable!void {
         const io = s.group.io;
-        s.owner = .here(io);
         defer {
             // Sealed first, so a later send gets Closed; what got in goes
             // out before the socket does.
@@ -689,7 +682,6 @@ pub const UdpSocket = struct {
     }
 
     fn drainQueue(s: *UdpSocket) void {
-        s.owner.check(s.group.io);
         s.sendBatches(s.pending.takeAll());
     }
 

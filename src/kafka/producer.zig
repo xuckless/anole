@@ -12,7 +12,6 @@ const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
 const push_list = dusty.push_list;
-const safety = @import("anole_safety");
 const test_hold = @import("test_hold.zig");
 const testHold = test_hold.testHold;
 const protocol = @import("protocol.zig");
@@ -363,8 +362,7 @@ const Sender = struct {
     /// Under `Producer.mutex`. `failed`: its spawn failed; the next
     /// `startSender` tries again.
     state: enum { starting, running, failed } = .starting,
-    /// The executor of its task, which alone uses `conn` (T3).
-    owner: safety.Owner = .none,
+    /// Used by its task alone, on that task's executor.
     conn: ?*cluster_mod.Conn = null,
 };
 
@@ -404,7 +402,6 @@ pub const Producer = struct {
     /// atomic pointer to telemetry that lives as long as the client (#159).
     tel: std.atomic.Value(?*const Telemetry) = .init(null),
 
-    teardown: safety.Teardown = .init,
     /// Over everything below but `group`. A leaf (L4): no cluster call, no
     /// spawn, no metrics family, no I/O and no other lock while it is held.
     mutex: std.Io.Mutex = .init,
@@ -442,7 +439,6 @@ pub const Producer = struct {
 
     /// Stops the senders, fails what is left, frees everything.
     pub fn deinit(self: *Producer) void {
-        self.teardown.begin();
         self.mutex.lockUncancelable(self.io);
         self.stopping = true;
         self.mutex.unlock(self.io);
@@ -466,7 +462,6 @@ pub const Producer = struct {
         self.topics.deinit(self.gpa);
         self.active.deinit(self.gpa);
         self.waits.deinit(self.gpa);
-        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -918,7 +913,6 @@ pub const Producer = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            s.owner = .here(self.io);
             s.state = .running;
         }
         defer if (s.conn) |c| {
@@ -1144,7 +1138,6 @@ pub const Producer = struct {
     }
 
     fn sendWorkInner(self: *Producer, s: *Sender, arena: std.mem.Allocator, work: []Work) cluster_mod.ConnError!void {
-        s.owner.check(self.io);
         if (s.conn == null) s.conn = try self.cluster.connectBroker(s.id);
         const conn = s.conn.?;
         std.mem.sort(Work, work, {}, struct {

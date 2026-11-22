@@ -26,7 +26,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole_log = @import("anole_log");
-const safety = @import("anole_safety");
 const framing_mod = @import("framing.zig");
 const net_metrics = @import("metrics.zig");
 
@@ -673,12 +672,8 @@ pub const TcpListener = struct {
     /// by nobody.
     fn driverFor(self: *TcpListener, info: *const dusty.RawInfo) !*Driver {
         const d = &self.drivers[info.executor % self.drivers.len];
-        if (d.started) {
-            d.owner.check(info.io);
-            return d;
-        }
+        if (d.started) return d;
         d.io = info.io;
-        d.owner = .here(info.io);
         d.started = true;
         placement.concurrent(info.group, info.io, .local, Driver.run, .{d}) catch |err| {
             d.started = false;
@@ -707,7 +702,6 @@ pub const TcpListener = struct {
 /// resolves on its own executor: a kick from any thread touches the slot,
 /// never the connection.
 const Driver = struct {
-    owner: safety.Owner = .none,
     /// Started (`driverFor`, its executor only).
     started: bool = false,
     io: std.Io = undefined,
@@ -1190,7 +1184,6 @@ const TcpConn = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     driver: *Driver,
-    owner: safety.Owner,
     /// The connection's executor, for the sends' fast path (null off zio:
     /// never taken).
     exec: ?usize,
@@ -1306,7 +1299,6 @@ const TcpConn = struct {
             .io = info.io,
             .gpa = gpa,
             .driver = driver,
-            .owner = .here(info.io),
             .exec = placement.currentExecutor(info.io),
             .kick = kick,
             .id = next_conn_id.fetchAdd(1, .monotonic),
@@ -1356,7 +1348,6 @@ const TcpConn = struct {
     fn release(a: *dusty.Adopter) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         const io = t.io;
-        t.owner.check(io);
         // Every spawn site checks this and spawns without a suspension in
         // between, on this executor.
         _ = t.flags.fetchOr(Flag.closed, .seq_cst);
@@ -1507,9 +1498,9 @@ const TcpConn = struct {
 
     /// The caller runs on the connection's executor. Off zio (`exec` null,
     /// as on `std.Io.Threaded`) never: the executor reasoning in this file
-    /// (T3's owner checks, M3's "nothing suspends between a look and its
-    /// use", the driver's slots) assumes zio's pinned executors, which
-    /// every Anole server runs on; it does not hold elsewhere.
+    /// (M3's "nothing suspends between a look and its use", the driver's
+    /// slots) assumes zio's pinned executors, which every Anole server runs
+    /// on; it does not hold elsewhere.
     fn onOwner(t: *const TcpConn) bool {
         const e = t.exec orelse return false;
         return placement.currentExecutor(t.io) == e;
@@ -1576,7 +1567,6 @@ const TcpConn = struct {
     /// refusal paths go on with `t`; a zio whose spawn could yield and then
     /// fail would make them use-after-free (MAINTAINING.md, zio bumps).
     fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) Spawned {
-        t.owner.check(t.io);
         if (t.isClosed()) return .refused;
         const slot = t.kick;
         const gen = slot.gen;
@@ -1873,7 +1863,6 @@ const TcpConn = struct {
     /// against the driver's `kicked` store then these loads, so a kick
     /// dropped because the slot was still listed finds its flag here.
     fn serviceKick(t: *TcpConn) void {
-        t.owner.check(t.io);
         if (t.flags.load(.seq_cst) & Flag.drain_pending != 0) {
             const f = t.flags.fetchAnd(~Flag.drain_pending, .seq_cst);
             if (f & Flag.drain_pending != 0) {
@@ -2085,7 +2074,6 @@ const TcpConn = struct {
     }
 
     fn writableTask(t: *TcpConn) void {
-        t.owner.check(t.io);
         t.writable_pending.store(false, .release);
         if (t.isClosed()) return;
         t.callLock();
@@ -2151,7 +2139,6 @@ const TcpConn = struct {
     fn flusher(t: *TcpConn) void {
         const io = t.io;
         const o = &t.service.options;
-        t.owner.check(io);
         while (true) {
             if (t.isDead()) {
                 t.discardAll();
@@ -2325,7 +2312,6 @@ const TcpConn = struct {
     /// ends (or `linger` passes), so a client that closes on FIN goes at
     /// once instead of holding the stop until `timeouts.shutdown`.
     fn drainTask(t: *TcpConn) void {
-        t.owner.check(t.io);
         if (t.isClosed()) return;
         t.callLock();
         defer t.callUnlock();
@@ -2455,7 +2441,6 @@ const TcpConn = struct {
     /// Hands a burst's bytes to the handler. False when the connection
     /// ended meanwhile (a bad frame, a failed callback).
     fn deliver(t: *TcpConn, bytes: []const u8) anyerror!bool {
-        t.owner.check(t.io);
         const table = t.service.table;
         const f = table.data orelse return true;
         const o = &t.service.options;

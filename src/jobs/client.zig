@@ -4,7 +4,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 const clock_mod = @import("clock.zig");
@@ -147,7 +146,6 @@ pub const Client = struct {
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
     /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
     work_stopped: bool = false,
-    teardown: safety.Teardown = .init,
     /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
@@ -204,7 +202,6 @@ pub const Client = struct {
     /// run may use any of them (SAFETY.md M2); `deinit` calls it first.
     /// Outside an app, call it before freeing what the handlers use.
     pub fn stopWork(self: *Client) void {
-        self.teardown.assertNotDead();
         if (self.work_stopped) return;
         self.work_stopped = true;
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
@@ -220,8 +217,6 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.teardown.begin();
-        // stopWork's assertNotDead accepts .closing, the state begin() set.
         self.stopWork();
         self.backend.vt.deinit(self.backend.ptr);
         for (self.queues) |*q| q.kinds.deinit(self.gpa);
@@ -239,7 +234,6 @@ pub const Client = struct {
             self.gpa.destroy(mm);
         }
         self.arena_state.deinit();
-        self.teardown.end();
         self.gpa.destroy(self);
     }
 
