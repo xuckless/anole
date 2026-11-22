@@ -442,7 +442,11 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 return null;
             }
             s.cancel();
-            try wait.waitAtLeast(c.io, "the engine lets the reset request go", &c.a.e.aborted_count, aborted + 1);
+            // `gone` is set only once the engine orphaned the slot (the
+            // count rises before it looks at the slot).
+            _, const sl, _ = try engine.slotOfKind(c.a.e, held, .request);
+            try wait.waitFlag(c.io, "the engine orphans the reset request", &sl.gone);
+            try std.testing.expect(c.a.e.aborted_count.load(.monotonic) >= aborted + 1);
             hold.release.store(true, .release);
             t.join();
             joined = true;

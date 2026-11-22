@@ -275,9 +275,8 @@ pub const Event = enum { answered, deadline, abandon };
 /// (*) stop: wake the task (a request), or end the call UNAVAILABLE
 /// (`grpc.stop`). (**) gRPC calls are swept by `grpc.sweep`, which only
 /// unwatches an orphan at its deadline. A `streaming` slot under `destroy`
-/// is cut whoever owns it (`abandonAll`), except an orphaned gRPC call,
-/// whose call memory went with its stream; a gRPC call's task is told once
-/// (task | timed_out -> abandoned).
+/// is cut whoever owns it (`abandonAll`); a gRPC call by its owner
+/// (`grpc_stream_cut`).
 pub const Owner = union(enum) {
     /// A task waits for the answer (HTTP/1.1), or writes it (a detached
     /// answer after `take`).
@@ -3268,9 +3267,8 @@ pub inline fn finish(x: *Exec, si: u32, w: u64, comptime ev: Event) void {
     const s = &x.slots[si];
     const io = x.engine.io;
     switch (s.owner) {
-        .task, .timed_out => switch (ev) {
+        .task => switch (ev) {
             .answered => s.event.set(io),
-            // A timed-out task was unlinked: the sweeper never meets it.
             .deadline => {
                 x.unlink(si);
                 s.owner.timeout();
@@ -3278,6 +3276,15 @@ pub inline fn finish(x: *Exec, si: u32, w: u64, comptime ev: Event) void {
             },
             .abandon => {
                 x.unlink(si);
+                s.owner.abandon();
+                if (isGrpc(s)) grpc.stop(x, s) else s.event.set(io);
+            },
+        },
+        .timed_out => switch (ev) {
+            .answered => s.event.set(io),
+            .deadline => unreachable, // unlinked when timed out
+            // The task answers 503, not 504; already unlinked.
+            .abandon => {
                 s.owner.abandon();
                 if (isGrpc(s)) grpc.stop(x, s) else s.event.set(io);
             },
@@ -3306,6 +3313,33 @@ pub inline fn finish(x: *Exec, si: u32, w: u64, comptime ev: Event) void {
     }
 }
 
+/// How `abandonAll` cuts a gRPC call `streaming` toward its client, by
+/// owner. A call's task is told once (`stop` rewrites the call's status, so
+/// not again while the task finishes with the consumer's); one still held
+/// by its Detached is told each round until its task takes it (the owner
+/// cannot say abandoned and keep the Detached); an orphaned call's memory
+/// went with its stream (its done-list entry releases it). A new owner is
+/// a new row here.
+pub const StreamCut = enum { skip, stop_once, stop };
+pub const grpc_stream_cut: std.EnumArray(std.meta.Tag(Owner), StreamCut) = .init(.{
+    .task = .stop_once,
+    .timed_out = .stop_once,
+    .abandoned = .skip,
+    .detached = .stop,
+    .orphan = .skip,
+});
+
+test "capi engine: destroy cuts a streaming gRPC call by its owner" {
+    const rows = [_]struct { std.meta.Tag(Owner), StreamCut }{
+        .{ .task, .stop_once }, .{ .timed_out, .stop_once }, .{ .abandoned, .skip },
+        .{ .detached, .stop },  .{ .orphan, .skip },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("owner: {t}\n", .{r[0]});
+        try std.testing.expectEqual(r[1], grpc_stream_cut.get(r[0]));
+    }
+}
+
 /// Run by the capi task while `abandon` is set (`destroy` on a server not
 /// drained): every request and call a consumer still owes is answered at
 /// once (503, UNAVAILABLE; streams are cut) and the consumer hears nothing
@@ -3317,18 +3351,14 @@ fn abandonAll(x: *Exec) void {
         const w = s.word.load(.acquire);
         switch (stateOf(w)) {
             .queued, .out => finish(x, si, w, .abandon),
-            // A stream is cut whoever owns it. A call's task is told once
-            // (`stop` rewrites the call's status); one still held by its
-            // Detached is told each round until its task takes it; an
-            // orphaned call's memory went with its stream (its done-list
-            // entry releases it).
-            .streaming => if (isGrpc(s)) switch (s.owner) {
-                .task, .timed_out => {
+            // A stream is cut whoever owns it; a gRPC call by its owner.
+            .streaming => if (isGrpc(s)) switch (grpc_stream_cut.get(s.owner)) {
+                .skip => {},
+                .stop_once => {
                     s.owner.abandon();
                     grpc.stop(x, s);
                 },
-                .detached => grpc.stop(x, s),
-                .abandoned, .orphan => {},
+                .stop => grpc.stop(x, s),
             } else {
                 s.out.acquire();
                 s.out.failed = true;
