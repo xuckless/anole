@@ -67,8 +67,10 @@ pub const Detached = struct {
         /// The response will be written by a task from now on, which may
         /// wait (for the peer, for more body). Under the connection's lock
         /// (the lock rule of the engine's own spawns), refuses with
-        /// `error.ConnectionClosed` once the connection's tasks are over,
-        /// else runs `spawn` into the connection's group, so the
+        /// `error.ConnectionClosed` once the connection's tasks are over
+        /// (HTTP/2; HTTP/3 aborts every detached response before its group
+        /// is joined, so it never refuses), else runs `spawn` into the
+        /// connection's group, so the
         /// connection's end cancels the task: the check and the spawn are
         /// one step, and no task joins a group already joined for the last
         /// time. On an error the owner calls `finish` with an error. On the
