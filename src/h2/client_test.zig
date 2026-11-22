@@ -258,6 +258,25 @@ test "h2 client: the connection's phase moves only by its table, and only forwar
     try std.testing.expect(P.freed.reached(.dead) and !P.shutting.reached(.dead) and P.open.reached(.open));
 }
 
+test "h2 client: a stream's request side moves only by its table" {
+    const Q = h2.Stream.Req;
+    const Row = struct { from: Q, wait: Q, room: Q, close_send: Q };
+    // The table in `Req`'s doc comment, cell for cell; none x close_send
+    // stays none (a stream with no writer never gets one).
+    const rows = [_]Row{
+        .{ .from = .none, .wait = .none, .room = .none, .close_send = .none },
+        .{ .from = .open, .wait = .waiting_room, .room = .open, .close_send = .closed },
+        .{ .from = .waiting_room, .wait = .waiting_room, .room = .open, .close_send = .closed },
+        .{ .from = .closed, .wait = .closed, .room = .closed, .close_send = .closed },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("from {t}\n", .{r.from});
+        try std.testing.expectEqual(r.wait, r.from.next(.wait));
+        try std.testing.expectEqual(r.room, r.from.next(.room));
+        try std.testing.expectEqual(r.close_send, r.from.next(.close_send));
+    }
+}
+
 test "h2 client: a stream's response moves only by its table; the first cause wins" {
     const R = h2.Stream.Resp;
     const Row = struct { name: []const u8, from: R, ev: R.Event, to: R };
@@ -305,7 +324,7 @@ test "h2 client: a stream's response moves only by its table; the first cause wi
 fn streamClosed(s: *h2.Stream) bool {
     s.conn.mutex.lockUncancelable(s.conn.io);
     defer s.conn.mutex.unlock(s.conn.io);
-    return s.protocol_done;
+    return !s.holders.contains(.protocol);
 }
 
 test "h2 client: a body read after its stream closed gives its window back to the connection" {
@@ -1670,7 +1689,7 @@ test "h2 client: a body writer whose stream the server ended gets WriteFailed, n
         fn f(st: *h2.Stream) bool {
             st.conn.mutex.lockUncancelable(st.conn.io);
             defer st.conn.mutex.unlock(st.conn.io);
-            return st.waiting_room;
+            return st.req == .waiting_room;
         }
     }.f);
     // The server answers in full, then ends the stream (grpc-go after an
