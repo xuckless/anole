@@ -526,7 +526,7 @@ pub const ClientConnection = struct {
         // goes out, but no more DATA is framed: `release` frees a stream
         // of a dead connection at once, while its unframed body (lent to
         // the core) is still queued.
-        self.proto.dead = true;
+        self.proto.kill();
         self.shut = true;
         if (self.failure == null) self.failure = err;
         self.unlock();

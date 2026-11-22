@@ -1493,7 +1493,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const b = &es.blocks[es.cur];
                 if (!b.inflight) return true;
                 const s = es.cs orelse return true;
-                if (es.reset or conn.send_shut or conn.proto.dead) return true;
+                if (es.reset or conn.send_shut or conn.proto.in == .dead) return true;
                 if (b.mark == null) {
                     var queued: usize = 0;
                     var it = s.pending.first;
@@ -1645,7 +1645,7 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.wakeRoom(es);
                     return;
                 };
-                if (es.reset or conn.send_shut or conn.proto.dead or conn.chainReclaim(es)) es.room.notify(conn.io);
+                if (es.reset or conn.send_shut or conn.proto.in == .dead or conn.chainReclaim(es)) es.room.notify(conn.io);
                 const idle = es.chain.first == null;
                 if ((idle or es.reset) and !es.reset_due) {
                     es.room_waiting = false;
@@ -2485,7 +2485,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return false;
             }
             if (conn.live.first != null or conn.flushing or conn.send_waiter or conn.ready.items.len != 0 or conn.awaiting.items.len != 0) return false;
-            if (conn.drain_notice or conn.goaway_sent or conn.proto.dead or conn.drain_req.load(.acquire) != 0) return false;
+            if (conn.drain_notice or conn.goaway_sent or conn.proto.in == .dead or conn.drain_req.load(.acquire) != 0) return false;
             if (conn.server.busy.load(.acquire).draining) return false;
             if (!connection.parkable()) return false;
             const shelf = conn.server.shelfHere() orelse return false;

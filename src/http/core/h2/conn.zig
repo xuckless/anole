@@ -88,8 +88,9 @@ pub const Role = enum { server, client };
 pub const Error = error{ResetStream};
 
 pub const RecvError = error{
-    /// A GOAWAY is queued in `out` (`Conn.goaway_sent` has its code): flush
-    /// `out`, then close. Every later `recv` fails the same way.
+    /// A GOAWAY is queued in `out` (`Conn.goaway_sent` has its code, and
+    /// `Conn.in` is `.dead`): flush `out`, then close. Every later `recv`
+    /// fails the same way.
     ConnectionError,
     /// The client preface was wrong; nothing is queued (RFC 9113 §3.4
     /// allows the GOAWAY to be omitted, and nghttp2 sends none). Close.
@@ -286,14 +287,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         send_window: i32 = default_window,
         recv_window: i32,
         recv_unacked: u32 = 0,
-        /// Client preface bytes still expected.
-        magic_left: u8 = client_magic.len,
-        /// The next frame must be the client's first SETTINGS.
-        first_settings: bool = true,
-        /// The DATA frame whose payload is arriving.
-        data_in: ?DataIn = null,
-        /// The header block being assembled (HEADERS without END_HEADERS).
-        block: ?Block = null,
+        /// Where the inbound parser is (`In`).
+        in: In = .{ .magic = client_magic.len },
         /// One request's (or trailers') field checks, per block; a
         /// response's for the client role.
         req: if (role == .server) fields.Request else fields.Response = .{},
@@ -301,10 +296,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         goaway_sent: ?ErrorCode = null,
         remote_last: u31 = std.math.maxInt(u31),
         /// The client role: the server sent GOAWAY, so no new streams.
+        /// Independent of `goaway_sent`: a client can have both.
         goaway_recv: bool = false,
-        /// A connection error was answered: nothing more is read
-        /// (nghttp2's IB_IGN_ALL).
-        dead: bool = false,
         /// Nesting of public calls; closes run when the outermost returns.
         depth: u32 = 0,
         closing: std.SinglyLinkedList = .{},
@@ -365,6 +358,40 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         const Kind = enum { request, trailers, ignore };
 
+        /// The inbound parser's phase: nghttp2's nghttp2_inbound_state
+        /// (nghttp2_session.h), one value, dispatched on by `recvFrames`.
+        /// Whole frames are parsed from the caller's buffer, so the
+        /// per-frame IB_READ_* states aren't stored.
+        ///
+        ///   magic          IB_READ_CLIENT_MAGIC (bytes left, never 0)
+        ///   first_settings IB_READ_FIRST_SETTINGS
+        ///   frame          IB_READ_HEAD
+        ///   data           IB_READ_PAD_DATA (pad null), IB_READ_DATA,
+        ///                  IB_IGN_DATA (deliver false)
+        ///   continuation   IB_EXPECT_CONTINUATION, IB_READ_HEADER_BLOCK
+        ///                  and IB_IGN_HEADER_BLOCK (kind .ignore)
+        ///   dead           IB_IGN_ALL
+        ///
+        /// Every transition (another store is a bug):
+        ///   magic -> magic | first_settings   recvFrames, preface bytes
+        ///   first_settings -> frame           onSettings (before its flood check)
+        ///   frame -> data                     dataHead
+        ///   data -> frame                     dataPayload, at the last byte
+        ///   frame -> continuation             onHeaders without END_HEADERS
+        ///   continuation -> frame             onContinuation at END_HEADERS
+        ///   any -> dead                       kill only (an error out of recv)
+        /// A wrong preface byte, a frame other than a non-ACK SETTINGS in
+        /// first_settings, and in continuation anything but a CONTINUATION
+        /// on the block's stream are connection errors (-> dead).
+        pub const In = union(enum) {
+            magic: u8,
+            first_settings,
+            frame,
+            data: DataIn,
+            continuation: Block,
+            dead,
+        };
+
         const Block = struct {
             stream_id: u31,
             kind: Kind,
@@ -410,7 +437,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             };
             errdefer c.out.deinit();
             if (role == .client) {
-                c.magic_left = 0;
+                c.in = .first_settings;
                 c.remote.max_concurrent_streams = client_initial_peer_streams;
                 const m = try c.out.writable(client_magic.len);
                 @memcpy(m[0..client_magic.len], client_magic);
@@ -450,7 +477,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             std.debug.assert(c.depth == 0 and c.closing.first == null);
             var i: usize = 0;
             while (c.table.next(&i)) |s| c.dropPending(s);
-            if (c.block) |*b| b.buf.deinit(c.gpa);
+            c.kill();
             while (c.spare.popFirst()) |node| c.gpa.destroy(@as(*Pending, @fieldParentPtr("node", node)));
             c.table.deinit();
             c.slab.deinit();
@@ -487,65 +514,82 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// executor will do: recv never yields).
         pub fn recv(c: *Self, bytes: []const u8, now_s: u64, scratch: []u8) RecvError!usize {
             std.debug.assert(scratch.len >= @max(c.opts.max_header_list_size, hpack.table_capacity));
-            if (c.dead) return error.ConnectionError;
+            if (c.in == .dead) return error.ConnectionError;
             c.enter();
             defer c.leave();
             c.now_s = now_s;
             var pos: usize = 0;
             c.recvFrames(bytes, &pos, scratch) catch |err| {
-                c.dead = true;
+                c.kill();
                 return err;
             };
             return pos;
         }
 
+        /// Any phase -> dead (nghttp2's IB_IGN_ALL): nothing more is read,
+        /// and the header block being assembled is freed. Idempotent.
+        pub fn kill(c: *Self) void {
+            if (c.in == .continuation) c.in.continuation.buf.deinit(c.gpa);
+            c.in = .dead;
+        }
+
+        /// nghttp2_session_mem_recv2: one switch on the phase (`In`).
         fn recvFrames(c: *Self, bytes: []const u8, pos: *usize, scratch: []u8) RecvError!void {
-            // NGHTTP2_IB_READ_CLIENT_MAGIC.
-            while (c.magic_left > 0) {
-                const rest = bytes[pos.*..];
-                if (rest.len == 0) return;
-                const n = @min(rest.len, c.magic_left);
-                const at = client_magic.len - c.magic_left;
-                if (!std.mem.eql(u8, rest[0..n], client_magic[at..][0..n])) return error.BadPreface;
-                pos.* += n;
-                c.magic_left -= @intCast(n);
-            }
-            while (true) {
-                const opts: frame.Options = .{ .max_frame_size = c.local.max_frame_size, .max_settings = c.opts.limits.max_settings };
-                if (c.data_in != null) {
+            while (true) switch (c.in) {
+                .magic => |left| {
+                    const rest = bytes[pos.*..];
+                    if (rest.len == 0) return;
+                    const n: u8 = @intCast(@min(rest.len, left));
+                    const at = client_magic.len - left;
+                    if (!std.mem.eql(u8, rest[0..n], client_magic[at..][0..n])) return error.BadPreface;
+                    pos.* += n;
+                    c.in = if (n == left) .first_settings else .{ .magic = left - n };
+                },
+                .data => {
                     try c.dataPayload(bytes, pos);
-                    if (c.data_in != null) return;
-                    continue;
-                }
-                const rest = bytes[pos.*..];
-                if (rest.len < frame.header_len) return;
-                const raw = frame.FrameHeader.parse(rest[0..frame.header_len]);
-                // NGHTTP2_IB_EXPECT_CONTINUATION, before the frame's own
-                // checks.
-                if (c.block) |b| if (raw.type != .continuation or raw.stream_id != b.stream_id)
-                    return c.terminate(.protocol_error, "unexpected non-CONTINUATION frame or stream_id is invalid");
-                // NGHTTP2_IB_READ_FIRST_SETTINGS.
-                if (c.first_settings and (raw.type != .settings or raw.flags & frame.flags.ack != 0))
-                    return c.terminate(.protocol_error, "SETTINGS expected");
-                if (raw.type == .data) {
-                    const h = switch (frame.parseHead(rest, opts)) {
-                        .head => |h| h,
-                        .fault => |f| return c.terminate(f.code, f.reason),
-                        .need => unreachable,
+                    if (c.in == .data) return;
+                },
+                .dead => return error.ConnectionError,
+                .first_settings, .frame, .continuation => {
+                    const rest = bytes[pos.*..];
+                    if (rest.len < frame.header_len) return;
+                    const raw = frame.FrameHeader.parse(rest[0..frame.header_len]);
+                    // The phase's check on the header, before the frame's
+                    // own checks.
+                    const why: ?[]const u8 = switch (c.in) {
+                        .frame => null,
+                        .continuation => |*b| if (raw.type != .continuation or raw.stream_id != b.stream_id)
+                            "unexpected non-CONTINUATION frame or stream_id is invalid"
+                        else
+                            null,
+                        .first_settings => if (raw.type != .settings or raw.flags & frame.flags.ack != 0)
+                            "SETTINGS expected"
+                        else
+                            null,
+                        .magic, .data, .dead => unreachable,
                     };
-                    pos.* += frame.header_len;
-                    try c.dataHead(h);
-                    continue;
-                }
-                switch (frame.parse(rest, opts)) {
-                    .need => return,
-                    .fault => |f| return c.terminate(f.code, f.reason),
-                    .frame => |f| {
-                        pos.* += f.len;
-                        try c.dispatch(f.parsed, scratch);
-                    },
-                }
-            }
+                    if (why) |w| return c.terminate(.protocol_error, w);
+                    const opts: frame.Options = .{ .max_frame_size = c.local.max_frame_size, .max_settings = c.opts.limits.max_settings };
+                    if (raw.type == .data) {
+                        const h = switch (frame.parseHead(rest, opts)) {
+                            .head => |h| h,
+                            .fault => |f| return c.terminate(f.code, f.reason),
+                            .need => unreachable,
+                        };
+                        pos.* += frame.header_len;
+                        try c.dataHead(h);
+                        continue;
+                    }
+                    switch (frame.parse(rest, opts)) {
+                        .need => return,
+                        .fault => |f| return c.terminate(f.code, f.reason),
+                        .frame => |f| {
+                            pos.* += f.len;
+                            try c.dispatch(f.parsed, scratch);
+                        },
+                    }
+                },
+            };
         }
 
         fn dispatch(c: *Self, p: frame.Parsed, scratch: []u8) RecvError!void {
@@ -598,8 +642,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// nghttp2_session_terminate_session_with_reason: GOAWAY with the
         /// last processed stream, and nothing more is read.
         fn terminate(c: *Self, code: ErrorCode, reason: []const u8) RecvError {
-            if (!c.dead) {
-                c.dead = true;
+            if (c.in != .dead) {
+                c.kill();
                 c.goaway_sent = code;
                 c.queueGoaway(code, reason) catch return error.OutOfMemory;
             }
@@ -629,8 +673,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // Ignored DATA is skipped whole, its padding unread: nghttp2
             // goes to NGHTTP2_IB_IGN_DATA before inbound_frame_handle_pad
             // (found by the session differential).
-            c.data_in = .{ .stream_id = id, .left = h.length, .pad = if (padded and deliver) null else 0, .end_stream = end_stream, .deliver = deliver };
-            try c.recvWindows(&c.data_in.?, h.length);
+            c.in = .{ .data = .{ .stream_id = id, .left = h.length, .pad = if (padded and deliver) null else 0, .end_stream = end_stream, .deliver = deliver } };
+            try c.recvWindows(&c.in.data, h.length);
             if (h.length == 0) {
                 if (!end_stream) try c.chargeEmptyFrame();
                 var none: usize = 0;
@@ -641,7 +685,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// NGHTTP2_IB_READ_PAD_DATA, NGHTTP2_IB_READ_DATA and
         /// NGHTTP2_IB_IGN_DATA: as much of the payload as `bytes` holds.
         fn dataPayload(c: *Self, bytes: []const u8, pos: *usize) RecvError!void {
-            const d = &c.data_in.?;
+            // Dies at `kill` or `c.in = .frame`: never read after either.
+            const d = &c.in.data;
             if (d.pad == null) {
                 if (pos.* == bytes.len) return;
                 const pad = bytes[pos.*];
@@ -666,7 +711,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 d.deliver = false;
                 // Ignored DATA is consumed at once (nghttp2's IB_IGN_DATA).
                 try c.consumeNow(null, n);
-                if (last) c.data_in = null;
+                if (last) c.in = .frame;
                 return;
             };
             // Padding is consumed at once.
@@ -678,12 +723,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                     try c.consumeNow(null, dn);
                     d.deliver = false;
                     try c.provokedReset(s, .protocol_error);
-                    if (last) c.data_in = null;
+                    if (last) c.in = .frame;
                     return;
                 };
             }
             const end = last and d.end_stream;
-            if (last) c.data_in = null;
+            if (last) c.in = .frame;
             if (dn == 0 and !end) return;
             if (end) {
                 // nghttp2_session_on_data_received: the content-length must
@@ -728,7 +773,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // while it is open (h2o's _continuation.buf).
             var b: Block = .{ .stream_id = id, .kind = kind, .end_stream = hd.end_stream };
             try b.buf.appendSlice(c.gpa, hd.fragment);
-            c.block = b;
+            c.in = .{ .continuation = b };
         }
 
         /// session_process_headers_frame: nghttp2_session_on_headers_received
@@ -819,7 +864,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         fn onContinuation(c: *Self, ct: frame.Continuation, scratch: []u8) RecvError!void {
-            const b = if (c.block) |*b| b else return c.terminate(.protocol_error, "CONTINUATION: unexpected");
+            if (c.in != .continuation) return c.terminate(.protocol_error, "CONTINUATION: unexpected");
+            // Dies at `kill` (which frees its buffer) or `c.in = .frame`.
+            const b = &c.in.continuation;
             // nghttp2_session_mem_recv2 :6831 (CVE-2024-28182), with a
             // GOAWAY where nghttp2 returns a fatal error (INTENTIONAL.md,
             // limits 4).
@@ -831,7 +878,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             try b.buf.appendSlice(c.gpa, ct.fragment);
             if (!ct.end_headers) return;
             var done = b.*;
-            c.block = null;
+            c.in = .frame;
             defer done.buf.deinit(c.gpa);
             try c.decodeBlock(done.stream_id, done.kind, done.end_stream, done.buf.items, scratch);
         }
@@ -1028,8 +1075,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // unlimited (RFC 9113 §6.5.2): the assumption ends with its
             // first (nghttp2_session_on_settings_received, :4495, as
             // NGHTTP2_DEFAULT_MAX_CONCURRENT_STREAMS).
-            if (role == .client and c.first_settings) c.remote.max_concurrent_streams = std.math.maxInt(u32);
-            c.first_settings = false;
+            if (c.in == .first_settings) {
+                if (role == .client) c.remote.max_concurrent_streams = std.math.maxInt(u32);
+                c.in = .frame;
+            }
             // nghttp2's early flood check (:5897): with the budget spent,
             // the entries aren't applied.
             try c.chargeControl(frame.header_len);
@@ -1425,7 +1474,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             comptime std.debug.assert(role == .client);
             c.enter();
             defer c.leave();
-            if (c.dead or c.goaway_recv or c.goaway_sent != null) return error.GoawayReceived;
+            if (c.in == .dead or c.goaway_recv or c.goaway_sent != null) return error.GoawayReceived;
             if (c.table.size >= c.remote.max_concurrent_streams) return error.StreamLimit;
             if (c.last_sent > std.math.maxInt(u31) - 2) return error.StreamIdsExhausted;
             const id: u31 = if (c.last_sent == 0) 1 else c.last_sent + 2;
@@ -1463,7 +1512,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// The client role: whether `submitRequest` would find room under
         /// the server's limit (and no GOAWAY).
         pub fn canOpen(c: *const Self) bool {
-            return !c.dead and !c.goaway_recv and c.goaway_sent == null and c.table.size < c.remote.max_concurrent_streams;
+            return c.in != .dead and !c.goaway_recv and c.goaway_sent == null and c.table.size < c.remote.max_concurrent_streams;
         }
 
         /// The response head: `:status` then `hdrs`, HEADERS split into
@@ -1614,7 +1663,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// idle connection parks only then, as nginx keeps a connection
         /// whose `state.incomplete` is set out of its idle mode.
         pub fn atFrameBoundary(c: *const Self) bool {
-            return c.data_in == null and c.block == null;
+            return switch (c.in) {
+                .magic, .first_settings, .frame, .dead => true,
+                .data, .continuation => false,
+            };
         }
 
         /// An idle connection's memory back (PLAN §3.4): the output
@@ -1657,7 +1709,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         pub fn pending(c: *Self, vecs: [][]const u8) Allocator.Error![]const []const u8 {
             c.enter();
             defer c.leave();
-            if (!c.dead) try c.frameData(vecs.len);
+            if (c.in != .dead) try c.frameData(vecs.len);
             return c.out.iovecs(vecs);
         }
 

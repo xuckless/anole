@@ -324,6 +324,56 @@ test "h2 client conn: the server's first frame must be SETTINGS" {
     try expectFrames(try t.drain(), &.{goawayWith(.protocol_error)});
 }
 
+test "h2 client conn: inbound phase and the GOAWAY facts" {
+    // The client role's rows of the `In` table (conn_test.zig's
+    // "h2 conn: inbound phase" has the rest), and GOAWAY sent and received
+    // as two facts that coexist.
+    const Step = enum { settings, ping, srv_goaway, our_goaway };
+    const Row = struct {
+        name: []const u8,
+        opts: conn.Options = .{},
+        steps: []const Step = &.{},
+        /// What the last step fails with.
+        err: ?anyerror = null,
+        tag: std.meta.Tag(CC.In),
+        goaway_sent: ?ErrorCode = null,
+        goaway_recv: bool = false,
+        max_concurrent_streams: u32 = std.math.maxInt(u32),
+    };
+    const rows = [_]Row{
+        .{ .name = "fresh: no magic to read, the server's SETTINGS first", .tag = .first_settings, .max_concurrent_streams = conn.client_initial_peer_streams },
+        .{ .name = "the server's PING first", .steps = &.{.ping}, .err = error.ConnectionError, .tag = .dead, .goaway_sent = .protocol_error, .max_concurrent_streams = conn.client_initial_peer_streams },
+        .{ .name = "the server's SETTINGS lift the limit", .steps = &.{.settings}, .tag = .frame },
+        // Lifted before the flood check, as nghttp2 (and before this
+        // rework) did.
+        .{ .name = "a first SETTINGS over the control budget", .opts = .{ .limits = .{ .control_frame_budget = 0 } }, .steps = &.{.settings}, .err = error.ConnectionError, .tag = .dead, .goaway_sent = .enhance_your_calm },
+        .{ .name = "GOAWAY received, then ours", .steps = &.{ .settings, .srv_goaway, .our_goaway }, .tag = .frame, .goaway_sent = .no_error, .goaway_recv = true },
+        .{ .name = "ours, then GOAWAY received", .steps = &.{ .settings, .our_goaway, .srv_goaway }, .tag = .frame, .goaway_sent = .no_error, .goaway_recv = true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        const t = try CT.create(testing.allocator, row.opts);
+        defer t.destroy();
+        // The magic is queued (`drain` checks it), then our SETTINGS.
+        try expectEqual(frame.Type.settings, (try t.drain())[0].type);
+        for (row.steps, 0..) |step, i| {
+            const r = switch (step) {
+                .settings => t.feed(try t.srv.settings(&.{})),
+                .ping => t.feed(try t.srv.ping(false, @splat(0))),
+                .srv_goaway => t.feed(try t.srv.goaway(0, .no_error)),
+                .our_goaway => t.c.goaway(.no_error, ""),
+            };
+            if (i + 1 == row.steps.len and row.err != null) try expectError(row.err.?, r) else try r;
+        }
+        try expectEqual(row.tag, std.meta.activeTag(t.c.in));
+        try expectEqual(row.goaway_sent, t.c.goaway_sent);
+        try expectEqual(row.goaway_recv, t.c.goaway_recv);
+        try expectEqual(row.max_concurrent_streams, t.c.remote.max_concurrent_streams);
+        if (row.goaway_sent != null or row.goaway_recv)
+            try expectError(error.GoawayReceived, t.c.submitRequest(&get, true, null));
+    }
+}
+
 test "h2 client conn: requests open odd IDs in order, and HEADERS carry the request head" {
     const t = try ready(.{});
     defer t.destroy();

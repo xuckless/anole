@@ -59,6 +59,8 @@ pub const Rec = struct {
     fail_data: bool = false,
     /// `reset(s, CANCEL)` from onField.
     reset_in_field: bool = false,
+    /// `atFrameBoundary` as the last onHeadersEnd saw it.
+    boundary_at_end: ?bool = null,
 
     pub fn log(r: *Rec, e: Event) void {
         if (r.record) r.events.append(r.gpa, e) catch @panic("OOM");
@@ -81,6 +83,7 @@ pub const Rec = struct {
 
     pub fn onHeadersEnd(r: *Rec, s: *Stream, end_stream: bool) conn.Error!void {
         r.log(.{ .end = .{ .id = s.id, .end_stream = end_stream, .trailers = s.flags.in_trailers } });
+        r.boundary_at_end = r.c.atFrameBoundary();
         if (r.fail_end) return error.ResetStream;
         if (end_stream and r.answer and s.canSend()) r.respond(s);
     }
@@ -701,6 +704,187 @@ test "h2 conn: preface and SETTINGS handshake" {
     }
 }
 
+/// What a row of "h2 conn: inbound phase" feeds (or does) to the server.
+const Input = enum {
+    empty,
+    magic,
+    magic10,
+    bad_byte,
+    magic_settings,
+    settings,
+    settings_ack,
+    settings_head8,
+    ping,
+    headers1,
+    post1,
+    data1_part,
+    data1_rest,
+    data1_empty_end,
+    padded1_head,
+    padded1_bad,
+    block3,
+    cont3_mid,
+    cont3_end,
+    cont5,
+    data3,
+    headers5,
+    our_goaway,
+    kill,
+};
+
+fn inputBytes(t: *T, blk: []const u8, i: Input) ![]const u8 {
+    const data1 = try t.data(1, "0123456789", false);
+    const padded1 = try t.raw(0, F.padded, 1, &.{ 5, 'a' });
+    return switch (i) {
+        .empty => "",
+        .magic => conn.client_magic,
+        .magic10 => conn.client_magic[0..10],
+        .bad_byte => "X",
+        .magic_settings => try std.mem.concat(t.arena(), u8, &.{ conn.client_magic, try t.settings(&.{}) }),
+        .settings => try t.settings(&.{}),
+        .settings_ack => try t.settingsAck(),
+        .settings_head8 => (try t.settings(&.{}))[0..8],
+        .ping => try t.ping(false, @splat(1)),
+        .headers1 => try t.headers(1, &get, true),
+        .post1 => try t.headers(1, &post, false),
+        .data1_part => data1[0..14],
+        .data1_rest => data1[14..],
+        .data1_empty_end => try t.data(1, "", true),
+        .padded1_head => padded1[0..9],
+        .padded1_bad => padded1[9..],
+        .block3 => try t.headersFrame(3, .{ .end_stream = true, .end_headers = false, .fragment = blk[0..5] }),
+        .cont3_mid => try t.continuation(3, false, blk[5..9]),
+        .cont3_end => try t.continuation(3, true, blk[9..]),
+        .cont5 => try t.continuation(5, true, blk[9..]),
+        .data3 => try t.data(3, "x", false),
+        .headers5 => try t.headers(5, &get, true),
+        .our_goaway, .kill => unreachable,
+    };
+}
+
+fn apply(t: *T, blk: []const u8, i: Input) !void {
+    switch (i) {
+        .our_goaway => try t.c.goaway(.no_error, ""),
+        // Twice: kill is idempotent.
+        .kill => for (0..2) |_| t.c.kill(),
+        else => try t.feed(try inputBytes(t, blk, i)),
+    }
+}
+
+test "h2 conn: inbound phase" {
+    // The `In` table, a row per transition and per rejected input: the
+    // prefix reaches a phase, the input is the event.
+    const ready_ = [_]Input{ .magic, .settings, .settings_ack };
+    const Row = struct {
+        name: []const u8,
+        opts: conn.Options = .{},
+        prefix: []const Input = &.{},
+        input: Input,
+        err: ?anyerror = null,
+        tag: std.meta.Tag(C.In),
+        /// The magic bytes left when `tag` is .magic.
+        left: u8 = 0,
+        /// The GOAWAY queued (dead rows): its code and debug text; null
+        /// for a death without one (BadPreface, kill).
+        code: ?ErrorCode = null,
+        debug: []const u8 = "",
+        /// The frames queued by the input (rows that live), unchecked when null.
+        frames: ?[]const Want = &.{},
+        boundary: bool,
+    };
+    const rows = [_]Row{
+        .{ .name = "magic initial", .input = .empty, .tag = .magic, .left = 24, .boundary = true },
+        .{ .name = "magic, 10 bytes", .input = .magic10, .tag = .magic, .left = 14, .boundary = true },
+        .{ .name = "magic done", .input = .magic, .tag = .first_settings, .boundary = true },
+        .{ .name = "magic ends mid-buffer", .input = .magic_settings, .tag = .frame, .frames = &.{.{ .type = .settings, .flags = F.ack }}, .boundary = true },
+        .{ .name = "bad magic", .prefix = &.{.magic10}, .input = .bad_byte, .err = error.BadPreface, .tag = .dead, .boundary = true },
+        .{ .name = "empty in first_settings", .prefix = &.{.magic}, .input = .empty, .tag = .first_settings, .boundary = true },
+        .{ .name = "empty in frame", .prefix = &ready_, .input = .empty, .tag = .frame, .boundary = true },
+        .{ .name = "first frame an ACK", .prefix = &.{.magic}, .input = .settings_ack, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "SETTINGS expected", .boundary = true },
+        .{ .name = "first frame a PING", .prefix = &.{.magic}, .input = .ping, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "SETTINGS expected", .boundary = true },
+        .{ .name = "first frame HEADERS", .prefix = &.{.magic}, .input = .headers1, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "SETTINGS expected", .boundary = true },
+        .{ .name = "first frame, 8 header bytes", .prefix = &.{.magic}, .input = .settings_head8, .tag = .first_settings, .boundary = true },
+        .{ .name = "first SETTINGS", .prefix = &.{.magic}, .input = .settings, .tag = .frame, .frames = &.{.{ .type = .settings, .flags = F.ack }}, .boundary = true },
+        .{ .name = "a second SETTINGS", .prefix = &.{ .magic, .settings }, .input = .settings, .tag = .frame, .frames = &.{.{ .type = .settings, .flags = F.ack }}, .boundary = true },
+        .{ .name = "DATA head and part", .prefix = &(ready_ ++ .{.post1}), .input = .data1_part, .tag = .data, .frames = null, .boundary = false },
+        .{ .name = "DATA rest", .prefix = &(ready_ ++ .{ .post1, .data1_part }), .input = .data1_rest, .tag = .frame, .frames = null, .boundary = true },
+        .{ .name = "empty DATA with END_STREAM", .prefix = &(ready_ ++ .{.post1}), .input = .data1_empty_end, .tag = .frame, .boundary = true },
+        .{ .name = "HEADERS without END_HEADERS", .prefix = &ready_, .input = .block3, .tag = .continuation, .boundary = false },
+        .{ .name = "middle CONTINUATION", .prefix = &(ready_ ++ .{.block3}), .input = .cont3_mid, .tag = .continuation, .boundary = false },
+        .{ .name = "END_HEADERS CONTINUATION", .prefix = &(ready_ ++ .{ .block3, .cont3_mid }), .input = .cont3_end, .tag = .frame, .boundary = true },
+        .{ .name = "PING during a block", .prefix = &(ready_ ++ .{.block3}), .input = .ping, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "unexpected non-CONTINUATION frame or stream_id is invalid", .boundary = true },
+        .{ .name = "DATA during a block", .prefix = &(ready_ ++ .{.block3}), .input = .data3, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "unexpected non-CONTINUATION frame or stream_id is invalid", .boundary = true },
+        .{ .name = "HEADERS during a block", .prefix = &(ready_ ++ .{.block3}), .input = .headers5, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "unexpected non-CONTINUATION frame or stream_id is invalid", .boundary = true },
+        .{ .name = "CONTINUATION on another stream", .prefix = &(ready_ ++ .{.block3}), .input = .cont5, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "unexpected non-CONTINUATION frame or stream_id is invalid", .boundary = true },
+        .{ .name = "CONTINUATION without a block", .prefix = &ready_, .input = .cont3_end, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "CONTINUATION: unexpected", .boundary = true },
+        .{ .name = "death in data: invalid padding", .prefix = &(ready_ ++ .{ .post1, .padded1_head }), .input = .padded1_bad, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "DATA: invalid padding", .boundary = true },
+        .{ .name = "death in continuation: too many", .opts = .{ .max_continuations = 1 }, .prefix = &(ready_ ++ .{ .block3, .cont3_mid }), .input = .cont3_mid, .err = error.ConnectionError, .tag = .dead, .code = .enhance_your_calm, .debug = "too many CONTINUATION frames", .boundary = true },
+        .{ .name = "kill in magic", .input = .kill, .tag = .dead, .boundary = true },
+        .{ .name = "kill in first_settings", .prefix = &.{.magic}, .input = .kill, .tag = .dead, .boundary = true },
+        .{ .name = "kill in frame", .prefix = &ready_, .input = .kill, .tag = .dead, .boundary = true },
+        .{ .name = "kill in data", .prefix = &(ready_ ++ .{ .post1, .data1_part }), .input = .kill, .tag = .dead, .boundary = true },
+        .{ .name = "kill in continuation", .prefix = &(ready_ ++ .{.block3}), .input = .kill, .tag = .dead, .boundary = true },
+        .{ .name = "our GOAWAY, then HEADERS: ignored, still reading", .prefix = &(ready_ ++ .{.our_goaway}), .input = .headers1, .tag = .frame, .boundary = true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        const t = try T.create(testing.allocator, row.opts);
+        defer t.destroy();
+        const blk = try t.block(&get ++ [_]Field{ .{ .name = "x-a", .value = "aaaaaaaa" }, .{ .name = "x-b", .value = "bbbbbbbb" } });
+        for (row.prefix) |i| try apply(t, blk, i);
+        _ = try t.drain();
+        if (row.err) |e| try expectError(e, apply(t, blk, row.input)) else try apply(t, blk, row.input);
+        try expectEqual(row.tag, std.meta.activeTag(t.c.in));
+        if (row.tag == .magic) try expectEqual(row.left, t.c.in.magic);
+        try expectEqual(row.boundary, t.c.atFrameBoundary());
+        const out = try t.drain();
+        if (row.tag != .dead) {
+            if (row.frames) |w| try expectFrames(out, w);
+            continue;
+        }
+        // Dead: the GOAWAY (or none), with goaway_sent the same fact.
+        try expectEqual(row.code, t.c.goaway_sent);
+        if (row.code) |code| {
+            try expectFrames(out, &.{goawayWith(code)});
+            try expectEqualStrings(row.debug, out[0].data);
+        } else try expectFrames(out, &.{});
+        // Absorbing: recv fails before reading, nothing more is queued
+        // or framed, and kill changes nothing.
+        try expectError(error.ConnectionError, t.feed(try t.ping(false, @splat(2))));
+        t.c.kill();
+        try expect(t.c.in == .dead);
+        try expectFrames(try t.drain(), &.{});
+    }
+    // The magic split at every byte.
+    {
+        const t = try T.create(testing.allocator, .{});
+        defer t.destroy();
+        for (conn.client_magic, 1..) |b, k| {
+            try t.feed(&.{b});
+            if (k < conn.client_magic.len) try expectEqual(conn.client_magic.len - k, t.c.in.magic) else try expect(t.c.in == .first_settings);
+        }
+    }
+    // The block's end is a frame boundary already when its handler runs.
+    {
+        const t = try ready(.{});
+        defer t.destroy();
+        const blk = try t.block(&get ++ [_]Field{ .{ .name = "x-a", .value = "aaaaaaaa" }, .{ .name = "x-b", .value = "bbbbbbbb" } });
+        for ([_]Input{ .block3, .cont3_mid, .cont3_end }) |i| try apply(t, blk, i);
+        try expectEqual(true, t.rec.boundary_at_end.?);
+    }
+    // A dead connection frames no more DATA: the response head queued
+    // before the kill goes out, its body doesn't.
+    {
+        const t = try ready(.{});
+        defer t.destroy();
+        try apply(t, "", .post1);
+        t.rec.respond(t.stream(1));
+        t.c.kill();
+        try expectFrames(try t.drain(), &.{.{ .type = .headers, .id = 1 }});
+    }
+    comptime std.debug.assert(@sizeOf(C.In) <= @sizeOf(@FieldType(C.In, "continuation")) + @alignOf(@FieldType(C.In, "continuation")));
+}
+
 const Shape = enum { idle, open, half_closed_remote, half_closed_local, closed_end_stream, rst_received, rst_sent, never_opened, forgotten };
 const Probe = enum { data, headers, priority_self, rst_stream, window_update, continuation, push_promise, unknown };
 const Answer = union(enum) { none, rst: ErrorCode, goaway: ErrorCode };
@@ -828,11 +1012,11 @@ test "h2 conn: CONTINUATION assembly" {
     };
     const live = counting.allocated_bytes - counting.freed_bytes;
     try t.feed(frames[0]);
-    try expect(t.c.block != null);
+    try expect(t.c.in == .continuation);
     try t.feed(frames[1]);
     try t.feed(frames[2]);
     try t.feed(frames[3]);
-    try expect(t.c.block == null);
+    try expect(t.c.in != .continuation);
     // The assembly buffer is gone again.
     try expectEqual(live, counting.allocated_bytes - counting.freed_bytes);
     var n: usize = 0;
