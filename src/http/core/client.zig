@@ -1462,6 +1462,21 @@ pub const Connection = struct {
 
 /// HTTP client response.
 /// Call deinit() when done to release the connection.
+/// Where a response body is: nobody has asked, a reader owns the wire, or
+/// the whole body is in memory (null when empty or bodyless). Every
+/// transition is in `ClientResponse.body` and `reader`.
+///
+///   state         body()                         reader()
+///   unread        read all -> cached(result)     setup ok -> reader_taken
+///                 (error: reader_taken)          (setup error: stays unread)
+///   reader_taken  debug assert, via reader()     debug assert (one per response)
+///   cached        return the bytes, no change    .fixed(bytes), no change
+const BodyState = union(enum) {
+    unread,
+    reader_taken,
+    cached: ?[]const u8,
+};
+
 pub const ClientResponse = struct {
     // Direct pointers for reading (testable without full connection)
     arena: std.mem.Allocator,
@@ -1471,14 +1486,11 @@ pub const ClientResponse = struct {
     max_response_size: usize,
     decompress: bool = true,
 
-    // Cached body (read lazily)
-    _body: ?[]const u8 = null,
-    _body_read: bool = false,
+    _body_state: BodyState = .unread,
 
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*ResponseBodyReader.Decode = null,
-    _body_reader_taken: bool = false,
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
@@ -1553,9 +1565,7 @@ pub const ClientResponse = struct {
     /// Content-Length sizes the buffer up front (capped at 16 KiB).
     /// Result is cached for subsequent calls.
     pub fn body(self: *ClientResponse) !?[]const u8 {
-        if (self._body_read) {
-            return self._body;
-        }
+        if (self._body_state == .cached) return self._body_state.cached;
 
         // Nothing to stage: the read streams straight into the arena.
         var no_buf: [0]u8 = .{};
@@ -1571,13 +1581,9 @@ pub const ClientResponse = struct {
             else => |e| return e,
         };
 
-        self._body_read = true;
-        if (result.len == 0) {
-            self._body = null;
-            return null;
-        }
-        self._body = result;
-        return result;
+        const bytes: ?[]const u8 = if (result.len == 0) null else result;
+        self._body_state = .{ .cached = bytes };
+        return bytes;
     }
 
     /// The response body: transfer framing undone, and the content coding
@@ -1598,15 +1604,15 @@ pub const ClientResponse = struct {
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
-        if (self._body_read) {
-            r.interface = .fixed(self._body orelse &.{});
+        if (self._body_state == .cached) {
+            r.interface = .fixed(self._body_state.cached orelse &.{});
             return r;
         }
 
         // The buffer belongs to the caller, so a second reader starts empty
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
-        std.debug.assert(!self._body_reader_taken); // one body reader per response
+        std.debug.assert(self._body_state != .reader_taken); // one body reader per response
 
         // A message complete at the head has no body, whatever the coding
         // headers say -- a HEAD response, a 204, a Content-Length of zero.
@@ -1622,7 +1628,7 @@ pub const ClientResponse = struct {
         // Claimed only once there is a reader to claim it for. A coding we
         // cannot undo fails above, and nothing was read; a caller that
         // handles that error has to be able to ask again.
-        self._body_reader_taken = true;
+        self._body_state = .reader_taken;
         return r;
     }
 };

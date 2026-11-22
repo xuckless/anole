@@ -2768,3 +2768,72 @@ test "client: closeIdle closes idle pooled connections" {
     again.deinit();
     try std.testing.expectEqual(@as(u64, 2), client.dials.load(.monotonic));
 }
+
+test "Client: the body is cached once, whichever of body() and reader() asks first" {
+    const io = std.testing.io;
+    const Row = struct {
+        name: []const u8,
+        wire: []const u8,
+        max: usize = 1024,
+        // body() twice: same slice, or null
+        expect_body: ?[]const u8,
+    };
+    const rows = [_]Row{
+        .{ .name = "fixed length", .wire = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", .expect_body = "hello" },
+        .{ .name = "empty body", .wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .expect_body = null },
+        .{ .name = "204 has no body", .wire = "HTTP/1.1 204 No Content\r\n\r\n", .expect_body = null },
+    };
+    inline for (rows) |row| {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try addr.listen(io, .{ .reuse_address = true });
+        defer listener.deinit(io);
+        const port = listener.socket.address.getPort();
+        var peer_future = try io.concurrent(twoResponsePeer(row.wire, "").run, .{ &listener, io });
+        defer peer_future.cancel(io);
+
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+        var client = dusty.Client.init(std.testing.allocator, io, .{});
+        defer client.deinit();
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+
+        const first = try resp.body();
+        const second = try resp.body();
+        if (row.expect_body) |want| {
+            try std.testing.expectEqualStrings(want, first.?);
+            try std.testing.expectEqual(first.?.ptr, second.?.ptr);
+            try std.testing.expectEqual(first.?.len, second.?.len);
+        } else {
+            try std.testing.expectEqual(null, first);
+            try std.testing.expectEqual(null, second);
+        }
+
+        // reader() after body() serves the cache; nothing is on the wire.
+        var buf: [16]u8 = undefined;
+        var r = try resp.reader(&buf);
+        const got = try r.interface.allocRemaining(std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings(row.expect_body orelse "", got);
+        peer_future.cancel(io);
+    }
+}
+
+test "Client: a body past max_response_size is ResponseTooLarge and not cached" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var peer_future = try io.concurrent(twoResponsePeer("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "").run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .max_response_size = 8 });
+    defer client.deinit();
+    var resp = try client.fetch(url, .{ .stream = true });
+    defer resp.deinit();
+    try std.testing.expectError(error.ResponseTooLarge, resp.body());
+    peer_future.cancel(io);
+}
