@@ -1006,6 +1006,22 @@ test "client: an Upgrade: websocket request is WebSocketNotSupported" {
     try std.testing.expectError(error.WebSocketNotSupported, t.get("/hello", .{ .headers = &.{.{ "Upgrade", "websocket" }} }));
 }
 
+test "client: a plain GET to a wsCallbacks route answers 426 with Upgrade: websocket" {
+    if (comptime !anole.features.websocket) return error.SkipZigTest;
+    const Handlers = struct {
+        pub fn message(_: *anole.websocket.Socket, _: anole.websocket.Message) !void {}
+    };
+    var app = try testApp();
+    defer app.deinit();
+    app.wsCallbacks("/rooms/:code", Handlers);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/rooms/abc", .{});
+    defer res.deinit();
+    try res.expectStatus(.upgrade_required);
+    try res.expectHeader("upgrade", "websocket");
+}
+
 test "client: a route conflict makes client() fail with RouteConflict" {
     var app = try testApp();
     defer app.deinit();
