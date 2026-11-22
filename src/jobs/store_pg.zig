@@ -620,8 +620,7 @@ pub const Postgres = struct {
     }
 
     /// A failed leader query: the session goes (closing it releases the
-    /// lock), and a cancel is passed on, never taken for "not the leader"
-    /// (SAFETY.md C3).
+    /// lock), and a cancel is passed on, never taken for "not the leader".
     fn queryFailed(self: *Postgres, err: anyerror) error{Canceled}!bool {
         _ = self.dropSession();
         if (err == error.Canceled) return error.Canceled;

@@ -135,7 +135,7 @@ pub const Channel = struct {
         options: h2.ConnectOptions,
         http: Http,
         http3: Http3,
-        /// Guards the fields below; never held across a dial (SAFETY.md L2).
+        /// Guards the fields below; never held across a dial.
         mutex: std.Io.Mutex = .init,
         /// `activeH2`/`activeH3` are dialing (single flight: a channel uses
         /// one of them; `.auto`'s HTTP/3 dial is `h3_dialing`, which never
@@ -283,8 +283,8 @@ pub const Channel = struct {
     }
 
     /// The HTTP/2 connection of an owned channel: a fresh one when the
-    /// current has gone. One dial at a time, with no lock held across it
-    /// (SAFETY.md L2): the calls that find it running wait for it, then
+    /// current has gone. One dial at a time, with no lock held across it:
+    /// the calls that find it running wait for it, then
     /// look again; a failed dial fails only its own call. `isOpen` takes
     /// the connection's own lock, so it is asked with the channel's let go.
     fn activeH2(self: *Channel) !*h2.ClientConnection {
@@ -572,8 +572,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         }
 
         /// A cancel of the calling task (not `cancel`/`release`): the call
-        /// is reset and ends CANCELLED, and the caller passes the cancel on
-        /// (SAFETY.md C3).
+        /// is reset and ends CANCELLED, and the caller passes the cancel on.
         fn taskCanceled(self: *Self, err: h2.StreamError) bool {
             if (err != error.Canceled or self.stream.canceledLocally()) return false;
             self.status = .init(.cancelled, "cancelled");

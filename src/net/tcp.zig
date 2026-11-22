@@ -17,7 +17,7 @@
 //! Exactly one party is responsible for an outbox at any time (`sched`),
 //! so bytes leave in send order.
 //!
-//! Lifetimes (SAFETY.md M2, T1, T4): a connection is a child of the core's
+//! Lifetimes: a connection is a child of the core's
 //! connection; its helper tasks (flusher, writable, drain) are children in
 //! its own group, joined before it is freed. The driver reaches it only
 //! through its kick slot, stable memory resolved on the driver's (and the
@@ -483,7 +483,7 @@ pub const Conn = struct {
     /// the caller filled, or an `OutChunk.borrowed`), with the listener's
     /// framing around it when `frame`. Takes the chunk on success (unless
     /// `taken` says otherwise); on an error it stays the caller's. Never
-    /// allocates, frees or waits, so a caller may hold a spin lock (L5):
+    /// allocates, frees or waits, so a caller may hold a spin lock:
     /// it frees a chunk left to it, and makes the returned wake, after.
     pub fn queueChunk(c: *Conn, chunk: *OutChunk, frame: bool) SendError!Queued {
         const t = c.tc();
@@ -664,7 +664,7 @@ pub const TcpListener = struct {
     }
 
     /// The driver of the caller's executor, started by its first
-    /// connection. No lock (T3): only this executor's connections call it.
+    /// connection. No lock: only this executor's connections call it.
     /// `started` is set before the spawn, which can suspend (zio's spawn
     /// backpressure yields the spawner): a connection opening meanwhile
     /// finds the driver started, not a second one. A spawn that fails has
@@ -695,10 +695,10 @@ pub const TcpListener = struct {
 /// One per executor and listener: writes the outboxes kicked since its last
 /// round, and starts the connections' drain callbacks. owner: its
 /// `TcpListener` (process-wide memory); it runs on one executor and only
-/// there (T3), set by the first `driverFor`. Its task lives in the server's
+/// there, set by the first `driverFor`. Its task lives in the server's
 /// connection group and ends with it.
 ///
-/// It reaches connections only through their kick slots (T4), which it
+/// It reaches connections only through their kick slots, which it
 /// resolves on its own executor: a kick from any thread touches the slot,
 /// never the connection.
 const Driver = struct {
@@ -709,7 +709,7 @@ const Driver = struct {
     kicks: push_list.PushList = .{},
     signal: placement.Signal = .{},
     /// Every wake of this driver, and of its connections' tasks, from off
-    /// its executor goes through it (T5); closed when `run` ends.
+    /// its executor goes through it; closed when `run` ends.
     gate: @import("../io_gate.zig").IoGate = .{},
     /// Its connections' kick slots (its executor only).
     slots: KickSlots = .{},
@@ -840,7 +840,7 @@ pub const Kick = struct {
 // ---------------------------------------------------------------------------
 // One connection
 
-/// One send's bytes, made before anything shared is touched (L5): what a
+/// One send's bytes, made before anything shared is touched: what a
 /// send copies into, or (borrowed) what the C ABI lends. An owned chunk is
 /// one allocation: this header, then `Framing.max_prefix` bytes of room, the
 /// payload, and room for a suffix, so a frame's prefix and suffix are
@@ -1171,7 +1171,7 @@ const Sched = struct {
 
 /// One raw TCP connection. owner: the core's connection (an `Adopter`,
 /// released by it, M2: a child of its owner); its executor is the
-/// connection's (T3): every helper task is a child in `group`, spawned
+/// connection's: every helper task is a child in `group`, spawned
 /// there. Applications hold `*Conn` by contract until `close` returns
 /// (docs/net.md §1), from any thread.
 const TcpConn = struct {
@@ -1221,14 +1221,14 @@ const TcpConn = struct {
     inflight: Fifo = .{},
     /// One written chunk kept for the next sends (an echo then allocates
     /// nothing): the biggest an owner send made, up to `OutChunk.spareMax`.
-    /// owner: the connection (M2), its executor only, no atomics; freed
+    /// owner: the connection, its executor only, no atomics; freed
     /// when it parks (and not refilled while parked) and at `release`.
     /// Sends from other threads and the C ABI make their own chunks.
     spare: ?*OutChunk = null,
     /// Parked: no task, no spare (its executor only).
     parked: bool = false,
     /// The helper tasks (flusher, writable, drain): children of the
-    /// connection (T1), canceled and joined by `release`.
+    /// connection, canceled and joined by `release`.
     group: std.Io.Group = .init,
 
     /// Futex word: 1 once the connection's serving is to end (its `Close`
@@ -1364,7 +1364,7 @@ const TcpConn = struct {
         // No drain hook runs for it after this (it runs under the drain's
         // lock, which `remove` takes).
         t.info.drain_hooks.remove(io, &t.drain_hook);
-        // A writable or drain callback still running is canceled (C1).
+        // A writable or drain callback still running is canceled.
         t.group.cancel(io);
         // A sender between its reservation and its push now gets Closed
         // (and frees its own chunk); what got in is dropped here.
@@ -1854,7 +1854,7 @@ const TcpConn = struct {
     /// The driver's turn with a kicked connection, on its executor. It
     /// suspends only in a spawn (the drain's, WRITABLE's, the flusher's:
     /// zio's spawn backpressure), and `release`, on this executor too, may
-    /// run and free `t` meanwhile (M3): after each spawn it goes on only
+    /// run and free `t` meanwhile: after each spawn it goes on only
     /// when `spawn` says the connection is still the one in its slot, and
     /// after a spawn that ends its turn (`handOver`) it touches nothing.
     ///

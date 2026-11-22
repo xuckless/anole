@@ -7,7 +7,7 @@
 //! handle can always take the lock and find the pipe serves another
 //! generation (`gen`): its call gets `error.Gone`, never a freed pointer.
 //! The lock is a spin lock held only to move bytes or flags, never across a
-//! wait, and a leaf (SAFETY.md L4): no other lock is taken under it, which
+//! wait, and a leaf: no other lock is taken under it, which
 //! debug and test builds check.
 const std = @import("std");
 const SpinLock = @import("anole_mem").SpinLock;

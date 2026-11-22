@@ -29,7 +29,7 @@ pub const Collector = struct {
     /// An answer is in `out` (set on the blocking `Io`).
     answered: std.Io.Event = .unset,
     /// Over `out`, `out_seq` and `out_ok`; held only to swap or move `out`,
-    /// never to allocate (SAFETY.md L5).
+    /// never to allocate.
     lock: SpinLock = .init,
     /// The latest answer: made by the collector's task, taken (and freed)
     /// by the console thread that asked for it, or replaced by the next.

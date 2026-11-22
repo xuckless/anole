@@ -1655,7 +1655,7 @@ const InterleaveProbe = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *InterleaveProbe = @alignCast(@fieldParentPtr("interface", w));
         // A yield, not a wait: a cancel it takes stays pending for the
-        // sender's next cancelation point (C3), the write goes on whole.
+        // sender's next cancelation point, the write goes on whole.
         self.io.sleep(.fromNanoseconds(1), .awake) catch self.io.recancel();
         var n: usize = 0;
         for (data[0 .. data.len - 1]) |bytes| {

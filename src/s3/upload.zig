@@ -75,7 +75,7 @@ const Fail = struct {
 
 /// owner: whoever opened it (`open`: a `put`, a handler's `Client.upload`,
 /// the C ABI's transfer slot), which calls `deinit` once. Lifetime: a child
-/// of that owner; its driver and part tasks are its children (T1): `deinit`
+/// of that owner; its driver and part tasks are its children: `deinit`
 /// cancels and joins their groups, then frees.
 pub const Upload = struct {
     client: *Client,
@@ -251,7 +251,7 @@ pub const Upload = struct {
 
     /// Waits for the driver to end, then returns its result, its strings
     /// copied into the call's arena: the result outlives the upload, whose
-    /// arena `deinit` frees (SAFETY.md M4).
+    /// arena `deinit` frees.
     pub fn awaitDone(self: *Upload, c: anytype) Error!Stored {
         while (true) {
             const seen = self.progress.seen();

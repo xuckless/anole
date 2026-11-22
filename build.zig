@@ -2233,7 +2233,7 @@ const Core = struct {
         // `fast_accept` and `fast_send` (see `anole.zio_options`), so a
         // program whose own `zio_options` leave them out still has them. And
         // in Debug `debug_cancel`: a task that parks after swallowing
-        // error.Canceled is reported (C3), and the test runner fails the
+        // error.Canceled is reported, and the test runner fails the
         // test. The default of a binary with no `zio_options` of its own.
         // Test binaries have it on in every optimize mode: their root, the
         // test runner, declares `zio_options` (src/testing/hooks.zig).

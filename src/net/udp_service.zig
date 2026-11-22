@@ -243,7 +243,7 @@ const Pending = struct { to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, 
 
 /// One `send`/`sendMany` call: its datagrams' addresses and bytes in one
 /// allocation (this header, the `Pending` entries, then the bytes), made
-/// before anything shared is touched (L5). owner: the caller until it is
+/// before anything shared is touched. owner: the caller until it is
 /// pushed; then the socket's sender, which frees it once sent.
 const Batch = struct {
     node: push_list.Node = .{},
@@ -329,7 +329,7 @@ pub const UdpSocket = struct {
     queue_bytes: std.atomic.Value(u64) = .init(0),
     want_writable: std.atomic.Value(bool) = .init(false),
     signal: placement.Signal = .{},
-    /// `go`'s tasks: children of the socket, on its executor (T1).
+    /// `go`'s tasks: children of the socket, on its executor.
     tasks: std.Io.Group = .init,
     // Sender task only.
     send_box: ?low.Udp.Outbox = null,
@@ -407,7 +407,7 @@ pub const UdpSocket = struct {
 
     /// The batch is made first (the only allocation), then its bytes are
     /// reserved, then it is pushed; the sender is woken when the list was
-    /// empty, through the group's gate (T5).
+    /// empty, through the group's gate.
     fn enqueue(s: *UdpSocket, items: []const Outgoing) Datagram.SendError!void {
         const cap = s.group.service.options.send_queue;
         var total: u64 = 0;
@@ -762,7 +762,7 @@ pub const UdpGroup = struct {
     sockets: []UdpSocket,
     readers: std.Io.Group = .init,
     senders: std.Io.Group = .init,
-    /// Every wake of a sender from off its executor goes through it (T5);
+    /// Every wake of a sender from off its executor goes through it;
     /// closed at the end of `run`, once the senders have ended.
     gate: @import("../io_gate.zig").IoGate = .{},
     handed_over: std.atomic.Value(bool) = .init(false),
@@ -948,7 +948,7 @@ pub const UdpGroup = struct {
         forever.wait(io) catch return error.Canceled;
     }
 
-    /// Wakes `s`'s sender from any thread (T5).
+    /// Wakes `s`'s sender from any thread.
     fn wake(g: *UdpGroup, s: *UdpSocket) void {
         if (!g.gate.enter()) return;
         defer g.gate.leave();

@@ -621,7 +621,7 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
         // Never handed over, so the consumer knows nothing of it: the call
         // ends here, with its status. Neither end is a cancel (none was
         // delivered), so neither may go through `serving.finish` as
-        // `error.Canceled`: its re-arm (`io.recancel()`) needs one (C3).
+        // `error.Canceled`: its re-arm (`io.recancel()`) needs one.
         x.release(si);
         return serving.finish(call, ended);
     }
@@ -729,7 +729,7 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
         .expired => {
             // A delivered cancel is the outcome even when a read error
             // landed too: `serving.finish` consumes the deadline's own and
-            // re-arms any other (SAFETY.md C3), and must see it.
+            // re-arms any other, and must see it.
             const err: anyerror = if (canceled) error.Canceled else s.grpc.read_error.?;
             x.release(si);
             if (canceled) {

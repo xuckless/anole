@@ -3,7 +3,7 @@
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
-//! cancellation during it (C3); a test that runs past 110 s is named and
+//! cancellation during it; a test that runs past 110 s is named and
 //! every thread's backtrace is dumped before the build runner's
 //! `--test-timeout` kills it (`watchdog`, TESTING.md D2), followed by
 //! every live zio task and the stack of each suspended one
@@ -33,7 +33,7 @@ const fuzz_abi = std.Build.abi.fuzz;
 const never_reuse = @import("anole_test_hooks").never_reuse;
 
 /// ANOLE: zio's count of swallowed cancellations (`debug_cancel`); a test
-/// during which it rises fails (SAFETY.md C3). build.zig gives every test
+/// during which it rises fails. build.zig gives every test
 /// binary this import (src/testing/hooks.zig, or a stub without zio).
 const hooks = @import("anole_test_hooks");
 
@@ -351,7 +351,7 @@ const captured = struct {
     var total: usize = 0;
     var on: std.atomic.Value(bool) = .init(false);
     /// Guards `ring`, `total` and `on`'s changes: a spin lock around a
-    /// bounded memcpy (SAFETY.md L5); nothing under it prints or waits.
+    /// bounded memcpy; nothing under it prints or waits.
     var lock: std.atomic.Value(bool) = .init(false);
 
     fn acquire() void {

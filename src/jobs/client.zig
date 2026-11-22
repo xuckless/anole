@@ -126,7 +126,7 @@ pub const Client = struct {
     /// The server's drain event: set by `app.jobs`, so the queue drains when serving does.
     drain_event: ?*std.Io.Event = null,
     metrics: ?*metrics_mod.Series = null,
-    /// The app's exporter (`start`): a span per run. Process-wide (M2),
+    /// The app's exporter (`start`): a span per run. Process-wide,
     /// owned by the app, which closes it first in `App.deinit` (it sends
     /// through the server's client) and frees it last, after the runtime
     /// has stopped. A run that settles in between (the drain cancels it)
@@ -199,7 +199,7 @@ pub const Client = struct {
     /// runs, to 10 s), then every task (fetchers, heartbeat, maintenance,
     /// runs) is canceled and joined. Idempotent; on the owner's thread, as
     /// `deinit`. The app calls it before it frees any connector, since a
-    /// run may use any of them (SAFETY.md M2); `deinit` calls it first.
+    /// run may use any of them; `deinit` calls it first.
     /// Outside an app, call it before freeing what the handlers use.
     pub fn stopWork(self: *Client) void {
         if (self.work_stopped) return;
@@ -859,7 +859,7 @@ pub const Client = struct {
             var span_id: [16]u8 = undefined;
             observe.trace.newId(self.io, &trace_id);
             observe.trace.newId(self.io, &span_id);
-            // In the run's arena, which the job lives in (M4).
+            // In the run's arena, which the job lives in.
             job.trace_id = a.dupe(u8, &trace_id) catch "";
             job.span_id = a.dupe(u8, &span_id) catch "";
             span = .{ .trace_id = trace_id, .span_id = span_id, .start_ns = std.Io.Clock.real.now(self.io).nanoseconds };
@@ -1150,7 +1150,7 @@ pub const Client = struct {
             if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
             self.unhold(box);
         } else |_| {
-            // Untracked, the run would get no heartbeat and no drain (U4).
+            // Untracked, the run would get no heartbeat and no drain.
             log.warn("{s}: no memory to track its run; put back", .{box.job.id_text});
             self.putBack(box.row);
         }
@@ -1217,7 +1217,7 @@ pub const Client = struct {
         };
         // The runs no longer held: those whose exact (id, attempt) the
         // store did not renew (a newer claim of the same job may be). The
-        // store is asked why with the lock released (SAFETY.md L2, L3):
+        // store is asked why with the lock released:
         // every run's start and end takes it.
         const Lost = struct { seq: u64, h: store.Held };
         var lost: std.ArrayList(Lost) = .empty;
@@ -1235,7 +1235,7 @@ pub const Client = struct {
             c.* = if (got) |row| row.state == .cancelled else false;
         }
         // A run may have ended during the calls: each is looked up again by
-        // its run's key (M3), never kept from before them.
+        // its run's key, never kept from before them.
         self.held_mutex.lockUncancelable(self.io);
         defer self.held_mutex.unlock(self.io);
         for (lost.items, cancelled) |l, c| {

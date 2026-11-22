@@ -1315,7 +1315,7 @@ const CHeaders = struct {
 fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!void {
     const s = slotOfReq(x, c.req) orelse return postGone(x, c.user_data, abi.S3_OP_SERVE, "the request ended first");
     // The request's memory may go at any suspension below (its stream
-    // reset, its deadline): what is read of it is copied first (M3).
+    // reset, its deadline): what is read of it is copied first.
     const a = ctx.arena;
     const req = s.req;
     const is_head = req.method == .head;
@@ -1501,7 +1501,7 @@ fn putBodyTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket, r: *Res) std.Io.C
     const h = Handle.decode(c.req);
     var po = c.putOptions();
     // The request's memory may go at any suspension below (its stream
-    // reset, its deadline): what is read of it is copied first (M3).
+    // reset, its deadline): what is read of it is copied first.
     if (po.content_type == null) if (s.req.headers.get("Content-Type")) |v| {
         po.content_type = ctx.arena.dupe(u8, v) catch {
             r.status = abi.E_NOMEM;

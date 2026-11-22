@@ -563,7 +563,7 @@ pub const Client = struct {
             test_close_hold = null;
             f(s);
         };
-        // Cancels and joins every monitor (SAFETY.md C1, T1): a monitor's
+        // Cancels and joins every monitor: a monitor's
         // connection is its own, closed by it alone.
         self.group.cancel(io);
         for (self.servers.items) |s| self.freeServer(s);
@@ -731,7 +731,7 @@ pub const Client = struct {
         try self.mutex.lock(io);
         while (true) {
             if (self.topology.compatibilityError()) |msg| {
-                // Logged after the unlock (L3), from a copy: the topology
+                // Logged after the unlock, from a copy: the topology
                 // rewrites its buffer under the lock.
                 var copy: [160]u8 = undefined;
                 const n = @min(msg.len, copy.len);
@@ -795,7 +795,7 @@ pub const Client = struct {
             s.monitor = placement.currentTask(io);
         }
         // The monitor's connection is its own (a local): nothing else ever
-        // touches it, so it closes it last, once (SAFETY.md M1, M3).
+        // touches it, so it closes it last, once.
         var connection: ?*Connection = null;
         defer {
             s.task_lock.lockUncancelable(io);

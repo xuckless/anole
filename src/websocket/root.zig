@@ -1282,8 +1282,8 @@ const read_block_len = 16 * 1024 + 512;
 /// its write buffers are `response.write_buffer_size` long (configurable,
 /// 16384 by default: no room for a frame's tail ahead of a whole record),
 /// `block_cache` serves past 32 KiB, and the TLS module's ciphertext
-/// blocks are its own (and absent without TLS). Owned by the process
-/// (SAFETY.md M2); a block taken is the taking run's until it gives it
+/// blocks are its own (and absent without TLS). Owned by the process;
+/// a block taken is the taking run's until it gives it
 /// back. No I/O or suspension runs between a pool's reads and writes, so a
 /// task that later runs on another thread just gives the block to that
 /// thread's pool.
@@ -1316,7 +1316,7 @@ const read_blocks = struct {
         }
         // rawFree, not `free`: `free` fills the block with `undefined`
         // first, 0xAA in ReleaseSafe, and the allocator is Zig code, so the
-        // store isn't dropped as dead (C1).
+        // store isn't dropped as dead.
         std.heap.smp_allocator.rawFree(b, .@"1", @returnAddress());
     }
 };

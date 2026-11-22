@@ -2,7 +2,7 @@
 //! thread) copy a record into one of up to 16 byte rings under a spin lock
 //! held for the copy only; readers copy a ring's live bytes out under it and
 //! parse them after, keep cursors and learn how many records the rings
-//! lapped. Nothing allocates under a ring's lock (SAFETY.md L5), and nothing
+//! lapped. Nothing allocates under a ring's lock, and nothing
 //! here ever waits for a console.
 const std = @import("std");
 const logging = @import("anole_log");

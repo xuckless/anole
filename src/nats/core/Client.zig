@@ -610,7 +610,7 @@ pub fn drain(client: *Client, options: DrainOptions) DrainError!void {
         }
         break :begin status;
     };
-    // Logged with no lock held (SAFETY.md L3).
+    // Logged with no lock held.
     if (status == .connected) log.debug("draining the client", .{});
     switch (status) {
         .connected => {},
@@ -1086,7 +1086,7 @@ fn closeWith(client: *Client, reason: CloseReason) void {
         client.changed.wake(io);
         break :under .{ was_open, attempt, stream };
     };
-    // With no lock held (SAFETY.md L2, L3): the log line, and the shutdown
+    // With no lock held: the log line, and the shutdown
     // of the attempt's socket, a zio I/O call.
     if (was_open) log.debug("closing the client", .{});
     if (attempt_stream) |stream| attempt.?.finishStop(io, stream);

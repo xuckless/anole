@@ -194,7 +194,7 @@ pub const Conn = struct {
     }
 
     /// A failed read or write: the cancel that ended it, so it reaches the
-    /// caller (C3), else the connection is gone.
+    /// caller, else the connection is gone.
     fn lost(cause: ?anyerror) ConnError {
         if (cause) |e| if (e == error.Canceled) return error.Canceled;
         return error.ConnectionLost;
@@ -252,7 +252,7 @@ pub const Cluster = struct {
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
+    /// Over `brokers`, `topics` and `refresh_busy`. A leaf: nothing
     /// waits, calls out or takes another lock while it is held.
     mutex: std.Io.Mutex = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,

@@ -313,7 +313,7 @@ const Session = struct {
     group: std.Io.Group = .init,
     deliveries: std.Io.Group = .init,
     /// Over `running`: the delivery tasks (one per partition, each on its
-    /// partition's executor) and `endSession`. A leaf (L4).
+    /// partition's executor) and `endSession`. A leaf.
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     running: usize = 0,

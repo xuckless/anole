@@ -85,7 +85,7 @@ pub const Metric = struct { name: []const u8, value: f64, unit: []const u8 };
 
 /// A language metric as the service keeps it: copied into fixed room, so
 /// that `setMetrics` and `/runtime` copy it under the service's spin lock
-/// without allocating (SAFETY.md L5).
+/// without allocating.
 const Stored = struct {
     name: [max_metric_name]u8 = @splat(0),
     name_len: u8 = 0,
@@ -161,7 +161,7 @@ pub const Service = struct {
     bye_reason: std.atomic.Value(u8) = .init(0),
 
     /// Over `clients`, the broadcast line and the language metrics; held
-    /// for bounded copies only, never across an allocation (SAFETY.md L5).
+    /// for bounded copies only, never across an allocation.
     lock: SpinLock = .init,
     /// In `clients_buf` (set by `init`).
     clients: std.ArrayList(*Client) = .empty,
@@ -319,7 +319,7 @@ pub const Service = struct {
         self.clients.appendBounded(c) catch {
             // Unreachable in practice (reap empties, live < max_clients < max_tracked); the fd is closed.
             // Clients whose thread ended faster than `reap` could join
-            // them fill the list (U4): this one is told busy.
+            // them fill the list: this one is told busy.
             self.lock.unlock();
             return refuseBusy(fd);
         };

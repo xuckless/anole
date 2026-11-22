@@ -27,8 +27,8 @@ pub const Pool = struct {
 
     /// Closes the idle sessions that have been idle longer than `limit`
     /// (all of them when null): QUIT, close, and their places freed.
-    /// Takes up to 16 per lock section and closes them after the unlock
-    /// (SAFETY.md L2, L3); allocates nothing. Returns how many.
+    /// Takes up to 16 per lock section and closes them after the unlock;
+    /// allocates nothing. Returns how many.
     pub fn closeIdle(self: *Pool, io: std.Io, observer: *const db.Observer, limit: ?std.Io.Duration) usize {
         const batch_len = 16;
         var total: usize = 0;

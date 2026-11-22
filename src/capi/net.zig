@@ -45,7 +45,7 @@ fn pack(g: u32, st: SlotState) u64 {
 pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
-    /// the connection, `onClose` while it takes it away. A leaf (L4):
+    /// the connection, `onClose` while it takes it away. A leaf:
     /// nothing is taken, allocated, freed or woken under it but the
     /// connection's atomics (a reset's non-blocking `setsockopt`/`shutdown`
     /// and its gated wakes); a call's chunk is made before it and, when the
@@ -129,7 +129,7 @@ pub const UdpState = struct {
     /// Set once the sockets exist (the first batch, or the start), cleared
     /// at the stop before they are freed.
     group: std.atomic.Value(?*net.UdpGroup) = .init(null),
-    /// The calls from consumer threads inside the group (T5): closed at the
+    /// The calls from consumer threads inside the group: closed at the
     /// stop, which waits for those inside. A send queues its batch inside
     /// it (the batch's one allocation included): short, never a wait.
     gate: @import("../io_gate.zig").IoGate = .{},
@@ -597,7 +597,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     // The SENT record first: a call that fails takes nothing.
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    // The chunk before the lock (L5): nothing allocates under it, and one
+    // The chunk before the lock: nothing allocates under it, and one
     // the call did not take is freed here, after it.
     var chunk: ?*net.OutChunk = null;
     defer if (chunk) |c| c.destroy();

@@ -185,7 +185,7 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    /// Over `consumers`, `started`, `drained` and `starting`. A leaf (L4).
+    /// Over `consumers`, `started`, `drained` and `starting`. A leaf.
     consumers_mutex: std.Io.Mutex = .init,
     started: bool = false,
     drained: bool = false,
@@ -337,7 +337,7 @@ pub const Client = struct {
         // The consumers added before `started` is set are started here, the
         // ones after it by `consume`: each by exactly one of the two. A start
         // spawns (and may suspend), and the log line may wait: both after
-        // the lock (L2, L3).
+        // the lock.
         const n = blk: {
             self.consumers_mutex.lockUncancelable(self.io);
             defer self.consumers_mutex.unlock(self.io);

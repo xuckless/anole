@@ -206,7 +206,7 @@ pub const Slab = struct {
 /// rehashes again. nghttp2's resize at a probe length of 128 stays as the
 /// safety net that keeps the u8 lengths from overflowing; long probes need
 /// many IDs on one home slot, which a peer can only aim for if it knows the
-/// seed, so conn.zig (M3) takes a fresh CSPRNG seed per connection.
+/// seed, so conn.zig takes a fresh CSPRNG seed per connection.
 pub const StreamTable = struct {
     gpa: Allocator,
     seed: u64,

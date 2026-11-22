@@ -2409,7 +2409,7 @@ test "a fake server canceled while it serves a client ends, and doesn't go back 
     defer listener.deinit(io);
     var accepted: std.atomic.Value(u32) = .init(0);
     var server = try io.concurrent(serveHangUpThenServe, .{ io, &listener, &accepted });
-    // Canceled and awaited on every way out (SAFETY.md T1).
+    // Canceled and awaited on every way out.
     var canceled = false;
     defer if (!canceled) server.cancel(io) catch {};
     // The first connection is hung up after its handshake; the second is

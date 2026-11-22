@@ -491,8 +491,8 @@ const DeadlineList = struct {
     tail: u32 = no_slot,
 };
 
-/// Guards the runtime's wakes made from threads that are not the runtime's
-/// (SAFETY.md T5): one per executor, on the line its inbox already shares
+/// Guards the runtime's wakes made from threads that are not the runtime's:
+/// one per executor, on the line its inbox already shares
 /// with consumers. It lives in src/io_gate.zig; its test hook is
 /// `io_gate.test_hook`.
 pub const IoGate = @import("../io_gate.zig").IoGate;
@@ -3685,7 +3685,7 @@ pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory
 /// an answer, `polling` for a pin), waiting out a pin under way: a
 /// consumer-held handle is `polling` only while `requestTrace` on another
 /// thread copies from its request, a few hundred bytes with nothing that
-/// allocates or waits (L5), so the wait is a short spin, as a seqlock
+/// allocates or waits, so the wait is a short spin, as a seqlock
 /// reader's retry. A pinned live handle is never taken for over. Null when
 /// moved; else the word that refused it (another state or generation).
 /// The move is `.seq_cst`: a pin's half of `Slot.gone`'s handshake.

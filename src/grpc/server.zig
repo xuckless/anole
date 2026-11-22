@@ -672,8 +672,8 @@ fn acceptEncoding() []const u8 {
 /// does not decode...), UNKNOWN for any other.
 pub fn finish(call: *Call, result: anyerror!void) !void {
     // A cancel the call's deadline did not make (the server stopping, the
-    // stream reset) stays the task's: re-armed once the status is out
-    // (SAFETY.md C3). The deadline's own is consumed: the call answers it.
+    // stream reset) stays the task's: re-armed once the status is out.
+    // The deadline's own is consumed: the call answers it.
     var rearm = false;
     defer if (rearm) call.io.recancel();
     const protection = call.io.swapCancelProtection(.blocked);

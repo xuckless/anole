@@ -135,7 +135,7 @@ pub fn endTied(x: *Exec, i: u32, cut: bool) void {
 /// Whether the request or call `h` is still there to serve. On `h`'s
 /// executor only: an orphaned slot (`Slot.orphan`, executor-local) is not,
 /// though a consumer call that failed may have handed it back to `out`:
-/// its request's memory went with its stream (SAFETY.md M3, T4).
+/// its request's memory went with its stream.
 pub fn slotLive(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];

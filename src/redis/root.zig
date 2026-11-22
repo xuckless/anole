@@ -333,7 +333,7 @@ const Pool = struct {
     /// `max` slots; the first `spare_len` hold the memory of closed
     /// connections, which the next dial reuses. A pooled `Connection` is
     /// freed only in `deinit` (process-wide, M2): a `Conn` from an earlier
-    /// checkout reads a lease, never freed memory (M6). Every one is
+    /// checkout reads a lease, never freed memory. Every one is
     /// counted in `open` or here, so there are `max` at most.
     spare: []*Connection,
     spare_len: usize = 0,
@@ -884,8 +884,8 @@ pub const Client = struct {
     /// replies; the first error reply fails the call.
     fn exchange(self: *Client, ctx: *const Ctx, held: ?*Connection, batch: *const Batch) anyerror![]Reply {
         var conn = held orelse try self.take(ctx);
-        // Whether this call holds `conn` from the pool and gives it back
-        // (M1): not between giving a stale one back and taking the next.
+        // Whether this call holds `conn` from the pool and gives it back:
+        // not between giving a stale one back and taking the next.
         var owned = held == null;
         defer if (owned) self.give(conn);
         if (conn.broken) return ctx.failf(self.errors, .unavailable, "the connection broke in an earlier call; release it and acquire another", .{});

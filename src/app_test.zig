@@ -593,7 +593,7 @@ fn rawGet(io: std.Io, to: std.Io.net.IpAddress, out: []u8) ![]const u8 {
     var r = stream.reader(io, &rbuf);
     var fw: std.Io.Writer = .fixed(out);
     if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-        // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+        // A cancel is handed on; anything else ends the read.
         if (r.err) |e| if (e == error.Canceled) return error.Canceled;
     }
     const resp = fw.buffered();

@@ -372,7 +372,7 @@ pub const AttemptState = struct {
         if (!state.shutting) return;
         const was = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(was);
-        // With cancellation blocked the wait returns no error, and a cancel stays pending (C3).
+        // With cancellation blocked the wait returns no error, and a cancel stays pending.
         while (state.shutting) state.client.changed.wait(io, &state.client.mutex, null) catch {};
     }
 };

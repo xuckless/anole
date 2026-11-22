@@ -158,7 +158,7 @@ pub const Span = struct {
     /// the context that enqueued it (otelriver, opentelemetry_oban and
     /// the Sidekiq instrumentation link by default).
     ///
-    /// owner: the Exporter (SAFETY.md M1), through the span that carries
+    /// owner: the Exporter, through the span that carries
     /// it. M2 class: child of the exporter (on its allocator), freed by
     /// `Exporter.release` exactly once: when the span is sent, dropped,
     /// left over at `close`, or given back by a test's `Taken.deinit`.
@@ -276,7 +276,7 @@ pub const Options = struct {
 /// already started.
 ///
 /// owner: whoever made it (`App` for `app.tracing`). M2 class:
-/// process-wide. Teardown (M5) runs in two steps, as the OpenTelemetry
+/// process-wide. Teardown runs in two steps, as the OpenTelemetry
 /// SDK's Shutdown: `close` sends what is queued and stops the task (it
 /// needs `client`'s server still running), after which `submit`, `job`
 /// and `child` are no-ops that allocate nothing and count the span as
@@ -304,7 +304,7 @@ pub const Exporter = struct {
     /// Over the flushers' wait for `finished`: `flush` waits on
     /// `progressed`; the task broadcasts after each batch and when it ends,
     /// `close` as it starts and once more after the join. Never held across
-    /// anything but the condition's own wait (SAFETY.md L2).
+    /// anything but the condition's own wait.
     progress_lock: std.Io.Mutex = .init,
     progressed: std.Io.Condition = .init,
     /// Tests: waits of a flusher for progress, counted under

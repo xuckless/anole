@@ -23,7 +23,7 @@ pub const Series = struct {
     leader: *m.Family(m.Gauge),
     cron_enqueued: *m.Family(m.Counter),
     /// Guards `kinds` and `names`. A leaf spin lock: nothing is allocated
-    /// under it (SAFETY.md L5).
+    /// under it.
     lock: SpinLock = .init,
     /// Label sets: at most `max_labels` names each, sized at `init`, so a
     /// put under `lock` never grows them. The names live until `deinit`.
@@ -77,7 +77,7 @@ pub const Series = struct {
             .full => return "other",
             .missing => {},
         }
-        // A new label: copied before the lock is taken again (L5).
+        // A new label: copied before the lock is taken again.
         const owned = self.gpa.dupe(u8, value) catch return "other";
         var kept = false;
         self.lock.lock();

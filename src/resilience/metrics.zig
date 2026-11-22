@@ -26,7 +26,7 @@ pub const Binding = struct {
     retries: *metrics.Family(metrics.Counter),
     throttled: *metrics.Family(metrics.Counter),
     /// Over `seen`: a lookup or an insert into room made beforehand, never
-    /// an allocation (SAFETY.md L5).
+    /// an allocation.
     lock: SpinLock = .init,
     /// Targets seen per client kind, each with room for `max_targets`
     /// from `init` on.

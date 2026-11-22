@@ -63,7 +63,7 @@ pub const Result = union(enum) {
 /// `Producer.deinit`), named by a generation-checked `Ref`. A batch keeps
 /// the ref, never a pointer it could outlive. The holder of the ref (one
 /// task or thread) gives the slot back; `complete` never frees, and a stale
-/// ref is a no-op (T4). The shape of the C ABI's handle slots
+/// ref is a no-op. The shape of the C ABI's handle slots
 /// (capi/engine.zig `Slot.word`).
 pub const Wait = struct {
     /// gen (u32) << 32 | state (u32). `gen` counts takes, so a stale ref
@@ -103,7 +103,7 @@ pub const Wait = struct {
 /// The wait slots. owner: the producer. The free list is taken under
 /// `Producer.mutex`; holders give slots back from any task or thread
 /// through `freed` (SAFETY.md L7's push-list hand-off: any thread pushes,
-/// the mutex holder takes). Bounded by the records pending (U4): it keeps
+/// the mutex holder takes). Bounded by the records pending: it keeps
 /// its high-water mark until `Producer.deinit`.
 const WaitTable = struct {
     chunks: std.ArrayList(*[chunk_len]Wait) = .empty,
@@ -195,7 +195,7 @@ const Batch = struct {
 };
 
 /// Batches of one partition waiting to be sent, oldest first: an intrusive
-/// FIFO, so moving a batch never allocates (U4). Under `Producer.mutex`.
+/// FIFO, so moving a batch never allocates. Under `Producer.mutex`.
 const BatchQueue = struct {
     head: ?*Batch = null,
     tail: ?*Batch = null,
@@ -355,7 +355,7 @@ const TopicState = struct {
 
 /// One per leader broker id. owner: the producer (memory freed in `deinit`,
 /// never earlier, so a pointer read under `mutex` stays valid after it); its
-/// task is a child of `Producer.group` (T1).
+/// task is a child of `Producer.group`.
 const Sender = struct {
     id: i32,
     wake: std.Io.Event = .unset,
@@ -402,7 +402,7 @@ pub const Producer = struct {
     /// atomic pointer to telemetry that lives as long as the client (#159).
     tel: std.atomic.Value(?*const Telemetry) = .init(null),
 
-    /// Over everything below but `group`. A leaf (L4): no cluster call, no
+    /// Over everything below but `group`. A leaf: no cluster call, no
     /// spawn, no metrics family, no I/O and no other lock while it is held.
     mutex: std.Io.Mutex = .init,
     drained: std.Io.Condition = .init,
@@ -427,7 +427,7 @@ pub const Producer = struct {
     /// The waiting callers' slots (M2's fourth class).
     waits: WaitTable = .{},
 
-    /// The senders (T1).
+    /// The senders.
     group: std.Io.Group = .init,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cl: *cluster_mod.Cluster, cfg: Config) !*Producer {

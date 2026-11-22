@@ -178,7 +178,7 @@ pub const Client = struct {
     /// `/readyz`'s check, once `start` has a `Health` for it.
     readiness: db.Readiness,
     /// Connections in use (readers taken, the writer held), for the gauges:
-    /// per executor, summed when read (SAFETY.md L7). A call that ends on
+    /// per executor, summed when read. A call that ends on
     /// another executor than it began leaves one slot high and one low;
     /// only the sum means anything.
     in_use: dusty.exec_counter.PerExecutor(i64) = .init,
@@ -441,7 +441,7 @@ pub const Client = struct {
 
     /// Gives a reader back when `lease` is the checkout holding it; a lease
     /// given back already (a checkout ended through a copy, then again)
-    /// does nothing but log (SAFETY.md M6): the reader is never in the free
+    /// does nothing but log: the reader is never in the free
     /// list twice, nor handed to two holders.
     fn releaseReader(self: *Client, io: std.Io, conn: *Connection, lease: u32) void {
         const r = &self.readers;
@@ -470,7 +470,7 @@ pub const Client = struct {
     /// Checks the writer out: one call, transaction, `iterate` or `acquire`
     /// holds it at a time (a pool of one; no order among the waiters). The
     /// returned lease gives it back (`unlockWriter`). Nothing is locked
-    /// when this returns: the holder suspends freely (SAFETY.md L2).
+    /// when this returns: the holder suspends freely.
     /// `WriterHeldByCaller`: the holder is the calling task itself (its own
     /// transaction, `iterate` or `acquire`), which waiting would never see
     /// end; glibc's error-checking mutex answers EDEADLK there (#160).
@@ -505,8 +505,7 @@ pub const Client = struct {
     }
 
     /// Gives the writer back when `lease` is the checkout holding it; a
-    /// lease given back already (a second `release`) does nothing but log
-    /// (SAFETY.md M6).
+    /// lease given back already (a second `release`) does nothing but log.
     fn unlockWriter(self: *Client, io: std.Io, lease: u32) void {
         const w = &self.writer;
         w.mutex.lockUncancelable(io);
@@ -601,7 +600,7 @@ pub const Client = struct {
                 w.mutex.unlock(io);
                 return err;
             }
-            // SAFETY (L3): sqlite3_interrupt only sets a flag, documented safe
+            // SAFETY: sqlite3_interrupt only sets a flag, documented safe
             // from any thread (https://sqlite.org/c3ref/interrupt.html); under
             // the mutex so it cannot reach the next job.
             if (w.running == &t.job) c.sqlite3_interrupt(w.conn.handle.db);
@@ -613,7 +612,7 @@ pub const Client = struct {
             // SQLiteInterrupt. One that ran to its end first answers what it
             // did (a write committed is answered as committed, #160; a
             // constraint failure as that), and the cancel is raised again
-            // for the caller's next cancelation point (C3), as
+            // for the caller's next cancelation point, as
             // `Deadline.run` does.
             if (comptime @typeInfo(R) == .error_union) {
                 if (t.result) |_| {} else |e| switch (@as(anyerror, e)) {
@@ -884,7 +883,7 @@ pub const Tx = struct {
         if (tx.finished) return;
         // A copy of this `Tx` ended it already: the connection (the writer
         // or the reader) may be another holder's now, its transaction not
-        // this one's to roll back (SAFETY.md M6).
+        // this one's to roll back.
         if (!tx.db.holds(tx.io, tx.conn, tx.on_writer, tx.lease)) {
             tx.finished = true;
             log.err("sqlite \"{s}\": a transaction was ended twice (through a copy of its Tx); the second time did nothing", .{tx.db.name});
@@ -1210,7 +1209,7 @@ pub fn Rows(comptime T: type) type {
             // A copy of these rows (or of their `Tx`) gave the connection
             // back already: its statement is done or another holder's (a
             // cached one is shared), and the connection may be another
-            // holder's (SAFETY.md M6).
+            // holder's.
             if (!self.db.holds(self.io, self.conn, self.on_writer, self.lease)) {
                 // A `Tx`'s rows whose `Tx` ended: its end did the statement.
                 if (!self.owns) return;
@@ -1294,7 +1293,7 @@ const Holder = union(enum) {
 
 /// owner: the `Client` (process-wide, M2); the thread is joined in
 /// `Client.deinit` before anything here is freed, so it wakes callers
-/// directly (SAFETY.md T5).
+/// directly.
 const Writer = struct {
     conn: Connection,
     thread: std.Thread,
@@ -1312,7 +1311,7 @@ const Writer = struct {
     /// SetMaxOpenConns(1), not a lock held across the holder's calls.
     holder: Holder = .free,
     /// The number of the latest checkout, bumped by each: a give-back or a
-    /// `holdsWriter` with another one, or while `free`, does nothing (M6).
+    /// `holdsWriter` with another one, or while `free`, does nothing.
     /// Whether it is held is `holder` alone.
     lease: u32 = 0,
     /// Signalled when the writer is given back.
@@ -1360,7 +1359,7 @@ const Connection = struct {
     tick: u64 = 0,
     /// A reader's checkout: bumped under `Readers.mutex` by each checkout
     /// and each give-back (odd while held), so a give-back with another
-    /// lease does nothing (M6). Unused on the writer (`Writer.lease`).
+    /// lease does nothing. Unused on the writer (`Writer.lease`).
     lease: u32 = 0,
     /// The statements of a `Tx`'s rows (`Tx.iterate`) not ended yet: the
     /// `Tx`'s end resets (or, uncached, finalizes) those its rows left

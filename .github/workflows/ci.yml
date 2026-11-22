@@ -169,7 +169,7 @@ jobs:
       matrix:
         # aarch64 Linux is a production target with no native job here. The
         # Windows cross build is gone: the windows job and test-flags caught
-        # every error it caught (T7).
+        # every error it caught.
         target: [aarch64-linux-gnu]
     runs-on: ubuntu-latest
     timeout-minutes: 76

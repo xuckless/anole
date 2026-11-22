@@ -953,7 +953,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// guards the certificate sources, which only a reload
             /// touches). Taken with no other lock held: SIGHUP's task, the
             /// console's thread, a C ABI thread.
-            /// Off zio: through the ctl gate (`Engine.enter`), or a console thread joined before the runtime ends (T5).
+            /// Off zio: through the ctl gate (`Engine.enter`), or a console thread joined before the runtime ends.
             cert_lock: std.Io.Mutex = .init,
             /// The routes recorded for the OpenAPI document (`-Dopenapi`),
             /// and what `app.openapi` asked for.
@@ -997,7 +997,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Ends the connector's own work that may still call other
             /// connectors (a job queue's runs), joining it. `App.deinit`
             /// calls it on every connector, last made first, before it
-            /// frees any (SAFETY.md M2). Null for the rest.
+            /// frees any. Null for the rest.
             stop_work: ?*const fn (context: *anyopaque) void = null,
 
             /// The console's `/db` system: the type's `console_system` decl
@@ -1932,7 +1932,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.exporter) |e| e.close();
             // Job runs may use anything the app made (a connector made
             // before or after the queue, app.udpSocket, the server's state):
-            // they end before any of it is freed (SAFETY.md M2). stopWork
+            // they end before any of it is freed. stopWork
             // needs only the runtime and `server.draining`.
             // So connectors made after app.jobs (NATS/Kafka consumers, SSE
             // topics, watches) stay open for the jobs drain, and their own
@@ -4203,7 +4203,7 @@ test "anole.Server: init with http and https binds both, and a route behind app.
             var out: [1024]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
             if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-                // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+                // A cancel is handed on; anything else ends the read.
                 if (r.err) |e| if (e == error.Canceled) return error.Canceled;
             }
             const resp = fw.buffered();
@@ -4406,7 +4406,7 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
             var out: [1024]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
             if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-                // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+                // A cancel is handed on; anything else ends the read.
                 if (r.err) |e| if (e == error.Canceled) return error.Canceled;
             }
             try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), path[1..]));
@@ -4721,7 +4721,7 @@ const BodyClient = struct {
         var out: [2048]u8 = undefined;
         var fw: std.Io.Writer = .fixed(&out);
         if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-            // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+            // A cancel is handed on; anything else ends the read.
             if (r.err) |e| if (e == error.Canceled) return error.Canceled;
         }
         const resp = fw.buffered();
@@ -5304,7 +5304,7 @@ const RawRequest = struct {
         var r = stream.reader(io_, &rbuf);
         var fw: std.Io.Writer = .fixed(out);
         if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-            // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+            // A cancel is handed on; anything else ends the read.
             if (r.err) |e| if (e == error.Canceled) return error.Canceled;
         }
         return fw.buffered();

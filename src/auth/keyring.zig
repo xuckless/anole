@@ -44,7 +44,7 @@ pub const Keyring = struct {
     max_retry: std.Io.Duration = .fromSeconds(300),
 
     /// Guards the fields below; never held across I/O, a verification or
-    /// a log call (SAFETY.md L2, L3).
+    /// a log call.
     mutex: std.Io.Mutex = .init,
     /// The current set; null before the first fetch.
     current: ?*Set = null,

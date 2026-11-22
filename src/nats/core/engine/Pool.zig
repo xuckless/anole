@@ -113,7 +113,7 @@ pub const Updated = struct {
 /// no longer names leave, but the current one. An empty list changes
 /// nothing: a server outside a cluster sends none. Each change is noted in
 /// `changes` (`max_changes` long), for the caller to act on with the
-/// pool's lock let go (SAFETY.md L3).
+/// pool's lock let go.
 pub fn update(pool: *Pool, io: Io, urls: []const []const u8, changes: []Change) Updated {
     std.debug.assert(changes.len >= max_changes);
     var updated: Updated = .{ .changes = changes[0..0] };
