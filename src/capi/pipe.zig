@@ -7,10 +7,10 @@
 //! handle can always take the lock and find the pipe serves another
 //! generation (`gen`): its call gets `error.Gone`, never a freed pointer.
 //! The lock is a spin lock held only to move bytes or flags, never across a
-//! wait, and a leaf (SAFETY.md L4): no other lock is taken under it, which
+//! wait, and a leaf: no other lock is taken under it, which
 //! debug and test builds check.
 const std = @import("std");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 const engine = @import("engine.zig");
 pub const gpa = engine.gpa;
@@ -37,7 +37,7 @@ pub const Chunk = struct {
 };
 
 pub const Pipe = struct {
-    lock: safety.SpinLock(.leaf) = .init,
+    lock: SpinLock = .init,
     /// The slot generation this pipe serves; 0 when it serves none.
     gen: u32 = 0,
     chunks: std.ArrayList(Chunk) = .empty,

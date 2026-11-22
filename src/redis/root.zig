@@ -81,7 +81,6 @@
 const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -322,9 +321,9 @@ pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void el
 
 /// The pool of one executor: idle connections, and how many are open.
 const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Signalled when a connection goes back, or a place frees up.
-    returned: safety.Condition = .init,
+    returned: std.Io.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle connections.
     idle: []*Connection,
     idle_len: usize = 0,
@@ -333,8 +332,8 @@ const Pool = struct {
     max: usize,
     /// `max` slots; the first `spare_len` hold the memory of closed
     /// connections, which the next dial reuses. A pooled `Connection` is
-    /// freed only in `deinit` (process-wide, M2): a `Conn` from an earlier
-    /// checkout reads a lease, never freed memory (M6). Every one is
+    /// freed only in `deinit` (process-wide): a `Conn` from an earlier
+    /// checkout reads a lease, never freed memory. Every one is
     /// counted in `open` or here, so there are `max` at most.
     spare: []*Connection,
     spare_len: usize = 0,
@@ -359,7 +358,7 @@ const Connection = struct {
     /// nothing of the call reached the server.
     sent: u64 = 0,
     /// Bumped by every give-back, under its pool's `mutex`: a `Conn` from
-    /// an earlier checkout gives nothing back (SAFETY.md M6, as pgxpool's
+    /// an earlier checkout gives nothing back (as pgxpool's
     /// idempotent `Release`). Read without the lock only by its holder.
     lease: u32 = 0,
 
@@ -469,7 +468,7 @@ pub const Client = struct {
     pubsub_hub: ?*PubSubHub = null,
     /// Init-once guard of `pubsub_hub`: held only to read it or make it
     /// (an allocation).
-    pubsub_hub_mutex: safety.Mutex(.leaf) = .init,
+    pubsub_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
@@ -502,7 +501,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.redis, name, opts.breaker, opts.retry),
             .observer = .{ .system = .redis, .name = name },
-            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
+            .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = opts.connect_timeout,
             .idle_timeout = opts.idle_timeout,
@@ -745,7 +744,7 @@ pub const Client = struct {
     /// check. Its failures are not logged; a cancel of the caller is
     /// `error.Canceled` (`db.Readiness` keeps no answer then).
     fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .last = noLast, .request = null };
@@ -885,8 +884,8 @@ pub const Client = struct {
     /// replies; the first error reply fails the call.
     fn exchange(self: *Client, ctx: *const Ctx, held: ?*Connection, batch: *const Batch) anyerror![]Reply {
         var conn = held orelse try self.take(ctx);
-        // Whether this call holds `conn` from the pool and gives it back
-        // (M1): not between giving a stale one back and taking the next.
+        // Whether this call holds `conn` from the pool and gives it back:
+        // not between giving a stale one back and taking the next.
         var owned = held == null;
         defer if (owned) self.give(conn);
         if (conn.broken) return ctx.failf(self.errors, .unavailable, "the connection broke in an earlier call; release it and acquire another", .{});

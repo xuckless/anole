@@ -6,7 +6,7 @@
 //! with its concurrency machinery taken out. Since Zig 0.16 that arena is
 //! lock-free and thread-safe: every allocation pays a `lock xadd`, a
 //! `cmpxchg` when it pads for alignment, and resize and free a `cmpxchg`
-//! each, 9% of the CPU of an HTTP/2 request on the M3 gate
+//! each, 9% of the CPU of an HTTP/2 request in the h2 benchmark
 //! (research/s2/h2-m4/arena.md). A request's arena never needed it: only
 //! the request's own task allocates from it (docs/routing.md). What is left
 //! is the std algorithm: bump in the first node; if it does not fit, grow
@@ -23,12 +23,10 @@
 //! Its user may change thread between calls, as long as two never overlap:
 //! an awaited call or a blocking-pool job may use a request's arena while
 //! the request's task waits, a task started with `io.concurrent` may not.
-//! Debug and test builds panic when two calls overlap.
 //!
 //! Re-diff against std's ArenaAllocator on every Zig bump.
 
 const std = @import("std");
-const safety = @import("anole_safety");
 const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
@@ -38,8 +36,6 @@ pub const LocalArena = struct {
     child_allocator: Allocator,
     /// The nodes, the one allocations come from first.
     used: ?*Node = null,
-    /// Debug and test builds: a call is inside the arena (`enter`).
-    inside: if (safety.enabled) std.atomic.Value(bool) else void = if (safety.enabled) .init(false) else {},
 
     pub const ResetMode = std.heap.ArenaAllocator.ResetMode;
 
@@ -98,8 +94,6 @@ pub const LocalArena = struct {
     /// limit) for the next ones. False when that node could not be had; the
     /// arena is empty and works then too.
     pub fn reset(arena: *LocalArena, mode: ResetMode) bool {
-        arena.enter();
-        defer arena.leave();
         const limit: ?usize = switch (mode) {
             .retain_capacity => null,
             .retain_with_limit => |limit| limit,
@@ -146,18 +140,6 @@ pub const LocalArena = struct {
         return true;
     }
 
-    /// Debug and test builds: panics when another call is inside the arena,
-    /// which only two tasks or threads using it at once can do (an
-    /// allocation never suspends its task).
-    inline fn enter(arena: *LocalArena) void {
-        if (safety.enabled and arena.inside.swap(true, .acquire))
-            @panic("a request arena used by two tasks at once: req.arena is not thread-safe (docs/routing.md)");
-    }
-
-    inline fn leave(arena: *LocalArena) void {
-        if (safety.enabled) arena.inside.store(false, .release);
-    }
-
     fn alignedIndex(buf_ptr: [*]u8, end_index: usize, alignment: Alignment) usize {
         // Wrapping, as std: the largest alignment is the largest usize.
         // SAFETY: addresses only, for the padding; nothing is made a pointer.
@@ -169,8 +151,6 @@ pub const LocalArena = struct {
         const arena: *LocalArena = @ptrCast(@alignCast(ctx));
         _ = ret_addr;
         assert(n > 0);
-        arena.enter();
-        defer arena.leave();
 
         var prev_size: usize = 0;
         if (arena.used) |node| {
@@ -213,8 +193,6 @@ pub const LocalArena = struct {
         _ = ret_addr;
         assert(memory.len > 0);
         assert(new_len > 0);
-        arena.enter();
-        defer arena.leave();
 
         const node = arena.used.?;
         const buf = node.buf();
@@ -243,8 +221,6 @@ pub const LocalArena = struct {
         _ = alignment;
         _ = ret_addr;
         assert(memory.len > 0);
-        arena.enter();
-        defer arena.leave();
 
         const node = arena.used.?;
         const buf = node.buf();

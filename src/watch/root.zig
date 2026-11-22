@@ -1,7 +1,7 @@
 //! Watching database changes: PostgreSQL LISTEN/NOTIFY, Redis pub/sub and
 //! streams, and MongoDB change streams, fed straight into SSE and
 //! WebSocket topics with no handler in between, into a handler, or read by
-//! handlers and background tasks (p3/realtime, design-realtime.md).
+//! handlers and background tasks (design-realtime.md).
 //!
 //!     _ = try app.watch(.{ .postgres = .{ .client = db, .channels = &.{"orders"} } }, .{
 //!         .to = &.{.{ .sse = .{ .topics = live, .topic = "orders" } }},

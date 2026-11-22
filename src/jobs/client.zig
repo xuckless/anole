@@ -1,10 +1,9 @@
 //! The job queue's client: enqueue, handlers, the runner (fetchers,
 //! heartbeat, maintenance, drain), cron and the admin calls
-//! (p3/jobs, design-jobs.md §3).
+//! (design-jobs.md §3).
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 const clock_mod = @import("clock.zig");
@@ -68,11 +67,11 @@ const JobBox = struct {
     arena_state: std.heap.ArenaAllocator,
     row: store.Row,
     /// Set by `prepare` before `hold` publishes the box; after that the
-    /// heartbeat writes only its atomics (SAFETY.md M3/T3).
+    /// heartbeat writes only its atomics.
     job: Job = undefined,
     /// The run's key in `Client.held`, set by `hold`: unique per run, where
     /// the job's id is not (a lost run may still be ending when its job is
-    /// claimed again). A local generation (SAFETY.md M2 fourth class, T4).
+    /// claimed again). A local generation.
     seq: u64 = 0,
     task: ?placement.Task = null,
     started: std.Io.Clock.Timestamp = undefined,
@@ -107,7 +106,7 @@ pub const Client = struct {
     /// cancels it: a run leaves `held` (`unhold`) before its task ends.
     /// Every section (hold, unhold, heartbeatOnce, drain, the tests' interruptedRun)
     /// takes no other lock, calls no store and never suspends; cancelTask only flags.
-    held_mutex: safety.Mutex(.leaf) = .init,
+    held_mutex: std.Io.Mutex = .init,
     /// The runs going on, by `JobBox.seq`.
     held: std.AutoArrayHashMapUnmanaged(u64, *JobBox) = .empty,
     /// The last `JobBox.seq` given out; under `held_mutex`.
@@ -127,7 +126,7 @@ pub const Client = struct {
     /// The server's drain event: set by `app.jobs`, so the queue drains when serving does.
     drain_event: ?*std.Io.Event = null,
     metrics: ?*metrics_mod.Series = null,
-    /// The app's exporter (`start`): a span per run. Process-wide (M2),
+    /// The app's exporter (`start`): a span per run. Process-wide,
     /// owned by the app, which closes it first in `App.deinit` (it sends
     /// through the server's client) and frees it last, after the runtime
     /// has stopped. A run that settles in between (the drain cancels it)
@@ -147,7 +146,6 @@ pub const Client = struct {
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
     /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
     work_stopped: bool = false,
-    teardown: safety.Teardown = .init,
     /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
@@ -201,10 +199,9 @@ pub const Client = struct {
     /// runs, to 10 s), then every task (fetchers, heartbeat, maintenance,
     /// runs) is canceled and joined. Idempotent; on the owner's thread, as
     /// `deinit`. The app calls it before it frees any connector, since a
-    /// run may use any of them (SAFETY.md M2); `deinit` calls it first.
+    /// run may use any of them; `deinit` calls it first.
     /// Outside an app, call it before freeing what the handlers use.
     pub fn stopWork(self: *Client) void {
-        self.teardown.assertNotDead();
         if (self.work_stopped) return;
         self.work_stopped = true;
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
@@ -220,8 +217,6 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.teardown.begin();
-        // stopWork's assertNotDead accepts .closing, the state begin() set.
         self.stopWork();
         self.backend.vt.deinit(self.backend.ptr);
         for (self.queues) |*q| q.kinds.deinit(self.gpa);
@@ -239,7 +234,6 @@ pub const Client = struct {
             self.gpa.destroy(mm);
         }
         self.arena_state.deinit();
-        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -817,7 +811,7 @@ pub const Client = struct {
     const Plan = struct { f: store.Finish, outcome: Outcome };
 
     /// Builds the run's `Job` before `hold` publishes the box to the
-    /// heartbeat and the drain (SAFETY.md M3/T3). No I/O.
+    /// heartbeat and the drain. No I/O.
     fn prepare(self: *Client, box: *JobBox) void {
         const row = box.row;
         const a = box.arena_state.allocator();
@@ -865,7 +859,7 @@ pub const Client = struct {
             var span_id: [16]u8 = undefined;
             observe.trace.newId(self.io, &trace_id);
             observe.trace.newId(self.io, &span_id);
-            // In the run's arena, which the job lives in (M4).
+            // In the run's arena, which the job lives in.
             job.trace_id = a.dupe(u8, &trace_id) catch "";
             job.span_id = a.dupe(u8, &span_id) catch "";
             span = .{ .trace_id = trace_id, .span_id = span_id, .start_ns = std.Io.Clock.real.now(self.io).nanoseconds };
@@ -1156,7 +1150,7 @@ pub const Client = struct {
             if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
             self.unhold(box);
         } else |_| {
-            // Untracked, the run would get no heartbeat and no drain (U4).
+            // Untracked, the run would get no heartbeat and no drain.
             log.warn("{s}: no memory to track its run; put back", .{box.job.id_text});
             self.putBack(box.row);
         }
@@ -1223,7 +1217,7 @@ pub const Client = struct {
         };
         // The runs no longer held: those whose exact (id, attempt) the
         // store did not renew (a newer claim of the same job may be). The
-        // store is asked why with the lock released (SAFETY.md L2, L3):
+        // store is asked why with the lock released:
         // every run's start and end takes it.
         const Lost = struct { seq: u64, h: store.Held };
         var lost: std.ArrayList(Lost) = .empty;
@@ -1241,7 +1235,7 @@ pub const Client = struct {
             c.* = if (got) |row| row.state == .cancelled else false;
         }
         // A run may have ended during the calls: each is looked up again by
-        // its run's key (M3), never kept from before them.
+        // its run's key, never kept from before them.
         self.held_mutex.lockUncancelable(self.io);
         defer self.held_mutex.unlock(self.io);
         for (lost.items, cancelled) |l, c| {
@@ -1261,7 +1255,7 @@ pub const Client = struct {
     /// A store call's failure, in a task that carries on after one: a
     /// cancel (the teardown's) is passed on, never taken for a failure that
     /// the task logs and goes past, or its next wait parks with the cancel
-    /// gone (SAFETY.md).
+    /// gone.
     fn passCancel(err: anyerror) std.Io.Cancelable!void {
         if (err == error.Canceled) return error.Canceled;
     }

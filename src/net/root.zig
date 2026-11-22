@@ -1,6 +1,6 @@
 //! Raw network I/O: the outbound streams the database clients and brokers
 //! connect with (`ClientStream`), and with `-Dnet` raw TCP and UDP servers
-//! on the server's runtime and listeners (p3/net).
+//! on the server's runtime and listeners.
 const features = @import("build_options");
 
 /// A connected stream: `connect`, then its reader and writer.

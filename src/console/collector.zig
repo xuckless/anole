@@ -4,7 +4,7 @@
 //! lock of the runtime, waits for the answer (up to `wait_ms`).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 pub const What = enum(u8) { ws, db };
 
@@ -29,8 +29,8 @@ pub const Collector = struct {
     /// An answer is in `out` (set on the blocking `Io`).
     answered: std.Io.Event = .unset,
     /// Over `out`, `out_seq` and `out_ok`; held only to swap or move `out`,
-    /// never to allocate (SAFETY.md L5).
-    lock: safety.SpinLock(.leaf) = .init,
+    /// never to allocate.
+    lock: SpinLock = .init,
     /// The latest answer: made by the collector's task, taken (and freed)
     /// by the console thread that asked for it, or replaced by the next.
     out: std.ArrayList(u8) = .empty,

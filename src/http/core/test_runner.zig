@@ -200,8 +200,8 @@ pub fn main(init: std.process.Init) !void {
         test_index += 1;
 
         current_test = friendly_name;
-        // Backed by memory that is never handed out again (SAFETY.md E1).
-        std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(@import("anole_safety").never_reuse_allocator, .{}) else .{};
+        // Backed by memory that is never handed out again.
+        std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(@import("anole_never_reuse").allocator, .{}) else .{};
         std.testing.io_instance = .init(gpa, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,
@@ -334,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(if (fail == 0 and leak == 0) 0 else 1);
 }
 
-/// ANOLE: per-test durations, the same lines as src/safety/test_runner.zig
+/// ANOLE: per-test durations, the same lines as src/testing/runner.zig
 /// writes (`<ns>\t<result>\t<name>\t<binary>`, one O_APPEND write each,
 /// so shards share the file); tools/test_durations.py summarizes them.
 /// Local only, POSIX only.
@@ -481,7 +481,7 @@ const Env = struct {
     do_log_capture: bool,
     /// ANOLE_TEST_SHARD=i/n: only the tests whose index in
     /// `builtin.test_functions` is i modulo n (build.zig's
-    /// `-Dtest-shards`; the same protocol as src/safety/test_runner.zig).
+    /// `-Dtest-shards`; the same protocol as src/testing/runner.zig).
     shard_index: usize = 0,
     shard_count: usize = 1,
     shard_label: []const u8 = "",

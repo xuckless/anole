@@ -142,7 +142,7 @@ pub fn updateInitialWindow(w: *i32, new: u31, old: u31) error{FlowControl}!void 
 /// allocators' 2 KiB size class (32 streams would spill into 4 KiB and waste
 /// half of it). Chunks are kept until `deinit`, so a connection keeps its
 /// high-water mark (9 chunks, 18 KiB, at 250 streams); returning idle chunks
-/// is M3 (the block cache's smallest class is 64 KiB, so chunks stay on the
+/// is not done (the block cache's smallest class is 64 KiB, so chunks stay on the
 /// general allocator).
 pub const Slab = struct {
     gpa: Allocator,
@@ -206,7 +206,7 @@ pub const Slab = struct {
 /// rehashes again. nghttp2's resize at a probe length of 128 stays as the
 /// safety net that keeps the u8 lengths from overflowing; long probes need
 /// many IDs on one home slot, which a peer can only aim for if it knows the
-/// seed, so conn.zig (M3) takes a fresh CSPRNG seed per connection.
+/// seed, so conn.zig takes a fresh CSPRNG seed per connection.
 pub const StreamTable = struct {
     gpa: Allocator,
     seed: u64,

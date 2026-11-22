@@ -381,17 +381,13 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // such as metrics) that the router cannot tell apart.
         error.RouteConflict => return named(abi.E_CONFIG, "RouteConflict", 0, "routes: {s}", .{e.start_why[0..e.start_why_len]}),
         error.OutOfMemory => return fail(abi.E_NOMEM, what, err),
-        // ---- p3/smtp ----
         // A mail server's settings that do not hold (a production run
         // without SMTP_URL, a URL that is not one): the configuration's.
         error.InvalidOptions => if (explained.len > 0) return named(abi.E_CONFIG, "InvalidOptions", 0, "{s}", .{explained}),
-        // ---- end p3/smtp ----
-        // ---- p3/lambda ----
         // SnapStart is how the function was published: the configuration's
         // to change. A Runtime API that failed is the platform's.
         error.SnapStartUnsupported => return named(abi.E_CONFIG, "SnapStartUnsupported", 0, "{s}", .{if (explained.len > 0) explained else "lambda: SnapStart is not supported yet"}),
         error.LambdaRuntimeApiFailed => return named(abi.E_SYSTEM, "LambdaRuntimeApiFailed", 0, "{s}", .{if (explained.len > 0) explained else "lambda: the Runtime API failed"}),
-        // ---- end p3/lambda ----
         error.DatabaseUnavailable => {
             if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
             return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
@@ -1365,8 +1361,6 @@ export fn anole_db_tx_release(tx: u64) i32 {
     return abi.OK;
 }
 
-// ---- p3/net ----
-
 export fn anole_net_addr_format(a: ?*const abi.NetAddr, buf: ?[*]u8, cap: usize) i64 {
     const addr = a orelse return failCode(abi.E_INVALID);
     const ip: std.Io.net.IpAddress = switch (addr.family) {
@@ -1466,9 +1460,7 @@ export fn anole_net_udp_find(s: ?*anyopaque, listener: Str, out: ?*u64) i32 {
     };
     return abi.OK;
 }
-// ---- end p3/net ----
 
-// ---- p3/jobs ----
 const jobs_mod = engine.jobs;
 
 fn jobsFailure(err: jobs_mod.CallError) i32 {
@@ -1553,9 +1545,7 @@ export fn anole_jobs_admin(j: ?*anyopaque, c_: ?*anyopaque, request: Str, user_d
     jobs_mod.admin(e, c, request.slice(), user_data) catch |err| return jobsFailure(err);
     return abi.OK;
 }
-// ---- end p3/jobs ----
 
-// ---- p3/webhooks ----
 const webhooks_mod = engine.webhooks;
 
 fn webhooksFailure(err: webhooks_mod.CallError) i32 {
@@ -1595,9 +1585,7 @@ export fn anole_webhooks_watch(j: ?*anyopaque, c_: ?*anyopaque, user_data: u64) 
     webhooks_mod.watch(e, c, user_data) catch |err| return webhooksFailure(err);
     return abi.OK;
 }
-// ---- end p3/webhooks ----
 
-// ---- p3/realtime ----
 // ---- Server-sent events -----------------------------------------------------------------
 
 export fn anole_sse_publish(s: ?*anyopaque, topic: Str, event: Str, data: ?*const anyopaque, len: usize, flags: u32) i32 {
@@ -1724,9 +1712,7 @@ export fn anole_watch_ack(l: u64, position: Str) i32 {
     };
     return abi.OK;
 }
-// ---- end p3/realtime ----
 
-// ---- p3/s3 ----
 // ---- object storage ---------------------------------------------------------------
 
 const s3_mod = engine.s3;
@@ -1947,9 +1933,7 @@ export fn anole_s3_multipart_abort(p: ?*anyopaque, c_: ?*anyopaque, key: Str, up
     s3_mod.multipartAbort(st, c, key, upload_id, o, user_data) catch |err| return s3Failure(err);
     return abi.OK;
 }
-// ---- end p3/s3 ----
 
-// ---- p3/smtp ----
 // ---- Mail --------------------------------------------------------------------------
 
 const smtp_mod = engine.smtp;
@@ -2012,7 +1996,3 @@ export fn anole_smtp_send_raw(m: ?*anyopaque, c_: ?*anyopaque, envelope_from: St
     smtp_mod.sendRaw(mail, c, envelope_from, recipients, n, body, o, user_data, &why) catch |err| return smtpFailure(err, &why);
     return abi.OK;
 }
-// ---- end p3/smtp ----
-
-// ---- p3/lambda ----
-// ---- end p3/lambda ----

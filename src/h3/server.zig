@@ -36,12 +36,10 @@
 //!
 //! Ported from ngtcp2's examples/server.cc and
 //! http3_server_proto_codec.cc (MIT, ngtcp2 1.25.0); the request and
-//! response plumbing follows the core's HTTP/2 engine as it was (the
-//! nghttp2 one, from the xuckless/dusty fork; the engine is
-//! src/http/core/h2/server.zig since M3).
+//! response plumbing follows the core's HTTP/2 engine
+//! (src/http/core/h2/server.zig).
 const std = @import("std");
 const zio = @import("zio");
-const safety = @import("anole_safety");
 const dusty = @import("dusty");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
@@ -2720,7 +2718,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.out.deinit(&ep.blocks, &s.conn.budget);
                 s.body.deinit(&ep.blocks);
                 // One chunk within the limit, as usual, is kept as it is.
-                _ = safety.resetArena(&s.arena, .{ .retain_with_limit = arena_keep });
+                _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
                 if (!ep.keepStream(s)) s.destroy(gpa, &ep.blocks);
             }
 

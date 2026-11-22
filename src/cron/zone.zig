@@ -1,7 +1,7 @@
 //! Time zones for schedules: fixed offsets, UTC and the system's TZif files
 //! (with the POSIX rule of the file's footer for instants past the last
 //! transition). std.tz parses TZif but does not evaluate the footer, so this
-//! reads the files itself (p3/jobs, design-jobs.md C4).
+//! reads the files itself (design-jobs.md C4).
 const std = @import("std");
 const builtin = @import("builtin");
 const Time = @import("../db/time.zig").Time;

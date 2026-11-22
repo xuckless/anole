@@ -19,7 +19,7 @@ fn get(io: std.Io, addr: std.Io.net.IpAddress, request: []const u8, out: []u8) !
     var r = stream.reader(io, &rbuf);
     var fw: std.Io.Writer = .fixed(out);
     if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
-        // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+        // A cancel is handed on; anything else ends the read.
         if (r.err) |e| if (e == error.Canceled) return error.Canceled;
     }
     return fw.buffered();

@@ -1,14 +1,12 @@
 //! The HTTP/2 server engine on Anole's own protocol core (conn.zig;
-//! research/h2h3-takeover/PLAN.md §3.3-§3.5, M3), in place of the nghttp2
-//! engine (removed at M6).
+//! research/h2h3-takeover/PLAN.md §3.3-§3.5).
 //! A connection runs as
 //!
 //!   * the reader (the connection's own task, which entered `serve`): reads,
 //!     feeds `Conn.recv`, runs the `no_wait` requests that came whole in the
 //!     read (`runInline`), then writes one batch of output itself;
 //!   * one task per other stream (`runStream`): builds a `Request` and a
-//!     sink-backed `Response` and runs the router, as the nghttp2 engine's
-//!     stream tasks do, so handlers and middleware are unchanged;
+//!     sink-backed `Response` and runs the router, so handlers and middleware are unchanged;
 //!   * a flusher task, only while output is left over (`flusherRun`).
 //!
 //! There is no writer task. Output goes out under a **flush token**
@@ -34,11 +32,11 @@
 //! blocks from malloc's slabs, freed at the first read after a trim interval
 //! that finds the connection idle (one that reads nothing more keeps them
 //! until its keep-alive deadline); the HPACK scratch one per executor (`scratch`); a request body
-//! sized as the nghttp2 engine's (`BodyBuf`); a streamed response in at most
+//! sized by `BodyBuf`; a streamed response in at most
 //! two 16 KiB blocks. A stream's arena, body and blocks are reused or freed
 //! only once `out` no longer borrows them (`retiring`).
 //!
-//! **Seams** (PLAN §3.5), with the nghttp2 engine's semantics: detached
+//! **Seams** (PLAN §3.5): detached
 //! responses (the C ABI's; `detach_engine`), parked ones (SSE; `H2Parked`)
 //! and RFC 8441 tunnels (WebSocket over HTTP/2). Tunnel and parked output is
 //! copied into a chain of blocks on the stream (`ChainBlock`), each let go
@@ -48,7 +46,7 @@
 //! the caller, which serves other requests (h2o's request_gathered_write, Go
 //! x/net/http2's writeFrameFromHandler).
 //!
-//! **Lifecycle** (PLAN §3.3 "Timers", §3.5 "Drain"; M3 item lifecycle): a
+//! **Lifecycle** (PLAN §3.3 "Timers", §3.5 "Drain"): a
 //! connection is the server's `Adopter` from its first byte (`start`), so it
 //! parks like an adopted HTTP/1.1 connection (D16, #97): once nothing is
 //! open, queued or half read, the reader gives its read buffer, the output
@@ -65,7 +63,6 @@
 //! mutex.
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 
 const conn_mod = @import("conn.zig");
 const hpack = @import("hpack.zig");
@@ -93,15 +90,8 @@ const parked_mod = @import("../parked.zig");
 const Parked = parked_mod.Parked;
 
 const log = std.log.scoped(.anole_h2);
-/// zio's count of the locks a task holds (`debug_held_locks`); a no-op for
-/// the core's stub zio.
-const held_locks = if (@hasDecl(@import("zio"), "held_locks")) @import("zio").held_locks else struct {
-    fn acquired() void {}
-    fn released() void {}
-};
 
-/// The client connection preface (RFC 9113 §3.4), shared with the nghttp2
-/// engine.
+/// The client connection preface (RFC 9113 §3.4).
 pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// True when the connection opens with the HTTP/2 preface. Reads only while
@@ -126,14 +116,13 @@ const arena_body_max = 4 * 1024;
 /// Request header entries a stream's table starts with (h2load sends one,
 /// a browser a dozen); it grows up to `max_header_count`.
 const initial_header_room = 8;
-/// Spare streams a connection keeps for reuse (as the nghttp2 engine).
+/// Spare streams a connection keeps for reuse.
 const max_spare_streams = 128;
 const min_spare_streams = 16;
-/// What a stream's arena keeps between requests (as the nghttp2 engine:
-/// an 8 KiB malloc class with the arena's node header). Not a smaller
+/// What a stream's arena keeps between requests (an 8 KiB malloc class with the arena's node header). Not a smaller
 /// first node grown on demand: SmpAllocator resizes only within a class,
 /// so every stream that grew would leave its old node on a free list that
-/// nothing in steady state reuses (M4, research/s2/h2-m4/heap.md).
+/// nothing in steady state reuses (research/s2/h2-m4/heap.md).
 pub const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
 /// A streamed response's block: the body writer's buffer, then borrowed by
 /// `out` until written. Two per stream on a task.
@@ -146,12 +135,11 @@ const drain_ping: [8]u8 = "anole-go".*;
 /// After the peer's side of the connection ended cleanly, while handlers
 /// still run, how often a PING asks whether the peer only half-closed (it
 /// may still read their responses) or is gone (the write after its reset
-/// fails, and the handlers are canceled). The nghttp2 engine's.
+/// fails, and the handlers are canceled).
 const half_close_probe_interval: std.Io.Duration = .fromMilliseconds(500);
 const probe_ping: [8]u8 = "anole-hc".*;
 /// The most bytes a tunnel or a parked response may have queued for the
-/// peer before its send waits, when the caller names no limit (the nghttp2
-/// engine's `tunnel_outbox_max`).
+/// peer before its send waits, when the caller names no limit.
 const tunnel_outbox_max = 1024 * 1024;
 
 const is_test = builtin.is_test;
@@ -178,8 +166,7 @@ pub var test_out_high: if (is_test) ?usize else void = if (is_test) null else {}
 pub var test_trim_epoch: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: whether the last connection served ran lock-free.
 pub var test_lock_free: if (is_test) std.atomic.Value(bool) else void = if (is_test) .init(false) else {};
-/// Tests only: streaming body writers handed out (`StreamSink.body`), as
-/// the nghttp2 engine counts them (grpc/server_test.zig reads it).
+/// Tests only: streaming body writers handed out (`StreamSink.body`; grpc/server_test.zig reads it).
 pub var test_sink_bodies: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
 /// Tests only: chain blocks alive (tunnels, parked responses).
 pub var test_chain_blocks: if (is_test) std.atomic.Value(u32) else void = if (is_test) .init(0) else {};
@@ -243,11 +230,10 @@ pub fn Engine(comptime Ctx: type) type {
         /// its drain if its socket wakes it, and the stop closes it.
         pub const Registry = struct {
             /// Held across the drain's walk, which waits for each
-            /// connection's lock where it has a mutex (`request`): SAFETY.md
-            /// L2's exception, as no other lock may be held while waiting
-            /// for one (the nghttp2 engine's registry is an unranked
-            /// `std.Io.Mutex` for the same walk). Taken with no lock held.
-            mutex: safety.IoLock = .init,
+            /// connection's lock where it has a mutex (`request`), so
+            /// no other lock may be held while waiting for one.
+            /// Taken with no lock held.
+            mutex: std.Io.Mutex = .init,
             list: std.DoublyLinkedList = .{},
 
             pub const field = "h2_conns";
@@ -336,7 +322,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// (`placement.single_executor_guarantee` and a zio `Io`), else a
         /// mutex. Nothing under it may yield.
         const ConnLock = struct {
-            mutex: safety.Mutex(.protocol) = .init,
+            mutex: std.Io.Mutex = .init,
             free: bool = false,
             owner: usize = 0,
             held: if (builtin.mode == .debug) bool else void = if (builtin.mode == .debug) false else {},
@@ -347,10 +333,6 @@ pub fn Engine(comptime Ctx: type) type {
                         std.debug.assert(placement.currentExecutor(io) == l.owner);
                         std.debug.assert(!l.held);
                         l.held = true;
-                        // Counted with zio's (`debug_held_locks`), as a
-                        // mutex is: a task that suspends under it panics at
-                        // the suspension.
-                        held_locks.acquired();
                     }
                     return;
                 }
@@ -359,10 +341,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn unlock(l: *ConnLock, io: std.Io) void {
                 if (l.free) {
-                    if (comptime builtin.mode == .debug) {
-                        l.held = false;
-                        held_locks.released();
-                    }
+                    if (comptime builtin.mode == .debug) l.held = false;
                     return;
                 }
                 l.mutex.unlock(io);
@@ -518,7 +497,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             /// Once a trim interval has passed: the spares unused since the
-            /// last trim go (as the nghttp2 engine's `trimSpares`), and an
+            /// last trim go, and an
             /// idle connection's output blocks. Under the lock.
             fn trimIdle(conn: *Conn) void {
                 const epoch = conn.trimEpoch();
@@ -573,8 +552,7 @@ pub fn Engine(comptime Ctx: type) type {
             pub fn onField(conn: *Conn, s: *PStream, name: []const u8, value: []const u8) conn_mod.Error!void {
                 _ = conn;
                 const es = EStream.of(s) orelse return;
-                // Trailers on a request are not passed on (as the nghttp2
-                // engine).
+                // Trailers on a request are not passed on .
                 if (s.flags.in_trailers) return;
                 const arena = es.arena.allocator();
                 const v = arena.dupe(u8, value) catch return error.ResetStream;
@@ -900,8 +878,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// (RFC 8441) whose handler is done has nothing left to read: it
             /// ends with RST_STREAM(NO_ERROR) as soon as its END_STREAM is
             /// framed (a reset before would drop it), rather than wait for a
-            /// peer that may keep its side open (the nghttp2 engine's
-            /// `startDiscard`).
+            /// peer that may keep its side open.
             fn startDiscard(conn: *Conn, es: *EStream, s: *PStream) void {
                 es.discarding = true;
                 es.discard_left = if (es.protocol.len > 0) 0 else es.windowSize(conn);
@@ -948,7 +925,7 @@ pub fn Engine(comptime Ctx: type) type {
                     _ = test_arena_high.fetchMax(used, .monotonic);
                 }
                 if (conn.spares.items.len < conn.max_spares) {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                    _ = es.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                     if (is_test) test_arena_kept.store(es.arena.queryCapacity(), .release);
                     if (conn.spares.append(conn.allocator, es)) |_| return else |_| {}
                 }
@@ -968,7 +945,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.proto.reset(s, .internal_error) catch return error.ResetStream;
             }
 
-            // -- Request bodies (the nghttp2 engine's M0 sizing, ported) --
+            // -- Request bodies (sized from the declared length) --
 
             /// The body buffer, on the first DATA: the body when its length
             /// is known (content-length, or the frame that ends it, when it
@@ -992,8 +969,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// last raise: the window grows a step (x4, up to
             /// `stream_window_reading` and the content-length), and the
             /// body buffer with it, within the connection's
-            /// `reading_window_budget` (the nghttp2 engine's `raiseWindow`,
-            /// #99). Under the lock.
+            /// `reading_window_budget` (#99). Under the lock.
             fn raiseWindow(conn: *Conn, es: *EStream) void {
                 es.raise_due = false;
                 const s = es.cs orelse return;
@@ -1033,7 +1009,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Phase one: GOAWAY with the largest stream ID, which streams
             /// already on the way still fit under, and a PING whose answer
-            /// says they have arrived (the nghttp2 engine's `beginDrain`).
+            /// says they have arrived.
             /// Answered streams whose peer keeps its request side open would
             /// hold the drain until its deadline: they end now. Under the
             /// lock; out of line (cold).
@@ -1068,8 +1044,8 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// The final GOAWAY is out, or the peer's came in, and no
             /// stream is open: nothing more is coming for this connection
-            /// (`nghttp2_session_want_read` is 0 for either, and the nghttp2
-            /// engine then closes; RFC 9113 §6.8: the peer opens no more
+            /// (nghttp2's `nghttp2_session_want_read` is 0 for either;
+            /// RFC 9113 §6.8: the peer opens no more
             /// streams). Under the lock.
             fn drained(conn: *Conn) bool {
                 return (conn.goaway_sent or conn.peer_goaway) and conn.live.first == null;
@@ -1207,14 +1183,13 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             /// How long a finished response may wait for the peer's credit
-            /// before it is reset (the nghttp2 engine's `sendTimeout`).
+            /// before it is reset.
             fn sendTimeout(conn: *const Conn) ?std.Io.Duration {
                 return conn.server.config.timeout.request orelse conn.server.config.timeout.keepalive;
             }
 
             /// Finished responses the peer gives no credit for are reset
-            /// with CANCEL at their send deadline (the nghttp2 engine's
-            /// writer `sweepSends`), so they don't hold the connection
+            /// with CANCEL at their send deadline, so they don't hold the connection
             /// (and its count in the server's in-flight requests) for
             /// good. A futex wait with a timeout, so it works with no
             /// shelf too (std.Io.Threaded). Only while some wait, on the
@@ -1406,8 +1381,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// Nothing more can go out: both directions are shut, so the
             /// reader stops too, the streams waiting for room are told, and
             /// the token goes (nobody takes it again).
-            /// A drained connection's end of our side, once (the nghttp2
-            /// engine's `shutSend`): close_notify under TLS, bounded by
+            /// A drained connection's end of our side, once: close_notify under TLS, bounded by
             /// `linger_timeout`, then the send side shut, so the peer reads
             /// a clean end after the final GOAWAY. The receive side stays
             /// open: what the peer still sends (a WINDOW_UPDATE, the PING's
@@ -1546,7 +1520,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// its window is raised to it now. Raised by its distance from
             /// `stream_window`, which the peer's ACK of our SETTINGS adds
             /// to a window opened before it, so it lands on `tunnel_window`
-            /// either way (the nghttp2 engine's `setTunnelWindow`). A
+            /// either way. A
             /// `tunnel_window` below `stream_window` is left at the latter
             /// (INTENTIONAL.md). Under the lock.
             fn setTunnelWindow(conn: *Conn, es: *EStream, s: *PStream) void {
@@ -1614,8 +1588,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// part per block (borrowed until written), and watches the
             /// stream for its blocks to be written. A block's cut still
             /// queued takes the new bytes (`Proto.growData`), so sends
-            /// faster than the flushes go out as one DATA run per block,
-            /// as the nghttp2 engine's outbox did. Under the lock.
+            /// faster than the flushes go out as one DATA run per block.
+            /// Under the lock.
             fn chainSubmit(conn: *Conn, es: *EStream, s: *PStream) conn_mod.SubmitError!void {
                 var it = es.chain.first;
                 while (it) |node| : (it = node.next) {
@@ -1746,8 +1720,7 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// A request body buffer: up to `arena_body_max` from the stream's
         /// arena, up to `block_cache.malloc_max` from the allocator
-        /// (malloc's slabs), larger from `block_cache` (the nghttp2
-        /// engine's `BodyBuf`).
+        /// (malloc's slabs), larger from `block_cache`.
         const BodyBuf = struct {
             mem: []u8 = &.{},
             from: enum { none, arena, heap, block } = .none,
@@ -1962,7 +1935,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // The node every reset keeps, so the first reset does not
                 // reallocate it.
                 if (es.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                    _ = es.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                 } else |_| {}
                 return es;
             }
@@ -2105,8 +2078,7 @@ pub fn Engine(comptime Ctx: type) type {
             const connection = conn.connection;
             // The flusher's task slot, held while the run lasts (the
             // reader's is the accept's or the wake's): a connection on its
-            // task counts as the two tasks it may run, as the nghttp2
-            // engine's reader and writer did, so `max_tasks` bounds them;
+            // task counts as the two tasks it may run, so `max_tasks` bounds them;
             // a parked one counts none. A run ends with its flushers done
             // (a park needs `flushing` clear, their last step; a close
             // joins them).
@@ -2139,8 +2111,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// error, and `Adopter.release` frees it: the tasks canceled and
         /// joined; detached responses nobody finished: their owners hear of
         /// it; parked ones: their owners hear the peer is gone and release
-        /// once their bursts are over, so they are waited for (the nghttp2
-        /// engine's teardown order: parked told, the group canceled,
+        /// once their bursts are over, so they are waited for (the
+        /// teardown order: parked told, the group canceled,
         /// detached aborted, then the wait). Also from the shelf's driver,
         /// for a parked connection, which has no stream.
         fn adopterRelease(a: *server_mod.Adopter) void {
@@ -2218,7 +2190,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .eof => {},
                 .done, .drained => linger = true,
                 // A connection error frames no more DATA: no response can
-                // finish (the nghttp2 engine's Http2ProtocolError).
+                // finish.
                 .dead => {
                     linger = true;
                     reader_failed = true;
@@ -2263,8 +2235,7 @@ pub fn Engine(comptime Ctx: type) type {
             // `attach` is checked here too, but its owner spawns after the
             // lock: safe where the connection's tasks share an executor
             // (pinned zio: no yield between the two), not where they don't
-            // (std.Io.Threaded). The nghttp2 engine's `attach` is the same;
-            // the fix is a `Detached` attach that spawns under the lock.
+            // (std.Io.Threaded). The fix is a `Detached` attach that spawns under the lock.
             {
                 conn.lock();
                 defer conn.unlock();
@@ -2288,8 +2259,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// that closed the whole connection answers the first with a TCP
         /// reset, so a later write fails (`send_shut`), and the handlers
         /// are canceled, with nobody left to answer; one that only
-        /// half-closed reads it and is still served. The nghttp2 engine's
-        /// probes (its writer's `closing` rounds): a handler's end wakes
+        /// half-closed reads it and is still served. A handler's end wakes
         /// the wait to look again, and only a whole interval without one
         /// sends the next PING.
         fn probeHalfClose(conn: *Conn, timer: *Timer) error{Canceled}!void {
@@ -2529,8 +2499,7 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         /// Hangs up on a peer whose side is still open once the connection
-        /// is over, so it still gets the last frames (the nghttp2 engine's
-        /// `lingeringClose`): close_notify under TLS and the send side
+        /// is over, so it still gets the last frames: close_notify under TLS and the send side
         /// shut, then what the peer sends is thrown away until it hangs up,
         /// `linger_timeout` passes, or `linger_limit` bytes. Where the timer
         /// cannot bound the reads only the send side is shut, as HTTP/1.x's
@@ -2683,9 +2652,8 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// Serves one request: on the reader (`timer` null, a `no_wait`
         /// route, no request timeout, whose timer would cancel the reader)
-        /// or on its own task. The nghttp2 engine's `serveStream`, with
-        /// the same request build, so the router, handlers and middleware
-        /// see the same request. On the reader the response may be
+        /// or on its own task. The router, handlers and middleware
+        /// see the same request on either. On the reader the response may be
         /// detached (`Detached`); on a task only to be parked. `.detached`:
         /// the stream's handler hold went to the detached response.
         fn serveStream(conn: *Conn, es: *EStream, timer: ?*Timer) !Served {
@@ -2761,7 +2729,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             // Room for an ordinary request's fields, grown up to the limit
             // for one with more, as over HTTP/1.1: most of a spare stream's
-            // arena otherwise (M4, #179).
+            // arena otherwise (#179).
             const max_headers = server.config.request.max_header_count;
             request.headers = http.Headers.init(arena, @min(max_headers, initial_header_room)) catch return error.OutOfMemory;
             var too_many = false;
@@ -2870,7 +2838,7 @@ pub fn Engine(comptime Ctx: type) type {
             return timer.fired();
         }
 
-        // -- Detached and parked responses (the nghttp2 engine's, ported) -
+        // -- Detached and parked responses --
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`Detached`).
@@ -3568,8 +3536,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             // -- A tunnel's or a parked response's chain (`ChainBlock`) ---
 
-            /// Appends `parts` to the body in one copy (the nghttp2 engine's
-            /// `appendOutbox` rule: waits while more than `max_pending`
+            /// Appends `parts` to the body in one copy (waits while more than `max_pending`
             /// bytes are queued, and always takes a message when nothing
             /// is). With `now` they go out now; without, at `kickOut`.
             /// From any task: one on another executor hops to the

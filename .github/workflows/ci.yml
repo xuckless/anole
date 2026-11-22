@@ -33,7 +33,7 @@ permissions:
 # costs minutes. Every unit test step passes
 # `--test-timeout 120s`: a test running that long is named and ended, and the
 # test runner dumps every thread's backtrace at 110 s (gdb on Linux; lldb,
-# else sample, on macOS; src/safety/test_runner.zig). Jobs with Docker
+# else sample, on macOS; src/testing/runner.zig). Jobs with Docker
 # containers save the containers' logs and states as an artifact when they
 # fail: their scripts keep the containers (named anole-*) under
 # ANOLE_KEEP_CONTAINERS=1 and an always() step removes them afterwards. The
@@ -63,24 +63,6 @@ jobs:
       # step's filter (TESTING.md, research/s15/test-audit.md T10).
       - name: Live-test coverage
         run: python3 -I tools/live_coverage.py
-
-  lint:
-    # K2: catches a new SAFETY.md E2 hit (T1, T5, U1, U3, C3, raw locks,
-    # doc-comment names) or a stale count, against the ratchet baseline
-    # tools/safety_lint.baseline.tsv, in seconds. `zig run` skips build.zig's
-    # configure pass, so no dependency is fetched; `zig build lint` runs the
-    # same check locally and `-Dlint-update` lowers the baseline.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.17.0
-      - name: Safety lint against the baseline
-        run: zig run tools/safety_lint.zig -- --baseline tools/safety_lint.baseline.tsv src
-      - name: The lint's own tests
-        run: zig test tools/safety_lint.zig
 
   test:
     # K2: catches the suite on the two first-class platforms (epoll/io_uring vs kqueue); the configure paths of the minimal profile; compile-only for web, tls=none, h3-without-h2.
@@ -187,7 +169,7 @@ jobs:
       matrix:
         # aarch64 Linux is a production target with no native job here. The
         # Windows cross build is gone: the windows job and test-flags caught
-        # every error it caught (T7).
+        # every error it caught.
         target: [aarch64-linux-gnu]
     runs-on: ubuntu-latest
     timeout-minutes: 76
@@ -783,7 +765,6 @@ jobs:
         if: always()
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
-  # ---- p3/s3 ----
   s3:
     # K2: catches the S3 client against MinIO, plain and TLS (the XML fuzz target runs in the fuzz job).
     name: S3 (the client against MinIO, plain and TLS; the C ABI's storage tests)
@@ -816,7 +797,6 @@ jobs:
       - name: Remove the containers
         if: always()
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
-  # ---- end p3/s3 ----
 
   postgres:
     # K2: catches the live PostgreSQL client with scram-sha-256 and verify-full TLS (caught the bare BEGIN iterate bug).

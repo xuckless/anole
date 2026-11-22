@@ -1,5 +1,5 @@
-//! Behaviour every store keeps, run here on the memory store (p3/jobs,
-//! design-jobs.md §14). `FakeClock` and `run = .manual` with `step` make the
+//! Behaviour every store keeps, run here on the memory store
+//! (design-jobs.md §14). `FakeClock` and `run = .manual` with `step` make the
 //! tests deterministic: nothing here waits for time to pass.
 const std = @import("std");
 const wait = @import("anole_test_wait");

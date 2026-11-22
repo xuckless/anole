@@ -2,17 +2,13 @@
 //! are on datagrams arriving or counters; nothing asserts a latency.
 const std = @import("std");
 const wait = @import("anole_test_wait");
-const safety = @import("anole_safety");
 const builtin = @import("builtin");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
 const udp_service = @import("udp_service.zig");
 
 const App = server_mod.App;
-/// The App's allocator panics at an allocation under a spin lock (SAFETY.md
-/// L5, E1): std's test allocator can't be intercepted, so it is wrapped.
-var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
-const alloc = checked.allocator();
+const alloc = std.testing.allocator;
 
 fn portOf(a: *App) u16 {
     return a.udpSocket("udp-0").?.address().getPort();

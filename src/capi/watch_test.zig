@@ -1,4 +1,4 @@
-//! C ABI tests for p3/realtime (watch), imported from engine_test.zig:
+//! C ABI tests for realtime (watch), imported from engine_test.zig:
 //! listeners over a fake source, bounds and gaps, formats, the end of a
 //! listener, and handle kinds.
 

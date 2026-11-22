@@ -776,7 +776,7 @@ test "gRPC-Web over HTTP/1.1: a deadline that cancels the handler is answered DE
     // HTTP/1.1, where the request's timer cancels the handler at the call's
     // deadline (an AutoCancel) and the connection's task then writes the
     // answer: a cancel swallowed there parks it on that write, which zio's
-    // debug_cancel reports and the test runner fails (SAFETY.md C3). The
+    // debug_cancel reports and the test runner fails. The
     // deadline's own cancel is claimed instead (Request._claimTimeoutCancel).
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
@@ -1368,7 +1368,7 @@ test "gRPC: grpc-status survives concurrent unary calls on several executors" {
     const h2 = @import("anole_h2_client");
     const Caller = struct {
         /// Counts every call that failed or did not end with OK.
-        /// A cancel of the group ends the caller (SAFETY.md C3).
+        /// A cancel of the group ends the caller.
         fn run(channel: *grpc.Channel, calls: usize, bad: *std.atomic.Value(usize)) std.Io.Cancelable!void {
             const client: grpc.Client(Echo) = .{ .channel = channel };
             for (0..calls) |_| {

@@ -17,7 +17,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
 
@@ -159,8 +158,8 @@ pub const Span = struct {
     /// the context that enqueued it (otelriver, opentelemetry_oban and
     /// the Sidekiq instrumentation link by default).
     ///
-    /// owner: the Exporter (SAFETY.md M1), through the span that carries
-    /// it. M2 class: child of the exporter (on its allocator), freed by
+    /// owner: the Exporter, through the span that carries
+    /// it. A child of the exporter (on its allocator), freed by
     /// `Exporter.release` exactly once: when the span is sent, dropped,
     /// left over at `close`, or given back by a test's `Taken.deinit`.
     pub const JobRun = struct {
@@ -276,8 +275,8 @@ pub const Options = struct {
 /// slow requests. `app.tracing(.{})` makes one owned by the server,
 /// already started.
 ///
-/// owner: whoever made it (`App` for `app.tracing`). M2 class:
-/// process-wide. Teardown (M5) runs in two steps, as the OpenTelemetry
+/// owner: whoever made it (`App` for `app.tracing`):
+/// process-wide. Teardown runs in two steps, as the OpenTelemetry
 /// SDK's Shutdown: `close` sends what is queued and stops the task (it
 /// needs `client`'s server still running), after which `submit`, `job`
 /// and `child` are no-ops that allocate nothing and count the span as
@@ -305,9 +304,9 @@ pub const Exporter = struct {
     /// Over the flushers' wait for `finished`: `flush` waits on
     /// `progressed`; the task broadcasts after each batch and when it ends,
     /// `close` as it starts and once more after the join. Never held across
-    /// anything but the condition's own wait (SAFETY.md L2).
-    progress_lock: safety.Mutex(.leaf) = .init,
-    progressed: safety.Condition = .init,
+    /// anything but the condition's own wait.
+    progress_lock: std.Io.Mutex = .init,
+    progressed: std.Io.Condition = .init,
     /// Tests: waits of a flusher for progress, counted under
     /// `progress_lock` as each starts. Test builds only.
     test_flush_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
@@ -320,7 +319,7 @@ pub const Exporter = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
-    /// M5's teardown state: alive, then closed (`close`), then dead
+    /// The teardown state: alive, then closed (`close`), then dead
     /// (`deinit`).
     state: std.atomic.Value(State) = .init(.alive),
 
@@ -415,12 +414,12 @@ pub const Exporter = struct {
         // takes the lock to broadcast: a change after this check wakes the
         // wait below.
         while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .alive) {
-            // A wake under the leaf lock, not a wait (L2 holds).
+            // A wake under the leaf lock, not a wait.
             self.kick.set(self.io);
             if (comptime builtin.is_test) _ = self.test_flush_waits.fetchAdd(1, .release);
             self.progressed.waitTimeout(self.io, &self.progress_lock, deadline) catch |err| switch (err) {
                 error.Timeout => return,
-                // SAFETY.md C3: the caller stays canceled.
+                // The caller stays canceled.
                 error.Canceled => {
                     self.io.recancel();
                     return;

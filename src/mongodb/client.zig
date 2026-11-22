@@ -12,7 +12,6 @@
 //! timeout bounds it and becomes `maxTimeMS`).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 const bson = @import("bson");
 const dusty = @import("dusty");
 const shared = @import("../db/root.zig");
@@ -110,8 +109,8 @@ pub const default_url = "mongodb://localhost:27017";
 /// A connection pool for one server on one executor (CMAP, without the
 /// background thread: connections open when a call needs one).
 const Pool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     /// Most recently used last.
     idle: std.ArrayList(*Connection) = .empty,
     /// Open, checked out, or being opened.
@@ -136,7 +135,7 @@ pub const Server = struct {
     /// Guards `monitor`: the monitor sets it as it starts and clears it
     /// before it returns, so whoever cancels it under this lock knows it
     /// has not returned (`placement.currentTask`'s contract).
-    task_lock: safety.Mutex(.leaf) = .init,
+    task_lock: std.Io.Mutex = .init,
     monitor: ?placement.Task = null,
     /// Under `Client.mutex`: the links of the servers whose monitors a
     /// `syncServers` starts or stops, walked after the unlock
@@ -200,7 +199,7 @@ pub const Session = struct {
 };
 
 const SessionPool = struct {
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     list: std.ArrayList(*Session) = .empty,
 };
 
@@ -237,9 +236,9 @@ pub const Client = struct {
     readiness: shared.Readiness = undefined,
 
     /// Guards the topology and the server list.
-    mutex: safety.Mutex(.leaf) = .init,
+    mutex: std.Io.Mutex = .init,
     /// Broadcast when the topology changes (selection waits on it).
-    changed: safety.Condition = .init,
+    changed: std.Io.Condition = .init,
     topology: sdam.Topology,
     servers: std.ArrayList(*Server) = .empty,
     /// Monitors.
@@ -484,7 +483,7 @@ pub const Client = struct {
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| {
-            self.readiness = .{ .io = self.io, .context = safety.toCtx(self), .ping = readyPing };
+            self.readiness = .{ .io = self.io, .context = self, .ping = readyPing };
             try self.readiness.register(h, self.name);
         }
         if (self.options.connect_at_start) self.warm() catch |err| {
@@ -506,7 +505,7 @@ pub const Client = struct {
             const c = try Connection.open(self.gpa, io, s.address, self.settings, true);
             c.generation = generation;
             c.server = s;
-            c.pool = safety.toCtx(p);
+            c.pool = p;
             p.mutex.lock(io) catch |err| {
                 c.close();
                 return err;
@@ -526,7 +525,7 @@ pub const Client = struct {
     /// A cancel of the caller is `error.Canceled` (`Readiness` keeps no
     /// answer then).
     fn readyPing(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
-        const self = safety.fromCtx(Client, context);
+        const self: *Client = @ptrCast(@alignCast(context));
         var buf: [2048]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var c: shared.Ctx = .{ .io = io, .arena = fba.allocator() };
@@ -564,7 +563,7 @@ pub const Client = struct {
             test_close_hold = null;
             f(s);
         };
-        // Cancels and joins every monitor (SAFETY.md C1, T1): a monitor's
+        // Cancels and joins every monitor: a monitor's
         // connection is its own, closed by it alone.
         self.group.cancel(io);
         for (self.servers.items) |s| self.freeServer(s);
@@ -607,7 +606,7 @@ pub const Client = struct {
     /// none, retirement for those it dropped, checks it asked for,
     /// generations copied over. Spawns, cancels and logs nothing: the
     /// monitors to start and stop are in the result, for `applyChanges`
-    /// after the unlock (SAFETY.md L2, L3: a spawn may yield).
+    /// after the unlock (a spawn may yield).
     fn syncServers(self: *Client) Changes {
         var changes: Changes = .{};
         for (self.topology.servers.items) |*ts| {
@@ -616,17 +615,17 @@ pub const Client = struct {
                     changes.failed = err;
                     continue;
                 };
-                ts.context = safety.toCtx(s);
+                ts.context = s;
                 s.start_next = changes.start;
                 changes.start = s;
             }
-            const s = safety.fromCtx(Server, ts.context);
+            const s: *Server = @ptrCast(@alignCast(ts.context.?));
             s.generation.store(ts.generation, .release);
         }
         if (self.topology.takeRemoved()) |removed| {
             defer self.gpa.free(removed);
             for (removed) |ctx| {
-                const s = safety.fromCtx(Server, ctx orelse continue);
+                const s: *Server = @ptrCast(@alignCast(ctx orelse continue));
                 // Seen at once by `stale` and by the monitor's loop.
                 s.retired.store(true, .release);
                 s.check_now.set(self.io);
@@ -640,7 +639,7 @@ pub const Client = struct {
                 self.gpa.free(checks);
             }
             for (checks) |address| if (self.topology.find(address)) |ts| {
-                safety.fromCtx(Server, ts.context).check_now.set(self.io);
+                @as(*Server, @ptrCast(@alignCast(ts.context.?))).check_now.set(self.io);
             };
         } else |err| changes.failed = err;
         self.changed.broadcast(self.io);
@@ -732,7 +731,7 @@ pub const Client = struct {
         try self.mutex.lock(io);
         while (true) {
             if (self.topology.compatibilityError()) |msg| {
-                // Logged after the unlock (L3), from a copy: the topology
+                // Logged after the unlock, from a copy: the topology
                 // rewrites its buffer under the lock.
                 var copy: [160]u8 = undefined;
                 const n = @min(msg.len, copy.len);
@@ -742,7 +741,7 @@ pub const Client = struct {
                 return error.IncompatibleServer;
             }
             if (self.topology.selectWritable()) |ts| {
-                const s = safety.fromCtx(Server, ts.context);
+                const s: *Server = @ptrCast(@alignCast(ts.context.?));
                 self.mutex.unlock(io);
                 return s;
             }
@@ -796,7 +795,7 @@ pub const Client = struct {
             s.monitor = placement.currentTask(io);
         }
         // The monitor's connection is its own (a local): nothing else ever
-        // touches it, so it closes it last, once (SAFETY.md M1, M3).
+        // touches it, so it closes it last, once.
         var connection: ?*Connection = null;
         defer {
             s.task_lock.lockUncancelable(io);
@@ -912,7 +911,7 @@ pub const Client = struct {
                 };
                 c.generation = generation;
                 c.server = s;
-                c.pool = safety.toCtx(p);
+                c.pool = p;
                 self.observer.connections(0, 1);
                 self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
                 return c;
@@ -973,9 +972,8 @@ pub const Client = struct {
     /// Gives `c` back to its pool, or closes it when it is broken, stale,
     /// or the client is closing.
     fn release(self: *Client, s: *Server, c: *Connection, io: std.Io) void {
-        // The pool it came from, wherever it is given back (SAFETY.md T3;
-        // mongo-go-driver's checkIn refuses another pool's).
-        const p = safety.fromCtx(Pool, c.pool);
+        // The pool it came from, wherever it is given back (mongo-go-driver's checkIn refuses another pool's).
+        const p: *Pool = @ptrCast(@alignCast(c.pool.?));
         const keep = !c.broken and !self.closing.load(.acquire) and !self.stale(s, c, io);
         p.mutex.lockUncancelable(io);
         if (keep) {
@@ -1105,7 +1103,7 @@ pub const Client = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const ts = self.topology.selectWritable() orelse return null;
-        return safety.fromCtx(Server, ts.context);
+        return @ptrCast(@alignCast(ts.context.?));
     }
 
     // -----------------------------------------------------------------------

@@ -1,10 +1,9 @@
 //! Retries, backoff, retry throttling and circuit breakers: the parts that
-//! need nothing but `std` and anole_safety's ranked locks, so the HTTP core
-//! (its own module) and the rest of Anole use the same types. `anole.resilience` (root.zig) re-exports
+//! need nothing but `std`, so the HTTP core (its own module) and the rest
+//! of Anole use the same types. `anole.resilience` (root.zig) re-exports
 //! them and adds the Prometheus binding.
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
 
@@ -452,7 +451,7 @@ pub const Breakers = struct {
         last_used: u64,
     };
     const Shard = struct {
-        mutex: safety.Mutex(.leaf) = .init,
+        mutex: std.Io.Mutex = .init,
         map: std.StringHashMapUnmanaged(*Entry) = .empty,
     };
 
@@ -518,7 +517,7 @@ pub const Breakers = struct {
         }
     }
 
-    /// Sharded (16 shards, a `safety.Mutex` each, held only for the map
+    /// Sharded (16 shards, a `std.Io.Mutex` each, held only for the map
     /// lookup). The pointer lives until `deinit` or the entry's eviction,
     /// which never happens while a permit of it is outstanding. A breaker
     /// made here is reported to the metrics after the shard's lock is let

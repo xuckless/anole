@@ -1,5 +1,5 @@
 //! An HTTP/2 client connection on the HTTP core's protocol core
-//! (src/http/core/h2/conn.zig in its client role, M5 of
+//! (src/http/core/h2/conn.zig in its client role;
 //! research/h2h3-takeover/PLAN.md): many concurrent streams over one TCP
 //! connection, cleartext (prior knowledge) or TLS with ALPN "h2". A reader
 //! task feeds the core, a writer task drains it, and one mutex guards it

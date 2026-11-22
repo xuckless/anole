@@ -321,7 +321,7 @@ test "canceling wait leaves the client running" {
     try client.start(io);
 
     var task = try io.concurrent(Client.wait, .{ &client, io });
-    // Canceled and awaited on every way out (SAFETY.md T1).
+    // Canceled and awaited on every way out.
     var task_done = false;
     defer if (!task_done) task.cancel(io) catch {};
     // Once the task waits, its cancelation ends the wait.

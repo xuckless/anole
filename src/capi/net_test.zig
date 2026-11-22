@@ -1,4 +1,4 @@
-//! C ABI tests for p3/net, imported from engine_test.zig: raw TCP and UDP
+//! C ABI tests for net, imported from engine_test.zig: raw TCP and UDP
 //! listeners through the engine, the way libanole's exports drive it.
 //! Deterministic: every wait is on a record arriving or bytes read.
 const std = @import("std");

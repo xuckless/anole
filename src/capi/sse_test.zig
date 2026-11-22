@@ -1,4 +1,4 @@
-//! The C ABI's server-sent events and watch configuration (p3/realtime).
+//! The C ABI's server-sent events and watch configuration.
 const std = @import("std");
 const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");

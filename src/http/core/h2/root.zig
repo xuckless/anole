@@ -4,7 +4,7 @@
 //! limits, the stream state, and the sans-IO connection core (conn.zig) with
 //! its output queue (out.zig), and the server engine on them (server.zig),
 //! which serves the server's HTTP/2. src/h2/client.zig is the client on the
-//! core's client role (`conn.Conn(.client, H)`, M5).
+//! core's client role (`conn.Conn(.client, H)`).
 
 const std = @import("std");
 

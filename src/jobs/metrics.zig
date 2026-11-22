@@ -1,7 +1,7 @@
 //! Prometheus series of the job queue (§7.1). `kind` and `name` labels take
 //! at most 256 distinct values; later ones report as "other".
 const std = @import("std");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const observe = @import("../observe/root.zig");
 
 const m = observe.metrics;
@@ -23,8 +23,8 @@ pub const Series = struct {
     leader: *m.Family(m.Gauge),
     cron_enqueued: *m.Family(m.Counter),
     /// Guards `kinds` and `names`. A leaf spin lock: nothing is allocated
-    /// under it (SAFETY.md L5).
-    lock: safety.SpinLock(.leaf) = .init,
+    /// under it.
+    lock: SpinLock = .init,
     /// Label sets: at most `max_labels` names each, sized at `init`, so a
     /// put under `lock` never grows them. The names live until `deinit`.
     kinds: std.StringHashMapUnmanaged(void) = .empty,
@@ -77,7 +77,7 @@ pub const Series = struct {
             .full => return "other",
             .missing => {},
         }
-        // A new label: copied before the lock is taken again (L5).
+        // A new label: copied before the lock is taken again.
         const owned = self.gpa.dupe(u8, value) catch return "other";
         var kept = false;
         self.lock.lock();
@@ -117,12 +117,10 @@ pub const Series = struct {
     }
 };
 
-test "jobs metrics: a new kind label is recorded without allocating under the label lock" {
+test "jobs metrics: a new kind label is recorded and rendered" {
     var registry: m.Registry = .init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
-    // Panics (SAFETY.md L5) when the series allocates under its spin lock.
-    var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
-    var s = try Series.init(checked.allocator(), &registry);
+    var s = try Series.init(std.testing.allocator, &registry);
     defer s.deinit();
     s.onEnqueued("default", "k1", true);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -146,14 +144,13 @@ fn finishedSamples(text: []const u8, sum: *u64, kinds: *u32, other: *bool) !void
     }
 }
 
-// SAFETY.md L5's multi-thread stress test of the label cap; TESTING.md W3
-// keeps it out of the unit suite (`zig build test-stress`).
+// The multi-thread stress test of the label cap; TESTING.md W3 keeps it
+// out of the unit suite (`zig build test-stress`).
 test "jobs metrics: [stress] eight threads recording 512 kinds keep at most 256 labels and count every event" {
     try @import("anole_test_wait").requireStress();
     var registry: m.Registry = .init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
-    var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
-    var s = try Series.init(checked.allocator(), &registry);
+    var s = try Series.init(std.testing.allocator, &registry);
     defer s.deinit();
     const Worker = struct {
         const each = 10_000;

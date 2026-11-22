@@ -948,7 +948,7 @@ pub const Response = struct {
     const initial_header_room = 16;
     /// The same for a response to a sink (an HTTP/2 or HTTP/3 stream):
     /// fewer, as every stream a connection has open at once, and every
-    /// spare one, keeps an arena of its own (M4, #179).
+    /// spare one, keeps an arena of its own (#179).
     const initial_sink_header_room = 8;
 
     /// A response written to an HTTP/1.x connection. Made by the server;

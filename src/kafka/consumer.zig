@@ -20,7 +20,6 @@
 //! rejoins (or leaves).
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const test_hold = @import("test_hold.zig");
 const placement = dusty.placement;
 const protocol = @import("protocol.zig");
@@ -258,10 +257,10 @@ const PartState = struct {
     partition: i32,
     leader: i32 = -1,
     /// Over `chunks` and `buffered`: the fetcher appends, the delivery task
-    /// takes (L1: they run on different executors). Nothing waits, calls
-    /// out or takes another lock while it is held (L2-L4).
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    /// takes (they run on different executors). Nothing waits, calls
+    /// out or takes another lock while it is held.
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     chunks: std.ArrayList(*Chunk) = .empty,
     buffered: usize = 0,
     /// The next offset to fetch (the fetcher's).
@@ -314,9 +313,9 @@ const Session = struct {
     group: std.Io.Group = .init,
     deliveries: std.Io.Group = .init,
     /// Over `running`: the delivery tasks (one per partition, each on its
-    /// partition's executor) and `endSession`. A leaf (L4).
-    mutex: safety.Mutex(.leaf) = .init,
-    cond: safety.Condition = .init,
+    /// partition's executor) and `endSession`. A leaf.
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     running: usize = 0,
 
     /// Ends the session at the member's next look, for `why`. When two
@@ -466,7 +465,7 @@ fn leaveGroup(m: *Member) std.Io.Cancelable!void {
     var e: protocol.Enc = .init(arena);
     protocol.encodeLeaveGroup(&e, c.opts.group, m.member_id.items, null) catch return;
     // Best effort: a failure leaves the member to the session timeout. A
-    // cancel is passed on (C3, #159).
+    // cancel is passed on (#159).
     _ = coord.call(arena, .leave_group, e.bytesWritten(), .fromSeconds(5)) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {},

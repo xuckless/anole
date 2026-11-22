@@ -20,7 +20,6 @@
 //! or the deadline in any of them cancels the others.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
@@ -182,11 +181,10 @@ pub const Call = struct {
         json_array: bool = false,
         /// The call's response stream: one writer at a time, across the
         /// stream's write and flush; also orders `addHeader` against the
-        /// head the first write sends. An I/O lock (SAFETY.md L2's
-        /// exception): its two takers, the handler and its streaming
-        /// writer task, run on the call's executor. Replaced at the S2
-        /// HTTP/2 takeover.
-        write_lock: safety.IoLock = .init,
+        /// head the first write sends. An I/O lock
+        /// (held across a wait): its two takers, the handler and its streaming
+        /// writer task, run on the call's executor.
+        write_lock: std.Io.Mutex = .init,
         /// The wire protocol and message encoding, from the request's
         /// content type.
         protocol: Protocol = .grpc,
@@ -673,8 +671,8 @@ fn acceptEncoding() []const u8 {
 /// does not decode...), UNKNOWN for any other.
 pub fn finish(call: *Call, result: anyerror!void) !void {
     // A cancel the call's deadline did not make (the server stopping, the
-    // stream reset) stays the task's: re-armed once the status is out
-    // (SAFETY.md C3). The deadline's own is consumed: the call answers it.
+    // stream reset) stays the task's: re-armed once the status is out.
+    // The deadline's own is consumed: the call answers it.
     var rearm = false;
     defer if (rearm) call.io.recancel();
     const protection = call.io.swapCancelProtection(.blocked);
@@ -1038,10 +1036,7 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 /// Where request frames are read and inflated, to be freed as soon as
 /// they are decoded into the call's arena (the client's too).
-pub const scratch = if (@import("builtin").is_test)
-    std.testing.allocator
-else
-    @import("anole_safety").process_gpa;
+pub const scratch = if (@import("builtin").is_test) std.testing.allocator else std.heap.smp_allocator;
 
 /// What a request message counts against `max_received_bytes` beyond its
 /// size: decoding allocates even for an empty one.

@@ -32,7 +32,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
-const safety = @import("anole_safety");
 const dusty = @import("dusty");
 pub const abi = @import("abi.zig");
 const config_mod = @import("config.zig");
@@ -89,12 +88,8 @@ pub const config = config_mod;
 const log = std.log.scoped(.anole_capi);
 
 /// The allocator for everything here: thread-safe, since consumers and
-/// executors both use it. A `safety.ProcessAllocator` of its own (SAFETY.md
-/// E1): in test builds freed memory is never reused, so a late access from
-/// a consumer thread faults at once; in Debug its leaks are checked when
-/// the engine goes (`destroy`); in release builds it is `smp_allocator`.
-pub const gpa = gpa_state.allocator();
-var gpa_state: safety.ProcessAllocator = .init(0xca61a11c);
+/// executors both use it.
+pub const gpa = std.heap.smp_allocator;
 
 /// The `std.Io` for consumer threads that block (`poll_wait`, blocking
 /// reads and writes) and for `start`/`wait`, outside the runtime.
@@ -343,7 +338,7 @@ pub const Slot = struct {
     ws_slot: u32 = no_slot,
     /// A server-sent events route the consumer decides
     /// (ANOLE_EV_SSE_SUBSCRIBE); `ws_slot` is then its SSE slot, and
-    /// `anole_sse_accept` stores the topics after the headers (p3/realtime).
+    /// `anole_sse_accept` stores the topics after the headers.
     sse_subscribe: bool = false,
     sse_last: u32 = 0,
     /// `anole_ws_accept`: the extra headers are stored as a response's are,
@@ -496,11 +491,11 @@ const DeadlineList = struct {
     tail: u32 = no_slot,
 };
 
-/// Guards the runtime's wakes made from threads that are not the runtime's
-/// (SAFETY.md T5): one per executor, on the line its inbox already shares
-/// with consumers. It lives in `safety` (src/safety/io_gate.zig); its test
-/// hook is `safety.io_gate_test_hook`.
-pub const IoGate = safety.IoGate;
+/// Guards the runtime's wakes made from threads that are not the runtime's:
+/// one per executor, on the line its inbox already shares
+/// with consumers. It lives in src/io_gate.zig; its test hook is
+/// `io_gate.test_hook`.
+pub const IoGate = @import("../io_gate.zig").IoGate;
 
 pub const Exec = struct {
     engine: *Engine,
@@ -718,8 +713,8 @@ pub const Exec = struct {
         c.wake();
     }
 
-    /// `postRecord`'s waiter was canceled while it waited for room. C3:
-    /// the cancel goes back to the caller's next wait. C2/U4: the record
+    /// `postRecord`'s waiter was canceled while it waited for room: the
+    /// cancel goes back to the caller's next wait. The record
     /// (often the end of something: ws_close, net_close) still takes its
     /// place in the ring, uncancelably, for at most `cancel_post_wait_ns`;
     /// past that the consumer is not polling. Not the overflow list: `poll`
@@ -1067,7 +1062,7 @@ pub const Route = struct {
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
     /// A WebTransport endpoint's settings.
     wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
-    /// A server-sent events endpoint (p3/realtime): its topic templates.
+    /// A server-sent events endpoint: its topic templates.
     sse: ?SseRoute = null,
 };
 
@@ -1328,9 +1323,7 @@ pub const Engine = struct {
     pub fn needsConsumer(e: *const Engine) bool {
         for (e.config.routes) |r| if (r.handler != null or r.websocket != null or r.webtransport != null) return true;
         if (e.config.grpc) |g| if (g.services.len > 0) return true;
-        // ---- p3/net ----
         for (e.config.listeners) |l| if (l.tcp != null or l.udp != null) return true;
-        // ---- end p3/net ----
         return false;
     }
 
@@ -1538,7 +1531,6 @@ pub const Engine = struct {
                 .max_routes = cfg.console.max_routes,
             },
             ._console_runtime = cfg.console.runtime,
-            // ---- p3/lambda ----
             .lambda = .{
                 .runtime_api = cfg.lambda.runtime_api,
                 .invoke_mode = cfg.lambda.invoke_mode,
@@ -1553,7 +1545,6 @@ pub const Engine = struct {
                 .shutdown_timeout = .fromMilliseconds(cfg.lambda.shutdown_timeout_ms),
                 .flush_timeout = .fromMilliseconds(cfg.lambda.flush_timeout_ms),
             },
-            // ---- end p3/lambda ----
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1633,10 +1624,8 @@ pub const Engine = struct {
                 .http3 = l.http3,
                 .proxy_protocol = l.proxy_protocol,
                 .proxy_protocol_from = l.proxy_protocol_from,
-                // ---- p3/net ----
                 .tcp = if (l.tcp) |t| try net.tcpService(e, a, t) else null,
                 .udp = if (l.udp) |u| try net.udpService(e, a, u) else null,
-                // ---- end p3/net ----
             };
             if (l.tls) |t| {
                 if (comptime features.tls != .boringssl) return error.Unsupported;
@@ -1738,7 +1727,7 @@ pub const Engine = struct {
                     .kind = .ws,
                 });
             } else if (rc.sse) |sc| {
-                // p3/realtime: parked event streams; an idle subscriber holds
+                // Parked event streams; an idle subscriber holds
                 // no task. The consumer decides the subscription (or not).
                 const route = try a.create(Route);
                 route.* = .{
@@ -2189,10 +2178,6 @@ pub const Engine = struct {
         e.consumers.deinit(gpa);
         e.arena.deinit();
         gpa.destroy(e);
-        // Debug and test builds: everything the engine allocated is freed by
-        // now (the leaks, with where they were made, go to the log, and are
-        // freed so the next engine starts clean).
-        if (gpa_state.reset() > 0) log.err("the C ABI engine leaked memory", .{});
     }
 
     pub fn stats(e: *Engine) abi.Stats {
@@ -3043,7 +3028,7 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             // send_headers, an answer call that failed), where
             // `requestTrace` could pin it: `gone` tells the pin the
             // memory went, and a pin taken before this saw it is waited
-            // out (SAFETY.md M3, T4: never a freed pointer).
+            // out (never a freed pointer).
             .responding, .done, .streaming => {
                 s.orphan = true;
                 s.gone.store(true, .seq_cst);
@@ -3493,9 +3478,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
                     const len = ev.len;
-                    // ---- p3/net ----
                     if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, len);
-                    // ---- end p3/net ----
                     if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                     freeRecord(rec);
                     x.ring.pop();
@@ -3546,9 +3529,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                 }
                 @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                 pos += ev.len;
-                // ---- p3/net ----
                 if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, ev.len);
-                // ---- end p3/net ----
                 if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                 x.ovf_head = linkOf(rec).*;
                 if (x.ovf_head == null) x.ovf_tail = null;
@@ -3655,7 +3636,7 @@ pub const TraceContext = struct {
 /// thread's call held it (`Slot.gone`, set by `detachedAborted`) has no
 /// memory left to read, even once that call hands it back to `out`: the
 /// pin sees `gone` and reads nothing. The pin only copies into stack
-/// buffers (SAFETY.md L5: an executor may spin on it, so it never
+/// buffers (an executor may spin on it, so it never
 /// allocates or waits); the copies go into `a` after it. Nothing is
 /// copied at dispatch: requests that hand nothing on pay nothing (the
 /// header scan stays off the hot path).
@@ -3704,7 +3685,7 @@ pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory
 /// an answer, `polling` for a pin), waiting out a pin under way: a
 /// consumer-held handle is `polling` only while `requestTrace` on another
 /// thread copies from its request, a few hundred bytes with nothing that
-/// allocates or waits (L5), so the wait is a short spin, as a seqlock
+/// allocates or waits, so the wait is a short spin, as a seqlock
 /// reader's retry. A pinned live handle is never taken for over. Null when
 /// moved; else the word that refused it (another state or generation).
 /// The move is `.seq_cst`: a pin's half of `Slot.gone`'s handshake.

@@ -7,7 +7,6 @@
 //! other stores.
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
 const store = @import("store.zig");
@@ -60,12 +59,12 @@ pub const Postgres = struct {
     held_owner: ?[]u8 = null,
     /// The leader's session: one pooled connection that holds the advisory
     /// lock for as long as it is open (Que's and GoodJob's shape). An I/O
-    /// lock (SAFETY.md L2's exception): held across the session checkout
+    /// lock: held across the session checkout
     /// and the leader query, taken with no other lock held (`maintain`, and
     /// `drain` after its unlock), guarding only `session`, `holds_lock` and
     /// `held_owner`. Temporary, until the maintenance task alone owns the
     /// session and the drain asks it by message.
-    leader_mutex: safety.IoLock = .init,
+    leader_mutex: std.Io.Mutex = .init,
     /// Tests only: runs in `takeAdvisory` with the session in hand, before its query.
     test_before_leader_query: if (builtin.is_test) ?*const fn (*Postgres) void else void = if (builtin.is_test) null else {},
 
@@ -621,8 +620,7 @@ pub const Postgres = struct {
     }
 
     /// A failed leader query: the session goes (closing it releases the
-    /// lock), and a cancel is passed on, never taken for "not the leader"
-    /// (SAFETY.md C3).
+    /// lock), and a cancel is passed on, never taken for "not the leader".
     fn queryFailed(self: *Postgres, err: anyerror) error{Canceled}!bool {
         _ = self.dropSession();
         if (err == error.Canceled) return error.Canceled;

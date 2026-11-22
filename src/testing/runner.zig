@@ -1,9 +1,9 @@
 //! Zig 0.17.0's default test runner (lib/compiler/test_runner.zig, MIT,
-//! Copyright (c) Zig contributors), with changes for SAFETY.md E1: the
+//! Copyright (c) Zig contributors), with changes: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
-//! cancellation during it (C3); a test that runs past 110 s is named and
+//! cancellation during it; a test that runs past 110 s is named and
 //! every thread's backtrace is dumped before the build runner's
 //! `--test-timeout` kills it (`watchdog`, TESTING.md D2), followed by
 //! every live zio task and the stack of each suspended one
@@ -11,9 +11,7 @@
 //! printed only when it fails or
 //! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
 //! and a SIGABRT handler); a failed test names its error (the
-//! server-mode runner printed only the trace); and a run with
-//! ANOLE_TEST_CHILD set runs only the tests whose names contain it
-//! (src/safety/child.zig, for tests whose claim is a panic); ANOLE_TEST_SHARD
+//! server-mode runner printed only the trace); and ANOLE_TEST_SHARD
 //! runs one shard of the tests (`shard`) and ANOLE_TEST_DURATIONS records
 //! each test's duration (`durations`). The fuzzing
 //! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
@@ -35,8 +33,8 @@ const fuzz_abi = std.Build.abi.fuzz;
 const never_reuse = @import("anole_test_hooks").never_reuse;
 
 /// ANOLE: zio's count of swallowed cancellations (`debug_cancel`); a test
-/// during which it rises fails (SAFETY.md C3). build.zig gives every test
-/// binary this import (src/safety/test_hooks.zig, or a stub without zio).
+/// during which it rises fails. build.zig gives every test
+/// binary this import (src/testing/hooks.zig, or a stub without zio).
 const hooks = @import("anole_test_hooks");
 
 fn swallowedCancels() u64 {
@@ -353,7 +351,7 @@ const captured = struct {
     var total: usize = 0;
     var on: std.atomic.Value(bool) = .init(false);
     /// Guards `ring`, `total` and `on`'s changes: a spin lock around a
-    /// bounded memcpy (SAFETY.md L5); nothing under it prints or waits.
+    /// bounded memcpy; nothing under it prints or waits.
     var lock: std.atomic.Value(bool) = .init(false);
 
     fn acquire() void {
@@ -571,7 +569,7 @@ pub const debug = struct {
     }
 };
 
-/// ANOLE: for `zig build crash-probe` only (src/safety/crash_probe.zig):
+/// ANOLE: for `zig build crash-probe` only (src/testing/crash_probe.zig):
 /// takes the capture's lock and keeps it, as a thread that panics inside
 /// `captured.append` does.
 pub const crash_probe = struct {
@@ -601,8 +599,8 @@ pub const std_options: std.Options = .{
 };
 
 /// ANOLE: zio reads its options from the root, the runner in a test binary:
-/// SAFETY.md's zio checks on in every test build, Debug or not (see
-/// src/safety/test_hooks.zig). Only a binary with zio reads it, and only
+/// zio's `debug_cancel` on in every test build, Debug or not (see
+/// src/testing/hooks.zig). Only a binary with zio reads it, and only
 /// those get `test_hooks.zig`, which declares it.
 pub const zio_options = hooks.zio_options;
 
@@ -976,15 +974,8 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     });
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
-    // ANOLE: a child run of one test (src/safety/child.zig): only the tests
-    // whose names contain ANOLE_TEST_CHILD.
-    // `getAlloc` maps the whole environment first, hence page_allocator
-    // and not the small `fba`.
-    const only: ?[]const u8 = init.environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_CHILD") catch null;
-
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
-        if (only) |o| if (std.mem.indexOf(u8, test_fn.name, o) == null) continue; // ANOLE
         if (std.mem.indexOfScalar(u32, shard.list(), @intCast(i)) == null) continue; // ANOLE
         testing.allocator_instance = .init(never_reuse.allocator, .{ // ANOLE
             .canary = 0xc3a701ba,

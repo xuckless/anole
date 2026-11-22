@@ -65,7 +65,7 @@ pub const Peer = struct {
     /// wrapped: `ReadFailed` or `WriteFailed`, with `error.Canceled` in the
     /// reader's or writer's `err`. A server that serves client after client
     /// returns on it: going back to `accept` would wait there for good, its
-    /// cancel spent, and the test's `cancel` with it (SAFETY.md C3).
+    /// cancel spent, and the test's `cancel` with it.
     pub fn canceled(peer: *const Peer, err: anyerror) bool {
         return switch (err) {
             error.Canceled => true,
