@@ -380,6 +380,108 @@ fn uriPath(uri: Uri) []const u8 {
     return path;
 }
 
+/// The dials in progress, and which origins last dialed to HTTP/1.1.
+///
+/// Why: N concurrent first requests to an origin that turns out to speak
+/// HTTP/2 must share ONE dial (one connection), so the first dialer for a
+/// key leads and the others wait. But if that origin speaks only HTTP/1.1
+/// nothing can be shared, and the same wait would run N dials strictly in
+/// series; so a dial that ended on HTTP/1.1 is remembered (`h1_memory`, a
+/// few origins) and requests to that key dial at once, in parallel.
+///
+/// The state of a key is derived, never stored (`stateOf`; h1 first):
+///   idle    no ticket listed, no live memory
+///   dialing a ticket is listed
+///   h1      memory live: now < until (at `until` it is expired)
+///
+/// | event                 | idle                     | dialing            | h1                 |
+/// |-----------------------|--------------------------|--------------------|--------------------|
+/// | enter                 | lead: ticket listed      | wait(generation)   | direct: no ticket  |
+/// | end, h2 or failed     | (only a leader ends)     | idle, gen + 1      | (cannot overlap)   |
+/// | end, h1               | (only a leader ends)     | h1, gen + 1        | (cannot overlap)   |
+/// | clock reaches `until` | -                        | -                  | idle, lazily       |
+///
+/// Only a leader ends a dial, and a key in h1 is never listed, so the
+/// cells marked so cannot occur. `end` unlists, notes the memory and bumps
+/// the generation in one critical section, then wakes (notify last); a
+/// waiter that read generation g never sleeps once it moved. All state is
+/// under `mutex`, which is never held across a wait. The memory is
+/// `slots` entries: a key refreshes its own slot, else replaces the slot
+/// that expires first (an expired one before any live one).
+const Dials = struct {
+    mutex: std.Io.Mutex = .init,
+    tickets: std.DoublyLinkedList = .{},
+    gen: std.atomic.Value(u32) = .init(0),
+    h1: [slots]H1 = @splat(.{}),
+
+    const slots = 8;
+    const h1_memory: std.Io.Duration = .fromSeconds(60);
+
+    const H1 = struct { key: u64 = 0, until: std.Io.Timestamp = .{ .nanoseconds = 0 } };
+    const KeyState = enum { idle, dialing, h1 };
+    const Ticket = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        key: u64,
+    };
+    /// lead: dial, then `end`. wait: sleep on the generation, then retry.
+    /// direct: dial without a ticket.
+    const Verdict = union(enum) { lead, wait: u32, direct };
+
+    /// The caller holds `mutex`.
+    fn stateOf(self: *Dials, key: u64, now: std.Io.Timestamp) KeyState {
+        for (self.h1) |e| if (e.key == key and now.nanoseconds < e.until.nanoseconds) return .h1;
+        var node = self.tickets.first;
+        while (node) |n| : (node = n.next) {
+            const other: *Ticket = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
+            if (other.key == key) return .dialing;
+        }
+        return .idle;
+    }
+
+    fn enter(self: *Dials, io: std.Io, ticket: *Ticket, now: std.Io.Timestamp) Verdict {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        switch (self.stateOf(ticket.key, now)) {
+            .h1 => return .direct,
+            .dialing => return .{ .wait = self.gen.load(.acquire) },
+            .idle => {
+                self.tickets.append(&ticket.node);
+                return .lead;
+            },
+        }
+    }
+
+    fn wait(self: *Dials, io: std.Io, gen: u32) std.Io.Cancelable!void {
+        try io.futexWait(u32, &self.gen.raw, gen);
+    }
+
+    /// The leader's end, whatever the outcome; `h1_at` is when the dial
+    /// ended on HTTP/1.1, null if it ended on h2 or failed.
+    fn end(self: *Dials, io: std.Io, ticket: *Ticket, h1_at: ?std.Io.Timestamp) void {
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.tickets.remove(&ticket.node);
+            if (h1_at) |at| self.note(ticket.key, at.addDuration(h1_memory));
+            _ = self.gen.fetchAdd(1, .release);
+        }
+        io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
+    }
+
+    /// The caller holds `mutex`.
+    fn note(self: *Dials, key: u64, until: std.Io.Timestamp) void {
+        var slot = &self.h1[0];
+        for (&self.h1) |*e| {
+            if (e.key == key) {
+                e.until = until;
+                return;
+            }
+            if (e.until.nanoseconds < slot.until.nanoseconds) slot = e;
+        }
+        slot.* = .{ .key = key, .until = until };
+    }
+};
+
 /// Pool of idle connections for reuse: one per executor (`Client.pools`).
 ///
 /// `acquire`/`release` are safe to call from multiple tasks running in
@@ -408,14 +510,10 @@ pub const ConnectionPool = struct {
     /// Whether `reap` is running or about to (guarded by `mutex`).
     reaping: bool = false,
     /// HTTP/2 origins with requests in flight (their carrier connections
-    /// are out of `idle`), and dials in progress that may end in one; both
-    /// guarded by `mutex`.
+    /// are out of `idle`), guarded by `mutex`; and the dials in progress
+    /// that may end in one (`Dials`, with its own lock).
     origins: std.DoublyLinkedList = .{},
-    dialing: std.DoublyLinkedList = .{},
-    dial_gen: std.atomic.Value(u32) = .init(0),
-    /// Origins whose last dial ended on HTTP/1.1 (a few; a ring).
-    h1_seen: [8]struct { key: u64 = 0, until: std.Io.Timestamp = .{ .nanoseconds = 0 } } = @splat(.{}),
-    h1_next: usize = 0,
+    dialing: Dials = .{},
     drains: std.Io.Group = .init,
     reaper: std.Io.Group = .init,
 
@@ -641,17 +739,6 @@ pub const ConnectionPool = struct {
         self.dropView(handle.origin, broken);
     }
 
-    /// The first dial for an origin that may speak HTTP/2 is made once:
-    /// the others wait for it (`dial_gen` changes when a dial ends), then
-    /// find its connection, or dial for themselves if it came to HTTP/1.1
-    /// (remembered for `h1_memory`) or failed.
-    const DialTicket = struct {
-        node: std.DoublyLinkedList.Node = .{},
-        key: u64,
-    };
-
-    const h1_memory: std.Io.Duration = .fromSeconds(60);
-
     fn dialKey(remote_host: []const u8, port: u16, protocol: Protocol) u64 {
         var h: std.hash.Wyhash = .init(port);
         var buf: [255]u8 = undefined;
@@ -660,56 +747,6 @@ pub const ConnectionPool = struct {
         h.update(buf[0..n]);
         h.update(&.{@backingInt(protocol)});
         return h.final();
-    }
-
-    /// Whether a dial to this origin recently ended on HTTP/1.1, so
-    /// there is nothing to share and nothing to wait for.
-    fn knownH1(self: *ConnectionPool, key: u64) bool {
-        const now = std.Io.Timestamp.now(self.io, .awake);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (self.h1_seen) |e| if (e.key == key and now.nanoseconds < e.until.nanoseconds) return true;
-        return false;
-    }
-
-    fn noteH1(self: *ConnectionPool, key: u64) void {
-        const until = std.Io.Timestamp.now(self.io, .awake).addDuration(h1_memory);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (&self.h1_seen) |*e| if (e.key == key) {
-            e.until = until;
-            return;
-        };
-        self.h1_seen[self.h1_next % self.h1_seen.len] = .{ .key = key, .until = until };
-        self.h1_next +%= 1;
-    }
-
-    /// Null: this task dials, and ends with `endDial`. Else the generation
-    /// to wait on (`waitDial`) until some dial ends.
-    fn beginDial(self: *ConnectionPool, ticket: *DialTicket) ?u32 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var node = self.dialing.first;
-        while (node) |n| : (node = n.next) {
-            const other: *DialTicket = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
-            if (other.key == ticket.key) return self.dial_gen.load(.acquire);
-        }
-        self.dialing.append(&ticket.node);
-        return null;
-    }
-
-    fn waitDial(self: *ConnectionPool, gen: u32) std.Io.Cancelable!void {
-        try self.io.futexWait(u32, &self.dial_gen.raw, gen);
-    }
-
-    fn endDial(self: *ConnectionPool, ticket: *DialTicket) void {
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            self.dialing.remove(&ticket.node);
-            _ = self.dial_gen.fetchAdd(1, .release);
-        }
-        self.io.futexWake(u32, &self.dial_gen.raw, std.math.maxInt(u32));
     }
 
     /// Release a connection back to the pool, or close it if the pool is
@@ -935,7 +972,7 @@ const H2Origin = if (has_h2_client) struct {
 /// | acquireOrigin (P)                    | -                      | -                                          | unchanged; found if listed and the session is open; refs + 1; a view is made | - |
 /// | makeView / initView (T)              | -                      | -                                          | -                                                  | made with request none; failure drops the ref (`dropView`, not broken) |
 /// | sendRequestH2 (T)                    | - (`sendRequest` h1)   | -                                          | -                                                  | `request` moves (`H2Request`) |
-/// | takeConnection result (T)            | `noteH1`               | -                                          | -                                                  | nothing |
+/// | takeConnection result (T)            | `Dials.end` notes h1   | -                                          | -                                                  | nothing |
 /// | acquireConnection, no h2 (T)         | used                   | -                                          | released back to idle untouched, h1 dialed         | - |
 /// | `ConnectionPool.release` (T)         | pooled or destroyed    | destroyed, never pooled                    | closing or pool off: destroyed; else `reset`, idle (unlisted, refs 0) or destroyed if the session closed | `releaseView`: stream released once, view freed, `dropView` |
 /// | `Connection.release` (T)             | keep-alive rules, pool | -                                          | - (not handed to requests)                         | to the pool, no keep-alive rules |
@@ -2148,16 +2185,20 @@ pub const Client = struct {
             }
             reused.* = false;
             if (comptime has_h2_client) if (advertise_http2 and unix_socket_path == null) {
-                var ticket: ConnectionPool.DialTicket = .{ .key = ConnectionPool.dialKey(host, port, protocol) };
-                if (!p.knownH1(ticket.key)) {
-                    if (p.beginDial(&ticket)) |gen| {
-                        try p.waitDial(gen);
+                var ticket: Dials.Ticket = .{ .key = ConnectionPool.dialKey(host, port, protocol) };
+                switch (p.dialing.enter(p.io, &ticket, std.Io.Timestamp.now(p.io, .awake))) {
+                    .wait => |gen| {
+                        try p.dialing.wait(p.io, gen);
                         continue;
-                    }
-                    defer p.endDial(&ticket);
-                    const conn = try self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
-                    if (conn.kind == .h1) p.noteH1(ticket.key);
-                    return conn;
+                    },
+                    .lead => {
+                        var h1_at: ?std.Io.Timestamp = null;
+                        defer p.dialing.end(p.io, &ticket, h1_at);
+                        const conn = try self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+                        if (conn.kind == .h1) h1_at = std.Io.Timestamp.now(p.io, .awake);
+                        return conn;
+                    },
+                    .direct => {},
                 }
             };
             return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
@@ -3121,6 +3162,151 @@ test "uriHost: decodes escaped host and rejects a missing or oversized host" {
     } else |err| {
         try std.testing.expectEqual(error.InvalidUrl, err);
     }
+}
+
+const dials_t0: std.Io.Timestamp = .{ .nanoseconds = 1_000 };
+
+fn dialsAt(ns: i96) std.Io.Timestamp {
+    return .{ .nanoseconds = ns };
+}
+
+/// Locked read of a key's state, as `enter` takes it.
+fn dialsState(d: *Dials, key: u64, now: std.Io.Timestamp) Dials.KeyState {
+    d.mutex.lockUncancelable(std.testing.io);
+    defer d.mutex.unlock(std.testing.io);
+    return d.stateOf(key, now);
+}
+
+test "Dials: every (key state, event) cell" {
+    const io = std.testing.io;
+    const Verdict = Dials.Verdict;
+    const Row = struct {
+        name: []const u8,
+        /// How the key got to its state; a failed dial ends like an h2 one.
+        setup: enum { fresh, dialing, ended_h2, ended_h1 },
+        /// The state before the event, the verdict of `enter`, the state after it.
+        before: Dials.KeyState,
+        enter: std.meta.Tag(Verdict),
+        after_enter: Dials.KeyState,
+    };
+    const rows = [_]Row{
+        .{ .name = "idle enter leads", .setup = .fresh, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "dialing enter waits", .setup = .dialing, .before = .dialing, .enter = .wait, .after_enter = .dialing },
+        .{ .name = "end h2 gives idle, the next leads", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "end failed behaves like h2", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "end h1 gives h1, enter dials directly", .setup = .ended_h1, .before = .h1, .enter = .direct, .after_enter = .h1 },
+    };
+    for (rows) |row| {
+        var d: Dials = .{};
+        var leader: Dials.Ticket = .{ .key = 7 };
+        const gen0 = d.gen.load(.acquire);
+        switch (row.setup) {
+            .fresh => {},
+            .dialing => try std.testing.expect(d.enter(io, &leader, dials_t0) == .lead),
+            .ended_h2, .ended_h1 => {
+                try std.testing.expect(d.enter(io, &leader, dials_t0) == .lead);
+                d.end(io, &leader, if (row.setup == .ended_h1) dials_t0 else null);
+                try std.testing.expectEqual(gen0 + 1, d.gen.load(.acquire));
+                try std.testing.expect(d.tickets.first == null);
+            },
+        }
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        try std.testing.expectEqual(row.before, dialsState(&d, 7, dials_t0));
+        var other: Dials.Ticket = .{ .key = 7 };
+        const v = d.enter(io, &other, dials_t0);
+        try std.testing.expectEqual(row.enter, std.meta.activeTag(v));
+        if (v == .wait) {
+            // Never listed; the generation it waits on moves when the leader ends.
+            try std.testing.expectEqual(d.gen.load(.acquire), v.wait);
+            try std.testing.expect(d.tickets.first == &leader.node and leader.node.next == null);
+        }
+        try std.testing.expectEqual(row.after_enter, dialsState(&d, 7, dials_t0));
+        if (v == .wait) {
+            d.end(io, &leader, null);
+            try std.testing.expect(d.gen.load(.acquire) != v.wait);
+        }
+    }
+}
+
+test "Dials: a dial in flight for another key leaves an h1 key direct, and keys are independent" {
+    const io = std.testing.io;
+    var d: Dials = .{};
+    var h1_leader: Dials.Ticket = .{ .key = 1 };
+    try std.testing.expect(d.enter(io, &h1_leader, dials_t0) == .lead);
+    d.end(io, &h1_leader, dials_t0);
+    var k2: Dials.Ticket = .{ .key = 2 };
+    try std.testing.expect(d.enter(io, &k2, dials_t0) == .lead);
+    const gen = d.gen.load(.acquire);
+    var again: Dials.Ticket = .{ .key = 1 };
+    try std.testing.expect(d.enter(io, &again, dials_t0) == .direct);
+    try std.testing.expectEqual(gen, d.gen.load(.acquire));
+    try std.testing.expect(d.tickets.first == &k2.node and k2.node.next == null);
+    // Another host, port or protocol is another key.
+    const base = ConnectionPool.dialKey("example.com", 443, .https);
+    for ([_]u64{
+        ConnectionPool.dialKey("example.com", 8443, .https),
+        ConnectionPool.dialKey("example.org", 443, .https),
+        ConnectionPool.dialKey("example.com", 443, .http),
+    }) |key| {
+        try std.testing.expect(key != base);
+        var t: Dials.Ticket = .{ .key = key };
+        try std.testing.expect(d.enter(io, &t, dials_t0) == .lead);
+        d.end(io, &t, null);
+    }
+    d.end(io, &k2, null);
+}
+
+test "Dials: the h1 memory expires at its until and is bounded" {
+    const io = std.testing.io;
+    const mem = Dials.h1_memory.nanoseconds;
+    var d: Dials = .{};
+    var t: Dials.Ticket = .{ .key = 5 };
+    try std.testing.expect(d.enter(io, &t, dials_t0) == .lead);
+    d.end(io, &t, dials_t0);
+    const until = dials_t0.nanoseconds + mem;
+    // Live until the instant `until`: at it, it is expired.
+    for ([_]struct { at: i96, want: Dials.KeyState }{
+        .{ .at = until - 1, .want = .h1 },
+        .{ .at = until, .want = .idle },
+        .{ .at = until + 1, .want = .idle },
+    }) |row| try std.testing.expectEqual(row.want, dialsState(&d, 5, dialsAt(row.at)));
+
+    // Noting a key again refreshes its slot in place.
+    try std.testing.expect(d.enter(io, &t, dialsAt(until)) == .lead);
+    d.end(io, &t, dialsAt(until));
+    d.mutex.lockUncancelable(io);
+    d.note(5, dialsAt(until + 10));
+    d.mutex.unlock(io);
+    var holding: usize = 0;
+    for (d.h1) |e| if (e.key == 5) {
+        holding += 1;
+        try std.testing.expectEqual(until + 10, e.until.nanoseconds);
+    };
+    try std.testing.expectEqual(@as(usize, 1), holding);
+
+    // Nine distinct keys at increasing times: the earliest is replaced.
+    var f: Dials = .{};
+    for (0..Dials.slots + 1) |i| {
+        var tk: Dials.Ticket = .{ .key = 100 + i };
+        const at = dialsAt(dials_t0.nanoseconds + @as(i96, @intCast(i)));
+        try std.testing.expect(f.enter(io, &tk, at) == .lead);
+        f.end(io, &tk, at);
+    }
+    const now = dialsAt(dials_t0.nanoseconds + Dials.slots);
+    try std.testing.expectEqual(Dials.KeyState.idle, dialsState(&f, 100, now));
+    for (1..Dials.slots + 1) |i| try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&f, 100 + i, now));
+
+    // An expired slot goes before any live one.
+    var g: Dials = .{};
+    for (0..Dials.slots) |i| {
+        // Keys 0..3 noted long before; 4..7 just now (key 0 is the empty slot's key, so start at 1).
+        const at = if (i < 4) dials_t0 else dialsAt(dials_t0.nanoseconds + mem);
+        g.note(200 + i, at.addDuration(Dials.h1_memory));
+    }
+    const later = dialsAt(dials_t0.nanoseconds + mem + 5);
+    g.note(300, later.addDuration(Dials.h1_memory));
+    for (4..Dials.slots) |i| try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&g, 200 + i, later));
+    try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&g, 300, later));
 }
 
 test "parseUrl: basic URL" {

@@ -964,6 +964,87 @@ test "dusty's client over HTTP/2: concurrent requests share one connection and o
     try std.testing.expect(f.dials() > dials_before);
 }
 
+test "dusty's client over HTTP/2: concurrent first requests to an HTTP/1.1-only origin are not serialised" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    const n = 8;
+    gate_arrivals.store(0, .release);
+    gate_open = .unset;
+    const Worker = struct {
+        fn run(c: *dusty.Client, port: u16, ok: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+            var url_buf: [64]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://localhost:{d}/gate", .{port}) catch return;
+            var response = c.fetch(url, .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+            defer response.deinit();
+            const body = response.body() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+            if (response.version().major == 1 and std.mem.eql(u8, body orelse "", "through the gate")) _ = ok.fetchAdd(1, .monotonic);
+        }
+    };
+    var ok: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer {
+        gate_open.set(io);
+        group.cancel(io);
+    }
+    for (0..n) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &f.client, f.h1Port(), &ok });
+    // All eight in the handler at once: each had a connection of its own
+    // without waiting for another's dial to finish.
+    try wait.waitAtLeast(io, "8 requests in the handler at once", &gate_arrivals, n);
+    gate_open.set(io);
+    try wait.waitAtLeast(io, "8 requests answered over HTTP/1.1", &ok, n);
+    try group.await(io);
+    try std.testing.expectEqual(@as(u64, n), f.dials());
+    try std.testing.expect(f.client.pool().dialing.tickets.first == null);
+}
+
+test "dusty's client over HTTP/2: a failed dial wakes the waiters and leaves no ticket" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    const Worker = struct {
+        fn run(c: *dusty.Client, failed: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+            var response = c.fetch("https://127.0.0.1:1/", .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    _ = failed.fetchAdd(1, .monotonic);
+                    return;
+                },
+            };
+            response.deinit();
+        }
+    };
+    var failed: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &f.client, &failed });
+    try wait.waitAtLeast(io, "4 fetches failed", &failed, 4);
+    try group.await(io);
+    try std.testing.expectEqual(@as(u64, 0), f.dials());
+    try std.testing.expect(f.client.pool().dialing.tickets.first == null);
+
+    var response = try f.client.fetch(try f.url("/hello"), .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+}
+
 test "dusty's client over HTTP/2: h2c_hosts speak cleartext HTTP/2 with prior knowledge" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
