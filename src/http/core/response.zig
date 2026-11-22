@@ -506,13 +506,18 @@ pub const BodyWriter = struct {
 ///   state            stream()            _upgradeWebSocket
 ///   buffered         forStream(..)       streaming
 ///   chunked          x                   x
-///   streaming        x                   x
+///   streaming        forStream(..) *     x
 ///   declared_length  x                   x
 ///
 /// x: not reached. Both run only while the head is not out (`stream` through
-/// `checkBodyNotStarted`, the upgrade through `header`), every other mode
-/// means it is out, and `resetBody` refuses once it is: the mode is set once,
-/// from `buffered`, and never goes back. Every other event only reads it:
+/// `checkBodyNotStarted`, the upgrade through `header`), and `resetBody`
+/// refuses once it is. The mode is set before its head is written, so a
+/// mode but `buffered` means the head is out only once that write succeeded.
+/// *: `_upgradeWebSocket` sets `streaming` and then its head can still fail
+/// (`writeHeader` -> `applyContentType` -> TooManyHeaders), leaving
+/// `streaming` with the head not out; an error path's `stream()` then moves
+/// it again (kept as before: the old `_chunked` won over `_streaming`). Every
+/// other mode is set once and never goes back. Every other event only reads it:
 /// `writer`, both `end`s (the terminator for `chunked`), `resetBody`,
 /// `clearWriter`, `write` with an abandoned writer (keepalive off for a
 /// `declared_length` not met), `adopt` (a 200 only for `chunked` or
@@ -876,8 +881,10 @@ pub const Response = struct {
     _headers_written: bool = false,
     keepalive: bool = true,
     /// How the body is framed on the wire; see `BodyMode`. Moved only by
-    /// `setBodyMode`. Every mode but `buffered` means the head is out
-    /// (`handOverLent`, `memoryBodyLen` and `sendBody` rely on it).
+    /// `setBodyMode`. A mode but `buffered` does not by itself mean the head
+    /// is out (a failed 101 head leaves `streaming`, see `BodyMode`), so
+    /// `memoryBodyLen` keeps its `_headers_written` test; `handOverLent` and
+    /// `sendBody` run only once the head is being sent.
     _body_mode: BodyMode = .buffered,
     /// The body writer handed out and not ended; see `BodyWriterState`.
     /// Moved only by `startBody` and `closeBodyWriter`.
@@ -1391,7 +1398,8 @@ pub const Response = struct {
         return was_open;
     }
 
-    /// `BodyMode`'s one move, from `buffered`, while the head is not out.
+    /// `BodyMode`'s move, while the head is not out: from `buffered`, or from
+    /// `streaming` after a 101 whose head failed (see `BodyMode`).
     fn setBodyMode(self: *Response, mode: BodyMode) void {
         self._body_mode = mode;
     }
