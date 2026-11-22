@@ -373,7 +373,9 @@ const Handlers = struct {
         s.router.addRouteWith(.get, "/nw/big", big, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/kb", kb, .{ .no_wait = true });
         s.router.addRouteWith(.get, "/nw/detach", Det.handler, .{ .no_wait = true });
+        s.router.addRouteWith(.get, "/nw/detach/inside", Det.finishedInside, .{ .no_wait = true });
         s.router.get("/park", Park.handler);
+        s.router.get("/park/inside", Park.releasedInside);
         s.router.get("/tunnel", Tun.handler);
         s.router.addRouteWith(.get, "/nw/baseline", baseline, .{ .no_wait = true });
         s.router.addRouteWith(.post, "/nw/baseline", baseline, .{ .no_wait = true });
@@ -545,6 +547,14 @@ const Det = struct {
         _ = count.fetchAdd(1, .acq_rel);
     }
 
+    /// Detaches and finishes before returning: `serveStream`'s caller
+    /// lets the stream go.
+    fn finishedInside(req: *Request, res: *Response) !void {
+        const d = try res.detach(req, .{ .abort = onAbort, .ctx = &aborts });
+        d.response.body = "finished inside";
+        d.finish({});
+    }
+
     fn onAbort(ctx: *anyopaque) void {
         const n: *std.atomic.Value(u32) = @ptrCast(@alignCast(ctx));
         _ = n.fetchAdd(1, .acq_rel);
@@ -592,6 +602,12 @@ const Park = struct {
         const p = try res._park(req, .{ .gone = onGone, .ctx = &gone });
         slot.store(p, .release);
         _ = count.fetchAdd(1, .acq_rel);
+    }
+
+    /// Parks and releases (without an end) before returning.
+    fn releasedInside(req: *Request, res: *Response) !void {
+        const p = try res._park(req, .{ .gone = onGone, .ctx = &gone });
+        p.release();
     }
 
     fn onGone(ctx: *anyopaque) void {
@@ -749,6 +765,28 @@ test "h2 engine: a tasked route runs on its own task; a noWait request whose bod
     try wait.waitAtLeast(testing.io, "the request waiting for its body got a task", &engine.test_spawned, spawned + 1);
     try c.sendBody(late, "came later", true);
     try expectEqualStrings("came later", (try c.until(late)).body.items);
+}
+
+test "h2 engine: a noWait request reset before its body ends never runs, and its stream is freed once" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const spawned = engine.test_spawned.load(.acquire);
+    const freed = engine.test_freed.load(.acquire);
+    // The HEADERS and the reset in one read: the stream waiting for its
+    // body is let go after it, with no task.
+    const id = try c.open("POST", "/nw/echo", &.{}, false);
+    try c.rst(id, .cancel);
+    try c.ping("awaiting".*);
+    try c.flush();
+    while (c.ping_acks == 0) try c.readOne();
+    try wait.waitAtLeast(testing.io, "the reset stream was freed", &engine.test_freed, freed + 1);
+    try expectEqual(spawned, engine.test_spawned.load(.acquire));
+    const next = try c.request("GET", "/nw/hello", null);
+    try expectEqualStrings("hello", (try c.until(next)).body.items);
+    try wait.waitAtLeast(testing.io, "the next stream was freed", &engine.test_freed, freed + 2);
+    try expectEqual(freed + 2, engine.test_freed.load(.acquire));
 }
 
 test "h2 engine: a streamed body larger than the window" {
@@ -1403,6 +1441,32 @@ test "h2 engine: a parked response released without ending is reset with CANCEL"
     try expectEqualStrings("hello", (try c.until(next)).body.items);
 }
 
+test "h2 engine: a response finished or released inside its handler is let go once, by the handler's caller" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const rows = [_]struct { path: []const u8, body: []const u8, rst: ?ErrorCode }{
+        // On the reader: detached, then finished.
+        .{ .path = "/nw/detach/inside", .body = "finished inside", .rst = null },
+        // On a task: parked (the head goes out), then released unended.
+        .{ .path = "/park/inside", .body = "", .rst = .cancel },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{s}\n", .{row.path});
+        const freed = engine.test_freed.load(.acquire);
+        const id = try c.request("GET", row.path, null);
+        const r = try c.until(id);
+        try expectEqual(200, r.status);
+        try expectEqualStrings(row.body, r.body.items);
+        try expectEqual(row.rst, r.rst);
+        const next = try c.request("GET", "/hello", null);
+        try expectEqualStrings("hello", (try c.until(next)).body.items);
+        try wait.waitAtLeast(testing.io, "both streams were freed", &engine.test_freed, freed + 2);
+        try expectEqual(freed + 2, engine.test_freed.load(.acquire));
+    }
+}
+
 test "h2 engine: a response head that can't be submitted is reset with INTERNAL_ERROR, whole, streamed, bare or on a tunnel, and the connection carries on" {
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{ .http2 = .{ .enable_connect_protocol = true } });
@@ -1459,6 +1523,71 @@ test "h2 engine: Resp, the response side: every state x event cell, and its pred
         errdefer std.debug.print("{t}\n", .{row.r});
         try expectEqual(row.ended, row.r.isEnded());
         try expectEqual(row.head_out, row.r.headOut());
+    }
+}
+
+test "h2 engine: Dispatch, who runs the handler: its predicates in every state" {
+    const D = E.Dispatch;
+    const rows = [_]struct { d: D, holds: bool, counted: bool, on_reader: bool, parked: bool, owned: bool }{
+        .{ .d = .head, .holds = false, .counted = false, .on_reader = false, .parked = false, .owned = false },
+        .{ .d = .queued_task, .holds = true, .counted = true, .on_reader = false, .parked = false, .owned = false },
+        .{ .d = .inline_awaiting_body, .holds = true, .counted = true, .on_reader = true, .parked = false, .owned = false },
+        .{ .d = .inline_ready, .holds = true, .counted = true, .on_reader = true, .parked = false, .owned = false },
+        .{ .d = .running_inline, .holds = true, .counted = true, .on_reader = true, .parked = false, .owned = false },
+        .{ .d = .running_tasked, .holds = true, .counted = true, .on_reader = false, .parked = false, .owned = false },
+        .{ .d = .{ .running_parked = undefined }, .holds = true, .counted = true, .on_reader = false, .parked = true, .owned = true },
+        .{ .d = .running_ended, .holds = true, .counted = true, .on_reader = false, .parked = false, .owned = false },
+        .{ .d = .{ .detached_inline = undefined }, .holds = true, .counted = true, .on_reader = true, .parked = false, .owned = true },
+        .{ .d = .{ .detached_tasked = undefined }, .holds = true, .counted = true, .on_reader = false, .parked = false, .owned = true },
+        .{ .d = .{ .parked = undefined }, .holds = true, .counted = true, .on_reader = false, .parked = true, .owned = true },
+        .{ .d = .done, .holds = false, .counted = true, .on_reader = false, .parked = false, .owned = false },
+    };
+    // Every state has its row.
+    try expectEqual(std.enums.values(std.meta.Tag(D)).len, rows.len);
+    for (rows) |row| {
+        errdefer std.debug.print("{t}\n", .{row.d});
+        try expectEqual(row.holds, row.d.holdsStream());
+        try expectEqual(row.counted, row.d.counted());
+        try expectEqual(row.on_reader, row.d.onReader());
+        try expectEqual(row.parked, row.d.isParked());
+        try expectEqual(row.owned, row.d.owned());
+    }
+}
+
+test "h2 engine: ReqBody, the request body: every state x event cell, and its predicates" {
+    const B = engine.ReqBody;
+    const rows = [_]struct { from: B, ev: B.Event, to: B }{
+        .{ .from = .receiving, .ev = .end, .to = .complete },
+        .{ .from = .receiving, .ev = .discard, .to = .discarding },
+        .{ .from = .receiving, .ev = .discard_tunnel, .to = .tunnel_closing },
+        .{ .from = .discarding, .ev = .end, .to = .dropped },
+        .{ .from = .discarding, .ev = .discard, .to = .discarding },
+        .{ .from = .discarding, .ev = .discard_tunnel, .to = .discarding },
+        .{ .from = .tunnel_closing, .ev = .end, .to = .dropped },
+        .{ .from = .tunnel_closing, .ev = .discard, .to = .tunnel_closing },
+        .{ .from = .tunnel_closing, .ev = .discard_tunnel, .to = .tunnel_closing },
+        .{ .from = .dropped, .ev = .end, .to = .dropped },
+        .{ .from = .dropped, .ev = .discard, .to = .dropped },
+        .{ .from = .dropped, .ev = .discard_tunnel, .to = .dropped },
+        .{ .from = .complete, .ev = .end, .to = .complete },
+        .{ .from = .complete, .ev = .discard, .to = .complete },
+        .{ .from = .complete, .ev = .discard_tunnel, .to = .complete },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{t} x {t}\n", .{ row.from, row.ev });
+        try expectEqual(row.to, row.from.next(row.ev));
+    }
+    const preds = [_]struct { b: B, done: bool, dropping: bool }{
+        .{ .b = .receiving, .done = false, .dropping = false },
+        .{ .b = .discarding, .done = false, .dropping = true },
+        .{ .b = .tunnel_closing, .done = false, .dropping = true },
+        .{ .b = .dropped, .done = true, .dropping = true },
+        .{ .b = .complete, .done = true, .dropping = false },
+    };
+    for (preds) |row| {
+        errdefer std.debug.print("{t}\n", .{row.b});
+        try expectEqual(row.done, row.b.done());
+        try expectEqual(row.dropping, row.b.dropping());
     }
 }
 
