@@ -9,6 +9,10 @@ breaking changes are listed anyway.
 
 - SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.
 
+### Fixed
+
+- Request and response header values lose trailing spaces and tabs (RFC 9110 5.5): `x-trim: spaced   ` reached the app with its spaces, and `Content-Length: 5 ` read as no length. Closes #247.
+
 ### Changed
 
 - **PostgreSQL calls that skip the statement cache take one round trip after their first run** (`describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Needs the pg.zig fork's description cache. Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.

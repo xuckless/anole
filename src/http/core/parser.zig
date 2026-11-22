@@ -73,6 +73,14 @@ fn inTrailers(parser: *const c.llhttp_t) bool {
     return parser.flags & @as(u16, @intCast(c.F_TRAILING)) != 0;
 }
 
+/// RFC 9110 5.5: a field value excludes trailing SP/HTAB (llhttp strips the
+/// leading ones). A slice shrink only: the value stays a view of the read buffer.
+fn trimOws(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and (value[end - 1] == ' ' or value[end - 1] == '\t')) end -= 1;
+    return value[0..end];
+}
+
 pub const RequestParser = struct {
     settings: c.llhttp_settings_t,
     parser: c.llhttp_t,
@@ -241,9 +249,10 @@ pub const RequestParser = struct {
         // Headers point directly into the read buffer, no copy needed. The
         // table starts small (`parseHeaders`) and grows to the limit.
         const headers = &self.request.headers;
-        headers.add(self.state.header_field, self.state.header_value) catch {
+        const value = trimOws(self.state.header_value);
+        headers.add(self.state.header_field, value) catch {
             if (!headers.grow(self.request.arena, self.request._config.max_header_count)) return -1;
-            headers.add(self.state.header_field, self.state.header_value) catch return -1;
+            headers.add(self.state.header_field, value) catch return -1;
         };
 
         self.state.header_value = "";
@@ -484,7 +493,7 @@ pub const ResponseParser = struct {
         std.debug.assert(self.state.has_header_field);
 
         // Headers point directly into arena-allocated read buffer, no copy needed
-        self.response.headers.add(self.state.header_field, self.state.header_value) catch return -1;
+        self.response.headers.add(self.state.header_field, trimOws(self.state.header_value)) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -1073,6 +1082,75 @@ test "ResponseParser: a response fed one byte at a time yields its status, versi
     const content_length = response.headers.get("Content-Length");
     try std.testing.expect(content_length != null);
     try std.testing.expectEqualStrings("5", content_length.?);
+}
+
+const long_value: [2000]u8 = @splat('y');
+const ows_rows = [_]struct { raw: []const u8, want: []const u8 }{
+    .{ .raw = "x", .want = "x" },
+    .{ .raw = "x ", .want = "x" },
+    .{ .raw = "x   ", .want = "x" },
+    .{ .raw = "x\t", .want = "x" },
+    .{ .raw = "x \t ", .want = "x" },
+    .{ .raw = " x ", .want = "x" },
+    .{ .raw = "   ", .want = "" },
+    .{ .raw = "\t", .want = "" },
+    .{ .raw = "", .want = "" },
+    .{ .raw = "a b ", .want = "a b" },
+    .{ .raw = "a\tb\t", .want = "a\tb" },
+    .{ .raw = &long_value ++ "   ", .want = &long_value },
+};
+
+test "RequestParser: trailing OWS of a header value is trimmed, whole and one byte at a time" {
+    for ([_]bool{ false, true }) |bytewise| for (ows_rows) |row| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var req: Request = .{
+            .arena = arena.allocator(),
+            ._parser = undefined,
+            ._transport = undefined,
+            .headers = try Headers.init(arena.allocator(), 32),
+        };
+        var parser: RequestParser = undefined;
+        try parser.init(&req);
+        defer parser.deinit();
+
+        const wire = try std.fmt.allocPrint(arena.allocator(), "GET / HTTP/1.1\r\nA: 1 \r\nX-Trim:{s}\r\nB: 2 \t\r\n\r\n", .{row.raw});
+        const step = if (bytewise) 1 else wire.len;
+        var i: usize = 0;
+        while (i < wire.len) : (i += step) {
+            parser.feed(wire[i..@min(i + step, wire.len)]) catch |err| switch (err) {
+                error.Paused => break,
+                else => return err,
+            };
+        }
+        try std.testing.expectEqualStrings(row.want, req.headers.get("X-Trim").?);
+        try std.testing.expectEqualStrings("1", req.headers.get("A").?);
+        try std.testing.expectEqualStrings("2", req.headers.get("B").?);
+    };
+}
+
+test "ResponseParser: trailing OWS of a header value is trimmed, whole and one byte at a time" {
+    for ([_]bool{ false, true }) |bytewise| for (ows_rows) |row| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var response: ParsedResponse = .{ .arena = arena.allocator() };
+        var parser: ResponseParser = undefined;
+        try parser.init(&response, 64);
+        defer parser.deinit();
+
+        const wire = try std.fmt.allocPrint(arena.allocator(), "HTTP/1.1 200 OK\r\nA: 1 \r\nX-Trim:{s}\r\nB: 2 \t\r\nContent-Length: 0\r\n\r\n", .{row.raw});
+        const step = if (bytewise) 1 else wire.len;
+        var i: usize = 0;
+        while (i < wire.len) : (i += step) {
+            parser.feed(wire[i..@min(i + step, wire.len)]) catch |err| switch (err) {
+                error.Paused => break,
+                else => return err,
+            };
+        }
+        try std.testing.expectEqualStrings(row.want, response.headers.get("X-Trim").?);
+        try std.testing.expectEqualStrings("1", response.headers.get("A").?);
+        try std.testing.expectEqualStrings("2", response.headers.get("B").?);
+    };
 }
 
 test "ResponseParser: 404 status" {
