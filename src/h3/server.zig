@@ -94,6 +94,113 @@ fn holdUntil(held: bool, until: u64, ts: u64) u64 {
     return if (held) until else ts + hold_ns;
 }
 
+/// A server connection's protocol life: open, the two-step drain (RFC
+/// 9114 §5.2) inside it, the closing and draining periods (RFC 9000
+/// §10.2), the end. Locked by the connection's mutex; changed only by
+/// `Conn.enter`. Every transition is a cell here: add behaviour as a row
+/// or a state, not as a branch beside `enter`.
+///
+/// | from \ event  | drain_notice(due) | drain_final | peer_close(end) | local_close(end) | end    |
+/// |---------------|-------------------|-------------|-----------------|------------------|--------|
+/// | open          | notice(due)       | -           | draining(end)   | closing(end)     | closed |
+/// | notice(due)   | -                 | final       | draining(end)   | closing(end)     | closed |
+/// | final         | -                 | -           | draining(end)   | closing(end)     | closed |
+/// | closing(end)  | -                 | -           | -               | -                | closed |
+/// | draining(end) | -                 | -           | -               | -                | closed |
+/// | closed        | -                 | -           | -               | -                | closed |
+///
+/// "-": no move, no wake, no kick. `due` is when the final GOAWAY goes,
+/// `end` when the period's three PTOs are over. `open`, `notice` and
+/// `final` are the open phase (`isOpen`): the drain is reachable only
+/// from `open`, and a peer or local close in it drops the drain.
+/// `(closing, peer_close)` is "-" on purpose: RFC 9000 §10.2.1 only lets
+/// a closing endpoint enter draining; it keeps answering with its own
+/// CONNECTION_CLOSE. `(closed, end)` moves (to itself): `finish` relies on
+/// the wake and the kick it brings for a connection already closed.
+const Life = union(enum(u8)) {
+    open,
+    notice: u64,
+    final,
+    closing: u64,
+    draining: u64,
+    closed,
+
+    const Tag = std.meta.Tag(Life);
+
+    const Event = union(enum) {
+        drain_notice: u64,
+        drain_final,
+        peer_close: u64,
+        local_close: u64,
+        end,
+    };
+
+    /// The table above.
+    fn next(from: Life, ev: Event) ?Life {
+        return switch (ev) {
+            .drain_notice => |due| if (from == .open) .{ .notice = due } else null,
+            .drain_final => if (from == .notice) .final else null,
+            .peer_close => |end| if (from.isOpen()) .{ .draining = end } else null,
+            .local_close => |end| if (from.isOpen()) .{ .closing = end } else null,
+            .end => .closed,
+        };
+    }
+
+    /// The open phase, drain included: one compare (the tag order).
+    fn isOpen(l: Life) bool {
+        return @backingInt(@as(Tag, l)) <= @backingInt(Tag.final);
+    }
+};
+
+/// Who tells a connection's streams of a move into a period or the end
+/// (`Conn.enter`): `enter` itself (`now`), the driver at its next service
+/// (`deferred`, `Conn.wake_pending`: the reader saw the peer's close, and
+/// what came just before it is still with the tasks it woke), or nobody
+/// (`none`: the drain's steps).
+const Wake = enum { now, deferred, none };
+
+/// Who holds a server connection: `accept` until it hands it to the
+/// driver, the driver until it retires it. Atomic (`Conn.seat`), as
+/// `kick` reads it from any thread.
+///
+/// | from \ event | handoff | retire  | give_up  |
+/// |--------------|---------|---------|----------|
+/// | accepting    | driven  | -       | given_up |
+/// | given_up     | -       | -       | -        |
+/// | driven       | -       | retired | -        |
+/// | retired      | -       | -       | -        |
+///
+/// "-": no change (retire in `accepting` and give_up in `driven` never
+/// happen: only a driven connection is retired, only an accepting one
+/// given up). The values make each question one instruction: bit 1 is
+/// "handed over" (kicks queue it, `connections_open` counts it), bit 0
+/// "over" (finishing: `service` and `finishAll` leave it alone).
+const Seat = enum(u8) {
+    accepting = 0,
+    given_up = 1,
+    driven = 2,
+    retired = 3,
+
+    const Event = enum { handoff, retire, give_up };
+
+    /// The table above.
+    fn next(from: Seat, ev: Event) Seat {
+        return switch (ev) {
+            .handoff => if (from == .accepting) .driven else from,
+            .retire => if (from == .driven) .retired else from,
+            .give_up => if (from == .accepting) .given_up else from,
+        };
+    }
+
+    fn handedOver(s: Seat) bool {
+        return @backingInt(s) >= @backingInt(Seat.driven);
+    }
+
+    fn over(s: Seat) bool {
+        return @backingInt(s) & 1 != 0;
+    }
+};
+
 /// The UDP socket buffers each endpoint asks for, both ways: room for
 /// bursts from many connections between two reads (aegon, goose and
 /// agensio ask for 4 MiB too). The system caps it (Linux: rmem_max and
@@ -1109,7 +1216,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// waited for in a task of their own, not here. On the driver only.
         fn retire(self: *Self, conn: *Conn) void {
             self.removeTimer(conn);
-            conn.retired = true;
+            conn.take(.retire);
             if (conn.tasks.load(.acquire) == 0) return conn.finish();
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
@@ -1119,7 +1226,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn closeNow(self: *Self, conn: *Conn) void {
             conn.abort();
             self.removeTimer(conn);
-            conn.retired = true;
+            conn.take(.retire);
             conn.finish();
         }
 
@@ -1134,7 +1241,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             while (list) |conn| {
                 list = conn.next_dirty;
                 conn.queued.store(false, .release);
-                if (!conn.retired and conn.heap_index == Conn.no_timer) self.closeNow(conn);
+                if (!conn.seat.load(.monotonic).over() and conn.heap_index == Conn.no_timer) self.closeNow(conn);
                 conn.unref();
             }
             while (self.timers.items.len > 0) self.closeNow(self.timers.items[0]);
@@ -1267,12 +1374,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             defer self.gpa.free(live);
             for (live) |conn| {
                 conn.lock();
-                switch (conn.state) {
-                    .closing, .draining => {
-                        conn.period_end = 0;
+                switch (conn.life) {
+                    .closing, .draining => |*end| {
+                        end.* = 0;
                         conn.kick();
                     },
-                    .open, .closed => {},
+                    .open, .notice, .final, .closed => {},
                 }
                 conn.unlock();
                 conn.unref();
@@ -1443,7 +1550,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // To the driver, which sends the handshake's packets and owns
             // the connection from now on.
-            conn.driven = true;
+            conn.take(.handoff);
             self.queue(conn);
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
             _ = self.stats.connections_open.fetchAdd(1, .monotonic);
@@ -1455,7 +1562,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn giveUp(self: *Self, conn: *Conn) void {
             if (conn.tasks.load(.acquire) == 0) return conn.destroy();
             if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .release);
-            conn.retired = true;
+            conn.take(.give_up);
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
 
@@ -1550,8 +1657,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// What all of the connection's send queues hold unacknowledged.
             budget: bridge.Budget,
             refs: std.atomic.Value(u32) = .init(1),
-            /// Handed to the driver (`accept`): kicks queue it from then on.
-            driven: bool = false,
+            /// Who holds it (`Seat`'s table): written by `accept` before
+            /// its handoff, then by the driver (`take`); read by `kick` on
+            /// any thread. With `wake_pending`, the only lifecycle word
+            /// not under the lock.
+            seat: std.atomic.Value(Seat) = .init(.accepting),
             /// In the endpoint's `dirty` list, linked through `next_dirty`.
             queued: std.atomic.Value(bool) = .init(false),
             next_dirty: ?*Conn = null,
@@ -1559,8 +1669,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// the driver's alone.
             heap_index: u32 = no_timer,
             timer_at: u64 = 0,
-            /// Over: out of the heap, and finishing (`Endpoint.retire`).
-            retired: bool = false,
             /// Request tasks running, and parked responses not released
             /// (`H3Parked`): while any, the connection ends on a finisher
             /// task.
@@ -1569,7 +1677,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `finish` waits for none (`parked_idle`). Locked.
             parked_open: u32 = 0,
             parked_idle: std.Io.Condition = .init,
-            state: State = .open,
+            /// Open, draining, closing, closed (`Life`'s table), with when
+            /// the final GOAWAY is due or the period ends. Locked; changed
+            /// only by `enter`.
+            life: Life = .open,
             /// ngtcp2's keep-alive is armed: a request stream is open.
             keep_alive_on: bool = false,
             last_error: c.ngtcp2_ccerr = undefined,
@@ -1577,10 +1688,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             close_pkt: []u8 = &.{},
             close_pkts_seen: u32 = 0,
             close_next_reply: u32 = 1,
-            /// When the closing or draining period ends.
-            period_end: u64 = 0,
             /// The peer closed the connection, and the streams have yet to
-            /// hear of it: the driver tells them (`wakeStreams`).
+            /// hear of it: set by `enter(.., .deferred)` on the reader,
+            /// swapped by the driver, which tells them (`wakeStreams`).
             wake_pending: std.atomic.Value(bool) = .init(false),
             /// The request streams. An array map: removing leaves no
             /// tombstones behind, which in a hash map with a stream opening
@@ -1616,16 +1726,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// guess is still tiny otherwise count that data lost and send
             /// it again in 1-RTT.
             hold_off: std.atomic.Value(bool) = .init(false),
-            drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
             hq_streams: std.AutoArrayHashMapUnmanaged(i64, *HqStream) = .empty,
-            drain_at: u64 = 0,
             /// WebTransport's streams, sessions and datagrams, when the
             /// endpoint speaks it.
             wt: ?*webtransport.Core = null,
 
-            const State = enum { open, closing, draining, closed };
             const no_timer = std.math.maxInt(u32);
 
             fn create(ep: *Self, remote: Addr, local: ?std.Io.net.IpAddress, hd: *const c.ngtcp2_pkt_hd, ocid: ?*const c.ngtcp2_cid, token_type: c.ngtcp2_token_type) !*Conn {
@@ -1717,7 +1824,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Frees everything. Nothing may reach the connection anymore.
             fn destroy(conn: *Conn) void {
                 const gpa = conn.ep.gpa;
-                if (conn.driven) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
+                if (conn.seat.load(.monotonic).handedOver()) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
                 gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
@@ -1753,7 +1860,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// the driver services the connection in its next round.
             fn kick(conn: *Conn) void {
                 conn.gen.notify(conn.ep.io);
-                if (conn.driven) conn.ep.queue(conn);
+                if (conn.seat.load(.monotonic).handedOver()) conn.ep.queue(conn);
+            }
+
+            /// The one writer of `seat`: `accept` before the handoff, the
+            /// driver after it.
+            fn take(conn: *Conn, ev: Seat.Event) void {
+                conn.seat.store(conn.seat.load(.monotonic).next(ev), .release);
             }
 
             /// Arms ngtcp2's keep-alive while a request stream is open, and
@@ -1761,7 +1874,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// SSE response outlives the idle timeout and an idle connection
             /// still closes at it. Locked.
             fn updateKeepAlive(conn: *Conn) void {
-                const want = conn.streams.count() > 0 and conn.state == .open;
+                const want = conn.streams.count() > 0 and conn.life.isOpen();
                 if (want == conn.keep_alive_on) return;
                 conn.keep_alive_on = want;
                 if (want) _ = conn.ep.stats.keep_alive_arms.fetchAdd(1, .monotonic);
@@ -1892,8 +2005,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Locked.
             fn readPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
-                switch (conn.state) {
-                    .open => {},
+                switch (conn.life) {
+                    .open, .notice, .final => {},
                     .closing => {
                         // Answer with the CONNECTION_CLOSE again, less and
                         // less often (RFC 9000 §10.2.1).
@@ -1934,14 +2047,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                             // tasks that earlier packets of this batch
                             // woke, so the streams hear of the end from
                             // the driver, after those have run, not here.
-                            conn.state = .draining;
-                            conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                            conn.wake_pending.store(true, .monotonic);
-                            conn.kick();
+                            _ = conn.enter(.{ .peer_close = conn.periodEnd() }, .deferred);
                             return;
                         },
                         c.NGTCP2_ERR_DROP_CONN => {
-                            conn.close(.closed);
+                            _ = conn.enter(.end, .now);
                             return;
                         },
                         c.NGTCP2_ERR_CRYPTO => if (conn.last_error.error_code == 0)
@@ -1963,7 +2073,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn service(conn: *Conn) void {
                 const ep = conn.ep;
                 const io = ep.io;
-                if (conn.retired) return;
+                if (conn.seat.load(.monotonic).over()) return;
                 while (true) {
                     if (conn.wake_pending.load(.monotonic)) {
                         conn.lock();
@@ -1982,35 +2092,37 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const flushed_at = conn.flush();
 
                     conn.lock();
-                    const state = conn.state;
+                    const life = conn.life;
                     // The flush's last clock read, when nothing went out
                     // after it, which is how a flush ends; else a fresh one.
                     const t = @max(flushed_at, c.ngtcp2_conn_get_timestamp(conn.q));
-                    var deadline: u64 = switch (state) {
+                    const deadline: u64 = switch (life) {
                         .open => c.ngtcp2_conn_get_expiry2(conn.q),
-                        .closing, .draining => conn.period_end,
-                        .closed => 0,
-                    };
-                    if (state == .open and conn.drain != .none) {
-                        deadline = @min(deadline, conn.drainStep(t));
-                        // The drain may have closed the connection, its
-                        // CONNECTION_CLOSE written at a later time than
-                        // `t`. ngtcp2 must never see time go back (it
-                        // asserts so, and its timers assume it), so `t` is
-                        // done with: start over.
-                        if (conn.state != .open) {
+                        .notice, .final => drain: {
+                            const expiry = c.ngtcp2_conn_get_expiry2(conn.q);
+                            const step = conn.drainStep(t);
+                            // The drain may have closed the connection, its
+                            // CONNECTION_CLOSE written at a later time than
+                            // `t`. ngtcp2 must never see time go back (it
+                            // asserts so, and its timers assume it), so `t`
+                            // is done with: start over.
+                            if (!conn.life.isOpen()) {
+                                conn.unlock();
+                                continue;
+                            }
+                            break :drain @min(expiry, step);
+                        },
+                        .closing, .draining => |end| end,
+                        .closed => {
                             conn.unlock();
-                            continue;
-                        }
-                    }
-                    if (state == .closed) {
-                        conn.unlock();
-                        return ep.retire(conn);
-                    }
+                            return ep.retire(conn);
+                        },
+                    };
                     if (deadline <= t) {
-                        switch (state) {
-                            .open => if (deadline == c.ngtcp2_conn_get_expiry2(conn.q)) conn.expire(t),
-                            else => conn.close(.closed),
+                        switch (life) {
+                            .open, .notice, .final => if (deadline == c.ngtcp2_conn_get_expiry2(conn.q)) conn.expire(t),
+                            .closing, .draining => _ = conn.enter(.end, .now),
+                            .closed => unreachable,
                         }
                         conn.unlock();
                         continue;
@@ -2036,7 +2148,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const ep = conn.ep;
                 while (true) {
                     conn.lock();
-                    if (conn.state != .open) {
+                    if (!conn.life.isOpen()) {
                         conn.unlock();
                         return now(ep.io);
                     }
@@ -2091,13 +2203,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.closeGracefully();
                     return t;
                 };
-                switch (conn.drain) {
-                    .none => return std.math.maxInt(u64),
-                    .notice => {
-                        if (t < conn.drain_at) return conn.drain_at;
+                switch (conn.life) {
+                    .notice => |due| {
+                        if (t < due) return due;
                         _ = h.nghttp3_conn_shutdown(hc);
-                        conn.drain = .final;
-                        conn.kick();
+                        _ = conn.enter(.drain_final, .none);
                         return t + 50 * std.time.ns_per_ms;
                     },
                     .final => {
@@ -2107,24 +2217,22 @@ pub fn Endpoint(comptime Ctx: type) type {
                         }
                         return t + 50 * std.time.ns_per_ms;
                     },
+                    .open, .closing, .draining, .closed => unreachable,
                 }
             }
 
             fn beginDrain(conn: *Conn) void {
                 conn.lock();
                 defer conn.unlock();
-                if (conn.state != .open or conn.drain != .none) return;
+                if (!conn.enter(.{ .drain_notice = conn.periodEnd() }, .none)) return;
                 if (conn.h3) |hc| _ = h.nghttp3_conn_submit_shutdown_notice(hc);
-                conn.drain = .notice;
-                conn.drain_at = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                conn.kick();
             }
 
             /// The final GOAWAY, sent, then CONNECTION_CLOSE: for a hand-over,
             /// which cannot wait for requests to finish.
             fn handOver(conn: *Conn) void {
                 conn.lock();
-                if (conn.state == .open) if (conn.h3) |hc| {
+                if (conn.life.isOpen()) if (conn.h3) |hc| {
                     _ = h.nghttp3_conn_shutdown(hc);
                 };
                 conn.unlock();
@@ -2148,26 +2256,34 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             fn abortLocked(conn: *Conn) void {
-                if (conn.state == .open) {
+                if (conn.life.isOpen()) {
                     c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.NGHTTP3_H3_NO_ERROR, null, 0);
                     conn.fail();
                 }
-                conn.close(.closed);
+                _ = conn.enter(.end, .now);
             }
 
             /// The connection failed or ends: send CONNECTION_CLOSE and
             /// enter the closing period, or go quietly for an idle timeout.
             /// Locked.
             fn fail(conn: *Conn) void {
-                if (conn.state != .open) return;
-                if (conn.last_error.type == c.NGTCP2_CCERR_TYPE_IDLE_CLOSE) return conn.close(.closed);
-                if (c.ngtcp2_conn_in_draining_period2(conn.q) != 0) return conn.enterPeriod(.draining);
+                if (!conn.life.isOpen()) return;
+                if (conn.last_error.type == c.NGTCP2_CCERR_TYPE_IDLE_CLOSE) {
+                    _ = conn.enter(.end, .now);
+                    return;
+                }
+                if (c.ngtcp2_conn_in_draining_period2(conn.q) != 0) {
+                    _ = conn.enter(.{ .peer_close = conn.periodEnd() }, .now);
+                    return;
+                }
                 var ps: c.ngtcp2_path_storage = undefined;
                 c.ngtcp2_path_storage_zero(&ps);
                 var pi: c.ngtcp2_pkt_info = undefined;
                 var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
                 const n = ngtcp2.connWriteConnectionClose(conn.q, &ps.path, &pi, &buf, &conn.last_error, now(conn.ep.io));
-                conn.enterPeriod(.closing);
+                // Its clock read after the write, which read one first:
+                // ngtcp2 never sees time go back.
+                _ = conn.enter(.{ .local_close = conn.periodEnd() }, .now);
                 if (n > 0) {
                     conn.close_pkt = conn.ep.gpa.dupe(u8, buf[0..@intCast(n)]) catch &.{};
                     // On the path in use now, which a migration may have
@@ -2178,20 +2294,25 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
-            /// The closing or draining period: three PTOs (RFC 9000 §10.2).
+            /// The one place `life` changes (`Life`'s table): the move,
+            /// then the streams told (`wake`), then the kick. False when
+            /// the table has no move: nothing changes, nothing wakes.
             /// Locked.
-            fn enterPeriod(conn: *Conn, state: State) void {
-                conn.state = state;
-                conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
-                conn.wakeStreams();
+            fn enter(conn: *Conn, ev: Life.Event, wake: Wake) bool {
+                conn.life = conn.life.next(ev) orelse return false;
+                switch (wake) {
+                    .now => conn.wakeStreams(),
+                    .deferred => conn.wake_pending.store(true, .monotonic),
+                    .none => {},
+                }
                 conn.kick();
+                return true;
             }
 
-            /// Locked.
-            fn close(conn: *Conn, state: State) void {
-                conn.state = state;
-                conn.wakeStreams();
-                conn.kick();
+            /// When a period or drain step that starts now ends: three
+            /// PTOs (RFC 9000 §10.2). Locked.
+            fn periodEnd(conn: *Conn) u64 {
+                return now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
             }
 
             /// Every stream's handler sees the connection gone.
@@ -2211,7 +2332,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const protection = io.swapCancelProtection(.blocked);
                 defer _ = io.swapCancelProtection(protection);
                 conn.lock();
-                conn.close(.closed);
+                _ = conn.enter(.end, .now);
                 // Responses still detached have nobody to go to.
                 var i: usize = 0;
                 while (i < conn.streams.count()) {
@@ -4641,6 +4762,54 @@ test "h3 stream phase: every state x event cell, and what each phase writes and 
                 .parked => |p| try std.testing.expectEqual(hp, p),
                 else => {},
             }
+        }
+    }
+}
+test "h3 conn life: every state x event cell of the transition table" {
+    comptime std.debug.assert(@sizeOf(Life) == 16);
+    const due = 7;
+    const end = 9;
+    const events = [_]Life.Event{ .{ .drain_notice = due }, .drain_final, .{ .peer_close = end }, .{ .local_close = end }, .end };
+    // One row a state, in declaration order (`isOpen` is one compare on
+    // it); `want` in the order of `events`, null for "-".
+    const rows = [_]struct { from: Life, want: [events.len]?Life, open: bool }{
+        .{ .from = .open, .want = .{ .{ .notice = due }, null, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .{ .notice = 3 }, .want = .{ null, .final, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .final, .want = .{ null, null, .{ .draining = end }, .{ .closing = end }, .closed }, .open = true },
+        .{ .from = .{ .closing = 3 }, .want = .{ null, null, null, null, .closed }, .open = false },
+        .{ .from = .{ .draining = 3 }, .want = .{ null, null, null, null, .closed }, .open = false },
+        .{ .from = .closed, .want = .{ null, null, null, null, .closed }, .open = false },
+    };
+    try std.testing.expectEqual(std.enums.values(Life.Tag).len, rows.len);
+    for (rows, 0..) |r, i| {
+        errdefer std.debug.print("life: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(i, @backingInt(@as(Life.Tag, r.from)));
+        try std.testing.expectEqual(r.open, r.from.isOpen());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            // Payloads included: `due` and `end` come from the event.
+            try std.testing.expectEqual(want, r.from.next(ev));
+        }
+    }
+}
+
+test "h3 conn seat: every state x event cell, and what each seat answers" {
+    comptime std.debug.assert(@sizeOf(Seat) == 1);
+    const events = [_]Seat.Event{ .handoff, .retire, .give_up };
+    const rows = [_]struct { from: Seat, want: [events.len]Seat, handed_over: bool, over: bool }{
+        .{ .from = .accepting, .want = .{ .driven, .accepting, .given_up }, .handed_over = false, .over = false },
+        .{ .from = .given_up, .want = .{ .given_up, .given_up, .given_up }, .handed_over = false, .over = true },
+        .{ .from = .driven, .want = .{ .driven, .retired, .driven }, .handed_over = true, .over = false },
+        .{ .from = .retired, .want = .{ .retired, .retired, .retired }, .handed_over = true, .over = true },
+    };
+    try std.testing.expectEqual(std.enums.values(Seat).len, rows.len);
+    for (rows) |r| {
+        errdefer std.debug.print("seat: {s}\n", .{@tagName(r.from)});
+        try std.testing.expectEqual(r.handed_over, r.from.handedOver());
+        try std.testing.expectEqual(r.over, r.from.over());
+        for (events, r.want) |ev, want| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            try std.testing.expectEqual(want, r.from.next(ev));
         }
     }
 }
