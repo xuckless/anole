@@ -65,7 +65,6 @@
 //! mutex.
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 
 const conn_mod = @import("conn.zig");
 const hpack = @import("hpack.zig");
@@ -948,7 +947,7 @@ pub fn Engine(comptime Ctx: type) type {
                     _ = test_arena_high.fetchMax(used, .monotonic);
                 }
                 if (conn.spares.items.len < conn.max_spares) {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                    _ = es.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                     if (is_test) test_arena_kept.store(es.arena.queryCapacity(), .release);
                     if (conn.spares.append(conn.allocator, es)) |_| return else |_| {}
                 }
@@ -1962,7 +1961,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // The node every reset keeps, so the first reset does not
                 // reallocate it.
                 if (es.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
-                    _ = safety.resetArena(&es.arena, .{ .retain_with_limit = arena_retain_limit });
+                    _ = es.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                 } else |_| {}
                 return es;
             }

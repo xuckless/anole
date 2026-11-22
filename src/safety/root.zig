@@ -12,9 +12,6 @@
 //!   which never hands out an address twice, so a use after free faults.
 //! - `process_gpa`, `ProcessAllocator`: the checked allocator for code that
 //!   can't take `std.testing.allocator` (process-wide pools, the C ABI).
-//! - `poison`, `resetArena`: pool memory taken back and request arenas
-//!   reset are poisoned (M6), so memory kept past its owner reads 0xDD or
-//!   faults.
 //! - `IoLock`: L2's exception, a lock held across I/O (rank `io`).
 //! - `SpinCheckedAllocator`: an allocator that panics when the calling
 //!   thread holds a `SpinLock` (L5).
@@ -143,120 +140,6 @@ var process_state: ProcessAllocator = .init(0x9e0c55a1);
 /// The process-wide `ProcessAllocator`, for process-wide pools whose memory
 /// is never all given back at one point (no leak check).
 pub const process_gpa: std.mem.Allocator = process_state.allocator();
-
-/// The byte freed pool memory is filled with (MSVC's "dead memory" byte):
-/// distinct from SafeAllocator's 0x55 and Zig's `undefined` 0xAA, so a crash
-/// says which mechanism freed it.
-pub const poison_byte: u8 = 0xDD;
-
-/// SAFETY.md M6: fills memory a pool takes back with `poison_byte`, so a
-/// pointer kept past its owner reads 0xDD rather than the old contents.
-/// Nothing outside Debug and test builds.
-pub inline fn poison(bytes: []u8) void {
-    if (enabled) @memset(bytes, poison_byte);
-}
-
-/// For a buffer every byte of which is written before it is read (a
-/// socket read, a copy): skips std's `undefined` fill, 0xAA over the
-/// whole allocation in ReleaseSafe (Allocator.zig `allocBytesAligned`).
-/// Poisoned instead in Debug and test builds (M6), so a read of a byte
-/// never written still shows. Freed as usual (`free`, an arena's reset).
-pub fn allocUninit(a: std.mem.Allocator, n: usize) error{OutOfMemory}![]u8 {
-    if (n == 0) return &.{};
-    const p = a.rawAlloc(n, .@"1", @returnAddress()) orelse return error.OutOfMemory;
-    poison(p[0..n]);
-    return p[0..n];
-}
-
-/// SAFETY.md M4/M6: resets a request or batch arena. In Debug and test
-/// builds every chunk goes back to the arena's child allocator
-/// (`.free_all`), which poisons it or makes it inaccessible, so a slice
-/// kept past its request reads poison or faults; otherwise `mode` as
-/// given (the retained capacity is the point of it in production). For
-/// `std.heap.ArenaAllocator` and the core's `LocalArena` alike.
-pub inline fn resetArena(arena: anytype, mode: std.heap.ArenaAllocator.ResetMode) bool {
-    const free_all = enabled and (!builtin.is_test or arena_poisoning.load(.monotonic));
-    return arena.reset(if (free_all) .free_all else mode);
-}
-
-/// Test builds: whether `resetArena` frees the arena (on by default). A
-/// test whose claim is the release behaviour, such as a warm path that
-/// allocates nothing, turns it off for its run and back on after: freeing
-/// is an allocation per request there. Debug builds always free; release
-/// builds never look at it.
-pub var arena_poisoning: std.atomic.Value(bool) = .init(true);
-
-/// `std.testing.allocator`, but what `alloc` returns is filled with
-/// `fill`, so a test can tell which bytes a caller wrote.
-const FillingAllocator = struct {
-    const fill: u8 = 0x5C;
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        } };
-    }
-
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
-        const p = std.testing.allocator.rawAlloc(len, alignment, ret) orelse return null;
-        @memset(p[0..len], fill);
-        return p;
-    }
-
-    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
-        return std.testing.allocator.rawResize(memory, alignment, new_len, ret);
-    }
-
-    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
-        return std.testing.allocator.rawRemap(memory, alignment, new_len, ret);
-    }
-
-    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
-        std.testing.allocator.rawFree(memory, alignment, ret);
-    }
-};
-
-test "allocUninit: no undefined fill, poisoned in Debug and test builds" {
-    const a = FillingAllocator.allocator();
-    const bytes = try allocUninit(a, 64);
-    defer a.free(bytes);
-    try std.testing.expectEqual(64, bytes.len);
-    const want: u8 = if (enabled) poison_byte else FillingAllocator.fill;
-    for (bytes) |b| try std.testing.expectEqual(want, b);
-
-    // `alloc` over the same allocator fills with `undefined` (0xAA) in the
-    // safe modes: the difference is the helper's. Test builds always have
-    // `enabled`, so the ReleaseSafe branch (no store at all) is read from
-    // the code and the flame graph, not tested.
-    const filled = try a.alloc(u8, 64);
-    defer a.free(filled);
-    if (builtin.mode == .debug or builtin.mode == .safe) {
-        for (filled) |b| try std.testing.expectEqual(0xAA, b);
-    }
-}
-
-test "allocUninit: zero bytes, out of memory, and an arena's rollback" {
-    const empty = try allocUninit(std.testing.allocator, 0);
-    try std.testing.expectEqual(0, empty.len);
-    std.testing.allocator.free(empty);
-
-    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, allocUninit(failing.allocator(), 16));
-
-    // Alignment 1, as `free` of a `[]u8` passes: freeing the last slice
-    // rolls the arena back, so the next one starts at the same place.
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const first = try allocUninit(arena.allocator(), 1000);
-    const capacity = arena.queryCapacity();
-    arena.allocator().free(first);
-    const second = try allocUninit(arena.allocator(), 1000);
-    try std.testing.expectEqual(first.ptr, second.ptr);
-    try std.testing.expectEqual(capacity, arena.queryCapacity());
-}
 
 test {
     std.testing.refAllDecls(@This());

@@ -85,8 +85,7 @@ pub const WebSocket = dusty.WebSocket;
 /// A message from `Socket.receive` or `Socket.next`: its `type`, its
 /// `data`, and for a close its `close_code`. `data` is valid until the
 /// next `receive` or `next`, and may point into the connection's read
-/// buffer: copy what must outlive it or go to another task (Debug builds
-/// overwrite it with 0xDD at the next read).
+/// buffer: copy what must outlive it or go to another task.
 pub const Message = WebSocket.Message;
 /// `.text`, `.binary`, `.close`, `.ping` or `.pong` (and `.continuation`,
 /// which `receive` never returns).
@@ -340,9 +339,6 @@ pub const Socket = struct {
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
         if (self._read.conn != null) {
-            // The last messages' bytes read 0xDD before a window change
-            // can take their buffer (`WebSocket.poisonLent`).
-            self._conn.h1.poisonLent();
             self._read.between(self._conn.h1.transport.reader);
         }
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
@@ -496,7 +492,6 @@ pub const Socket = struct {
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
         if (self._read.conn != null) {
-            self._conn.h1.poisonLent();
             self._read.release(self._conn.h1.transport.reader);
         }
         switch (self._conn) {
@@ -995,8 +990,6 @@ const H1Callbacks = struct {
         // close, a failed read or callback, and a cancel alike.
         defer window.release(ws.transport.reader);
         while (true) {
-            // As `Socket.receive`: before the window may move to a block.
-            ws.poisonLent();
             window.adapt(ws.transport.reader);
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {
@@ -1310,7 +1303,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else safety.allocUninit(safety.process_gpa, read_block_len) catch return null;
+        } else @import("anole_mem").allocUninit(safety.process_gpa, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1318,9 +1311,6 @@ const read_blocks = struct {
     fn give(b: []u8) void {
         std.debug.assert(b.len == read_block_len);
         _ = held.fetchSub(1, .monotonic);
-        // SAFETY.md M6: poisoned in Debug and test builds, so a reader left
-        // pointing at a returned block reads 0xDD rather than old frames.
-        safety.poison(b);
         if (free_len < cap) {
             free[free_len] = b.ptr;
             free_len += 1;
@@ -1979,7 +1969,7 @@ fn testHandshake(a: std.mem.Allocator) !dusty.Request {
     return req;
 }
 
-test "websocket: a read block from an empty pool is new, poisoned in test builds, and counted while held" {
+test "websocket: a read block from an empty pool is new and counted while held" {
     // This thread's pool, emptied, so `take` allocates (`allocUninit`).
     var kept: [read_blocks.cap][]u8 = undefined;
     var kept_len: usize = 0;
@@ -1989,7 +1979,6 @@ test "websocket: a read block from an empty pool is new, poisoned in test builds
     const held = _readBlocksHeld();
     const b = read_blocks.take().?;
     try std.testing.expectEqual(read_block_len, b.len);
-    for (b) |byte| try std.testing.expectEqual(safety.poison_byte, byte);
     try std.testing.expectEqual(held + 1, _readBlocksHeld());
     read_blocks.give(b);
     try std.testing.expectEqual(held, _readBlocksHeld());

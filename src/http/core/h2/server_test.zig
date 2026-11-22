@@ -1110,10 +1110,7 @@ const CountingAllocator = struct {
 };
 
 test "h2 budget: a warm connection serves requests without allocating" {
-    // The release behaviour: a spare stream keeps its arena's memory.
-    const safety = @import("anole_safety");
-    safety.arena_poisoning.store(false, .monotonic);
-    defer safety.arena_poisoning.store(true, .monotonic);
+    // A spare stream keeps its arena's memory.
     var counting: CountingAllocator = .{ .inner = testing.allocator };
     var fx: Fixture = undefined;
     try fx.start(counting.allocator(), testing.io, .{});
@@ -1163,9 +1160,6 @@ test "h2 budget: no allocation above malloc_max on the body and out paths" {
 }
 
 test "h2 engine: a burst of 100 streams on a warm connection allocates nothing" {
-    const safety = @import("anole_safety");
-    safety.arena_poisoning.store(false, .monotonic);
-    defer safety.arena_poisoning.store(true, .monotonic);
     var counting: CountingAllocator = .{ .inner = testing.allocator };
     var fx: Fixture = undefined;
     try fx.start(counting.allocator(), testing.io, .{});
@@ -1543,10 +1537,7 @@ test "h2 engine: a response ended before its request starts no send-deadline wai
 }
 
 test "h2 engine: an ordinary exchange takes under 2 KiB of its stream's arena; a spare keeps one node of the limit and allocates nothing again" {
-    // The release behaviour: a spare stream keeps its arena's node.
-    const safety = @import("anole_safety");
-    safety.arena_poisoning.store(false, .monotonic);
-    defer safety.arena_poisoning.store(true, .monotonic);
+    // A spare stream keeps its arena's node.
     var counting: CountingAllocator = .{ .inner = testing.allocator };
     var fx: Fixture = undefined;
     try fx.start(counting.allocator(), testing.io, .{});
