@@ -426,6 +426,7 @@ pub const pg_options = dbCommon("postgres") ++ resilience_entries ++ [_]Entry{
     .{ .zig = "acquire_timeout", .json = "databases[].postgres.acquire_timeout_ms", .kind = .ms },
     .{ .zig = "connect_timeout", .json = "databases[].postgres.connect_timeout_ms", .kind = .ms },
     .{ .zig = "statement_cache_size", .json = "databases[].postgres.statement_cache_size" },
+    .{ .zig = "describe_cache_size", .json = "databases[].postgres.describe_cache_size" },
     .{ .zig = "max_lifetime", .json = "databases[].postgres.max_lifetime_ms", .kind = .ms },
     .{ .zig = "idle_timeout", .json = "databases[].postgres.idle_timeout_ms", .kind = .ms },
     .{ .zig = "sslmode", .json = "databases[].postgres.sslmode", .kind = .custom, .note = "by name: \"disable\", \"verify-full\"..." },

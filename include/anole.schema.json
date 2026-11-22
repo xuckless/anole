@@ -3270,6 +3270,13 @@
           "default": 256,
           "description": "Statements each connection keeps prepared."
         },
+        "describe_cache_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 64,
+          "description": "Statement descriptions each connection remembers for calls that skip the statement cache, which then take one round trip after their first run; 0: off."
+        },
         "max_lifetime_ms": {
           "type": "integer",
           "minimum": 0,

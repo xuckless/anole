@@ -294,6 +294,7 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         .acquire_timeout = ms(p.acquire_timeout_ms),
         .connect_timeout = if (p.connect_timeout_ms > 0) ms(p.connect_timeout_ms) else null,
         .statement_cache_size = p.statement_cache_size,
+        .describe_cache_size = p.describe_cache_size,
         .max_lifetime = if (p.max_lifetime_ms > 0) ms(p.max_lifetime_ms) else null,
         .idle_timeout = if (p.idle_timeout_ms > 0) ms(p.idle_timeout_ms) else null,
         .sslmode = if (p.sslmode) |m| switch (config_mod.sslMode(m).?) {

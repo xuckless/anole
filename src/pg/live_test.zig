@@ -171,6 +171,42 @@ test "pg: live verbs, rows into structs, and errors as statuses" {
     // A connection left in use would be reported by d.deinit's leak check.
 }
 
+test "pg: live calls that skip the statement cache take one round trip after the first (describe_cache_size)" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    // Once with the statement cache off, once per call.
+    const off = try open(io, .{ .max_connections = 1, .statement_cache_size = 0 });
+    defer off.deinit();
+    const on = try open(io, .{ .max_connections = 1 });
+    defer on.deinit();
+    for ([_]*pg.Client{ off, on }, 0..) |d, i| {
+        const q = if (i == 0) d.with(.{}) else d.with(.{ .prepare = false });
+        _ = try q.exec(&c, "DROP TABLE IF EXISTS anole_pg_describe; CREATE TABLE anole_pg_describe (n int primary key, s text)", .{});
+        for (0..4) |n| {
+            try testing.expectEqual(@as(u64, 1), try q.exec(&c, "INSERT INTO anole_pg_describe VALUES ($1, $2)", .{ @as(i32, @intCast(n)), "row" }));
+            try testing.expectEqual(@as(i64, @intCast(n + 1)), try q.one(i64, &c, "SELECT count(*) FROM anole_pg_describe WHERE s = $1", .{"row"}));
+        }
+        try testing.expectEqual(@as(i32, 4), try q.one(i32, &c, "INSERT INTO anole_pg_describe VALUES ($1, $2) RETURNING n", .{ @as(i32, 4), "row" }));
+
+        // The wrong number of arguments on a statement that is described: a
+        // developer's message, nothing sent, and the connection is fine.
+        const sql = "SELECT $1::int + $2::int";
+        try testing.expectEqual(@as(i32, 3), try q.one(i32, &c, sql, .{ @as(i32, 1), @as(i32, 2) }));
+        const level = quiet();
+        defer testing.log_level = level;
+        try testing.expectError(error.Database, q.one(i32, &c, sql, .{@as(i32, 1)}));
+        try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "differ in number") != null);
+        try testing.expectEqual(@as(i32, 5), try q.one(i32, &c, sql, .{ @as(i32, 2), @as(i32, 3) }));
+        _ = try q.exec(&c, "DROP TABLE anole_pg_describe", .{});
+    }
+}
+
 test "pg: live table and run: values known only at run time, in PostgreSQL's text format" {
     _ = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
