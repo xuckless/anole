@@ -4,6 +4,7 @@
 //! MIT). Internal to the WebSocket module: `receive` returns messages still
 //! compressed when permessage-deflate is in use, and `Socket` inflates them.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const codec = @import("anole_websocket_codec").server;
 const websocket = @import("root.zig");
@@ -38,6 +39,8 @@ pub const H2Socket = struct {
     /// `retained_message_max` of it while it is incomplete (`held`).
     budget: ?*dusty.admission.State = null,
     held: dusty.admission.Held = .{},
+    /// Tests: how often `message` was grown (`messageCapacity`).
+    message_grows: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// Sending is over: a close went out.
     closed: bool = false,
     write_mutex: std.Io.Mutex = .init,
@@ -145,6 +148,23 @@ pub const H2Socket = struct {
         }
     }
 
+    /// The capacity `message` grows to so that `items` bytes and a `chunk`
+    /// more fit, or null when they fit already. `frame_rest` is what the
+    /// frame's header declared past the chunk, `last` whether the frame ends
+    /// the message. Sized once for what is declared: to the end of the
+    /// message in its last frame, at least by half again before it (many
+    /// small frames never copy once each). But never more than twice what
+    /// has arrived, or `retained_message_max` (kept between messages
+    /// anyway), so a length the peer only declared commits no memory, and
+    /// never past `max`.
+    pub fn messageCapacity(items: usize, chunk: usize, frame_rest: u64, last: bool, capacity: usize, max: usize) ?usize {
+        const need = items + chunk;
+        if (need <= capacity) return null;
+        const exact = @min(need +| frame_rest, max);
+        const wanted = if (last) exact else @max(exact, capacity + capacity / 2);
+        return @min(wanted, @max(need, 2 * capacity, retained_message_max), max);
+    }
+
     /// Acts on one codec event, before its bytes are let go (payloads are
     /// slices of the read buffer). A message for the caller, or null to
     /// keep reading.
@@ -155,16 +175,27 @@ pub const H2Socket = struct {
                     self.fail(.too_large);
                     return error.MessageTooLarge;
                 }
-                // The first `retained_message_max` bytes hold nothing: the
-                // socket keeps that much between messages anyway, as one
-                // over HTTP/1.1 keeps its read buffer, so a small message is
-                // never refused, however full the budget.
-                const total = self.message.items.len + payload.len;
-                if (total > retained_message_max) if (self.budget) |a| if (!self.held.growTo(a, self.io, total - retained_message_max)) {
-                    self.fail(.try_again_later);
-                    return error.TryAgainLater;
+                // What the frame's header declared past this chunk: the
+                // codec has counted the chunk off by the time it hands it on.
+                const frame_rest: u64 = switch (self.frames.parser.state) {
+                    .payload => |p| p.remaining,
+                    else => 0,
                 };
-                try self.message.appendSlice(std.heap.c_allocator, payload);
+                const m = &self.message;
+                if (messageCapacity(m.items.len, payload.len, frame_rest, self.frames.cur_fin, m.capacity, self.max_message_size)) |capacity| {
+                    // The first `retained_message_max` bytes hold nothing:
+                    // the socket keeps that much between messages anyway, as
+                    // one over HTTP/1.1 keeps its read buffer, so a small
+                    // message is never refused, however full the budget.
+                    // Past it, the budget is charged before the memory is.
+                    if (capacity > retained_message_max) if (self.budget) |a| if (!self.held.growTo(a, self.io, capacity - retained_message_max)) {
+                        self.fail(.try_again_later);
+                        return error.TryAgainLater;
+                    };
+                    try m.ensureTotalCapacityPrecise(std.heap.c_allocator, capacity);
+                    if (builtin.is_test) self.message_grows += 1;
+                }
+                self.message.appendSliceAssumeCapacity(payload);
                 return null;
             },
             .data_end => |end| {
