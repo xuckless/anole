@@ -83,19 +83,13 @@ pub const ExecState = struct {
     }
 };
 
-/// The jobs client, null when the engine has none.
-fn jobsClient(e: *Engine) ?*anole.jobs.Client {
-    if (comptime !features.jobs) return null;
-    if (comptime !@hasField(@TypeOf(e.jobs_state), "client")) return null;
-    return e.jobs_state.client;
-}
-
 /// The server's main thread, before the listeners open (after `db.open`,
 /// `nats.open` and `kafka.open`).
 pub fn open(e: *Engine, app: *anole.App) !void {
     if (comptime !features.webhooks) return;
     const w = e.config.webhooks orelse return;
-    const jc = jobsClient(e) orelse {
+    const client: ?*anole.jobs.Client = if (comptime features.jobs) e.jobs_state.client else null;
+    const jc = client orelse {
         log.err("webhooks: the \"webhooks\" configuration needs \"jobs\"", .{});
         return error.Config;
     };
