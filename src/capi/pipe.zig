@@ -10,7 +10,7 @@
 //! wait, and a leaf (SAFETY.md L4): no other lock is taken under it, which
 //! debug and test builds check.
 const std = @import("std");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 const engine = @import("engine.zig");
 pub const gpa = engine.gpa;

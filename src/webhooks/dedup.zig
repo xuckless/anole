@@ -3,7 +3,6 @@
 //! after anything else. A bounded in-memory store (process-wide, sharded)
 //! and a Redis/Valkey one.
 const std = @import("std");
-const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 
 pub const Claim = enum { new, pending, done };

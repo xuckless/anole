@@ -7,6 +7,7 @@ const std = @import("std");
 const core = @import("resilience_core");
 const observe = @import("../observe/root.zig");
 const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 const metrics = observe.metrics;
 

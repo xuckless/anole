@@ -36,7 +36,6 @@
 //! producers put them; librdkafka's default differs.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");

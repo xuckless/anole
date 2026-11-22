@@ -3,7 +3,6 @@
 //! other stores' semantics. Scans are linear: it is not meant for millions
 //! of jobs.
 const std = @import("std");
-const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 

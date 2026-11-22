@@ -35,7 +35,6 @@ const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
 const resilience = @import("resilience_core");
-const safety = @import("anole_safety");
 const features = @import("build_options");
 const wire = @import("wire.zig");
 const alt_svc = @import("../h3/alt_svc.zig");

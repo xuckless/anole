@@ -23,7 +23,6 @@
 const std = @import("std");
 const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
-const safety = @import("anole_safety");
 
 /// The pool's settings: `ServerOptions.blocking`, or `Pool.init`.
 pub const Options = struct {

@@ -20,6 +20,7 @@ const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const SlotTable = @import("slot_table.zig").SlotTable;

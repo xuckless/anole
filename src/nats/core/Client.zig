@@ -69,7 +69,6 @@ const dialer = @import("engine/connect.zig");
 const manager = @import("engine/manager.zig");
 const time = @import("engine/time.zig");
 const Broadcast = @import("engine/Broadcast.zig");
-const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 const Client = @This();
 

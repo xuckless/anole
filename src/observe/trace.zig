@@ -17,7 +17,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
 

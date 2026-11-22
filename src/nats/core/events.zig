@@ -26,7 +26,6 @@ const Allocator = std.mem.Allocator;
 const ServerAddress = @import("ServerAddress.zig");
 const CloseReason = @import("Client.zig").CloseReason;
 const time = @import("engine/time.zig");
-const safety = @import("anole_safety");
 
 pub const Event = union(enum) {
     /// The first connection is up.

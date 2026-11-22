@@ -14,7 +14,6 @@
 const std = @import("std");
 const Io = std.Io;
 const time = @import("time.zig");
-const safety = @import("anole_safety");
 const Broadcast = @This();
 
 /// Changes on every wake; a sleeper waits for it to change.
@@ -22,8 +21,7 @@ epoch: std.atomic.Value(u32) = .init(0),
 /// Tasks in `wait`; a wake without any costs nothing.
 waiters: u32 = 0,
 
-/// Releases `mutex` (a `*safety.Mutex(rank)`, or a NATS engine lock's
-/// `*Io.Mutex`), sleeps until `wake`, the deadline or a spurious wakeup,
+/// Releases `mutex` (a `*Io.Mutex`), sleeps until `wake`, the deadline or a spurious wakeup,
 /// and takes `mutex` back, also when canceled.
 pub fn wait(b: *Broadcast, io: Io, mutex: anytype, deadline: ?Io.Clock.Timestamp) Io.Cancelable!void {
     // Read under the mutex: a wake after the caller's last look changes it.

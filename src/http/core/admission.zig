@@ -52,7 +52,7 @@
 //!   fails, not only the next spawn (#48).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const placement = @import("placement.zig");
 
 /// `ServerConfig.admission`.

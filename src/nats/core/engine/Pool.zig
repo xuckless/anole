@@ -13,7 +13,6 @@ const Allocator = std.mem.Allocator;
 const Options = @import("../Options.zig");
 const ServerAddress = @import("../ServerAddress.zig");
 const server_error = @import("../protocol/server_error.zig");
-const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 const Pool = @This();
 

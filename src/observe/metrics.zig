@@ -20,7 +20,6 @@
 //! raw path, so their number stays bounded.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const common = @import("common.zig");
 
 /// A value that only goes up (requests, errors, bytes). Safe from any

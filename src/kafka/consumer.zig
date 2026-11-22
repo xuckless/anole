@@ -20,7 +20,6 @@
 //! rejoins (or leaves).
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const test_hold = @import("test_hold.zig");
 const placement = dusty.placement;
 const protocol = @import("protocol.zig");

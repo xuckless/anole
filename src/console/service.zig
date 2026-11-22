@@ -15,7 +15,7 @@ const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const procinfo = @import("procinfo.zig");
 const reexec = @import("reexec.zig");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 const protocol = ui.protocol;
 const sys = ui.sys;

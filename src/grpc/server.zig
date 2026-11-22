@@ -20,7 +20,6 @@
 //! or the deadline in any of them cancels the others.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");

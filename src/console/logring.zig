@@ -7,7 +7,7 @@
 const std = @import("std");
 const logging = @import("anole_log");
 const ui = @import("anole_console_ui");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 pub const ring_count = 16;
 pub const header_len = 16;

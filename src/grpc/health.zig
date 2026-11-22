@@ -12,7 +12,6 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const server = @import("server.zig");
-const safety = @import("anole_safety");
 /// The generated grpc.health.v1 messages and service.
 pub const pb = @import("gen/grpc/health/v1.pb.zig");
 

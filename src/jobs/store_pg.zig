@@ -7,7 +7,6 @@
 //! other stores.
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
 const store = @import("store.zig");

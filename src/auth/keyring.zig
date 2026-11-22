@@ -14,7 +14,6 @@
 const std = @import("std");
 const jws = @import("jws.zig");
 const Client = @import("../client.zig").Client;
-const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole_auth);
 

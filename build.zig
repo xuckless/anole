@@ -1099,9 +1099,6 @@ pub fn build(b: *std.Build) void {
                 m.addImport("zio", zio_stub);
                 const stub_safety = Core.safetyModule(bb, zio_stub, never_reuse, t, opt);
                 m.addImport("anole_safety", stub_safety);
-                // resilience_core imports anole_safety too: on the stub, or
-                // src/safety/root.zig would be in two modules.
-                m.addImport("resilience_core", bb.createModule(.{ .root_source_file = bb.path("src/resilience/core.zig"), .target = t, .optimize = opt, .imports = &.{.{ .name = "anole_safety", .module = stub_safety }} }));
                 m.addImport("anole_test_wait", wait);
                 // The core's runner backs std.testing.allocator with it; the
                 // same instance as the hooks module's and the safety's.
@@ -2268,9 +2265,7 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        // Its breakers' shard locks are ranked (SAFETY.md L4): it takes the
-        // same anole_safety as every module it is imported into.
-        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "anole_safety", .module = safety }} });
+        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
         const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });

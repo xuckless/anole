@@ -8,7 +8,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const ui = @import("anole_console_ui");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const observe_common = @import("../observe/common.zig");
 
 pub const bucket_count = ui.protocol.bucket_count;

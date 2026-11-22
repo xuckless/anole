@@ -6,7 +6,6 @@
 //! Every call takes `c` (a request, a `*Job` or an `anole.db.Ctx`): it
 //! carries `io` and the `arena` that results live in.
 const std = @import("std");
-const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const dedup_mod = @import("dedup.zig");
 

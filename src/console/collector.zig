@@ -4,7 +4,7 @@
 //! lock of the runtime, waits for the answer (up to `wait_ms`).
 const std = @import("std");
 const builtin = @import("builtin");
-const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 
 pub const What = enum(u8) { ws, db };
 

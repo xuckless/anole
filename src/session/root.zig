@@ -20,7 +20,6 @@ const dusty = @import("dusty");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const db = @import("../db/root.zig");
-const safety = @import("anole_safety");
 
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;

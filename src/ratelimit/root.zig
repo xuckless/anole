@@ -14,7 +14,6 @@
 //! LRU list so a full table costs O(1) per new key.
 const std = @import("std");
 const dusty = @import("dusty");
-const safety = @import("anole_safety");
 const declarations = @import("../openapi/declarations.zig");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};

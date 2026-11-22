@@ -2,6 +2,7 @@
 //! at most 256 distinct values; later ones report as "other".
 const std = @import("std");
 const safety = @import("anole_safety");
+const SpinLock = @import("anole_mem").SpinLock;
 const observe = @import("../observe/root.zig");
 
 const m = observe.metrics;

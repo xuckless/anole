@@ -4,7 +4,6 @@
 //! and the observer; this is the shared state and the parts that only
 //! touch it.
 const std = @import("std");
-const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const session_mod = @import("session.zig");
 
