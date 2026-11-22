@@ -14,6 +14,7 @@ const bridge = @import("bridge.zig");
 const h3_metrics = @import("metrics.zig");
 const metrics = @import("../observe/metrics.zig");
 const quic_tls = @import("quic_tls.zig");
+const tls_c = @import("ngtcp2.zig").c;
 const net = @import("net.zig");
 const udp_net = @import("../net/udp.zig");
 const Udp = udp_net.Udp;
@@ -484,6 +485,25 @@ test "h3 client: a GET returns the handler's body" {
     const conn = try f.connect(gpa, io);
     defer conn.close();
 
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 client: the SSL has shed its handshake configuration once connected" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // SSL_set_quic_transport_params stores into the config and returns 0
+    // when there is none.
+    try std.testing.expectEqual(@as(c_int, 0), tls_c.SSL_set_quic_transport_params(conn.ssl, "x", 1));
+    // The connection still works.
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
