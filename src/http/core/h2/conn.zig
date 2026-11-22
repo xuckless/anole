@@ -389,6 +389,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             data: DataIn,
             continuation: Block,
             dead,
+
+            /// Nothing of a frame is held in the phase (`atFrameBoundary`).
+            const at_boundary = std.EnumArray(std.meta.Tag(In), bool).init(.{
+                .magic = true,
+                .first_settings = true,
+                .frame = true,
+                .data = false,
+                .continuation = false,
+                .dead = true,
+            });
         };
 
         const Block = struct {
@@ -1640,10 +1650,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// idle connection parks only then, as nginx keeps a connection
         /// whose `state.incomplete` is set out of its idle mode.
         pub fn atFrameBoundary(c: *const Self) bool {
-            return switch (c.in) {
-                .magic, .first_settings, .frame, .dead => true,
-                .data, .continuation => false,
-            };
+            return In.at_boundary.get(std.meta.activeTag(c.in));
         }
 
         /// An idle connection's memory back (PLAN §3.4): the output

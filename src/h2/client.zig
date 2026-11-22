@@ -250,15 +250,18 @@ pub const ClientConnection = struct {
 
         pub const Event = enum { retire, close, end, freed };
 
+        /// The table above, phase by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(Phase, std.EnumArray(Event, Phase)).init(.{
+            .open = .init(.{ .retire = .draining, .close = .shutting, .end = .dead, .freed = .open }),
+            .draining = .init(.{ .retire = .draining, .close = .shutting, .end = .dead, .freed = .draining }),
+            .shutting = .init(.{ .retire = .shutting, .close = .shutting, .end = .dead, .freed = .shutting }),
+            .dead = .init(.{ .retire = .dead, .close = .dead, .end = .dead, .freed = .freed }),
+            .freed = .init(.{ .retire = .freed, .close = .freed, .end = .freed, .freed = .freed }),
+        });
+
         pub fn next(p: Phase, ev: Event) Phase {
-            const to: Phase = switch (ev) {
-                .retire => .draining,
-                .close => .shutting,
-                .end => .dead,
-                // Only from dead (see the table).
-                .freed => if (p == .dead) .freed else p,
-            };
-            return if (to.reached(p)) to else p;
+            return table.get(p).get(ev);
         }
 
         /// Whether `p` is `at` or later.
@@ -906,20 +909,17 @@ pub const Stream = struct {
 
         pub const Event = enum { wait, room, close_send };
 
+        /// The table above, state by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(Req, std.EnumArray(Event, Req)).init(.{
+            .none = .init(.{ .wait = .none, .room = .none, .close_send = .none }),
+            .open = .init(.{ .wait = .waiting_room, .room = .open, .close_send = .closed }),
+            .waiting_room = .init(.{ .wait = .waiting_room, .room = .open, .close_send = .closed }),
+            .closed = .init(.{ .wait = .closed, .room = .closed, .close_send = .closed }),
+        });
+
         pub fn next(r: Req, ev: Event) Req {
-            return switch (r) {
-                .none, .closed => r,
-                .open => switch (ev) {
-                    .wait => .waiting_room,
-                    .room => r,
-                    .close_send => .closed,
-                },
-                .waiting_room => switch (ev) {
-                    .wait => r,
-                    .room => .open,
-                    .close_send => .closed,
-                },
-            };
+            return table.get(r).get(ev);
         }
     };
 
@@ -978,11 +978,16 @@ pub const Stream = struct {
         }
 
         /// Whether the final response head arrived.
+        const head_seen = std.EnumArray(std.meta.Tag(Resp), bool).init(.{
+            .waiting = false,
+            .head = true,
+            .done = true,
+            .failed_before_head = false,
+            .failed_after_head = true,
+        });
+
         pub fn headSeen(r: Resp) bool {
-            return switch (r) {
-                .waiting, .failed_before_head => false,
-                .head, .done, .failed_after_head => true,
-            };
+            return head_seen.get(std.meta.activeTag(r));
         }
     };
 
