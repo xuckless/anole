@@ -674,7 +674,7 @@ pub const ClientConnection = struct {
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
             const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
-            if (stream.lingering and !stream.protocol_done) return true;
+            if (stream.lingering and stream.holders.contains(.quic)) return true;
         }
         return false;
     }
@@ -998,7 +998,7 @@ pub const ClientConnection = struct {
                 .blocked => {
                     s.resent();
                     s.endEarly(error.StreamReset);
-                    s.protocol_done = true;
+                    s.holders.remove(.quic);
                 },
             }
         }
@@ -1043,10 +1043,10 @@ pub const ClientConnection = struct {
     /// (`Stream.tooEarly`). Locked, once the handshake is done.
     fn resendOne(self: *ClientConnection, hc: *h.nghttp3_conn, s: *Stream, head: []h.nghttp3_nv) Resend {
         // Released or canceled meanwhile: nothing to send again.
-        if (s.user_done or s.cause != null) {
+        if (!s.holders.contains(.user) or s.cause != null) {
             s.resent();
             s.endEarly(error.Canceled);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
             return .ended;
         }
@@ -1056,7 +1056,7 @@ pub const ClientConnection = struct {
         if (self.closing) {
             s.unsent();
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
             return .ended;
         }
@@ -1066,7 +1066,7 @@ pub const ClientConnection = struct {
         if (rv != 0) {
             s.resent();
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             return .ended;
         }
         // The new ID from here on, whatever the submit does: the old one
@@ -1458,7 +1458,7 @@ pub const ClientConnection = struct {
         if (streamOfUser(sud)) |s| {
             if (s.reset_code == null and flags & c.NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0) s.reset_code = rx_code;
             s.endEarly(error.StreamReset);
-            s.protocol_done = true;
+            s.holders.remove(.quic);
             s.maybeFree();
         }
         self.kick();
@@ -1502,7 +1502,7 @@ pub const ClientConnection = struct {
             bridge.consume(self.q, stream_id, len);
             return 0;
         };
-        if (s.user_done) {
+        if (!s.holders.contains(.user)) {
             // Let go (`releaseSent`): nobody reads it.
             bridge.consume(self.q, stream_id, len);
             return 0;
@@ -1693,12 +1693,12 @@ pub const Stream = struct {
     /// (`readData`) wake it, as well as acknowledgements.
     wants_room: bool = false,
 
-    /// Both the caller (`release`) and QUIC (stream close) are done.
-    user_done: bool = false,
+    /// The caller (`.user`, until `release`) and QUIC (`.quic`, until the
+    /// stream's close); `maybeFree` frees it once both are gone.
+    holders: std.EnumSet(bridge.Holder) = .full,
     /// Let go with `releaseSent`: what it sent is still on its way, and
     /// `ClientConnection.close` waits for it.
     lingering: bool = false,
-    protocol_done: bool = false,
     /// Where the request stands with early data.
     early: Early = .not_early,
 
@@ -1723,19 +1723,19 @@ pub const Stream = struct {
     /// Who owns the stream while it goes again. In `.sent_early` and
     /// `.sent_early_final` it is a submitted stream like any other: QUIC
     /// stream `id` carries it as user data in ngtcp2 and nghttp3, and it
-    /// is freed by `maybeFree` once the caller released it (`user_done`)
-    /// and QUIC closed `id` (`protocol_done`, from `onStreamClose`).
+    /// is freed by `maybeFree` once the caller released it (`.user` gone)
+    /// and QUIC closed `id` (`.quic` gone, in `onStreamClose`).
     /// `tooEarly` detaches it from `id`: both user data pointers are
     /// cleared (so no callback for `id` reaches it again: `onStreamClose`,
     /// the acks and `readData` see null, and nghttp3 writes no more on `id`
     /// after `nghttp3_conn_shutdown_stream_write`, so `readData` is not
     /// called), and `id` is reset with STOP_SENDING; QUIC closes `id` on
     /// its own. In `.resend_due` nothing in QUIC refers to the stream; it
-    /// is in `live`, the caller holds it, and `protocol_done` stays false,
+    /// is in `live`, the caller holds it, and `.quic` stays in `holders`,
     /// so `release` does not free it: the driver does, in `resendOne`,
     /// which either submits it on a new stream (from there it is a
     /// submitted stream again) or, released or canceled meanwhile, or
-    /// after a GOAWAY, ends it (`protocol_done`, then `maybeFree`, which
+    /// after a GOAWAY, ends it (`.quic` gone, then `maybeFree`, which
     /// frees it if released). Should the connection close first (the
     /// driver stops), `closeLocked` ends it `.unsent`, `release` frees it
     /// after the close (a closed connection has no stream close to wait
@@ -1886,7 +1886,7 @@ pub const Stream = struct {
 
     /// Frees the stream once both sides let go. Locked.
     fn maybeFree(self: *Stream) void {
-        if (!(self.user_done and self.protocol_done)) return;
+        if (self.holders.count() != 0) return;
         self.conn.live.remove(&self.node);
         self.conn.updateKeepAlive();
         self.free();
@@ -2037,7 +2037,7 @@ pub const Stream = struct {
 
     fn cancelLocked(self: *Stream, cause: StreamError) void {
         const conn = self.conn;
-        if (self.submitted and !self.protocol_done and conn.state != .closed)
+        if (self.submitted and self.holders.contains(.quic) and conn.state != .closed)
             _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, self.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
         self.endEarly(cause);
         conn.kick();
@@ -2050,10 +2050,10 @@ pub const Stream = struct {
         defer conn.unlock();
         const sent = !self.has_body or self.send_stopped or (self.send_closed and self.out.allSent());
         if (!(self.body_done and sent)) self.cancelLocked(error.Canceled);
-        self.user_done = true;
+        self.holders.remove(.user);
         // A stream QUIC never got, or one the connection's end left
         // behind, has no close to wait for.
-        if (!self.submitted or conn.state == .closed) self.protocol_done = true;
+        if (!self.submitted or conn.state == .closed) self.holders.remove(.quic);
         self.maybeFree();
     }
 
@@ -2076,13 +2076,13 @@ pub const Stream = struct {
         // The response from here on is dropped, its credit given back, so
         // the server can always reach its end.
         const unread = self.body.items.len - self.body_start;
-        if (unread > 0 and self.submitted and !self.protocol_done and conn.state != .closed)
+        if (unread > 0 and self.submitted and self.holders.contains(.quic) and conn.state != .closed)
             bridge.consume(conn.q, self.id, unread);
         self.body.clearRetainingCapacity();
         self.body_start = 0;
         self.lingering = true;
-        self.user_done = true;
-        if (!self.submitted or conn.state == .closed) self.protocol_done = true;
+        self.holders.remove(.user);
+        if (!self.submitted or conn.state == .closed) self.holders.remove(.quic);
         self.maybeFree();
     }
 
@@ -2115,7 +2115,7 @@ pub const Stream = struct {
                     self.body_start = 0;
                 }
                 // The server may send that much more.
-                if (!self.protocol_done and conn.state != .closed) bridge.consume(conn.q, self.id, n);
+                if (self.holders.contains(.quic) and conn.state != .closed) bridge.consume(conn.q, self.id, n);
                 conn.unlock();
                 w.advance(n);
                 conn.kick();

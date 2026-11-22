@@ -408,6 +408,9 @@ const Fixture = struct {
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/slow", slowNoWait, .{ .no_wait = true });
+        // The task cap is resolved here, as a server that serves HTTP/3
+        // beside its own listeners does before it starts.
+        if (config.max_tasks != null) try http.prepareStatic();
         var bundle = try @import("../tls/testing.zig").bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
@@ -1304,6 +1307,55 @@ test "h3 server: requests the client cancels keep their stream credit until thei
     try std.testing.expect(holding_peak.load(.monotonic) <= 8);
 
     // The connection carries on.
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 server: a request past the task cap is rejected unprocessed, and its stream credit comes back" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .max_tasks = 3 }, .{});
+    defer f.stop(gpa, io);
+    hold_started.store(0, .monotonic);
+    holding_now.store(0, .monotonic);
+    holding_peak.store(0, .monotonic);
+    hold_gate = .unset;
+    defer hold_gate.set(io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // The cap's worth of handlers, all holding.
+    var held: [3]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (held[0..opened]) |st| st.release();
+    for (&held) |*st| {
+        st.* = try request(conn, "GET", "/hold", .{});
+        opened += 1;
+    }
+    try wait.waitEqual(io, "3 handlers holding", &holding_now, 3);
+
+    // Each request past it is refused as one the server never processed.
+    // Nine of them with three held is past the connection's 8 streams:
+    // each refused stream gives its credit back once QUIC closes it.
+    for (0..9) |_| {
+        const s = try request(conn, "GET", "/hello", .{});
+        defer s.release();
+        try std.testing.expectError(error.StreamReset, s.waitHead());
+        try std.testing.expect(s.unprocessed());
+        try std.testing.expectEqual(@as(?u64, @import("anole_nghttp3_c").NGHTTP3_H3_REQUEST_REJECTED), s.resetCode());
+    }
+    try std.testing.expectEqual(@as(u32, 3), hold_started.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 9), f.http.admission.refused_tasks.load(.monotonic));
+
+    // The held three answer, and the connection carries on.
+    hold_gate.set(io);
+    for (held) |st| {
+        try st.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), st.status);
+    }
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);

@@ -2416,7 +2416,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// A request's head is complete: give it a task. Locked.
             fn startStream(conn: *Conn, stream: *Stream) void {
                 stream.started = true;
-                stream.refs.handler = true;
+                stream.holders.insert(.handler);
                 // The flush waits for its answer (`Stream.unhold`).
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
@@ -2441,7 +2441,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                         log.debug("HTTP/3: stream {d} refused at the task cap", .{stream.id})
                     else
                         log.err("HTTP/3: no task for stream {d}", .{stream.id});
-                    stream.refs.handler = false;
+                    // The handler never started: its hold goes without a
+                    // free. QUIC still holds the stream (every caller runs
+                    // for one QUIC has not closed), so the lines below
+                    // touch a live stream and QUIC's close frees it.
+                    stream.holders.remove(.handler);
                     stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
@@ -2465,7 +2469,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn queueInline(conn: *Conn, stream: *Stream) void {
                 conn.ready.append(conn.ep.gpa, stream) catch return conn.startStream(stream);
                 stream.started = true;
-                stream.refs.handler = true;
+                stream.holders.insert(.handler);
                 stream.inline_mode = true;
             }
 
@@ -2555,8 +2559,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `max_header_count`: the rest of it is not kept, and the
             /// request is answered 431 without reaching a handler.
             head_too_large: bool = false,
-            /// Who still holds the stream.
-            refs: struct { quic: bool = true, handler: bool = false, parked: bool = false } = .{},
+            /// Who still holds the stream (`Holder`); the last `release`
+            /// frees it.
+            holders: std.EnumSet(Holder) = .initOne(.quic),
             /// The connection's flush waits for this request's answer
             /// (`Conn.holding`), counted in receive round `round`. Only the
             /// stream's task changes it once the task runs.
@@ -2613,6 +2618,34 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// grew it past `arena_keep` into a node too big for malloc's
             /// slabs, an mmap and munmap per request.
             sink_buf: []u8 = &.{},
+
+            /// Who may still touch the stream; the set (`holders`) empty
+            /// means freed, by `release`, the one place a holder goes
+            /// (but startStream's spawn failure, which QUIC outlives).
+            /// QUIC holds it from creation to its close, the handler from
+            /// `startStream`/`queueInline`/an awaited body to its end, a
+            /// parked response from `detachedPark` to `H3Parked.release`.
+            ///
+            ///   {quic}                 + handler -> {quic,handler}
+            ///   {quic}                 - quic    -> freed (credit +1)
+            ///   {quic,handler}         - quic    -> {handler} (a reset request
+            ///                                       keeps its credit until
+            ///                                       its handler ends)
+            ///   {quic,handler}         - handler -> {quic}
+            ///   {quic,handler}         + parked  -> {quic,handler,parked}
+            ///   {quic,handler,parked}  - handler -> {quic,parked}
+            ///   {quic,handler,parked}  - quic    -> {handler,parked}
+            ///   {quic,handler,parked}  - parked  -> {quic,handler} (released
+            ///                                       inside the handler)
+            ///   {quic,parked} | {handler,parked}
+            ///                          - either  -> the other one stays
+            ///   {handler} | {parked}   - it      -> freed
+            ///
+            /// Inserting a holder already in the set (queueInline, then
+            /// startStream from runInline) and removing one already gone
+            /// are no-ops. QUIC never comes back once gone, and a park
+            /// needs the handler's hold.
+            const Holder = enum { quic, handler, parked };
 
             /// The request body's receive side:
             ///
@@ -2730,13 +2763,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Drops one holder; the last frees the stream. Locked.
-            fn release(s: *Stream, who: enum { quic, handler, parked }) void {
-                switch (who) {
-                    .quic => s.refs.quic = false,
-                    .handler => s.refs.handler = false,
-                    .parked => s.refs.parked = false,
-                }
-                if (s.refs.quic or s.refs.handler or s.refs.parked) return;
+            fn release(s: *Stream, who: Holder) void {
+                s.holders.remove(who);
+                if (s.holders.count() != 0) return;
                 const conn = s.conn;
                 if (conn.streams.swapRemove(s.id)) {
                     gauges.add(conn.ep.io, .h3_streams, -1);
@@ -2798,7 +2827,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (gone) return;
                 // A parked response (`.detached`, the only detach a task's
-                // handler may do) holds the stream itself (`refs.parked`):
+                // handler may do) holds the stream itself (`.parked`):
                 // the handler's hold goes as for any other.
                 _ = s.serve(false) catch |err| return s.failed(err);
             }
@@ -3430,23 +3459,24 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer conn.unlock();
                 // Let go before it ended (the owner gave up on a stream the
                 // peer still has open): reset it, so QUIC closes it.
-                if (!s.send.hasEnded() and s.refs.quic) {
+                if (!s.send.hasEnded() and s.holders.contains(.quic)) {
                     s.reset = true;
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
-                } else if (s.recv != .done and !s.reset and s.refs.quic) {
+                } else if (s.recv != .done and !s.reset and s.holders.contains(.quic)) {
                     conn.lingerRead(s);
                 }
                 s.parked = null;
                 s.detached = null;
                 conn.parked_open -= 1;
                 _ = conn.tasks.fetchSub(1, .acq_rel);
-                // One release for both holds: the stream may be freed
-                // here, with `self` in its arena. Released from inside the
-                // handler, the handler's hold stays: `serve`'s caller lets
-                // go when it returns.
+                // The handler's hold, then the park's: `.parked` is held
+                // through the first, so only the second may free the
+                // stream, with `self` in its arena. Released from inside
+                // the handler, the handler's hold stays: `serve`'s caller
+                // lets go when it returns.
                 if (holds_handler) {
-                    if (s.in_handler) s.ended_in_handler = true else s.refs.handler = false;
+                    if (s.in_handler) s.ended_in_handler = true else s.release(.handler);
                 }
                 s.release(.parked);
                 conn.kick();
@@ -3467,7 +3497,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             defer conn.unlock();
             if (s.reset) return error.WriteFailed;
             s.parked = p;
-            s.refs.parked = true;
+            s.holders.insert(.parked);
             // Bursts run on tasks, which may wait for the peer: the stream's
             // cap applies (not a `no_wait` request's queue past it).
             s.inline_mode = false;
@@ -4283,7 +4313,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.queueInline(s);
             } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
                 s.started = true;
-                s.refs.handler = true;
+                s.holders.insert(.handler);
                 s.await_body = true;
             } else |_| conn.startStream(s);
             return 0;

@@ -14,6 +14,15 @@ const h = nghttp3.c;
 
 const log = std.log.scoped(.anole_h3);
 
+/// Who still holds a client or WebTransport stream, kept as
+/// `std.EnumSet(Holder)`: it is freed once both are gone, in either order
+/// (removing one already gone does nothing). `user` is the caller, or for
+/// a peer's WebTransport stream the session's queue or the orphans until
+/// it is accepted or refused; `quic` lasts until QUIC closes the stream,
+/// and on the client through a 425's resend (`.resend_due`), which the
+/// driver ends.
+pub const Holder = enum { user, quic };
+
 /// One side of a connection, as the bridge sees it.
 pub const Side = struct {
     q: *c.ngtcp2_conn,

@@ -264,7 +264,7 @@ pub const Core = struct {
         // Orphans are among them, but for those QUIC is done with.
         var it = core.streams.valueIterator();
         while (it.next()) |s| s.*.free();
-        for (core.orphans.items) |s| if (s.protocol_done) s.free();
+        for (core.orphans.items) |s| if (!s.holders.contains(.quic)) s.free();
         core.streams.deinit(gpa);
         core.orphans.deinit(gpa);
         core.undecided.deinit(gpa);
@@ -539,7 +539,7 @@ pub const Core = struct {
         if (!isUni(stream_id) and stream_id & 1 == 0 and !core.sessions.contains(stream_id)) core.dropOrphans(stream_id);
         const e = core.streams.fetchRemove(stream_id) orelse return false;
         const s = e.value;
-        s.protocol_done = true;
+        s.holders.remove(.quic);
         if (std.mem.indexOfScalar(*Stream, core.orphans.items, s)) |i| {
             // A one-way stream that arrived whole before its session was
             // established (the server opened it right after its 200): kept,
@@ -552,11 +552,11 @@ pub const Core = struct {
                 return true;
             }
             _ = core.orphans.swapRemove(i);
-            s.user_done = true;
+            s.holders.remove(.user);
         }
         // A peer's stream no session took (its prefix never completed):
         // nobody else will let go of it.
-        if (!s.local and s.session == null) s.user_done = true;
+        if (!s.local and s.session == null) s.holders.remove(.user);
         if (!s.in_fin and s.recv_err == null and s.kind != .uni_out) s.recv_err = error.StreamReset;
         if (!s.fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
         s.dequeue();
@@ -1035,7 +1035,7 @@ pub const Session = struct {
         // What the handler still holds goes too.
         while (self.members.pop()) |s| {
             s.session = null;
-            s.user_done = true;
+            s.holders.remove(.user);
             s.maybeFree();
         }
         self.members.deinit(core.gpa);
@@ -1074,7 +1074,7 @@ pub const Session = struct {
         self.close_info = .{ .code = info.code, .reason = self.reason_buf[0..n], .by = info.by };
         const core = self.core;
         for (self.members.items) |s| {
-            if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, s.id, error_session_gone);
+            if (s.holders.contains(.quic) and !core.closed) _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, s.id, error_session_gone);
             if (s.recv_err == null and !s.in_fin) s.recv_err = error.SessionClosed;
             if (s.send_err == null) s.send_err = error.SessionClosed;
             s.discardInput();
@@ -1263,7 +1263,7 @@ pub const Session = struct {
         // The reader's buffer only now that a handler has the stream.
         s.allocReader() catch {
             s.refuse(error_session_gone);
-            s.user_done = true;
+            s.holders.remove(.user);
             s.maybeFree();
             return null;
         };
@@ -1382,7 +1382,8 @@ pub const Session = struct {
             c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
         if (rv != 0) return error.StreamIdBlocked;
         const s = try Stream.create(core, id, kind, true);
-        s.user_done = true;
+        // Only QUIC's from here on: its close frees it.
+        s.holders.remove(.user);
         _ = try s.out.write(core.pool(), core.budget(), head, 0, true);
         try core.streams.put(core.gpa, id, s);
         s.enqueue();
@@ -1752,9 +1753,11 @@ pub const Stream = struct {
     write_err: ?Error = null,
     writer_iface: std.Io.Writer,
 
-    /// The handler let go (or never had it), and QUIC is done with it.
-    user_done: bool,
-    protocol_done: bool = false,
+    /// `.user`: the handler that opens it, or (a peer's) the session's
+    /// queue or the orphans until it is accepted or refused; `.quic`:
+    /// until QUIC is done with it. `maybeFree` frees it once both are
+    /// gone.
+    holders: std.EnumSet(bridge.Holder) = .full,
 
     /// Bidirectional, or one-way in (accepted) or out (opened).
     pub const Kind = enum { bidi, uni_in, uni_out };
@@ -1769,10 +1772,6 @@ pub const Stream = struct {
             .kind = kind,
             .local = local,
             .prefix_done = local,
-            // Held from the start: by the handler that opens it, or (a
-            // peer's) by the session's queue or the orphans until it is
-            // accepted or refused.
-            .user_done = false,
             .reader_iface = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readStream } },
             .writer_iface = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
         };
@@ -1804,7 +1803,7 @@ pub const Stream = struct {
 
     /// Frees the stream once nothing holds it. Locked.
     fn maybeFree(s: *Stream) void {
-        if (!(s.user_done and s.protocol_done)) return;
+        if (s.holders.count() != 0) return;
         if (s.session) |session| {
             if (std.mem.indexOfScalar(*Stream, session.members.items, s)) |i| _ = session.members.swapRemove(i);
         }
@@ -1888,16 +1887,16 @@ pub const Stream = struct {
     /// Refuses a peer's stream that nobody holds (yet): reset both ways,
     /// and freed once QUIC is done with it. Locked.
     fn disown(s: *Stream, code: u64) void {
-        s.user_done = true;
+        s.holders.remove(.user);
         s.refuse(code);
         // An orphan QUIC was already done with: nothing else frees it.
-        if (s.protocol_done) s.maybeFree();
+        s.maybeFree();
     }
 
     /// Resets the stream both ways with `code`. Locked.
     fn refuse(s: *Stream, code: u64) void {
         const core = s.core;
-        if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, s.id, code);
+        if (s.holders.contains(.quic) and !core.closed) _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, s.id, code);
         if (s.recv_err == null and !s.in_fin) s.recv_err = error.StreamReset;
         if (s.send_err == null) s.send_err = error.StreamReset;
         s.discardInput();
@@ -1911,7 +1910,7 @@ pub const Stream = struct {
         const core = s.core;
         s.discarding = true;
         const left = s.in.len;
-        if (left > 0 and !s.protocol_done and !core.closed) bridge.consume(core.q, s.id, left);
+        if (left > 0 and s.holders.contains(.quic) and !core.closed) bridge.consume(core.q, s.id, left);
         s.in.deinit(core.pool());
         s.rx.notify(core.io);
     }
@@ -1991,7 +1990,7 @@ pub const Stream = struct {
         core.host.lock();
         defer core.host.unlock();
         if (s.kind == .uni_in or s.send_err != null or s.fin_sent) return;
-        if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(code));
+        if (s.holders.contains(.quic) and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(code));
         s.send_err = error.StreamReset;
         s.dequeue();
         s.tx.notify(core.io);
@@ -2005,7 +2004,7 @@ pub const Stream = struct {
         core.host.lock();
         defer core.host.unlock();
         if (s.kind == .uni_out or s.in_fin or s.recv_err != null) return;
-        if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_read(core.q, 0, s.id, toHttp3Error(code));
+        if (s.holders.contains(.quic) and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_read(core.q, 0, s.id, toHttp3Error(code));
         s.recv_err = error.StreamReset;
         s.discardInput();
         s.rx.notify(core.io);
@@ -2019,7 +2018,7 @@ pub const Stream = struct {
         const core = s.core;
         core.host.lock();
         defer core.host.unlock();
-        if (!s.protocol_done and !core.closed) {
+        if (s.holders.contains(.quic) and !core.closed) {
             if (s.kind != .uni_in and !s.send_closed and s.send_err == null) {
                 _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(0));
                 s.send_err = error.StreamReset;
@@ -2032,7 +2031,7 @@ pub const Stream = struct {
             }
         }
         s.discardInput();
-        s.user_done = true;
+        s.holders.remove(.user);
         s.wakeAll();
         s.maybeFree();
         core.host.kick();
@@ -2125,7 +2124,7 @@ pub const Stream = struct {
         if (s.in.len == 0 or dest.len == 0) return 0;
         const n = s.in.take(core.pool(), dest);
         // The peer may send that much more.
-        if (!s.protocol_done and !core.closed) bridge.consume(core.q, s.id, n);
+        if (s.holders.contains(.quic) and !core.closed) bridge.consume(core.q, s.id, n);
         return n;
     }
 
