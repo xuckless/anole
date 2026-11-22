@@ -1,6 +1,6 @@
 //! Tests whose claim is a panic. A panic ends the process, so the test runs
 //! its own binary again with `ANOLE_TEST_CHILD` set to a part of its name:
-//! the runner (src/safety/test_runner.zig) then runs only the tests whose
+//! the runner (src/testing/runner.zig) then runs only the tests whose
 //! names contain it, and the test, seeing `isChild`, does the thing that
 //! panics. The parent checks how the child ended and what it wrote to
 //! stderr.
@@ -12,13 +12,13 @@
 //!         try std.testing.expect(std.mem.indexOf(u8, out, "...") != null);
 //!     }
 //!
-//! Only binaries built with src/safety/test_runner.zig (`addSafeTest` in
+//! Only binaries built with src/testing/runner.zig (`addSafeTest` in
 //! build.zig) know the variable.
 const std = @import("std");
 const builtin = @import("builtin");
 
 /// The environment variable the runner filters on (keep in sync with
-/// src/safety/test_runner.zig).
+/// src/testing/runner.zig).
 pub const env_key = "ANOLE_TEST_CHILD";
 
 /// Whether this process is the child started by `runPanicking(key)`.

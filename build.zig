@@ -781,7 +781,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = use_llvm,
     });
     // `-Dtest-shards=N` runs the main suite as N processes of the same
-    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
+    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/testing/runner.zig)
     // and the HTTP core's as max(1, N/2), 4 and 2 by default;
     // each shard's tests are its index modulo N. With a live server
     // (`-D*-test-url`, `-Dredis-test-port`) the default is 1: the live
@@ -833,7 +833,7 @@ pub fn build(b: *std.Build) void {
         run_main_fuzz.skip_foreign_checks = true;
         fuzz_step.dependOn(&run_main_fuzz.step);
     }
-    // The hang probe (src/safety/hang_probe.zig): a test that never returns,
+    // The hang probe (src/testing/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
     // It imports Anole's zio for the test whose hang is a task suspended
@@ -841,7 +841,7 @@ pub fn build(b: *std.Build) void {
     {
         const probe = addSafeTest(b, .{
             .name = "hang-probe",
-            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/testing/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
             .use_llvm = use_llvm,
         });
         const run_probe = b.addRunArtifact(probe);
@@ -849,7 +849,7 @@ pub fn build(b: *std.Build) void {
         b.step("hang-probe", "Run a deliberately hanging test to see the hang dump (use --test-timeout; fails by design)").dependOn(&run_probe.step);
         if (b.option(bool, "hang-probe", "Add the deliberately hanging test to `zig build test` (fails by design)") orelse false) test_step.dependOn(&run_probe.step);
     }
-    // The crash probe (src/safety/crash_probe.zig): a test that segfaults,
+    // The crash probe (src/testing/crash_probe.zig): a test that segfaults,
     // one that aborts and one that panics with the log lock held, each in
     // its own binary run without the build runner's protocol; passes when
     // each died of SIGABRT (the segfault handler and a panic end in abort)
@@ -865,7 +865,7 @@ pub fn build(b: *std.Build) void {
             const name, const what, const expect = probe_case;
             const probe = addSafeTest(b, .{
                 .name = b.fmt("crash-probe-{s}", .{name}),
-                .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+                .root_module = b.createModule(.{ .root_source_file = b.path("src/testing/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
                 .filters = &.{b.fmt("crash probe: {s}", .{what})},
                 .use_llvm = use_llvm,
             });
@@ -2148,7 +2148,7 @@ fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const
     return runs;
 }
 
-/// `b.addTest` with src/safety/test_runner.zig: Zig's default test runner
+/// `b.addTest` with src/testing/runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a
 /// test during which zio reports a swallowed cancellation (SAFETY.md E1,
 /// C3). The root module gets `anole_test_hooks`, which the runner asks for
@@ -2156,7 +2156,7 @@ fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const
 /// stub without one.
 fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
     var o = options;
-    o.test_runner = .{ .path = b.path("src/safety/test_runner.zig"), .mode = .server };
+    o.test_runner = .{ .path = b.path("src/testing/runner.zig"), .mode = .server };
     const m = o.root_module;
     // Frame pointers in every mode (Debug keeps them anyway): the hang
     // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
@@ -2168,12 +2168,12 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
         // The binary's own never_reuse module if anole_safety is in it.
         const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
-            .root_source_file = b.path("src/safety/test_hooks.zig"),
+            .root_source_file = b.path("src/testing/hooks.zig"),
             .target = m.resolved_target,
             .optimize = m.optimize,
             .imports = &.{ .{ .name = "zio", .module = z }, .{ .name = "anole_never_reuse", .module = never_reuse } },
         }) else b.createModule(.{
-            .root_source_file = b.path("src/safety/test_hooks_none.zig"),
+            .root_source_file = b.path("src/testing/hooks_none.zig"),
             .target = m.resolved_target,
             .optimize = m.optimize,
             .imports = &.{.{ .name = "anole_never_reuse", .module = never_reuse }},
@@ -2241,7 +2241,7 @@ const Core = struct {
         // and the test runner fails the test. These are the defaults of a
         // binary with no `zio_options` of its own. Test binaries have both
         // on in every optimize mode: their root, the safety test runner,
-        // declares `zio_options` (src/safety/test_hooks.zig), so a
+        // declares `zio_options` (src/testing/hooks.zig), so a
         // ReleaseSafe test binary checks suspensions as it counts locks.
         const debug = optimize == .debug;
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .fast_send = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
@@ -2357,11 +2357,11 @@ const Core = struct {
         });
     }
 
-    /// src/safety/never_reuse.zig alone: the test allocator's backing
+    /// src/testing/never_reuse.zig alone: the test allocator's backing
     /// allocator, shared by anole_safety and the test runner (a file is in
     /// one module per compilation).
     fn neverReuseModule(b: *std.Build, target: ?std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode) *std.Build.Module {
-        return b.createModule(.{ .root_source_file = b.path("src/safety/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        return b.createModule(.{ .root_source_file = b.path("src/testing/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one

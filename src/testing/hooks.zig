@@ -1,4 +1,4 @@
-//! What the test runner (src/safety/test_runner.zig) asks of the code under
+//! What the test runner (src/testing/runner.zig) asks of the code under
 //! test, for a test binary with zio: its count of swallowed cancellations
 //! (`debug_cancel`; 0 when the option is off or the zio is the core's stub),
 //! a dump of every live task for a hang dump, and the binary's zio options.
@@ -32,5 +32,5 @@ pub const zio_options: zio.Options = blk: {
     break :blk o;
 };
 
-/// The test allocator's backing allocator (src/safety/never_reuse.zig).
+/// The test allocator's backing allocator (src/testing/never_reuse.zig).
 pub const never_reuse = @import("anole_never_reuse");

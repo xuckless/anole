@@ -1,5 +1,5 @@
 //! A deliberately hanging test, to see the test runner's hang dump work
-//! (src/safety/test_runner.zig, TESTING.md D2). Never part of the suite:
+//! (src/testing/runner.zig, TESTING.md D2). Never part of the suite:
 //! `zig build test -Dhang-probe=true` adds it, `zig build hang-probe` runs it
 //! alone. With `ANOLE_TEST_DUMP_AFTER=5` and `--test-timeout 20s` the output
 //! shows the hung test by name, its log, every thread's backtrace (the main

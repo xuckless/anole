@@ -33,7 +33,7 @@ permissions:
 # costs minutes. Every unit test step passes
 # `--test-timeout 120s`: a test running that long is named and ended, and the
 # test runner dumps every thread's backtrace at 110 s (gdb on Linux; lldb,
-# else sample, on macOS; src/safety/test_runner.zig). Jobs with Docker
+# else sample, on macOS; src/testing/runner.zig). Jobs with Docker
 # containers save the containers' logs and states as an artifact when they
 # fail: their scripts keep the containers (named anole-*) under
 # ANOLE_KEEP_CONTAINERS=1 and an always() step removes them afterwards. The

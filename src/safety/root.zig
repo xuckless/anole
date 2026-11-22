@@ -41,7 +41,7 @@ pub const checkAllocation = lock.checkAllocation;
 pub const notePanic = lock.notePanic;
 pub const SpinCheckedAllocator = @import("alloc_check.zig").SpinCheckedAllocator;
 /// Tests whose claim is a panic: they run their own binary again (see
-/// child.zig). Test binaries built with src/safety/test_runner.zig only.
+/// child.zig). Test binaries built with src/testing/runner.zig only.
 pub const child = @import("child.zig");
 const ctx = @import("ctx.zig");
 pub const toCtx = ctx.toCtx;

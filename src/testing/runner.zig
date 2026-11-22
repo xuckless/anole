@@ -36,7 +36,7 @@ const never_reuse = @import("anole_test_hooks").never_reuse;
 
 /// ANOLE: zio's count of swallowed cancellations (`debug_cancel`); a test
 /// during which it rises fails (SAFETY.md C3). build.zig gives every test
-/// binary this import (src/safety/test_hooks.zig, or a stub without zio).
+/// binary this import (src/testing/hooks.zig, or a stub without zio).
 const hooks = @import("anole_test_hooks");
 
 fn swallowedCancels() u64 {
@@ -571,7 +571,7 @@ pub const debug = struct {
     }
 };
 
-/// ANOLE: for `zig build crash-probe` only (src/safety/crash_probe.zig):
+/// ANOLE: for `zig build crash-probe` only (src/testing/crash_probe.zig):
 /// takes the capture's lock and keeps it, as a thread that panics inside
 /// `captured.append` does.
 pub const crash_probe = struct {
@@ -602,7 +602,7 @@ pub const std_options: std.Options = .{
 
 /// ANOLE: zio reads its options from the root, the runner in a test binary:
 /// SAFETY.md's zio checks on in every test build, Debug or not (see
-/// src/safety/test_hooks.zig). Only a binary with zio reads it, and only
+/// src/testing/hooks.zig). Only a binary with zio reads it, and only
 /// those get `test_hooks.zig`, which declares it.
 pub const zio_options = hooks.zio_options;
 

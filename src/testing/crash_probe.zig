@@ -1,5 +1,5 @@
 //! Tests that crash on purpose, to check that the test runner prints a
-//! crashing test's held log lines (src/safety/test_runner.zig, `captured`).
+//! crashing test's held log lines (src/testing/runner.zig, `captured`).
 //! Never part of the suite: `zig build crash-probe` builds this file twice,
 //! once per test (a crash ends the process), runs each binary and passes
 //! when the process died of the expected signal and its stderr holds the
