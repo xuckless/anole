@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Transport = @import("transport.zig").Transport;
 const placement = @import("placement.zig");
 const admission = @import("admission.zig");
@@ -420,7 +421,7 @@ pub const WebSocket = struct {
         while (true) {
             // The batch ends where reading would wait for the peer: what
             // it held goes out first.
-            if (self.batch.deferred.load(.monotonic) and bufferedFrame(self.transport.reader.buffered()) == null and
+            if (self.batch.isHeld() and bufferedFrame(self.transport.reader.buffered()) == null and
                 !(bufferedHeader(self.transport.reader.buffered()) and self.transport.bufferedBelow()))
             {
                 try self.flushDeferred();
@@ -614,7 +615,7 @@ pub const WebSocket = struct {
     fn flushDeferred(self: *WebSocket) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        if (!self.batch.isHeld() or self.closed) return;
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
@@ -992,6 +993,12 @@ pub const WebSocket = struct {
     }
 };
 
+/// The task (`placement.taskId`) on this thread that is inside a batch of
+/// some socket right now: it read a message with another already buffered
+/// behind it. Frames it sends to other sockets wait for their backstops
+/// (`WebSocket.sendFlush`). 0 when none.
+threadlocal var batching_task: usize = 0;
+
 /// One write per read: the frames the reading task sends while the peer's
 /// next message is already in the read buffer stay in the write buffer
 /// until the batch ends, when they go out together. A peer that sends
@@ -1027,19 +1034,72 @@ pub const WebSocket = struct {
 /// Shared with layers that frame WebSocket messages themselves (over
 /// HTTP/2 and HTTP/3): the owner gives it a flush function and calls
 /// `flushing` under its write lock as every flush starts.
-/// The task (`placement.taskId`) on this thread that is inside a batch of
-/// some socket right now: it read a message with another already buffered
-/// behind it. Frames it sends to other sockets wait for their backstops
-/// (`WebSocket.sendFlush`). 0 when none.
-threadlocal var batching_task: usize = 0;
-
+///
+/// A batch's four lifecycles, each one value with its own writer and lock
+/// (one word for all would cost a compare-and-swap on every send, since
+/// `flushing` writes Held per flush):
+///
+/// Round: `owner`, the reading task's id while a batch lasts, else 0, with
+/// the thread's `batching_task`. Written only by the reader (`round`,
+/// `endRound`, `deinit`), read lock-free by senders (`holds`) as a hint:
+/// a stale "mine" is a frame the reader's next send or read flushes, a
+/// stale "not mine" one that goes out now.
+///
+/// | event        | owner | batching_task                    |
+/// |--------------|-------|----------------------------------|
+/// | round(true)  | me    | me                               |
+/// | round(false) | 0     | 0 if it is me, else kept         |
+/// | endRound     | 0     | 0 if it was the owner, else kept |
+/// | deinit       | kept  | 0 if it was the owner, else kept |
+///
+/// Held: `deferred` (`isHeld`), frames sit in the write buffer for the
+/// batch. Every write under the owner's write lock; read lock-free by the
+/// reader and under `home.mutex` by `Backstop.run` and `endIfIdle`, so
+/// `hold` sets it BEFORE it queues, and `flushing` runs BEFORE the write
+/// that parks.
+///
+/// | state | hold                           | flushing | hold refused a backstop |
+/// |-------|--------------------------------|----------|-------------------------|
+/// | out   | held (the batch's first frame) | out      | unreachable: a refusal follows a move to held |
+/// | held  | held (no-op: one load)         | out      | out (the caller flushes now) |
+///
+/// Membership (`member`, with `home` valid iff not free) x MemberEvent:
+///
+/// | state  | queue (`hold`)       | pop (`Backstop.run`) | leave (`deinit`) |
+/// |--------|----------------------|----------------------|------------------|
+/// | free   | queued (join; the backstop may refuse: stays free) | unreachable: only queued batches are listed | free |
+/// | joined | queued (append, wake)| unreachable          | free             |
+/// | queued | queued (no re-append, no second wake) | joined | free (unlink) |
+///
+/// Lock: `free` under the owner's write lock (only a sender joins),
+/// `joined`/`queued` under `home.mutex`; free -> queued under both, in
+/// that order. `deinit` leaves only a batch with a `home`.
+///
+/// Task (`task`, the flusher) x TaskEvent:
+///
+/// | state   | start (`hold`, `run`) | idle (`endIfIdle`)    | stop (`stopFlusher`) |
+/// |---------|-----------------------|-----------------------|----------------------|
+/// | none    | running (spawned; a failed spawn stays none, the caller learns) | unreachable: only the flusher task raises it | none (no-op) |
+/// | running | running (no spawn, the caller wakes it) | none (only when not Held; the task returns) | none (after awaiting the task) |
+///
+/// Lock: while `member == .free` the owner's write lock (off zio's
+/// executors: such a flusher has no `home` and never goes idle); while
+/// joined or queued `home.mutex`. `stopFlusher` runs with nothing held and
+/// no reader running, and clears a free batch's task with no lock.
+///
+/// Across the axes: `Backstop.run` pops, and if Held starts the flusher
+/// (Task start) then wakes it; `endIfIdle` stays running while Held;
+/// `leave` does not touch Task, and `deinit` cancels the flusher's group
+/// whatever Task says: a flusher past `endIfIdle` (Task none) is still
+/// returning, and its `Group` lives in this struct. Kept as today, not
+/// fixed here: a `hold` off zio's executors on a joined batch takes the
+/// thread path, writing Task under the write lock while `endIfIdle`
+/// writes it under `home.mutex`; and a flusher started off the executors
+/// keeps its null `home` (never idles) if the batch later joins.
 pub const Batch = struct {
-    /// The reading task (`placement.taskId`) while the batch lasts; 0
-    /// when there is none.
+    /// Round: the reading task while the batch lasts; 0 when none.
     owner: std.atomic.Value(usize) = .init(0),
-    /// Frames sit in the write buffer for the batch. Set by the reading
-    /// task, cleared by whichever flush sends them, as it starts; both
-    /// under the owner's write lock.
+    /// Held (`isHeld`). Under the owner's write lock.
     deferred: std.atomic.Value(bool) = .init(false),
     /// The socket's own flusher: one task, started when a batch needs it
     /// and, on zio's executors, ended when it has nothing more to flush
@@ -1047,20 +1107,42 @@ pub const Batch = struct {
     flusher: std.Io.Group = .init,
     /// Set when a held batch needs the flusher; it waits on it.
     wake: placement.Signal = .{},
-    /// The flusher task is running. Under the owner's write lock off zio's
-    /// executors, under `home`'s lock on them.
-    started: bool = false,
+    task: Task = .none,
     /// Starts the flusher with the owner's flush function (`hold`).
     start_flusher: ?*const fn (*Batch, std.Io) std.Io.ConcurrentError!void = null,
-    /// The executor backstop this batch is queued on, from its first batch
-    /// on zio's executors.
+    /// The executor backstop this batch joined; set iff `member != .free`.
     home: ?*Backstop = null,
-    /// In `home`'s queue. Under its lock.
+    /// In `home`'s queue while `member == .queued`.
     node: std.DoublyLinkedList.Node = .{},
-    queued: bool = false,
-    /// Off only for tests that count writes, where a backstop on another
-    /// thread (`std.Io.Threaded`) would flush at a moment of its choosing.
-    backstop_on: bool = true,
+    member: Membership = .free,
+    /// Tests that count writes turn it off: a backstop on another thread
+    /// (`std.Io.Threaded`) would flush at a moment of its choosing.
+    backstop_on: if (builtin.is_test) bool else void = if (builtin.is_test) true else {},
+
+    const Membership = enum { free, joined, queued };
+    const MemberEvent = enum { queue, pop, leave };
+    const Task = enum { none, running };
+    const TaskEvent = enum { start, idle, stop };
+
+    /// The tables above (null: unreachable). Every move of `member` and
+    /// `task` is a cell here: add behaviour as a cell, not a branch.
+    const member_table = std.EnumArray(Membership, std.EnumArray(MemberEvent, ?Membership)).init(.{
+        .free = .init(.{ .queue = .queued, .pop = null, .leave = .free }),
+        .joined = .init(.{ .queue = .queued, .pop = null, .leave = .free }),
+        .queued = .init(.{ .queue = .queued, .pop = .joined, .leave = .free }),
+    });
+    const task_table = std.EnumArray(Task, std.EnumArray(TaskEvent, ?Task)).init(.{
+        .none = .init(.{ .start = .running, .idle = null, .stop = .none }),
+        .running = .init(.{ .start = .running, .idle = .none, .stop = .none }),
+    });
+
+    fn moveMember(self: *Batch, ev: MemberEvent) void {
+        self.member = member_table.get(self.member).get(ev).?;
+    }
+
+    fn moveTask(self: *Batch, ev: TaskEvent) void {
+        self.task = task_table.get(self.task).get(ev).?;
+    }
 
     /// The reading task, as it hands a message on: `more` when another
     /// whole message (or a close) is already buffered behind it.
@@ -1095,6 +1177,11 @@ pub const Batch = struct {
         return owner != 0 and owner == placement.taskId(io);
     }
 
+    /// Held: frames sit in the write buffer for the batch.
+    pub inline fn isHeld(self: *const Batch) bool {
+        return self.deferred.load(.monotonic);
+    }
+
     /// Under the owner's write lock, with a frame left in the buffer for
     /// the batch. The first frame of a batch queues it for the backstop,
     /// which has `flushFn(self)` flush what the batch still holds once the
@@ -1103,11 +1190,11 @@ pub const Batch = struct {
     pub fn hold(self: *Batch, io: std.Io, comptime flushFn: fn (*Batch) std.Io.Cancelable!void) bool {
         if (self.deferred.load(.monotonic)) return true;
         self.deferred.store(true, .monotonic);
-        if (!self.backstop_on) return true;
+        if (comptime builtin.is_test) if (!self.backstop_on) return true;
         self.start_flusher = Flusher(flushFn).start;
         if (placement.currentExecutor(io) != null) {
-            if (Backstop.queue(self, io)) return true;
-        } else if (self.started or self.startFlusher(io)) {
+            if ((self.home orelse &Backstop.local).queue(self, io)) return true;
+        } else if (self.startFlusher(io)) {
             self.wake.set(io);
             return true;
         }
@@ -1115,9 +1202,10 @@ pub const Batch = struct {
         return false;
     }
 
+    /// Task `start`: spawns from `none` only. False when the spawn fails.
     fn startFlusher(self: *Batch, io: std.Io) bool {
-        self.start_flusher.?(self, io) catch return false;
-        self.started = true;
+        if (self.task == .none) self.start_flusher.?(self, io) catch return false;
+        self.moveTask(.start);
         return true;
     }
 
@@ -1142,17 +1230,17 @@ pub const Batch = struct {
         };
     }
 
-    /// The flusher, after a flush on zio's executors: it ends when the
+    /// The flusher, after a flush on zio's executors: Task `idle` when the
     /// batch holds nothing more, so a socket keeps no task between
     /// batches; the backstop starts one again for the next batch that
     /// needs it. Under `home`'s lock, which the backstop holds to see
-    /// `started` and wake the flusher, so a batch that started holding
-    /// meanwhile (`deferred`, set before it queues) keeps this one running.
+    /// `task` and wake the flusher, so a batch that started holding
+    /// meanwhile (Held, set before it queues) keeps this one running.
     fn endIfIdle(self: *Batch, home: *Backstop, io: std.Io) bool {
         home.mutex.lockUncancelable(io);
         defer home.mutex.unlock(io);
-        if (self.deferred.load(.monotonic)) return false;
-        self.started = false;
+        if (self.isHeld()) return false;
+        self.moveTask(.idle);
         return true;
     }
 
@@ -1165,22 +1253,23 @@ pub const Batch = struct {
         self.deferred.store(false, .monotonic);
     }
 
-    /// Ends the socket's flusher task, if it has one: for a socket that
-    /// waits with no task reading it. With nothing held (`deferred` clear),
-    /// so no backstop starts it again meanwhile; started again with the
-    /// next batch that needs it.
+    /// Task `stop`: ends the socket's flusher task, if it has one, for a
+    /// socket that waits with no task reading it. With nothing held, so no
+    /// backstop starts it again meanwhile; started again with the next
+    /// batch that needs it.
     pub fn stopFlusher(self: *Batch, io: std.Io) void {
-        if (!self.started) return;
+        if (self.task == .none) return;
         self.flusher.cancel(io);
         if (self.home) |home| {
             home.mutex.lockUncancelable(io);
             defer home.mutex.unlock(io);
-            self.started = false;
-        } else self.started = false;
+            self.moveTask(.stop);
+        } else self.moveTask(.stop);
     }
 
     /// Takes the batch off its executor's backstop and stops its flusher.
-    /// Before the owner goes away.
+    /// Before the owner goes away. The cancel is unconditional, not
+    /// `stopFlusher`: see the tables above.
     pub fn deinit(self: *Batch, io: std.Io) void {
         const owner = self.owner.load(.monotonic);
         if (owner != 0 and batching_task == owner) batching_task = 0;
@@ -1200,40 +1289,65 @@ pub const Batch = struct {
 /// so the lock is never contended there; it is for a socket whose reading
 /// task the handler started elsewhere. Lock order: an owner's write lock,
 /// then this one; nothing under this lock takes a write lock or waits.
+///
+/// State x Event, all under `mutex` (`live` counts the joined batches):
+///
+/// | state    | join (a free batch queues) | leave_other (live stays > 0) | leave_last (live becomes 0) | task_ended (`leave`, after the cancel) |
+/// |----------|----------------------------|------------------------------|-----------------------------|-----------------------------------------|
+/// | stopped  | running (task spawned; a failed spawn refuses: stays stopped) | unreachable: live is 0 | unreachable: live is 0 | unreachable: no task |
+/// | running  | running                    | running                      | stopping                    | unreachable: only `leave` cancels it |
+/// | stopping | stopping: refused, the caller flushes at once (the hand-over) | unreachable: live is 0 | unreachable: live is 0 | stopped |
+///
+/// `leave_last` and `task_ended` are two lock acquisitions: the cancel in
+/// between awaits the task, which takes `mutex`, and no lock is held
+/// across a wait. running implies live >= 1; stopped and stopping imply
+/// live 0 and nothing pending; every pending batch is queued with this
+/// home.
 const Backstop = struct {
     mutex: std.Io.Mutex = .init,
-    /// Batches to look at, each queued once (`Batch.queued`).
+    /// Batches to look at, each queued once (`Batch.member`).
     pending: std.DoublyLinkedList = .{},
-    /// Batches that have queued here and not left.
+    /// Batches that have joined and not left.
     live: usize = 0,
     task: std.Io.Group = .init,
     wake: placement.Signal = .{},
-    running: bool = false,
-    /// `leave` is waiting for the task to end: nothing joins meanwhile.
-    stopping: bool = false,
+    state: State = .stopped,
 
     threadlocal var local: Backstop = .{};
 
-    /// Queues `batch` on the calling task's executor, or on the one it
-    /// joined: false when there is no backstop to be had.
-    fn queue(batch: *Batch, io: std.Io) bool {
-        const self = batch.home orelse &local;
+    const State = enum { stopped, running, stopping };
+    const Event = enum { join, leave_other, leave_last, task_ended };
+
+    /// The table above (null: unreachable).
+    const table = std.EnumArray(State, std.EnumArray(Event, ?State)).init(.{
+        .stopped = .init(.{ .join = .running, .leave_other = null, .leave_last = null, .task_ended = null }),
+        .running = .init(.{ .join = .running, .leave_other = .running, .leave_last = .stopping, .task_ended = null }),
+        .stopping = .init(.{ .join = .stopping, .leave_other = null, .leave_last = null, .task_ended = .stopped }),
+    });
+
+    fn move(self: *Backstop, ev: Event) void {
+        self.state = table.get(self.state).get(ev).?;
+    }
+
+    /// Queues `batch` here (its `home`, or the calling thread's backstop
+    /// for a free batch): false when the batch cannot join.
+    fn queue(self: *Backstop, batch: *Batch, io: std.Io) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (batch.home == null) {
-            if (self.stopping) return false;
-            if (!self.running) {
-                placement.concurrent(&self.task, io, .local, run, .{ self, io }) catch return false;
-                self.running = true;
+        if (batch.member == .free) {
+            switch (self.state) {
+                .stopping => return false,
+                .stopped => placement.concurrent(&self.task, io, .local, run, .{ self, io }) catch return false,
+                .running => {},
             }
+            self.move(.join);
             self.live += 1;
             batch.home = self;
         }
-        if (!batch.queued) {
-            self.pending.append(&batch.node);
-            batch.queued = true;
-            self.wake.set(io);
-        }
+        if (batch.member == .queued) return true;
+        batch.moveMember(.queue);
+        self.pending.append(&batch.node);
+        self.wake.set(io);
         return true;
     }
 
@@ -1245,10 +1359,10 @@ const Backstop = struct {
             defer self.mutex.unlock(io);
             while (self.pending.popFirst()) |node| {
                 const batch: *Batch = @fieldParentPtr("node", node);
-                batch.queued = false;
+                batch.moveMember(.pop);
                 // Flushed by its reader, as it went to read: the usual case.
-                if (!batch.deferred.load(.monotonic)) continue;
-                if (batch.started or batch.startFlusher(io)) {
+                if (!batch.isHeld()) continue;
+                if (batch.startFlusher(io)) {
                     batch.wake.set(io);
                 } else {
                     // No task for it: what it holds goes out with its
@@ -1261,26 +1375,22 @@ const Backstop = struct {
 
     fn leave(self: *Backstop, batch: *Batch, io: std.Io) void {
         self.mutex.lockUncancelable(io);
-        if (batch.queued) {
-            self.pending.remove(&batch.node);
-            batch.queued = false;
-        }
+        if (batch.member == .queued) self.pending.remove(&batch.node);
+        batch.moveMember(.leave);
         batch.home = null;
         self.live -= 1;
         const last = self.live == 0;
-        if (last) self.stopping = true;
+        self.move(if (last) .leave_last else .leave_other);
         self.mutex.unlock(io);
         if (!last) return;
         // Waits for the task to end; a batch that starts meanwhile flushes
-        // at once (`queue`).
+        // at once (`queue` refuses it while stopping).
         self.task.cancel(io);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.running = false;
-        self.stopping = false;
+        self.move(.task_ended);
     }
 };
-
 /// XORs `payload` with the 4-byte mask `key` (RFC 6455 §5.3), from the
 /// key's first byte: a vector at a time, the tail a word and then a byte
 /// at a time. About ten times the byte loop's speed from 64 bytes up.
@@ -2064,7 +2174,7 @@ test "WebSocket: from a task mid-batch, a big frame, or one the buffer has no ro
     try std.testing.expect(b_probe.writes > writes);
     try std.testing.expectEqual(@as(usize, 0), b_probe.interface.end);
     try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len + 4 + big.len), b_probe.out.items.len);
-    try std.testing.expect(!b.batch.deferred.load(.monotonic));
+    try std.testing.expect(!b.batch.isHeld());
 }
 
 test "WebSocket: sendNoFlush leaves frames for one flush, in order" {
@@ -2142,6 +2252,201 @@ test "WebSocket: what a batch holds goes out when the reader waits for something
     try ws.write_mutex.lock(io);
     defer ws.write_mutex.unlock(io);
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A' }, probe.out.items);
+}
+
+/// Every (state, event) cell of one of `Batch`'s or `Backstop`'s tables,
+/// against the cells written out in `want` (null: unreachable).
+fn expectCells(comptime S: type, comptime E: type, table: std.EnumArray(S, std.EnumArray(E, ?S)), want: std.EnumArray(S, [std.enums.values(E).len]?S)) !void {
+    for (std.enums.values(S)) |from| {
+        errdefer std.debug.print("state: {s}\n", .{@tagName(from)});
+        for (std.enums.values(E), want.get(from)) |ev, cell| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            try std.testing.expectEqual(cell, table.get(from).get(ev));
+        }
+    }
+}
+
+/// What the `Batch` and `Backstop` doc comments promise between moves.
+fn expectInvariants(b: *Backstop, batches: []const *Batch, io: std.Io) !void {
+    b.mutex.lockUncancelable(io);
+    defer b.mutex.unlock(io);
+    if (b.state == .running) try std.testing.expect(b.live >= 1) else {
+        try std.testing.expectEqual(@as(usize, 0), b.live);
+        try std.testing.expectEqual(@as(?*std.DoublyLinkedList.Node, null), b.pending.first);
+    }
+    for (batches) |batch| {
+        try std.testing.expectEqual(batch.home == null, batch.member == .free);
+        var listed: usize = 0;
+        var it = b.pending.first;
+        while (it) |node| : (it = node.next) {
+            const in: *Batch = @fieldParentPtr("node", node);
+            try std.testing.expectEqual(.queued, in.member);
+            try std.testing.expectEqual(@as(?*Backstop, b), in.home);
+            if (in == batch) listed += 1;
+        }
+        try std.testing.expectEqual(@as(usize, @intFromBool(batch.member == .queued)), listed);
+    }
+}
+
+test "WebSocket batch: every membership, flusher task and backstop state x event cell" {
+    try expectCells(Batch.Membership, Batch.MemberEvent, Batch.member_table, .init(.{
+        // queue, pop, leave
+        .free = .{ .queued, null, .free },
+        .joined = .{ .queued, null, .free },
+        .queued = .{ .queued, .joined, .free },
+    }));
+    try expectCells(Batch.Task, Batch.TaskEvent, Batch.task_table, .init(.{
+        // start, idle, stop
+        .none = .{ .running, null, .none },
+        .running = .{ .running, .none, .none },
+    }));
+    try expectCells(Backstop.State, Backstop.Event, Backstop.table, .init(.{
+        // join, leave_other, leave_last, task_ended
+        .stopped = .{ .running, null, null, null },
+        .running = .{ .running, .running, .stopping, null },
+        .stopping = .{ .stopping, null, null, .stopped },
+    }));
+}
+
+test "WebSocket batch: a backstop that is stopping refuses a join, and the batch keeps what it holds" {
+    const io = std.testing.io;
+    // The hand-over: the last batch's `leave` waits for the task to end.
+    var b: Backstop = .{ .state = .stopping };
+    var batch: Batch = .{};
+    batch.deferred.store(true, .monotonic);
+    try std.testing.expect(!b.queue(&batch, io));
+    try std.testing.expectEqual(.free, batch.member);
+    try std.testing.expectEqual(@as(?*Backstop, null), batch.home);
+    try std.testing.expectEqual(.stopping, b.state);
+    // `hold` clears it as it answers false: the caller flushes now.
+    try std.testing.expect(batch.isHeld());
+    try expectInvariants(&b, &.{&batch}, io);
+}
+
+test "WebSocket batch: with no backstop a hold only marks the frames held, once, until a flush starts" {
+    const io = std.testing.io;
+    const flushFn = struct {
+        fn flush(_: *Batch) std.Io.Cancelable!void {}
+    }.flush;
+    var batch: Batch = .{};
+    batch.backstop_on = false;
+    defer batch.deinit(io);
+    for ([_]bool{ true, true, false, true }) |hold| {
+        if (hold) try std.testing.expect(batch.hold(io, flushFn)) else batch.flushing();
+        try std.testing.expectEqual(hold, batch.isHeld());
+        try std.testing.expectEqual(.free, batch.member);
+        try std.testing.expectEqual(.none, batch.task);
+    }
+}
+
+test "WebSocket batch: the backstop starts with its first batch, lists each once, and stops with its last" {
+    const io = std.testing.io;
+    var b: Backstop = .{};
+    var x: Batch = .{};
+    var y: Batch = .{};
+    const both = [_]*Batch{ &x, &y };
+    try std.testing.expect(b.queue(&x, io));
+    try std.testing.expect(b.queue(&y, io));
+    // Listed still or already looked at (the task runs on its own thread):
+    // listed once either way.
+    try std.testing.expect(b.queue(&x, io));
+    try expectInvariants(&b, &both, io);
+    {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        try std.testing.expectEqual(.running, b.state);
+        try std.testing.expectEqual(@as(usize, 2), b.live);
+        for (both) |batch| try std.testing.expectEqual(@as(?*Backstop, &b), batch.home);
+    }
+    b.leave(&x, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.running, b.state);
+    try std.testing.expectEqual(@as(usize, 1), b.live);
+    try std.testing.expectEqual(.free, x.member);
+    b.leave(&y, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.stopped, b.state);
+    try std.testing.expectEqual(.free, y.member);
+    // A new first batch starts a new task.
+    try std.testing.expect(b.queue(&x, io));
+    try std.testing.expectEqual(.running, b.state);
+    try std.testing.expectEqual(@as(usize, 1), b.live);
+    b.leave(&x, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.stopped, b.state);
+}
+
+test "WebSocket batch: a flusher goes idle only once its batch holds nothing" {
+    const io = std.testing.io;
+    const rows = [_]struct { member: Batch.Membership, held: bool, ends: bool, task: Batch.Task }{
+        .{ .member = .joined, .held = true, .ends = false, .task = .running },
+        .{ .member = .joined, .held = false, .ends = true, .task = .none },
+        .{ .member = .queued, .held = true, .ends = false, .task = .running },
+        .{ .member = .queued, .held = false, .ends = true, .task = .none },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("member: {s}, held: {}\n", .{ @tagName(r.member), r.held });
+        // The states alone: no backstop or flusher task runs.
+        var b: Backstop = .{ .state = .running, .live = 1 };
+        var batch: Batch = .{ .member = r.member, .home = &b, .task = .running };
+        if (r.member == .queued) b.pending.append(&batch.node);
+        batch.deferred.store(r.held, .monotonic);
+        try std.testing.expectEqual(r.ends, batch.endIfIdle(&b, io));
+        try std.testing.expectEqual(r.task, batch.task);
+        try std.testing.expectEqual(r.member, batch.member);
+        try expectInvariants(&b, &.{&batch}, io);
+    }
+}
+
+test "WebSocket batch: off zio's executors a hold starts the socket's flusher, stopFlusher ends it, the next hold starts it again" {
+    const io = std.testing.io;
+    const Counted = struct {
+        batch: Batch = .{},
+        flushed: std.atomic.Value(u32) = .init(0),
+        fn flush(batch: *Batch) std.Io.Cancelable!void {
+            const self: *@This() = @fieldParentPtr("batch", batch);
+            _ = self.flushed.fetchAdd(1, .release);
+        }
+    };
+    var c: Counted = .{};
+    // Ends the flusher the second hold starts.
+    defer c.batch.deinit(io);
+    const wait = @import("anole_test_wait");
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expectEqual(.running, c.batch.task);
+    try std.testing.expectEqual(.free, c.batch.member);
+    try wait.waitAtLeast(io, "the flusher flushed", &c.flushed, 1);
+    c.batch.flushing();
+    c.batch.stopFlusher(io);
+    try std.testing.expectEqual(.none, c.batch.task);
+    c.batch.stopFlusher(io);
+    try std.testing.expectEqual(.none, c.batch.task);
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expectEqual(.running, c.batch.task);
+    try wait.waitAtLeast(io, "the new flusher flushed", &c.flushed, 2);
+}
+
+test "WebSocket batch: deinit ends the reader's round, and the last joined batch stops the backstop" {
+    const io = std.testing.io;
+    var reading: Batch = .{};
+    reading.round(io, true);
+    try std.testing.expect(Batch.sendingFromBatch(io));
+    reading.deinit(io);
+    try std.testing.expect(!Batch.sendingFromBatch(io));
+
+    var never: Batch = .{};
+    never.deinit(io);
+    try std.testing.expectEqual(.free, never.member);
+    try std.testing.expectEqual(.none, never.task);
+
+    var b: Backstop = .{};
+    var joined: Batch = .{};
+    try std.testing.expect(b.queue(&joined, io));
+    joined.deinit(io);
+    try std.testing.expectEqual(.stopped, b.state);
+    try std.testing.expectEqual(@as(usize, 0), b.live);
+    try expectInvariants(&b, &.{&joined}, io);
 }
 
 test "applyMask: matches the byte-by-byte XOR at every length and through the tail" {
