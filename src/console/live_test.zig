@@ -436,6 +436,7 @@ const Check = struct {
             .{ .pattern = "/with", .want = true },
             .{ .pattern = "/g/x", .want = true },
             .{ .pattern = "/two", .want = true },
+            .{ .pattern = "/mid", .want = true },
             .{ .pattern = "/notes/:id", .want = false },
             .{ .pattern = "/lobby", .want = false },
             .{ .pattern = "/live", .want = false },
@@ -503,6 +504,8 @@ test "console live: an attached console gets each panel's data from a real app (
     app.with(.{pages}).get("/with", plain);
     app.group("/g", .{pages}).get("/x", plain);
     app.with(.{ pages, app.responseCache(.{}) }).get("/two", plain);
+    // A cache with another middleware after it: the chain is searched, not its tail.
+    app.with(.{ pages, anole.middleware.RequestId.init(.{}) }).get("/mid", plain);
     app.ws("/lobby", lobby);
     const live = try app.sseTopics(.{ .heartbeat = null });
     app.sse("/live", live, .{ .topics = &.{"news"} });
