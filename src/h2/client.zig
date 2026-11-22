@@ -879,26 +879,7 @@ pub const Stream = struct {
 
     const block_len = 16 * 1024;
 
-    /// How far the response got, and why it ended early: one value, moved
-    /// only by `next`. Every transition is a cell below: add behaviour as
-    /// a state or an event here, not as a flag beside `resp`.
-    ///
-    /// | state \ event      | head | end  | fail(e)               |
-    /// |--------------------|------|------|-----------------------|
-    /// | waiting            | head | -    | failed_before_head(e) |
-    /// | head               | -    | done | failed_after_head(e)  |
-    /// | done               | -    | -    | - (complete: no cause)|
-    /// | failed_before_head | -    | -    | - (first cause wins)  |
-    /// | failed_after_head  | -    | -    | - (first cause wins)  |
-    ///
-    /// `head`: the final response head is in (`onHeadersEnd`, not a 1xx);
-    /// `end`: END_STREAM (`endBody`); `fail`: a header callback failed or the
-    /// stream ended early (`failHeaders`, `onHeadRefused`, `finishLocked`).
-    /// `end` before a head and `head` after a failure do not happen (DATA
-    /// and trailers come after a head; the core resets the stream and skips
-    /// the block of a failed header callback), so those cells keep the state.
-    /// "Before or after the head" is kept because `waitHead` and
-    /// `unprocessed` answer differently.
+    /// The two parties that keep a stream alive (see `holders`, `letGo`).
     pub const Holder = enum { user, protocol };
 
     /// The request body's writer: one value, moved only by `next`. Every
@@ -942,6 +923,26 @@ pub const Stream = struct {
         }
     };
 
+    /// How far the response got, and why it ended early: one value, moved
+    /// only by `next`. Every transition is a cell below: add behaviour as
+    /// a state or an event here, not as a flag beside `resp`.
+    ///
+    /// | state \ event      | head | end  | fail(e)               |
+    /// |--------------------|------|------|-----------------------|
+    /// | waiting            | head | -    | failed_before_head(e) |
+    /// | head               | -    | done | failed_after_head(e)  |
+    /// | done               | -    | -    | - (complete: no cause)|
+    /// | failed_before_head | -    | -    | - (first cause wins)  |
+    /// | failed_after_head  | -    | -    | - (first cause wins)  |
+    ///
+    /// `head`: the final response head is in (`onHeadersEnd`, not a 1xx);
+    /// `end`: END_STREAM (`endBody`); `fail`: a header callback failed or the
+    /// stream ended early (`failHeaders`, `onHeadRefused`, `finishLocked`).
+    /// `end` before a head and `head` after a failure do not happen (DATA
+    /// and trailers come after a head; the core resets the stream and skips
+    /// the block of a failed header callback), so those cells keep the state.
+    /// "Before or after the head" is kept because `waitHead` and
+    /// `unprocessed` answer differently.
     pub const Resp = union(enum) {
         waiting,
         head,
