@@ -11,6 +11,7 @@ const h2c = dusty.h2_core_for_tests;
 const tc = h2c.test_client;
 const wsc = @import("anole_websocket_codec").client;
 const websocket = @import("root.zig");
+const H2Socket = @import("h2_socket.zig").H2Socket;
 const observe = @import("../observe/root.zig");
 
 var saw_draining: std.atomic.Value(bool) = .init(false);
@@ -814,6 +815,16 @@ fn sendPieces(client: *Client) !void {
     }
 }
 
+/// What `sendPieces` holds of the budget: the message buffer's capacity
+/// past the 64 KiB kept, grown by half a time across the fragments.
+fn piecesHeld() usize {
+    var capacity: usize = 0;
+    for (0..33) |i| {
+        if (H2Socket.messageCapacity(i * 2000, 2000, 0, false, capacity, std.math.maxInt(usize))) |c| capacity = c;
+    }
+    return capacity - 64 * 1024;
+}
+
 test "WebSocket over HTTP/2: a small message passes a full buffer budget; one past the 64 KiB kept holds the rest, and past the budget is closed 1013" {
     const gpa = std.testing.allocator;
     // One executor, so every socket's bytes are on row 0.
@@ -867,7 +878,7 @@ test "WebSocket over HTTP/2: a small message passes a full buffer budget; one pa
     defer if (b_open) b.deinit();
     try b.open();
     try sendPieces(&b);
-    try waitHeld(io, &server, 33 * 2000 - 64 * 1024);
+    try waitHeld(io, &server, piecesHeld());
     b.deinit();
     b_open = false;
     try waitHeld(io, &server, 0);

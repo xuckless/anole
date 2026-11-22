@@ -875,7 +875,7 @@ pub fn registerMethod(
                 return server.serveTranscoded(M, handler, rule.body, rule.response_body, ctx, req, res, captures, opts);
             }
         };
-        addBinding(Ctx, target, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")", false);
+        addBinding(Ctx, target, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")", options.no_wait and M.kind == .unary);
     }
 }
 
@@ -883,8 +883,8 @@ pub fn registerMethod(
 /// to `router`: its own route, or a route other bindings of the same shape
 /// share. `serve` runs when the template matched, with `options` (whose
 /// `data` it may read). `no_wait`: the route's requests may run on the
-/// protocol's reader (`dusty.RouteOptions.no_wait`), for the first binding
-/// that makes its route.
+/// protocol's reader (`dusty.RouteOptions.no_wait`); a route is no_wait only
+/// if every binding on it is.
 pub fn addBinding(
     comptime Ctx: type,
     target: anytype,
@@ -1014,6 +1014,9 @@ fn attach(
             router.conflicted("google.api.http on {s}: {s} {s} is already a route of a service registered with other middleware", .{ where, method.name(), route.info.path }) catch @panic("OOM");
             return;
         }
+        // A route is no_wait only if every binding on it is; registration is
+        // before serving, and the one `Route` is what every lookup reads.
+        if (!no_wait) @constCast(route).no_wait = false;
         const bindings: *Bindings = @ptrCast(@alignCast(@constCast(route.info.data.?)));
         insert(bindings, binding, method);
         return;
@@ -1196,6 +1199,31 @@ test "addBinding: a ** template also gets the route of its prefix, and a route t
     try std.testing.expect((try router.findHandler(&req)).?.action != &Dispatch(void).handle);
     req.url = "/docs/x/a";
     try std.testing.expect((try router.findHandler(&req)).?.action == &Dispatch(void).handle);
+}
+
+test "addBinding: a route is no_wait only if every binding on it is" {
+    const R = dusty.Router(void);
+    const options: server.RegisterOptions = .{};
+    const template = try Template.parse("/v/{id}");
+    const verb = try Template.parse("/v/{id}:x");
+    const other = try Template.parse("/w/{id}");
+    const cases = [_]struct { first: bool, second: bool, want: bool }{
+        .{ .first = true, .second = true, .want = true },
+        .{ .first = true, .second = false, .want = false },
+        .{ .first = false, .second = true, .want = false },
+        .{ .first = false, .second = false, .want = false },
+    };
+    for (cases) |c| {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        addBinding(void, &router, .get, &template, noServe, &options, "a", c.first);
+        addBinding(void, &router, .get, &verb, noServe, &options, "b", c.second);
+        addBinding(void, &router, .get, &other, noServe, &options, "c", true);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expectEqual(c.want, router.noWait(.get, "/v/1"));
+        try std.testing.expect(router.noWait(.get, "/w/1"));
+    }
 }
 
 test "insert: a binding for the prefix of a ** template stays behind the exact ones before it" {
