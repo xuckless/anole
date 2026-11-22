@@ -183,8 +183,7 @@ pub const Call = struct {
         /// stream's write and flush; also orders `addHeader` against the
         /// head the first write sends. An I/O lock
         /// (held across a wait): its two takers, the handler and its streaming
-        /// writer task, run on the call's executor. Replaced at the S2
-        /// HTTP/2 takeover.
+        /// writer task, run on the call's executor.
         write_lock: std.Io.Mutex = .init,
         /// The wire protocol and message encoding, from the request's
         /// content type.

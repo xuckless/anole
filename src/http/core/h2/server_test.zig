@@ -1,9 +1,8 @@
 //! Tests for server.zig, the HTTP/2 engine on Anole's own protocol core
 //! ("h2 engine: ..."). Each drives `Engine(void).serve` directly over a
-//! loopback connection (the server is never `run`: the engine is not wired
-//! in yet), with a small client written on our own codecs (frame.zig,
-//! hpack.zig), so they depend neither on nghttp2 nor on the nghttp2
-//! engine's test client.
+//! loopback connection (the server is never `run`), with a small client
+//! written on our own codecs (frame.zig,
+//! hpack.zig), so they do not depend on nghttp2.
 const std = @import("std");
 const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
@@ -1017,8 +1016,7 @@ test "h2 engine: Out is released at the first read after a trim interval that fi
 
 test "h2 engine: a finished response the peer never takes is reset at its send deadline" {
     // No shelf and no timers here (std.Io.Threaded): the flusher's futex
-    // wait carries the deadline (`waitSends`), as the nghttp2 engine's
-    // writer did.
+    // wait carries the deadline (`waitSends`).
     var fx: Fixture = undefined;
     try fx.start(testing.allocator, testing.io, .{ .timeout = .{ .request = .fromMilliseconds(300) } });
     defer fx.stop();

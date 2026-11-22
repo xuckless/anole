@@ -142,7 +142,7 @@ pub fn updateInitialWindow(w: *i32, new: u31, old: u31) error{FlowControl}!void 
 /// allocators' 2 KiB size class (32 streams would spill into 4 KiB and waste
 /// half of it). Chunks are kept until `deinit`, so a connection keeps its
 /// high-water mark (9 chunks, 18 KiB, at 250 streams); returning idle chunks
-/// is M3 (the block cache's smallest class is 64 KiB, so chunks stay on the
+/// is not done (the block cache's smallest class is 64 KiB, so chunks stay on the
 /// general allocator).
 pub const Slab = struct {
     gpa: Allocator,

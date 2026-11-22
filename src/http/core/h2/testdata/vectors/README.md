@@ -2,8 +2,8 @@
 
 What nghttp2 1.70.0 (xuckless/nghttp2, `anole` branch) answered to the inputs
 of the HTTP/2 differential tests, recorded once while it was still linked, so
-that the tests compare against it without the library (M6 of
-research/h2h3-takeover/PLAN.md removed nghttp2 from the build).
+that the tests compare against it without the library (nghttp2 is no longer
+part of the build).
 
 The tests replay them: `h2/conn_diff_test.zig`, `h2/hpack_diff_test.zig` and
 `h2/fields_test.zig`. The reader and the format are `h2/vectors.zig`

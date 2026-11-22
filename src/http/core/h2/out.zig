@@ -18,7 +18,7 @@
 //!
 //! **Borrowed bytes** stay referenced until written: a borrower may reuse
 //! its parts once `sent_total >= mark()` taken after they were framed, or
-//! once `borrowing()` is false (M3's batch arena reset point).
+//! once `borrowing()` is false (the engine's arena reset point).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

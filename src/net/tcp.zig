@@ -1498,7 +1498,7 @@ const TcpConn = struct {
 
     /// The caller runs on the connection's executor. Off zio (`exec` null,
     /// as on `std.Io.Threaded`) never: the executor reasoning in this file
-    /// (M3's "nothing suspends between a look and its use", the driver's
+    /// ("nothing suspends between a look and its use", the driver's
     /// slots) assumes zio's pinned executors, which every Anole server runs
     /// on; it does not hold elsewhere.
     fn onOwner(t: *const TcpConn) bool {

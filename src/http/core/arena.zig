@@ -6,7 +6,7 @@
 //! with its concurrency machinery taken out. Since Zig 0.16 that arena is
 //! lock-free and thread-safe: every allocation pays a `lock xadd`, a
 //! `cmpxchg` when it pads for alignment, and resize and free a `cmpxchg`
-//! each, 9% of the CPU of an HTTP/2 request on the M3 gate
+//! each, 9% of the CPU of an HTTP/2 request in the h2 benchmark
 //! (research/s2/h2-m4/arena.md). A request's arena never needed it: only
 //! the request's own task allocates from it (docs/routing.md). What is left
 //! is the std algorithm: bump in the first node; if it does not fit, grow

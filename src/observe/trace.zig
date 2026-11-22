@@ -319,7 +319,7 @@ pub const Exporter = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
-    /// M5's teardown state: alive, then closed (`close`), then dead
+    /// The teardown state: alive, then closed (`close`), then dead
     /// (`deinit`).
     state: std.atomic.Value(State) = .init(.alive),
 
