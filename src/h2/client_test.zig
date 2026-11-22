@@ -258,6 +258,49 @@ test "h2 client: the connection's phase moves only by its table, and only forwar
     try std.testing.expect(P.freed.reached(.dead) and !P.shutting.reached(.dead) and P.open.reached(.open));
 }
 
+test "h2 client: a stream's response moves only by its table; the first cause wins" {
+    const R = h2.Stream.Resp;
+    const Row = struct { name: []const u8, from: R, ev: R.Event, to: R };
+    const a: h2.StreamError = error.Timeout;
+    const b: h2.StreamError = error.StreamReset;
+    // The table in `Resp`'s doc comment, cell for cell.
+    const rows = [_]Row{
+        .{ .name = "waiting x head", .from = .waiting, .ev = .head, .to = .head },
+        .{ .name = "waiting x end", .from = .waiting, .ev = .end, .to = .waiting },
+        .{ .name = "waiting x fail", .from = .waiting, .ev = .{ .fail = a }, .to = .{ .failed_before_head = a } },
+        .{ .name = "head x head", .from = .head, .ev = .head, .to = .head },
+        .{ .name = "head x end", .from = .head, .ev = .end, .to = .done },
+        .{ .name = "head x fail", .from = .head, .ev = .{ .fail = a }, .to = .{ .failed_after_head = a } },
+        .{ .name = "done x head", .from = .done, .ev = .head, .to = .done },
+        .{ .name = "done x end", .from = .done, .ev = .end, .to = .done },
+        .{ .name = "done x fail: a complete response keeps no cause", .from = .done, .ev = .{ .fail = a }, .to = .done },
+        .{ .name = "failed_before_head x head", .from = .{ .failed_before_head = a }, .ev = .head, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_before_head x end", .from = .{ .failed_before_head = a }, .ev = .end, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_before_head x fail: the first cause wins", .from = .{ .failed_before_head = a }, .ev = .{ .fail = b }, .to = .{ .failed_before_head = a } },
+        .{ .name = "failed_after_head x head", .from = .{ .failed_after_head = a }, .ev = .head, .to = .{ .failed_after_head = a } },
+        .{ .name = "failed_after_head x end", .from = .{ .failed_after_head = a }, .ev = .end, .to = .{ .failed_after_head = a } },
+        .{ .name = "failed_after_head x fail: the first cause wins", .from = .{ .failed_after_head = a }, .ev = .{ .fail = b }, .to = .{ .failed_after_head = a } },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        try std.testing.expectEqual(r.to, r.from.next(r.ev));
+    }
+    // What `waitHead`, `unprocessed`, `resetCode` and reads see per state.
+    const Seen = struct { state: R, cause: ?h2.StreamError, head: bool };
+    const seen = [_]Seen{
+        .{ .state = .waiting, .cause = null, .head = false },
+        .{ .state = .head, .cause = null, .head = true },
+        .{ .state = .done, .cause = null, .head = true },
+        .{ .state = .{ .failed_before_head = a }, .cause = a, .head = false },
+        .{ .state = .{ .failed_after_head = b }, .cause = b, .head = true },
+    };
+    for (seen) |r| {
+        errdefer std.debug.print("state: {t}\n", .{r.state});
+        try std.testing.expectEqual(r.cause, r.state.cause());
+        try std.testing.expectEqual(r.head, r.state.headSeen());
+    }
+}
+
 /// The core has closed the stream: its whole response is in.
 fn streamClosed(s: *h2.Stream) bool {
     s.conn.mutex.lockUncancelable(s.conn.io);

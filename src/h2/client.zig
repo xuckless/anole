@@ -529,7 +529,6 @@ pub const ClientConnection = struct {
                 if (self.proto.submitRequest(fields, end_stream, stream)) |ps| {
                     stream.ps = ps;
                     stream.id = ps.id;
-                    stream.submitted = true;
                     if (fixed != null) {
                         stream.borrowed = true;
                         self.proto.submitData(ps, &stream.fixed_part, true) catch |err| {
@@ -712,7 +711,7 @@ pub const ClientConnection = struct {
         /// Fails the stream with `cause` from a header callback: the core
         /// resets it and skips the rest of its header block.
         fn failHeaders(stream: *Stream, cause: StreamError) proto.conn.Error {
-            if (stream.cause == null) stream.cause = cause;
+            stream.resp = stream.resp.next(.{ .fail = cause });
             return error.ResetStream;
         }
 
@@ -756,7 +755,7 @@ pub const ClientConnection = struct {
                 return;
             }
             if (!end_stream) stream.allocBody() catch return failHeaders(stream, error.StreamReset);
-            stream.head_ready = true;
+            stream.resp = stream.resp.next(.head);
             stream.head_event.set(io);
             if (end_stream) stream.endBody();
         }
@@ -790,7 +789,7 @@ pub const ClientConnection = struct {
         pub fn onHeadRefused(h: *Handler, s: *PStream) void {
             _ = h;
             const stream = Stream.of(s) orelse return;
-            if (stream.cause == null) stream.cause = error.HeadersTooLarge;
+            stream.resp = stream.resp.next(.{ .fail = error.HeadersTooLarge });
         }
 
         pub fn onWindow(h: *Handler, s: ?*PStream) void {
@@ -834,7 +833,6 @@ pub const Stream = struct {
     id: i32 = -1,
     node: std.DoublyLinkedList.Node = .{},
     arena: std.heap.ArenaAllocator,
-    submitted: bool = false,
     /// The request's budget, shared by every wait on the stream.
     deadline: Deadline,
     /// The core's side of the stream, until it closes.
@@ -848,12 +846,10 @@ pub const Stream = struct {
     header_list_size: usize = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
-    head_ready: bool = false,
+    /// How far the response got (`Resp`). Under the connection's mutex.
+    resp: Resp = .waiting,
+    /// Set once the head is in or the stream ended (`finishLocked`).
     head_event: std.Io.Event = .unset,
-    /// The response is complete (END_STREAM).
-    body_done: bool = false,
-    /// Why the stream ended early. Under the connection's mutex.
-    cause: ?StreamError = null,
     error_code: u32 = 0,
     /// Behind the last `ReadFailed` (the reading task's) and `WriteFailed`
     /// (the writing task's).
@@ -886,6 +882,69 @@ pub const Stream = struct {
     protocol_done: bool = false,
 
     const block_len = 16 * 1024;
+
+    /// How far the response got, and why it ended early: one value, moved
+    /// only by `next`. Every transition is a cell below: add behaviour as
+    /// a state or an event here, not as a flag beside `resp`.
+    ///
+    /// | state \ event      | head | end  | fail(e)               |
+    /// |--------------------|------|------|-----------------------|
+    /// | waiting            | head | -    | failed_before_head(e) |
+    /// | head               | -    | done | failed_after_head(e)  |
+    /// | done               | -    | -    | - (complete: no cause)|
+    /// | failed_before_head | -    | -    | - (first cause wins)  |
+    /// | failed_after_head  | -    | -    | - (first cause wins)  |
+    ///
+    /// `head`: the final response head is in (`onHeadersEnd`, not a 1xx);
+    /// `end`: END_STREAM (`endBody`); `fail`: a header callback failed or the
+    /// stream ended early (`failHeaders`, `onHeadRefused`, `finishLocked`).
+    /// `end` before a head and `head` after a failure do not happen (DATA
+    /// and trailers come after a head; the core resets the stream and skips
+    /// the block of a failed header callback), so those cells keep the state.
+    /// "Before or after the head" is kept because `waitHead` and
+    /// `unprocessed` answer differently.
+    pub const Resp = union(enum) {
+        waiting,
+        head,
+        done,
+        failed_before_head: StreamError,
+        failed_after_head: StreamError,
+
+        pub const Event = union(enum) { head, end, fail: StreamError };
+
+        pub fn next(r: Resp, ev: Event) Resp {
+            return switch (r) {
+                .waiting => switch (ev) {
+                    .head => .head,
+                    .end => r,
+                    .fail => |e| .{ .failed_before_head = e },
+                },
+                .head => switch (ev) {
+                    .head => r,
+                    .end => .done,
+                    .fail => |e| .{ .failed_after_head = e },
+                },
+                .done, .failed_before_head, .failed_after_head => r,
+            };
+        }
+
+        /// Why the stream ended early; null while it has not, or once its
+        /// response was complete.
+        pub fn cause(r: Resp) ?StreamError {
+            return switch (r) {
+                .waiting, .head, .done => null,
+                .failed_before_head, .failed_after_head => |e| e,
+            };
+        }
+
+        /// Whether the final response head arrived.
+        pub fn headSeen(r: Resp) bool {
+            return switch (r) {
+                .waiting, .failed_before_head => false,
+                .head, .done, .failed_after_head => true,
+            };
+        }
+    };
 
     const Block = struct {
         mem: []u8 = &.{},
@@ -959,7 +1018,7 @@ pub const Stream = struct {
     /// Under the connection's mutex: END_STREAM arrived. The reader sees
     /// the end once it has taken what is queued.
     fn endBody(self: *Stream) void {
-        self.body_done = true;
+        self.resp = self.resp.next(.end);
         self.body.close(self.conn.io);
     }
 
@@ -967,9 +1026,7 @@ pub const Stream = struct {
     /// `cause` marks the stream as ended early, unless its response was
     /// complete or it already has one.
     fn finishLocked(self: *Stream, cause: ?StreamError) void {
-        if (cause) |e| if (self.cause == null and !self.body_done) {
-            self.cause = e;
-        };
+        if (cause) |e| self.resp = self.resp.next(.{ .fail = e });
         self.body.close(self.conn.io);
         self.head_event.set(self.conn.io);
     }
@@ -1004,14 +1061,15 @@ pub const Stream = struct {
     /// connection whatever its method.
     pub fn unprocessed(self: *const Stream) bool {
         if (self.error_code == @backingInt(ErrorCode.refused_stream)) return true;
-        return self.id > self.conn.goaway_last_id and !self.head_ready;
+        return self.id > self.conn.goaway_last_id and !self.resp.headSeen();
     }
 
     /// The error code of the RST_STREAM that ended the stream (the
     /// server's, or the echo of one sent here); null when it did not end
     /// in a reset.
     pub fn resetCode(self: *const Stream) ?u64 {
-        if (self.cause != null and self.cause.? == error.StreamReset) return self.error_code;
+        const cause = self.resp.cause() orelse return null;
+        if (cause == error.StreamReset) return self.error_code;
         return null;
     }
 
@@ -1027,7 +1085,7 @@ pub const Stream = struct {
         };
         conn.lock();
         defer conn.unlock();
-        if (!self.head_ready) return self.cause orelse error.ConnectionClosed;
+        if (!self.resp.headSeen()) return self.resp.cause() orelse error.ConnectionClosed;
     }
 
     fn waitHeadEvent(self: *Stream) std.Io.Cancelable!void {
@@ -1084,7 +1142,7 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         defer conn.unlock();
-        return if (self.cause) |e| e == error.Canceled else false;
+        return if (self.resp.cause()) |e| e == error.Canceled else false;
     }
 
     /// Ends the request body (END_STREAM).
@@ -1094,7 +1152,7 @@ pub const Stream = struct {
         conn.lock();
         self.send_closed = true;
         // An empty end rides on the last DATA still queued.
-        if (self.ps) |ps| if (self.cause == null and !conn.phase.reached(.dead)) conn.proto.submitData(ps, &.{}, true) catch {};
+        if (self.ps) |ps| if (self.resp.cause() == null and !conn.phase.reached(.dead)) conn.proto.submitData(ps, &.{}, true) catch {};
         conn.unlock();
         conn.kickWriter();
     }
@@ -1174,7 +1232,7 @@ pub const Stream = struct {
         const n = self.deadline.run(takeBody, .{ self, dest }) catch |err| switch (err) {
             error.Closed => {
                 conn.lock();
-                const cause = self.cause;
+                const cause = self.resp.cause();
                 conn.unlock();
                 self.read_err = cause orelse return error.EndOfStream;
                 return error.ReadFailed;
@@ -1212,11 +1270,11 @@ pub const Stream = struct {
             conn.lock();
             defer conn.unlock();
             const ps = self.ps orelse {
-                self.write_err = self.cause orelse error.StreamReset;
+                self.write_err = self.resp.cause() orelse error.StreamReset;
                 return error.WriteFailed;
             };
-            if (self.cause != null or conn.phase.reached(.dead)) {
-                self.write_err = self.cause orelse error.ConnectionClosed;
+            if (self.resp.cause() != null or conn.phase.reached(.dead)) {
+                self.write_err = self.resp.cause() orelse error.ConnectionClosed;
                 return error.WriteFailed;
             }
             const b = &self.blocks[self.cur];
@@ -1250,11 +1308,11 @@ pub const Stream = struct {
                 // The stream or the connection is gone: the block may still
                 // be lent to `out`, so it is never handed back to write into.
                 if (self.ps == null or conn.phase.reached(.dead)) {
-                    self.write_err = self.cause orelse if (conn.phase.reached(.dead)) error.ConnectionClosed else error.StreamReset;
+                    self.write_err = self.resp.cause() orelse if (conn.phase.reached(.dead)) error.ConnectionClosed else error.StreamReset;
                     return error.WriteFailed;
                 }
                 if (self.roomFree()) {
-                    if (self.cause) |e| {
+                    if (self.resp.cause()) |e| {
                         self.write_err = e;
                         return error.WriteFailed;
                     }
