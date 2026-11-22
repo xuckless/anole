@@ -716,7 +716,7 @@ const WtFixture = struct {
 
     fn start(fx: *WtFixture) !void {
         const json =
-            \\{"executors": 1, "timeouts": {"request_ms": 3000, "shutdown_ms": 2000},
+            \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 2000},
             \\ "listeners": [{"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}, "http3": true}],
             \\ "routes": [{"path": "/wt", "webtransport": {"handler": 9, "datagram_queue": 8}}]}
         ;
@@ -2283,7 +2283,7 @@ const RawGet = struct {
 /// the earlier records of the first.
 fn wsDecideRun(comptime claim: anytype, upgrades: u32, paused: bool) !void {
     const json =
-        \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
+        \\{"executors": 1, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
         \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
         \\ "routes": [
         \\   {"path": "/decide", "timeout_ms": 300, "websocket": {"handler": 10, "accept": "consumer", "origins": ["*"]}},
