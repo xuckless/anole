@@ -111,19 +111,27 @@ pub const Options = struct {
     restart_wait_ms: u32 = 15_000,
 };
 
+/// Why the console says bye; set before `setStopping`.
+pub const ByeReason = enum(u8) { stop, drain };
+const bye_text = std.EnumArray(ByeReason, []const u8).init(.{ .stop = "stop", .drain = "drain" });
+
+/// Restart handshake with `run`: idle -> requested (handleRestart's swap; a
+/// second handleRestart while requested answers busy); requested ->
+/// succeeded | failed (restartFinished); any -> idle (handleRestart after it
+/// answered).
+const RestartState = enum(u8) { idle, requested, succeeded, failed };
+
 const Client = struct {
     service: *Service,
     fd: sys.fd_t,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
-    in_process: bool = false,
     /// Broadcast sequence this client has flushed.
     seen_broadcast: std.atomic.Value(u32) = .init(0),
 
     reader: protocol.LineReader = .init(protocol.max_client_line),
     out: std.ArrayList(u8) = .empty,
     out_off: usize = 0,
-    hello_done: bool = false,
 
     // subscriptions
     next_sub: u32 = 1,
@@ -158,7 +166,7 @@ pub const Service = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     /// `stop` ran (the owner's thread only).
     stopped: bool = false,
-    bye_reason: std.atomic.Value(u8) = .init(0),
+    bye_reason: std.atomic.Value(ByeReason) = .init(.stop),
 
     /// Over `clients`, the broadcast line and the language metrics; held
     /// for bounded copies only, never across an allocation.
@@ -176,7 +184,7 @@ pub const Service = struct {
     broadcast_len: usize = 0,
 
     // restart handshake with `run`
-    restart_state: std.atomic.Value(u8) = .init(0), // 0 idle, 1 requested, 2 ok, 3 failed
+    restart_state: std.atomic.Value(RestartState) = .init(.idle),
     restart_pid: std.atomic.Value(i32) = .init(0),
 
     metrics: [max_metrics]Stored = @splat(.{}),
@@ -304,11 +312,11 @@ pub const Service = struct {
 
     /// Adds an already connected stream (the in-process console's socketpair
     /// end, or an accepted socket). The service owns `fd` from here.
-    pub fn adopt(self: *Service, fd: sys.fd_t, in_process: bool) !void {
+    pub fn adopt(self: *Service, fd: sys.fd_t) !void {
         self.reap();
         if (self.liveCount() >= protocol.max_clients) return refuseBusy(fd);
         const c = try self.gpa.create(Client);
-        c.* = .{ .service = self, .fd = fd, .in_process = in_process };
+        c.* = .{ .service = self, .fd = fd };
         errdefer self.gpa.destroy(c);
         sys.setNonblock(fd);
         if (comptime builtin.is_test) if (test_before_append) |hook| {
@@ -383,7 +391,7 @@ pub const Service = struct {
                 sys.close(fd);
                 continue;
             }
-            self.adopt(fd, false) catch {};
+            self.adopt(fd) catch {};
         }
     }
 
@@ -427,7 +435,7 @@ pub const Service = struct {
             };
             _ = sys.poll(&fds, tick_ms);
             if (self.stopping.load(.acquire)) {
-                const reason: []const u8 = if (self.bye_reason.load(.acquire) == 1) "drain" else "stop";
+                const reason = bye_text.get(self.bye_reason.load(.acquire));
                 try send(c, .{ .bye = .{ .reason = reason } });
                 try flush(c);
                 return;
@@ -532,7 +540,6 @@ pub const Service = struct {
                     try flush(c);
                     return error.Version;
                 }
-                c.hello_done = true;
             },
             .req => |r| try handleRequest(c, a, r),
             else => {},
@@ -587,7 +594,7 @@ pub const Service = struct {
                 if (self.opts.read_only) return fail(c, r.id, protocol.code_refused, "the console is read-only (console.read_only)");
                 if (!confirmed(r, protocol.confirm_drain)) return fail(c, r.id, protocol.code_confirm_required, "send confirm \"drain\"");
                 std.log.scoped(.anole).info("console: drain requested", .{});
-                self.bye_reason.store(1, .release);
+                self.bye_reason.store(.drain, .release);
                 try reply(c, r.id, emptyObject());
                 try flush(c);
                 self.host.stop(self.host.ctx);
@@ -629,18 +636,16 @@ pub const Service = struct {
         }
         if (!confirmed(r, protocol.confirm_restart)) return fail(c, r.id, protocol.code_confirm_required, "send confirm \"restart\"");
         const restart = self.host.restart orelse return fail(c, r.id, protocol.code_unavailable, "no listener hand-off");
-        if (self.restart_state.swap(1, .acq_rel) == 1) return fail(c, r.id, protocol.code_busy, "a restart is already in progress");
+        if (self.restart_state.swap(.requested, .acq_rel) == .requested) return fail(c, r.id, protocol.code_busy, "a restart is already in progress");
         std.log.scoped(.anole).info("console: restart requested", .{});
         restart(self.host.ctx);
         const deadline = sys.monotonicMs() + self.opts.restart_wait_ms;
         while (sys.monotonicMs() < deadline) {
-            const st = self.restart_state.load(.acquire);
-            if (st >= 2) break;
+            if (self.restart_state.load(.acquire) != .requested) break;
             var p = [1]sys.PollFd{.{ .fd = -1, .events = 0, .revents = 0 }};
             _ = sys.poll(&p, 50);
         }
-        const st = self.restart_state.swap(0, .acq_rel);
-        if (st == 2) {
+        if (self.restart_state.swap(.idle, .acq_rel) == .succeeded) {
             const pid = self.restart_pid.load(.acquire);
             var buf: [128]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
@@ -657,7 +662,7 @@ pub const Service = struct {
     /// Called by `run` after the hand-off attempt.
     pub fn restartFinished(self: *Service, ok: bool, successor_pid: i32) void {
         self.restart_pid.store(successor_pid, .release);
-        self.restart_state.store(if (ok) 2 else 3, .release);
+        self.restart_state.store(if (ok) .succeeded else .failed, .release);
     }
 
     fn handleFullRestart(c: *Client, a: std.mem.Allocator, r: protocol.Request) !void {

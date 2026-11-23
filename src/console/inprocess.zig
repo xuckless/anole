@@ -66,7 +66,7 @@ pub fn open(gpa: std.mem.Allocator, svc: *service_mod.Service, logs: ?*logring.L
     errdefer self.term.close();
     const pair = os.socketpair() catch return error.SystemResources;
     errdefer sys.close(pair[1]);
-    self.service.adopt(pair[0], true) catch |e| {
+    self.service.adopt(pair[0]) catch |e| {
         sys.close(pair[1]);
         return switch (e) {
             error.Busy => error.Busy,

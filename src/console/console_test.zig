@@ -146,7 +146,7 @@ const Harness = struct {
     /// A connected, hello'd client.
     fn attach(self: *Harness) !ui.client.Conn {
         const pair = try os.socketpair();
-        try self.svc.adopt(pair[0], false);
+        try self.svc.adopt(pair[0]);
         var c = ui.client.Conn.init(self.gpa, pair[1], pair[1]);
         errdefer c.deinit();
         try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
@@ -306,7 +306,7 @@ test "service: the fifth client is told busy" {
         c.deinit();
     };
     const pair = try os.socketpair();
-    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0], false));
+    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0]));
     var c5 = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
     defer {
         c5.close();
@@ -325,7 +325,7 @@ test "service: a client past the tracked limit is told busy" {
     service.Service.test_before_append = service.Service.testFillFinished;
     defer service.Service.test_before_append = null;
     const pair = try os.socketpair();
-    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0], false));
+    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0]));
     var c = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
     defer {
         c.close();
@@ -340,7 +340,7 @@ test "service: a newer protocol gets a version error" {
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
     defer h.deinit();
     const pair = try os.socketpair();
-    try h.svc.adopt(pair[0], false);
+    try h.svc.adopt(pair[0]);
     defer sys.close(pair[1]);
     // Read the server's hello by hand, then answer with proto 2.
     var buf: [4096]u8 = undefined;
@@ -457,7 +457,7 @@ test "service: stopping sends bye to every client" {
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_s.deinit();
     const a = arena_s.allocator();
-    h.svc.bye_reason.store(1, .release);
+    h.svc.bye_reason.store(.drain, .release);
     h.svc.setStopping();
     const bye = (try waitFor(&c, a, .bye)).bye;
     try std.testing.expectEqualStrings("drain", bye.reason);
