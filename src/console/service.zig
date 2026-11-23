@@ -6,7 +6,6 @@
 //! rings that each client reads at its own pace, and a client that stops
 //! reading blocks only its own thread.
 const std = @import("std");
-const builtin = @import("builtin");
 const dusty = @import("dusty");
 const ui = @import("anole_console_ui");
 const logging = @import("anole_log");
@@ -15,7 +14,6 @@ const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const procinfo = @import("procinfo.zig");
 const reexec = @import("reexec.zig");
-const SpinLock = @import("anole_mem").SpinLock;
 
 const protocol = ui.protocol;
 const sys = ui.sys;
@@ -84,7 +82,7 @@ pub const Info = struct {
 pub const Metric = struct { name: []const u8, value: f64, unit: []const u8 };
 
 /// A language metric as the service keeps it: copied into fixed room, so
-/// that `setMetrics` and `/runtime` copy it under the service's spin lock
+/// that `setMetrics` and `/runtime` copy it under the service's lock
 /// without allocating.
 const Stored = struct {
     name: [max_metric_name]u8 = @splat(0),
@@ -99,10 +97,20 @@ pub const max_metric_name = 48;
 pub const max_metric_unit = 16;
 pub const max_metrics = 32;
 
-/// Clients the service tracks at once: the ones attached and the ones whose
-/// thread ended and is not joined yet (`reap`). A fixed list, so that adding
-/// one under the spin lock never allocates.
-const max_tracked = 2 * protocol.max_clients + 8;
+/// A lock whose waiters block (a futex), taken from the console's own
+/// threads and from the C ABI's: `std.Io.Mutex` on the threaded `Io`,
+/// since none of them runs in an `Io` of its own.
+const Lock = struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *Lock) void {
+        self.inner.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock(std.Io.Threaded.global_single_threaded.io());
+    }
+};
 
 pub const Options = struct {
     read_only: bool = false,
@@ -168,13 +176,12 @@ pub const Service = struct {
     stopped: bool = false,
     bye_reason: std.atomic.Value(ByeReason) = .init(.stop),
 
-    /// Over `clients`, the broadcast line and the language metrics; held
-    /// for bounded copies only, never across an allocation.
-    lock: SpinLock = .init,
-    /// In `clients_buf` (set by `init`).
+    /// Over `clients`, the broadcast line and the language metrics; never
+    /// held across I/O, a wait or a host callback.
+    lock: Lock = .{},
+    /// Attached clients and the ones whose thread ended and that `reap` has
+    /// not joined yet.
     clients: std.ArrayList(*Client) = .empty,
-    // SAFETY: only `clients.items` is read; `init` points `clients` here.
-    clients_buf: [max_tracked]*Client = undefined,
     attached: std.atomic.Value(u32) = .init(0),
     euid: u32,
 
@@ -204,7 +211,6 @@ pub const Service = struct {
             .euid = sys.geteuid(),
             .runtime_name = info.runtime,
         };
-        self.clients = .initBuffer(&self.clients_buf);
         self.stop_pipe = try sys.pipe();
         return self;
     }
@@ -261,32 +267,26 @@ pub const Service = struct {
 
     /// Frees the service, once nothing can reach it any more (after `stop`).
     pub fn destroy(self: *Service) void {
+        self.clients.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
     /// Joins and frees every client whose thread ended.
+    /// One at a time, so that the join runs outside the lock.
     fn reap(self: *Service) void {
         while (true) {
-            var finished: [8]*Client = undefined;
-            var n: usize = 0;
-            self.lock.lock();
-            var i: usize = 0;
-            while (i < self.clients.items.len and n < finished.len) {
-                const c = self.clients.items[i];
-                if (c.done.load(.acquire)) {
-                    finished[n] = c;
-                    n += 1;
-                    _ = self.clients.swapRemove(i);
-                } else i += 1;
-            }
-            self.lock.unlock();
-            for (finished[0..n]) |c| {
-                if (c.thread) |t| t.join();
-                c.reader.deinit(self.gpa);
-                c.out.deinit(self.gpa);
-                self.gpa.destroy(c);
-            }
-            if (n < finished.len) return;
+            const c = c: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                for (self.clients.items, 0..) |x, i| {
+                    if (x.done.load(.acquire)) break :c self.clients.swapRemove(i);
+                }
+                return;
+            };
+            if (c.thread) |t| t.join();
+            c.reader.deinit(self.gpa);
+            c.out.deinit(self.gpa);
+            self.gpa.destroy(c);
         }
     }
 
@@ -315,57 +315,27 @@ pub const Service = struct {
     pub fn adopt(self: *Service, fd: sys.fd_t) !void {
         self.reap();
         if (self.liveCount() >= protocol.max_clients) return refuseBusy(fd);
+        errdefer sys.close(fd);
         const c = try self.gpa.create(Client);
         c.* = .{ .service = self, .fd = fd };
         errdefer self.gpa.destroy(c);
         sys.setNonblock(fd);
-        if (comptime builtin.is_test) if (test_before_append) |hook| {
-            test_before_append = null;
-            hook(self);
-        };
-        self.lock.lock();
-        self.clients.appendBounded(c) catch {
-            // Unreachable in practice (reap empties, live < max_clients < max_tracked); the fd is closed.
-            // Clients whose thread ended faster than `reap` could join
-            // them fill the list: this one is told busy.
-            self.lock.unlock();
-            return refuseBusy(fd);
-        };
-        self.lock.unlock();
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            try self.clients.append(self.gpa, c);
+        }
         _ = self.attached.fetchAdd(1, .monotonic);
         c.thread = std.Thread.spawn(.{}, clientMain, .{c}) catch {
             _ = self.attached.fetchSub(1, .monotonic);
             self.lock.lock();
+            defer self.lock.unlock();
             for (self.clients.items, 0..) |x, i| if (x == c) {
                 _ = self.clients.swapRemove(i);
                 break;
             };
-            self.lock.unlock();
-            sys.close(fd);
             return error.SystemResources;
         };
-    }
-
-    /// Tests: runs once in `adopt`, after its count of live clients and
-    /// before the new one is added, where clients whose thread ended can
-    /// fill the list before `reap` joins them. Test builds only.
-    pub var test_before_append: if (builtin.is_test) ?*const fn (*Service) void else void = if (builtin.is_test) null else {};
-
-    /// Tests: fills the list with clients whose thread has ended and that
-    /// `reap` has not joined yet (no thread, no socket). Test builds only.
-    pub fn testFillFinished(self: *Service) void {
-        comptime std.debug.assert(builtin.is_test);
-        while (true) {
-            const c = self.gpa.create(Client) catch @panic("OOM");
-            c.* = .{ .service = self, .fd = -1, .done = .init(true) };
-            self.lock.lock();
-            const added = if (self.clients.appendBounded(c)) |_| true else |_| false;
-            self.lock.unlock();
-            if (!added) {
-                self.gpa.destroy(c);
-                return;
-            }
-        }
     }
 
     // ---------------------------------------------------------- acceptor

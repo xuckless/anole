@@ -321,25 +321,14 @@ test "service: the fifth client is told busy" {
     }
     try std.testing.expectError(error.Refused, c5.handshake("test", 5000, sys.monotonicMs));
     try std.testing.expect(std.mem.startsWith(u8, c5.refusal.?, "busy:"));
-}
-
-test "service: a client past the tracked limit is told busy" {
-    if (!os.supported) return error.SkipZigTest;
-    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
-    defer h.deinit();
-    // Past the count of live clients, the list fills with clients whose
-    // thread ended and that are not joined yet.
-    service.Service.test_before_append = service.Service.testFillFinished;
-    defer service.Service.test_before_append = null;
-    const pair = try os.socketpair();
-    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0]));
-    var c = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
-    defer {
-        c.close();
-        c.deinit();
+    // The four attached ones keep working.
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    for (&clients) |*c| {
+        _ = try c.ping();
+        try c.flush();
+        try std.testing.expect((try waitFor(c, arena_s.allocator(), .res)).res.ok);
     }
-    try std.testing.expectError(error.Refused, c.handshake("test", 5000, sys.monotonicMs));
-    try std.testing.expect(std.mem.startsWith(u8, c.refusal.?, "busy:"));
 }
 
 test "service: a newer protocol gets a version error" {
