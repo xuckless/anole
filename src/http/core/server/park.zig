@@ -768,9 +768,12 @@ test "Parked.phase: every (phase, event) pair" {
     }
 }
 
-// Runs on the core's zio stub (core-test) too, where nothing is polled and
-// the shutdown act compiles out; the socket checks need the real one.
+// Runs on the core's zio stub (core-test), where nothing is polled and the
+// shutdown act compiles out; on the real zio it would shut down an unset
+// poll's socket, so it skips there. The real shutdown is covered end to end
+// by park_test.zig's deadline and TLS rows.
 test "Parked.phase: a shelf closes each connection once, in every order" {
+    if (comptime supported) return error.SkipZigTest;
     const Conn = struct {
         p: Parked = .{ .vtable = &vtable },
         expire_mode: enum { deferred, done_inline, fails } = .deferred,
@@ -876,11 +879,6 @@ test "Parked.phase: a shelf closes each connection once, in every order" {
     };
     for (rows) |row| {
         errdefer std.debug.print("row: {s}\n", .{row.name});
-        var fds: [2]std.c.fd_t = undefined;
-        try std.testing.expectEqual(0, std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
-        defer for (fds) |fd| {
-            _ = std.c.close(fd);
-        };
         var shelf: Shelf = .{ .io = std.testing.io, .long_park = .fromSeconds(3600) };
         var c = row.conn;
         if (row.timed) c.p.deadline = now(shelf.io).addDuration(.fromSeconds(60));
@@ -888,7 +886,6 @@ test "Parked.phase: a shelf closes each connection once, in every order" {
             switch (check.op) {
                 // `Shelf.park` without the queue, which needs a runtime.
                 .park => {
-                    if (comptime supported) c.p.poll = .init(fds[0], .recv);
                     c.p.parked_at = now(shelf.io).subDuration(row.parked_for);
                     _ = c.p.step(.park);
                     shelf.insert(&c.p);
@@ -903,11 +900,6 @@ test "Parked.phase: a shelf closes each connection once, in every order" {
             errdefer std.debug.print("after {t}\n", .{check.op});
             try std.testing.expectEqual(check.phase, c.p.phase);
             try std.testing.expectEqual(check.closes, c.closes);
-            if (comptime supported and check.phase == .shut) {
-                // The socket was shut down: the peer reads its end.
-                var b: [1]u8 = undefined;
-                try std.testing.expectEqual(0, std.c.recv(fds[1], &b, 1, std.c.MSG.DONTWAIT));
-            }
         }
         try std.testing.expectEqual(row.wakes, c.wakes);
         try std.testing.expectEqual(row.woke_from_long, c.p.woke_from_long);
