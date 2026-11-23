@@ -443,6 +443,9 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         error.Answered => return,
         else => |e| return e,
     };
+    // A call in flight on the console's `/conns` (a refused one never began).
+    dusty.gauges.add(req.io, .grpc_calls, 1);
+    defer dusty.gauges.add(req.io, .grpc_calls, -1);
     // A unary response is collected in the call's arena and sent whole
     // (`endBody`): HEADERS, DATA and the trailers in one go, with no
     // streaming queue or writer between (#99). The streaming kinds stream.

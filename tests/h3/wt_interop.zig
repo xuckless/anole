@@ -5,7 +5,8 @@
 //!
 //!   wt-interop-server CERT KEY WWW DOWNLOADS PORT TESTCASE PROTOCOLS REQUESTS
 //!
-//! TESTCASE `handshake` accepts sessions; `transfer` answers "GET name" on
+//! TESTCASE `handshake` accepts a session and closes it (so the connection
+//! can idle out and the client exit); `transfer` answers "GET name" on
 //! unidirectional streams (with a stream of its own, "PUSH name\n" and the
 //! file), on bidirectional streams (the file on the same stream) and in
 //! datagrams ("PUSH name\n" and the file); `transfer-TYPE-send` asks the
@@ -28,13 +29,29 @@ pub const std_options: std.Options = .{
 
 const Kind = enum { unidirectional, bidirectional, datagram };
 
+/// From TESTCASE: `handshake`, `transfer-KIND-send`, anything else answers.
+const Mode = union(enum) { handshake, answer, ask: Kind };
+
+fn parseMode(testcase: []const u8) !Mode {
+    if (std.mem.eql(u8, testcase, "handshake")) return .handshake;
+    if (std.mem.startsWith(u8, testcase, "transfer-") and std.mem.endsWith(u8, testcase, "-send")) {
+        const kind = testcase["transfer-".len .. testcase.len - "-send".len];
+        return .{ .ask = std.meta.stringToEnum(Kind, kind) orelse return error.Usage };
+    }
+    return .answer;
+}
+
+/// Gap between datagrams sent in a row: a burst outruns the receiver's queue
+/// (and the interop sim's 10 Mbit/s, 25-packet one), and datagrams are never
+/// resent.
+const datagram_gap: std.Io.Duration = .fromMilliseconds(5);
+
 const Ctx = struct {
     gpa: std.mem.Allocator,
     www: std.Io.Dir,
     downloads: std.Io.Dir,
     protocols: []const u8,
-    /// Null: answer requests (`transfer`, `handshake`).
-    send: ?Kind,
+    mode: Mode,
     requests: []const u8,
 };
 
@@ -50,17 +67,14 @@ pub fn main(init: std.process.Init) !void {
     const protocols = args.next() orelse "";
     const requests = args.next() orelse "";
 
-    var send: ?Kind = null;
-    if (std.mem.startsWith(u8, testcase, "transfer-") and std.mem.endsWith(u8, testcase, "-send")) {
-        send = std.meta.stringToEnum(Kind, testcase["transfer-".len .. testcase.len - "-send".len]) orelse return error.Usage;
-    }
+    const mode = try parseMode(testcase);
     const io = init.io;
     var ctx: Ctx = .{
         .gpa = init.gpa,
         .www = try std.Io.Dir.cwd().openDir(io, www, .{}),
         .downloads = try std.Io.Dir.cwd().openDir(io, downloads, .{}),
         .protocols = protocols,
-        .send = send,
+        .mode = mode,
         .requests = requests,
     };
     var app = try anole.Server(Ctx).init(init.gpa, .{
@@ -97,19 +111,22 @@ fn session(ctx: *Ctx, req: *http.Request, res: *http.Response) !void {
     const s = (try wt.accept(req, res, .{})) orelse return res.fail(.bad_request, "WebTransport only");
     defer s.deinit();
     std.log.info("session on /{s}, protocol \"{s}\"", .{ endpoint, chosen });
-    const dir = ctx.www.openDir(req.io, endpoint, .{}) catch null;
-    var group: std.Io.Group = .init;
-    defer group.cancel(req.io);
-    if (ctx.send) |kind| {
-        ask(ctx, s, req.io, endpoint, kind) catch |err| std.log.err("asking for files: {t}", .{err});
-        s.close(0, "") catch {};
-        return;
+    switch (ctx.mode) {
+        .handshake => s.close(0, "") catch {},
+        .ask => |kind| {
+            ask(ctx, s, req.io, endpoint, kind) catch |err| std.log.err("asking for files: {t}", .{err});
+            s.close(0, "") catch {};
+        },
+        .answer => {
+            const files = ctx.www.openDir(req.io, endpoint, .{}) catch return wait(s);
+            var group: std.Io.Group = .init;
+            defer group.cancel(req.io);
+            try group.concurrent(req.io, answerUni, .{ s, req.io, files });
+            try group.concurrent(req.io, answerBidi, .{ s, req.io, files });
+            try group.concurrent(req.io, answerDatagrams, .{ s, req.io, ctx.gpa, files });
+            group.await(req.io) catch {};
+        },
     }
-    const files = dir orelse return wait(s);
-    try group.concurrent(req.io, answerUni, .{ s, req.io, files });
-    try group.concurrent(req.io, answerBidi, .{ s, req.io, files });
-    try group.concurrent(req.io, answerDatagrams, .{ s, req.io, ctx.gpa, files });
-    group.await(req.io) catch {};
 }
 
 /// Until the client closes the session.
@@ -190,6 +207,7 @@ fn answerDatagrams(s: *wt.Session, io: std.Io, gpa: std.mem.Allocator, files: st
         const out = std.fmt.allocPrint(gpa, "PUSH {s}\n{s}", .{ name, data }) catch continue;
         defer gpa.free(out);
         s.sendDatagram(out) catch |err| std.log.warn("datagram PUSH {s} ({d} bytes): {t}", .{ name, out.len, err });
+        try io.sleep(datagram_gap, .awake);
     }
 }
 
@@ -224,12 +242,11 @@ fn ask(ctx: *Ctx, s: *wt.Session, io: std.Io, endpoint: []const u8, kind: Kind) 
         .datagram => {
             var got: usize = 0;
             var buf: [2048]u8 = undefined;
-            // Spaced out, as the browser clients do: a burst of 200 would
-            // outrun the receiver's datagram queue.
+            // Spaced out (`datagram_gap`), as the browser clients do.
             for (names.items) |n| {
                 const d = try std.fmt.bufPrint(&buf, "GET {s}", .{n});
                 try s.sendDatagram(d);
-                try io.sleep(.fromMilliseconds(5), .awake);
+                try io.sleep(datagram_gap, .awake);
             }
             while (got < names.items.len) : (got += 1) {
                 const d = try s.receiveDatagram(&buf);

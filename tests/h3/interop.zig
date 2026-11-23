@@ -41,7 +41,8 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = "0.0.0.0", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key } } },
-        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true, .prefer_v2 = v2 },
+        // ngtcp2's interop server has none; the runner's loss cases need the client's PTO backoff past 10 s.
+        .http3 = .{ .handshake_timeout = .zero, .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true, .prefer_v2 = v2 },
     }, {});
     defer app.deinit();
     const dir = try std.Io.Dir.cwd().openDir(app.io(), www, .{});
