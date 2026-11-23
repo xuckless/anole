@@ -91,8 +91,6 @@ const Slots = SlotTable(NetSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full 
 pub const ExecState = struct {
     slots: Slots = .{},
 
-    /// The tasks it runs (the net drivers) belong to the server's group and
-    /// end with it.
     /// The highest generation handed out (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
         return st.slots.maxGen();

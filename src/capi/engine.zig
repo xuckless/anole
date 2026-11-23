@@ -409,6 +409,12 @@ test "capi engine: every _state field and every area's Exec field is declared" {
     }
     inline for (state_areas) |n| try std.testing.expect(@hasField(Engine, n ++ "_state"));
     inline for (exec_areas) |n| try std.testing.expect(@hasField(Exec, n));
+    // An Exec field whose type has a lifecycle hook is declared, or its hooks would never run.
+    inline for (@typeInfo(Exec).@"struct".field_names) |f| {
+        const T = @FieldType(Exec, f);
+        if (comptime @typeInfo(T) == .@"struct" and (@hasDecl(T, "deinit") or @hasDecl(T, "maxGen") or @hasDecl(T, "cancel")))
+            try std.testing.expect(contains(exec_areas, f));
+    }
     // An area with an Engine state has its Exec field declared too.
     inline for (areas) |n| try std.testing.expect(contains(exec_areas, n));
 }
