@@ -184,7 +184,7 @@ pub const T = struct {
             .scratch = undefined,
         };
         t.rec = .{ .gpa = gpa, .arena = t.arena_state.allocator() };
-        t.scratch = try gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
+        t.scratch = try gpa.alloc(u8, @max(opts.http2.max_header_list_size, hpack.table_capacity));
         errdefer gpa.free(t.scratch);
         t.c = try C.init(conn_gpa, &t.rec, opts);
         t.rec.c = &t.c;
@@ -652,8 +652,8 @@ test "h2 conn: initial SETTINGS, in wire order, per option combination" {
     const rows = [_]struct { name: []const u8, opts: conn.Options, want: []const S }{
         .{ .name = "default", .opts = .{}, .want = &(head ++ .{np}) },
         .{ .name = "raised frame size", .opts = .{ .max_frame_size = 1 << 16 }, .want = &(head ++ .{ fs, np }) },
-        .{ .name = "connect only", .opts = .{ .enable_connect_protocol = true }, .want = &(head ++ .{ cp, np }) },
-        .{ .name = "both", .opts = .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true }, .want = &(head ++ .{ fs, cp, np }) },
+        .{ .name = "connect only", .opts = .{ .http2 = .{ .enable_connect_protocol = true } }, .want = &(head ++ .{ cp, np }) },
+        .{ .name = "both", .opts = .{ .http2 = .{ .enable_connect_protocol = true }, .max_frame_size = 1 << 16 }, .want = &(head ++ .{ fs, cp, np }) },
     };
     for (rows) |row| {
         errdefer std.debug.print("row: {s}\n", .{row.name});
@@ -718,7 +718,7 @@ test "h2 conn: preface and SETTINGS handshake" {
     }
     // Optional entries: MAX_FRAME_SIZE above the default, CONNECT.
     {
-        const t = try T.create(testing.allocator, .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true, .connection_window = 65535 });
+        const t = try T.create(testing.allocator, .{ .http2 = .{ .enable_connect_protocol = true, .connection_window = 65535 }, .max_frame_size = 1 << 16 });
         defer t.destroy();
         const first = try t.drain();
         try expectFrames(first, &.{.{ .type = .settings }});
@@ -861,7 +861,9 @@ test "h2 conn: inbound phase" {
         .{ .name = "CONTINUATION on another stream", .prefix = &(ready_ ++ .{.block3}), .input = .cont5, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "unexpected non-CONTINUATION frame or stream_id is invalid", .boundary = true },
         .{ .name = "CONTINUATION without a block", .prefix = &ready_, .input = .cont3_end, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "CONTINUATION: unexpected", .boundary = true },
         .{ .name = "death in data: invalid padding", .prefix = &(ready_ ++ .{ .post1, .padded1_head }), .input = .padded1_bad, .err = error.ConnectionError, .tag = .dead, .code = .protocol_error, .debug = "DATA: invalid padding", .boundary = true },
-        .{ .name = "death in continuation: too many", .opts = .{ .max_continuations = 1 }, .prefix = &(ready_ ++ .{ .block3, .cont3_mid }), .input = .cont3_mid, .err = error.ConnectionError, .tag = .dead, .code = .enhance_your_calm, .debug = "too many CONTINUATION frames", .boundary = true },
+        .{ .name = "death in continuation: too many", .opts = .{ .http2 = .{ .max_continuations = 1 } }, .prefix = &(ready_ ++ .{ .block3, .cont3_mid }), .input = .cont3_mid, .err = error.ConnectionError, .tag = .dead, .code = .enhance_your_calm, .debug = "too many CONTINUATION frames", .boundary = true },
+        .{ .name = "death in continuation: none allowed", .opts = .{ .http2 = .{ .max_continuations = 0 } }, .prefix = &(ready_ ++ .{.block3}), .input = .cont3_mid, .err = error.ConnectionError, .tag = .dead, .code = .enhance_your_calm, .debug = "too many CONTINUATION frames", .boundary = true },
+        .{ .name = "continuation: no limit", .opts = .{ .http2 = .{ .max_continuations = std.math.maxInt(usize) } }, .prefix = &(ready_ ++ .{ .block3, .cont3_mid }), .input = .cont3_end, .tag = .frame, .boundary = true },
         .{ .name = "kill in magic", .input = .kill, .tag = .dead, .boundary = true },
         .{ .name = "kill in first_settings", .prefix = &.{.magic}, .input = .kill, .tag = .dead, .boundary = true },
         .{ .name = "kill in frame", .prefix = &ready_, .input = .kill, .tag = .dead, .boundary = true },
@@ -1098,7 +1100,7 @@ test "h2 conn: a single-frame block allocates nothing" {
 
 test "h2 conn: block bytes over max_header_list_size and too many CONTINUATIONs" {
     {
-        const t = try ready(.{ .max_header_list_size = 4096 });
+        const t = try ready(.{ .http2 = .{ .max_header_list_size = 4096 } });
         defer t.destroy();
         // '~' doesn't shrink with Huffman: the block is as long as the list.
         const big = @as([3000]u8, @splat('~'));
@@ -1108,7 +1110,7 @@ test "h2 conn: block bytes over max_header_list_size and too many CONTINUATIONs"
         try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
     }
     {
-        const t = try ready(.{ .max_continuations = 2 });
+        const t = try ready(.{ .http2 = .{ .max_continuations = 2 } });
         defer t.destroy();
         const blk = try t.block(&get);
         try t.feed(try t.headersFrame(1, .{ .end_stream = true, .end_headers = false, .fragment = blk[0..1] }));
@@ -1120,7 +1122,7 @@ test "h2 conn: block bytes over max_header_list_size and too many CONTINUATIONs"
 }
 
 test "h2 conn: a header list over the limit is refused" {
-    const t = try ready(.{ .max_header_list_size = 4096 });
+    const t = try ready(.{ .http2 = .{ .max_header_list_size = 4096 } });
     defer t.destroy();
     // 4247 bytes decoded from a block under 4096.
     const big = @as([2000]u8, @splat('~'));
@@ -1207,7 +1209,7 @@ test "h2 conn: SETTINGS_INITIAL_WINDOW_SIZE applied to open streams" {
 }
 
 test "h2 conn: our INITIAL_WINDOW_SIZE applies at the ACK" {
-    const t = try T.create(testing.allocator, .{ .initial_window = 100_000 });
+    const t = try T.create(testing.allocator, .{ .http2 = .{ .stream_window = 100_000 } });
     defer t.destroy();
     _ = try t.drain();
     try t.feed(conn.client_magic);
@@ -1227,7 +1229,7 @@ test "h2 conn: our INITIAL_WINDOW_SIZE applies at the ACK" {
 }
 
 test "h2 conn: consumed batches WINDOW_UPDATE" {
-    const t = try ready(.{ .initial_window = 1000, .connection_window = 65535 });
+    const t = try ready(.{ .http2 = .{ .stream_window = 1000, .connection_window = 65535 } });
     defer t.destroy();
     t.rec.consume = false;
     try t.feed(try t.headers(1, &post, false));
@@ -1440,7 +1442,7 @@ test "h2 conn: a DATA frame past the window is a FLOW_CONTROL_ERROR however the 
     // bytes made room for the rest when they arrived a few at a time, and
     // the 2000-byte frame on a 1024-byte window was taken.
     for ([_]bool{ false, true }) |bytewise| {
-        const t = try ready(.{ .initial_window = 1024 });
+        const t = try ready(.{ .http2 = .{ .stream_window = 1024 } });
         defer t.destroy();
         t.bytewise = bytewise;
         try t.feed(try t.headers(1, &post, false));
@@ -1726,7 +1728,7 @@ test "h2 conn: a burst's spare Pending nodes are trimmed while a stream stays op
 }
 
 test "h2 conn: spare Pending nodes are capped at max_concurrent_streams" {
-    const t = try ready(.{ .max_concurrent_streams = 8 });
+    const t = try ready(.{ .http2 = .{ .max_concurrent_streams = 8 } });
     defer t.destroy();
     try expectEqual(8, t.c.spare_cap);
     t.rec.record = false;
@@ -1746,7 +1748,7 @@ test "h2 conn: spare Pending nodes are capped at max_concurrent_streams" {
 }
 
 test "h2 conn: WINDOW_UPDATEs per KiB consumed follow the half-window rule" {
-    const t = try ready(.{ .initial_window = 65535, .connection_window = 1024 * 1024 });
+    const t = try ready(.{ .http2 = .{ .stream_window = 65535, .connection_window = 1024 * 1024 } });
     defer t.destroy();
     t.rec.record = false;
     try t.feed(try t.headers(1, &post, false));
@@ -1797,7 +1799,7 @@ test "h2 conn: a head that can't fit 64 KiB is refused before the buffer grows" 
 
 test "h2 conn: a large upload and a large download at once with small windows" {
     const total = 4 << 20;
-    const t = try ready(.{ .initial_window = 65535, .connection_window = 65535 });
+    const t = try ready(.{ .http2 = .{ .stream_window = 65535, .connection_window = 65535 } });
     defer t.destroy();
     t.rec.record = false;
     const body = try t.arena().alloc(u8, total);
@@ -2038,7 +2040,7 @@ test "h2 conn: on_request_headers_received" {
     }
     // Over the maximum sent but not yet acknowledged: REFUSED_STREAM.
     {
-        const t = try T.create(testing.allocator, .{ .max_concurrent_streams = 1 });
+        const t = try T.create(testing.allocator, .{ .http2 = .{ .max_concurrent_streams = 1 } });
         defer t.destroy();
         try t.feed(conn.client_magic);
         try t.feed(try t.settings(&.{}));
@@ -2351,7 +2353,7 @@ test "h2 conn: submit_headers_continuation_extra_large" {
 }
 
 test "h2 conn: submit_settings_update_local_window_size" {
-    const t = try T.create(testing.allocator, .{ .initial_window = 16 * 1024 });
+    const t = try T.create(testing.allocator, .{ .http2 = .{ .stream_window = 16 * 1024 } });
     defer t.destroy();
     _ = try t.drain();
     try t.feed(conn.client_magic);
@@ -2397,7 +2399,7 @@ test "h2 conn: submit_rst_stream" {
 }
 
 test "h2 conn: max_concurrent_streams" {
-    const t = try ready(.{ .max_concurrent_streams = 2 });
+    const t = try ready(.{ .http2 = .{ .max_concurrent_streams = 2 } });
     defer t.destroy();
     try t.feed(try t.headers(1, &get, false));
     try t.feed(try t.headers(3, &get, false));
@@ -2447,7 +2449,7 @@ test "h2 conn: flow_control" {
 }
 
 test "h2 conn: flow_control_data_recv" {
-    const t = try ready(.{ .initial_window = 65535 });
+    const t = try ready(.{ .http2 = .{ .stream_window = 65535 } });
     defer t.destroy();
     t.rec.consume = false;
     try t.feed(try t.headers(1, &post, false));
@@ -2718,7 +2720,7 @@ pub const Peak = struct {
 fn fuzzOne(input: []const u8) anyerror!void {
     var peak: Peak = .{ .child = testing.allocator };
     {
-        const t = try T.createSplit(testing.allocator, peak.allocator(), .{ .max_header_list_size = 4096, .initial_window = 1024, .connection_window = 65535, .max_concurrent_streams = 16 });
+        const t = try T.createSplit(testing.allocator, peak.allocator(), .{ .http2 = .{ .max_header_list_size = 4096, .stream_window = 1024, .connection_window = 65535, .max_concurrent_streams = 16 } });
         defer t.destroy();
         t.rec.record = false;
         t.rec.answer = true;

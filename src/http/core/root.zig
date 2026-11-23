@@ -193,6 +193,7 @@ pub const h2_proto = struct {
     pub const hpack = @import("h2/hpack.zig");
     pub const frame = @import("h2/frame.zig");
     pub const out = @import("h2/out.zig");
+    pub const blocks = @import("h2/blocks.zig");
     pub const streams = @import("h2/streams.zig");
 };
 /// Tests only: the HTTP/2 codecs, protocol core and the engine on them

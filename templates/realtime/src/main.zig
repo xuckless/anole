@@ -59,10 +59,14 @@ pub fn routes(app: *anole.Server(App)) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var state: App = .{ .rooms = .init(init.gpa, .{}) };
-    defer state.rooms.deinit();
+    var state: App = .{ .rooms = undefined };
     var app = try anole.Server(App).init(init.gpa, .{}, &state);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        state.rooms.deinit();
+    }
+    // The rooms take the runtime's io (`app.io()`, not `init.io`).
+    state.rooms = .init(init.gpa, app.io(), .{});
     app.use(anole.observe.AccessLog.init(.{}));
     app.openapi(.{ .info = .{ .title = "{{name}}", .version = "0.1.0" } });
     routes(&app);

@@ -309,8 +309,8 @@ fn callParked(e: *engine.Engine) bool {
 /// from the server, not a reset or a closed connection).
 fn expectStopping(s: anytype) !void {
     try std.testing.expect(try s.receive() == null);
-    try std.testing.expectEqual(grpc.Code.unavailable, s.status.?.code);
-    try std.testing.expectEqualStrings("the server is stopping", s.status.?.message);
+    try std.testing.expectEqual(grpc.Code.unavailable, s.status().?.code);
+    try std.testing.expectEqualStrings("the server is stopping", s.status().?.message);
 }
 
 /// Three client-streaming calls (they do not detach) into a ring of 2
@@ -419,8 +419,8 @@ fn deadlineWhileParked(e: *engine.Engine, io: std.Io) !void {
     defer s2.deinit();
     try s2.send(.{ .message = "c" });
     try std.testing.expect(try s2.receive() == null);
-    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s2.status.?.code);
-    try std.testing.expectEqualStrings("deadline exceeded", s2.status.?.message);
+    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s2.status().?.code);
+    try std.testing.expectEqualStrings("deadline exceeded", s2.status().?.message);
     try std.testing.expectEqual(@as(u64, 1), e.stats().expired);
 }
 
@@ -489,8 +489,8 @@ fn cancelWithReadError(e: *engine.Engine, io: std.Io) !void {
     try s.send(.{ .message = &big });
     try std.testing.expect(try s.receive() == null);
     try std.testing.expect(!CanceledWait.gave_up.load(.acquire));
-    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s.status.?.code);
-    try std.testing.expectEqualStrings("deadline exceeded", s.status.?.message);
+    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s.status().?.code);
+    try std.testing.expectEqualStrings("deadline exceeded", s.status().?.message);
 }
 
 test "capi grpc: a deadline cancel delivered to a call's wait wins over a read error that lands before the task looks again: DEADLINE_EXCEEDED" {
@@ -595,7 +595,7 @@ fn checkInitialMetadata(x: *Ctx) anyerror!void {
     try std.testing.expectEqualStrings("headers", reply.message);
     try std.testing.expectEqualStrings("yes", s.stream.header("x-initial") orelse "");
     try std.testing.expect(try s.receive() == null);
-    try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
 }
 
 fn checkServerStream(x: *Ctx) anyerror!void {
@@ -609,7 +609,7 @@ fn checkServerStream(x: *Ctx) anyerror!void {
         try std.testing.expectEqualStrings("tick", m.message);
     }
     try std.testing.expectEqual(@as(i32, 5), n);
-    try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
 }
 
 /// More messages than read_ahead (8): the consumer's credit lets the rest in.
@@ -626,7 +626,7 @@ fn checkClientStream(x: *Ctx) anyerror!void {
     const reply = (try s.receive()).?;
     try std.testing.expectEqualStrings(want.items, reply.message);
     try std.testing.expect(try s.receive() == null);
-    try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
 }
 
 fn checkBidi(x: *Ctx) anyerror!void {
@@ -640,7 +640,7 @@ fn checkBidi(x: *Ctx) anyerror!void {
     }
     try s.closeSend();
     try std.testing.expect(try s.receive() == null);
-    try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
 }
 
 /// A call past its deadline: DEADLINE_EXCEEDED at the client, ABORT at the

@@ -138,43 +138,18 @@ pub const max_headers_len = 65536;
 /// RFC 9218 §7.1's PRIORITY_UPDATE; frame.zig reports it as unknown.
 const priority_update_type = 0x10;
 
-/// config.ServerConfig's defaults, so that every limit's default number
-/// lives in one place (config.zig, or limits.Limits for those with no key).
-const h2_defaults: config.ServerConfig.Http2 = .{};
-
-/// The connection's limits. The defaults are config.ServerConfig.Http2's
-/// and Request's (the server maps the config into this), except `max_frame_size`,
-/// which has no config key and is advertised only above 16384, and
-/// `limits`, which has no config keys (PLAN §5.4).
+/// The connection's limits: `http2` is the config's, the single copy of
+/// every default (`stream_window` is SETTINGS_INITIAL_WINDOW_SIZE; the server
+/// body's own keys, `stream_window_reading`, `tunnel_window`,
+/// `reading_window_budget` and `inline_no_wait`, are not read here). The
+/// rest have no config key (PLAN §5.4).
 pub const Options = struct {
-    /// SETTINGS_MAX_CONCURRENT_STREAMS (`max_concurrent_streams`); a
-    /// request past it is refused (REFUSED_STREAM, the refused budget).
-    max_concurrent_streams: u32 = h2_defaults.max_concurrent_streams,
-    /// SETTINGS_INITIAL_WINDOW_SIZE (`stream_window`).
-    initial_window: u31 = h2_defaults.stream_window,
-    /// The connection's receive window (`connection_window`), at least
-    /// 65535: raised with a WINDOW_UPDATE right after our SETTINGS.
-    connection_window: u31 = h2_defaults.connection_window,
-    /// SETTINGS_MAX_FRAME_SIZE.
+    http2: config.ServerConfig.Http2 = .{},
+    /// SETTINGS_MAX_FRAME_SIZE; advertised only above 16384.
     max_frame_size: u24 = frame.min_max_frame_size,
-    /// SETTINGS_MAX_HEADER_LIST_SIZE (`max_header_list_size`); also the
-    /// most a header block may take on the wire before it is decoded
-    /// (PLAN §5.4).
-    max_header_list_size: u32 = h2_defaults.max_header_list_size,
     /// Regular fields in a request head (`request.max_header_count`):
     /// more is answered 431. Cookie crumbs count once, pseudo-headers not.
     max_header_count: usize = (config.ServerConfig.Request{}).max_header_count,
-    /// CONTINUATION frames after one HEADERS (`max_continuations`).
-    max_continuations: u32 = h2_defaults.max_continuations,
-    /// SETTINGS_ENABLE_CONNECT_PROTOCOL (`enable_connect_protocol`).
-    enable_connect_protocol: bool = false,
-    /// The rapid-reset budget (`stream_reset_burst/rate`, D15 point 1).
-    stream_reset_burst: u64 = h2_defaults.stream_reset_burst,
-    stream_reset_rate: u64 = h2_defaults.stream_reset_rate,
-    /// Streams refused before a handler saw them
-    /// (`refused_stream_burst/rate`).
-    refused_stream_burst: u64 = h2_defaults.refused_stream_burst,
-    refused_stream_rate: u64 = h2_defaults.refused_stream_rate,
     limits: limits.Limits = .{},
     /// The stream table's hash seed: a CSPRNG value per connection in
     /// production (streams.StreamTable).
@@ -426,7 +401,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// the caller's stack, whose pages a connection's task keeps
         /// (#223).
         pub fn initAt(c: *Self, gpa: Allocator, handler: *H, opts: Options) Allocator.Error!void {
-            const cw: u31 = @max(default_window, opts.connection_window);
+            const cw: u31 = @max(default_window, opts.http2.connection_window);
             c.* = .{
                 .gpa = gpa,
                 .handler = handler,
@@ -436,11 +411,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .slab = .init(gpa),
                 // A client's streams count against the server's limit,
                 // which may be anything.
-                .table = .init(gpa, if (role == .server) opts.max_concurrent_streams else std.math.maxInt(u32), opts.seed),
+                .table = .init(gpa, if (role == .server) opts.http2.max_concurrent_streams else std.math.maxInt(u32), opts.seed),
                 .recv_window = cw,
-                .spare_cap = @intCast(@max(1, @min(max_spare, opts.max_concurrent_streams))),
-                .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
-                .refused_budget = .init(opts.refused_stream_burst, opts.refused_stream_rate),
+                .spare_cap = @intCast(@max(1, @min(max_spare, opts.http2.max_concurrent_streams))),
+                .reset_budget = .init(opts.http2.stream_reset_burst, opts.http2.stream_reset_rate),
+                .refused_budget = .init(opts.http2.refused_stream_burst, opts.http2.refused_stream_rate),
                 .empty_budget = .init(opts.limits.empty_frame_burst, opts.limits.empty_frame_rate),
                 .glitch_budget = .init(opts.limits.glitch_burst, opts.limits.glitch_rate),
             };
@@ -455,16 +430,16 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // Wire order; null is an optional entry that is off.
             const table = [_]?frame.Setting{
                 if (role == .server)
-                    .{ .id = .max_concurrent_streams, .value = opts.max_concurrent_streams }
+                    .{ .id = .max_concurrent_streams, .value = opts.http2.max_concurrent_streams }
                 else
                     .{ .id = .enable_push, .value = 0 },
-                .{ .id = .initial_window_size, .value = opts.initial_window },
-                .{ .id = .max_header_list_size, .value = opts.max_header_list_size },
+                .{ .id = .initial_window_size, .value = opts.http2.stream_window },
+                .{ .id = .max_header_list_size, .value = opts.http2.max_header_list_size },
                 if (opts.max_frame_size > frame.min_max_frame_size)
                     .{ .id = .max_frame_size, .value = opts.max_frame_size }
                 else
                     null,
-                if (opts.enable_connect_protocol) .{ .id = .enable_connect_protocol, .value = 1 } else null,
+                if (opts.http2.enable_connect_protocol) .{ .id = .enable_connect_protocol, .value = 1 } else null,
                 .{ .id = .no_rfc7540_priorities, .value = 1 },
             };
             var buf: [table.len]frame.Setting = undefined;
@@ -517,7 +492,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// hpack.table_capacity) bytes, used only during the call (one per
         /// executor will do: recv never yields).
         pub fn recv(c: *Self, bytes: []const u8, now_s: u64, scratch: []u8) RecvError!usize {
-            std.debug.assert(scratch.len >= @max(c.opts.max_header_list_size, hpack.table_capacity));
+            std.debug.assert(scratch.len >= @max(c.opts.http2.max_header_list_size, hpack.table_capacity));
             if (c.in == .dead) return error.ConnectionError;
             c.enter();
             defer c.leave();
@@ -860,7 +835,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // size follows the peer's frame size and the writer's iovecs,
             // not a stalled reader. The other half, closing a connection
             // whose flushes stall, is the server's write timeout (PLAN §3.3).
-            if (c.table.size >= c.opts.max_concurrent_streams or c.out.ownedUnsent() > c.opts.limits.out_high) {
+            if (c.table.size >= c.opts.http2.max_concurrent_streams or c.out.ownedUnsent() > c.opts.limits.out_high) {
                 try c.refuse(id);
                 return .ignore;
             }
@@ -875,7 +850,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             // GOAWAY where nghttp2 returns a fatal error (INTENTIONAL.md,
             // limits 4).
             b.continuations += 1;
-            if (b.continuations > c.opts.max_continuations)
+            if (b.continuations > c.opts.http2.max_continuations)
                 return c.terminate(.enhance_your_calm, "too many CONTINUATION frames");
             if (ct.fragment.len == 0 and !ct.end_headers) try c.chargeEmptyFrame();
             try c.chargeHeaderBlock(b.buf.items.len + ct.fragment.len);
@@ -891,12 +866,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// one complete block. An ignored block is still decoded, for the
         /// HPACK table (nghttp2's IB_IGN_HEADER_BLOCK).
         fn decodeBlock(c: *Self, id: u31, kind: Kind, end_stream: bool, input: []const u8, scratch: []u8) RecvError!void {
-            var blk = c.decoder.block(input, scratch, c.opts.max_header_list_size);
+            var blk = c.decoder.block(input, scratch, c.opts.http2.max_header_list_size);
             const s = (if (kind == .ignore) null else c.table.get(id)) orelse return c.skipBlock(null, &blk);
             if (s.state == .closed) return c.skipBlock(null, &blk);
             const trailers = kind == .trailers;
             c.req = .{};
-            const fo: fields.Opts = .{ .connect_protocol = c.opts.enable_connect_protocol, .stream_id = id };
+            const fo: fields.Opts = .{ .connect_protocol = c.opts.http2.enable_connect_protocol, .stream_id = id };
             // Regular fields, the cookie's crumbs once (RFC 9113 §8.2.3: a
             // browser sends one crumb a cookie, joined again for the handler).
             var count: usize = 0;
@@ -1135,7 +1110,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         fn applyLocalSettings(c: *Self) RecvError!void {
             const old = c.local.initial_window;
             c.local = .{
-                .initial_window = c.opts.initial_window,
+                .initial_window = c.opts.http2.stream_window,
                 .max_frame_size = c.opts.max_frame_size,
             };
             var i: usize = 0;
@@ -1368,7 +1343,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// without holding the block, so it ends (PLAN §5.4; nghttp2 inflates
         /// as it reads and has no such cap: INTENTIONAL.md, limits 5).
         inline fn chargeHeaderBlock(c: *Self, len: usize) RecvError!void {
-            if (len > c.opts.max_header_list_size) return c.terminate(.enhance_your_calm, "header block too large");
+            if (len > c.opts.http2.max_header_list_size) return c.terminate(.enhance_your_calm, "header block too large");
         }
 
         // ---------------------------------------------------------------
@@ -1411,7 +1386,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         fn creditConn(c: *Self) Allocator.Error!void {
-            const w = @max(default_window, c.opts.connection_window);
+            const w = @max(default_window, c.opts.http2.connection_window);
             if (!due(w, c.recv_window, c.recv_unacked)) return;
             try c.queueWindowUpdate(0, @intCast(c.recv_unacked));
             c.recv_window += @intCast(c.recv_unacked);

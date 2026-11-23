@@ -429,6 +429,7 @@ test {
     _ = @import("client.zig");
     _ = @import("app_test.zig");
     _ = @import("handoff.zig");
+    _ = @import("fanout.zig");
     _ = @import("cache/response.zig");
     _ = @import("cache/response_test.zig");
     _ = blocking;

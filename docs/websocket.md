@@ -402,18 +402,22 @@ compressor. The server declines an 8-bit server window.
 
 `anole.websocket.Rooms` keeps named groups of sockets. Create one per server
 and reach it from your handlers through the server's context type.
-`Rooms.init(allocator, .{})` takes an allocator and options (the rooms take
-the runtime's `std.Io` from the first socket that joins), so it can be made before the server:
+`Rooms.init(allocator, io, options)` takes an allocator, the runtime's
+`std.Io` (`app.io()`, not `init.io`: the sockets run on the runtime) and
+options, so set it once the server exists, and free it after `app.deinit()` (jobs and watches may still use it until then):
 
 ```zig
 const App = struct {
     rooms: anole.websocket.Rooms,
 };
 
-var state: App = .{ .rooms = .init(init.gpa, .{}) };
-defer state.rooms.deinit();
+var state: App = .{ .rooms = undefined };
 var app = try anole.Server(App).init(init.gpa, .{}, &state);
-defer app.deinit();
+defer {
+    app.deinit();
+    state.rooms.deinit();
+}
+state.rooms = .init(init.gpa, app.io(), .{});
 app.ws("/chat/:room", chat);
 try app.listen(":8082");
 ```
@@ -449,7 +453,7 @@ lock. Each member with something queued has a task of its own, on the
 socket's executor, that sends its queue in order. A slow client therefore
 holds up nobody else, not even the broadcaster: it only fills its own queue.
 
-The queue is bounded. `Rooms.init(allocator, .{ ... })` sets
+The queue is bounded. `Rooms.init(allocator, io, .{ ... })` sets
 `anole.websocket.Rooms.Options`:
 
 | Field | Default | Meaning |

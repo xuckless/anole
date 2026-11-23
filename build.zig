@@ -924,6 +924,7 @@ pub fn build(b: *std.Build) void {
             .{ .file = "10_log_reserved_field", .contains = "rename it, e.g. 'user_level'" },
             .{ .file = "11_invalid_code_grammar", .contains = "e.g. 'users.name_taken'" },
             .{ .file = "12_rename_on_fallback_type", .contains = "structs, ?T and []const T" },
+            .{ .file = "13_empty_path_on_server", .contains = "anole: route GET : must start with '/'" },
         };
         const ce_step = b.step("test-compile-errors", "Check that bad routes and calls are compile errors with the right message");
         for (cases) |c| {

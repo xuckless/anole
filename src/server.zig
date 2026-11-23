@@ -807,6 +807,65 @@ pub const OnlyOn = struct {
     }
 };
 
+/// Where a server is in its life, owned by the thread that called `init`
+/// (a plain enum: `stop` only sets an Event). Why a table: every lifecycle
+/// move is a cell of `next`; add a state or a cell, never a flag beside it.
+///
+/// | from \ event | configure  | prepare             | serve   | end     |
+/// |--------------|------------|---------------------|---------|---------|
+/// | building     | configured | staged (one-shots)  | -       | -       |
+/// | configured   | refuse     | prepared (one-shots)| -       | -       |
+/// | staged       | prepared   | same                | -       | -       |
+/// | prepared     | refuse     | same                | serving | -       |
+/// | serving      | refuse     | same                | serving | stopped |
+/// | stopped      | refuse     | same                | serving | -       |
+///
+/// configure: `listen`, `listenTls`, `run` apply the listener options
+/// (`addRawListener` asks it too); refuse is `error.ListenersAlreadySet`.
+/// prepare: `run`, Lambda INIT, `testing.client`; the one-shots (the helper
+/// routes) run on the move out of building or configured, `same` re-runs
+/// only the repeatable checks (OpenAPI, conflicts, `prepareStatic`).
+/// serve and end: `run` around its loop. A `run` after one ended serves
+/// again, unguarded as it always was. A `run` that overlaps a serving one
+/// breaks run's contract (the `init` thread, one at a time): its end
+/// leaves stopped and the outer run's end hits a `-` cell (a panic in
+/// safe builds, undefined in ReleaseFast). `-` cannot happen otherwise
+/// (null, asserted). A failed prepare stays prepared; Lambda INIT stays
+/// prepared; the OpenAPI tool only configures. The connectors keep their own fact (`startConnectors`):
+/// the C ABI starts them while building.
+const Phase = enum {
+    /// `init` named no listener: `pending` holds the options.
+    building,
+    /// The listeners are set.
+    configured,
+    /// Prepared before the listeners were set (`testing.client`);
+    /// `pending` still holds the options.
+    staged,
+    /// Listeners set and the helper routes added.
+    prepared,
+    /// `run` is in its loop.
+    serving,
+    /// That run ended.
+    stopped,
+
+    const Event = enum { configure, prepare, serve, end };
+
+    const Row = std.EnumArray(Event, ?Phase);
+    const table = std.EnumArray(Phase, Row).init(.{
+        .building = .init(.{ .configure = .configured, .prepare = .staged, .serve = null, .end = null }),
+        .configured = .init(.{ .configure = null, .prepare = .prepared, .serve = null, .end = null }),
+        .staged = .init(.{ .configure = .prepared, .prepare = .staged, .serve = null, .end = null }),
+        .prepared = .init(.{ .configure = null, .prepare = .prepared, .serve = .serving, .end = null }),
+        .serving = .init(.{ .configure = null, .prepare = .serving, .serve = .serving, .end = .stopped }),
+        .stopped = .init(.{ .configure = null, .prepare = .stopped, .serve = .serving, .end = null }),
+    });
+
+    /// The table above; null for refuse and for `-`.
+    fn next(p: Phase, ev: Event) ?Phase {
+        return table.get(p).get(ev);
+    }
+};
+
 /// A server whose handlers share the state `Ctx`: `init(gpa, options,
 /// &state)`, and handlers `fn (state: *Ctx, req, res) !void` (or plain
 /// `(req, res)`). For no state, `App`.
@@ -912,8 +971,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         owned_middleware: std.ArrayList(http.Middleware(Ctx)) = .empty,
         /// What `init` was given when it named no listener (neither
         /// `http` nor `https`): `listen`, `listenTls` or `run` sets them up
-        /// from it. Null once they are.
-        pending: ?Options = null,
+        /// from it. Meaningful while `phase` allows `configure`.
+        pending: Options = .{},
+        /// The lifecycle (`Phase`): every move is a cell of `Phase.next`.
+        phase: Phase = .building,
         /// The `Alt-Svc` middleware, once there is one.
         alt_svc: ?*AltSvc = null,
         /// For tests: stands for ANOLE_OPENAPI_OUT / ANOLE_OPENAPI_CHECK.
@@ -938,9 +999,6 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// The admission gate's collector is on `metrics`.
             admission_metrics: bool = false,
             health: ?*observe.Health = null,
-            /// `metrics` and `health` register their routes when serving
-            /// starts, so `use` can still follow them.
-            routes_added: bool = false,
             grpc_health: ?*grpc_mod.Health = null,
             exporter: ?*observe.trace.Exporter = null,
             /// The breaker and retry series of the outbound client, when it has a policy.
@@ -954,6 +1012,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
             /// in order.
             connectors: std.ArrayList(Connector) = .empty,
+            /// `startConnectors` ran (its one writer): connectors made
+            /// later start at once. Not a `Phase`: the C ABI starts them
+            /// while building.
             connectors_started: bool = false,
             /// The connector whose start failed, and why (for the startup error's text).
             failed_system: ?[]const u8 = null,
@@ -972,27 +1033,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// `serveOpenApi` could not build the document; `run` fails with it.
             openapi_failed: if (features.openapi) ?anyerror else void = if (features.openapi) null else {},
 
-            /// Adds a connector with an `observer` (a database or service)
-            /// and gives it its console slot, its index plus one: the `i`
-            /// of its `/db` entry and of its `Stats.db` row. Entries leave
-            /// only from the tail (the caller's `dropConnector` when a late
-            /// start fails), so an index never shifts.
-            fn addObserved(self: *Extras, gpa: std.mem.Allocator, comptime T: type, value: *T) !void {
-                try self.connectors.append(gpa, .of(T, value));
-                value.observer.console_slot = @intCast(self.connectors.items.len);
+            /// Hands one connector what the app observes with: the one start
+            /// call, for `startConnectors` and for a connector made later.
+            fn startOne(self: *const Extras, c: Connector) !void {
+                return c.start(c.context, self.metrics, self.exporter, self.health);
             }
 
-            /// Removes the entry of a connector its constructor is about to
-            /// free (its start failed), so the teardown never reaches it.
-            fn dropConnector(self: *Extras, context: *anyopaque) void {
-                var i = self.connectors.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (self.connectors.items[i].context == context) {
-                        _ = self.connectors.orderedRemove(i);
-                        return;
-                    }
-                }
+            /// Appends a connector; one with an `observer` (a database or
+            /// service) gets its console slot, its index plus one: the `i`
+            /// of its `/db` entry and of its `Stats.db` row. Entries never
+            /// leave before the teardown (a late start that fails keeps its
+            /// entry, see `addConnector`), so an index never shifts.
+            fn addObserved(self: *Extras, gpa: std.mem.Allocator, comptime T: type, value: *T) !void {
+                try self.connectors.append(gpa, .of(T, value));
+                if (comptime @hasField(T, "observer")) value.observer.console_slot = @intCast(self.connectors.items.len);
             }
         };
 
@@ -1370,6 +1424,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (h3_possible) self.alt_svc = self.addAltSvc();
             } else {
                 try self.listenOn(opts);
+                self.phase = .configured;
             }
             return self;
         }
@@ -2093,17 +2148,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn takePending(self: *Self, comptime what: []const u8) !Options {
-            return self.pending orelse {
+            if (Phase.next(self.phase, .configure) == null) {
                 // Not the end of the server: `run` still serves those.
                 errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
                 return error.ListenersAlreadySet;
-            };
+            }
+            return self.pending;
         }
 
         /// The listeners `init` left for later; a failure also ends
-        /// `waitReady`.
+        /// `waitReady`. The phase moves first: a failed configure still
+        /// counts as the one.
         fn configure(self: *Self, opts: Options) !void {
-            self.pending = null;
+            self.phase = Phase.next(self.phase, .configure).?;
             if (self.mode.lambda) |l| {
                 // Lambda accepts no connections: what the options named is
                 // set aside (one startup line says what).
@@ -2287,16 +2344,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return handlers.adapt(Ctx, handler);
         }
 
-        /// Adds `handler` at `path` on `target` (the router, or a group),
+        /// Adds `handler` at `path` on `target` (a group; the server's own verbs use its root group),
         /// behind a `ResponseCache` of its own when it is `anole.cached`.
-        fn register(self: *Self, target: anytype, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+        fn register(self: *Self, target: http.Router(Ctx).Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
             const H = @TypeOf(handler);
             if (comptime features.openapi) if (method) |m| self.recordRoute(target, m, path, handler);
             if (comptime handlers.isCached(H)) {
                 var settings: ResponseCache.Options = H.cache_options;
                 // Named by its route in metrics.
                 if (settings.name == null) settings.name = std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{
-                    if (@TypeOf(target) == *http.Router(Ctx)) "" else target.prefix, path,
+                    target.prefix, path,
                 }) catch @panic("OOM");
                 const cache = self.responseCache(settings);
                 const g = target.group("", &.{http.Middleware(Ctx).init(cache)});
@@ -2307,12 +2364,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Keeps the route for the OpenAPI document: its comptime-built
         /// operation, its path and the documented middleware of its chain.
-        fn recordRoute(self: *Self, target: anytype, method: http.Method, path: []const u8, comptime handler: anytype) void {
+        fn recordRoute(self: *Self, target: http.Router(Ctx).Group, method: http.Method, path: []const u8, comptime handler: anytype) void {
             if (comptime handlers.routeDoc(handler).hidden) return;
             const verb = std.meta.stringToEnum(openapi_mod.operation.Verb, @tagName(method)) orelse return;
             const a = self.arena.allocator();
-            const prefix = if (comptime @TypeOf(target) == *http.Router(Ctx)) "" else target.prefix;
-            const joined = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, path }) catch @panic("OOM");
+            const joined = std.fmt.allocPrint(a, "{s}{s}", .{ target.prefix, path }) catch @panic("OOM");
             const op = comptime &openapi_mod.operation.forHandler(handler);
             self.extras.doc_entries.append(a, .{
                 .verb = verb,
@@ -2324,11 +2380,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// The OpenAPI declarations of the middleware a route on `target`
         /// runs behind, the server's first.
-        fn chainDocs(self: *Self, target: anytype) []const *const openapi_mod.mw.Info {
+        fn chainDocs(self: *Self, target: http.Router(Ctx).Group) []const *const openapi_mod.mw.Info {
             const a = self.arena.allocator();
             var out: std.ArrayList(*const openapi_mod.mw.Info) = .empty;
-            const groups: []const http.Middleware(Ctx) = if (comptime @TypeOf(target) == *http.Router(Ctx)) &.{} else target.middlewares;
-            for ([_][]const http.Middleware(Ctx){ self.router.middlewares, groups }) |list| {
+            for ([_][]const http.Middleware(Ctx){ self.router.middlewares, target.middlewares }) |list| {
                 for (list) |m| if (m.openapi) |p| out.append(a, @ptrCast(@alignCast(p))) catch @panic("OOM");
             }
             return out.items;
@@ -2341,7 +2396,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.addRoute(.get, cfg.health_path, health);
         pub fn addRoute(self: *Self, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
-            self.register(self.router, method, path, handler);
+            self.root().addRoute(method, path, handler);
         }
 
         /// A `ResponseCache` owned by the server, for `with`, `group` or
@@ -2353,8 +2408,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     pages.invalidate(.{ .path = "/about" });
         pub fn responseCache(self: *Self, settings: ResponseCache.Options) *ResponseCache {
             const cache = ResponseCache.init(self.gpa, self.io(), settings) catch @panic("OOM");
-            self.extras.connectors.append(self.arena.allocator(), .of(ResponseCache, cache)) catch @panic("OOM");
-            if (self.extras.connectors_started) cache.start(self.extras.metrics, self.extras.exporter, self.extras.health) catch {};
+            // Its start only registers metrics (families exist or are made): OOM is its one error.
+            self.addConnector(ResponseCache, cache) catch |err| @panic(@errorName(err));
             return cache;
         }
 
@@ -2367,50 +2422,41 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.get("/users/:id", getUser);
         pub fn get(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.get, path, handler, true);
-            self.register(self.router, .get, path, handler);
+            self.root().get(path, handler);
         }
         /// As `get`, for HEAD.
         pub fn head(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.head, path, handler, true);
-            self.register(self.router, .head, path, handler);
+            self.root().head(path, handler);
         }
         /// As `get`, for POST.
         pub fn post(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.post, path, handler, true);
-            self.register(self.router, .post, path, handler);
+            self.root().post(path, handler);
         }
         /// As `get`, for PUT.
         pub fn put(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.put, path, handler, true);
-            self.register(self.router, .put, path, handler);
+            self.root().put(path, handler);
         }
         /// As `get`, for PATCH.
         pub fn patch(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.patch, path, handler, true);
-            self.register(self.router, .patch, path, handler);
+            self.root().patch(path, handler);
         }
         /// As `get`, for DELETE.
         pub fn delete(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.delete, path, handler, true);
-            self.register(self.router, .delete, path, handler);
+            self.root().delete(path, handler);
         }
         /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
         /// without one.)
         pub fn options(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.options, path, handler, true);
-            self.register(self.router, .options, path, handler);
+            self.root().options(path, handler);
         }
         /// The HTTP QUERY method (a GET with a body).
         pub fn query(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.query, path, handler, true);
-            self.register(self.router, .query, path, handler);
+            self.root().query(path, handler);
         }
         /// As `get`, for every method; a route for a specific method at a
         /// path wins over it.
         pub fn any(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(null, path, handler, true);
-            self.register(self.router, null, path, handler);
+            self.root().any(path, handler);
         }
 
         /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
@@ -2441,9 +2487,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// arena, so options built at run time (e.g. from `anole.config.load`)
         /// need not outlive registration.
         pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
-            if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-            comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
+            self.root().wsWith(path, handler, upgrade);
         }
 
         /// A WebSocket endpoint at `path` served through callbacks:
@@ -2465,9 +2509,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `wsCallbacks` with upgrade options (copied into the server's arena,
         /// as with `wsWith`).
         pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
-            if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-            comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
+            self.root().wsCallbacksWith(path, Handlers, upgrade);
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -2493,10 +2535,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// `webtransport` with accept options (the drain's close, timeout).
         pub fn webtransportWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
-            if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-            comptime checkPattern("GET", path);
-            self.enableWebTransport();
-            self.router.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
+            self.root().webtransportWith(path, handler, accept);
         }
 
         /// The HTTP/3 listener speaks WebTransport, now or once it is set
@@ -2580,136 +2619,155 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Routes registered under a prefix and behind middleware; see
         /// `Server.group`. Groups nest: a nested group's prefix and
         /// middleware come after its parent's.
-        pub const Group = struct {
-            server: *Self,
-            /// The core router's group underneath.
-            inner: http.Router(Ctx).Group,
+        pub const Group = GroupOf(false);
 
-            /// `Server.group`, nested: `prefix` after this group's, and
-            /// `middlewares` after its own.
-            pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
-                return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
-            }
-            /// Routes behind more middleware, with no further prefix.
-            pub fn with(g: Group, middlewares: anytype) Group {
-                return g.group("", middlewares);
-            }
-            /// `Server.get` under this group.
-            pub fn get(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.get, path, handler, false);
-                g.server.register(g.inner, .get, path, handler);
-            }
-            /// `Server.head` under this group.
-            pub fn head(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.head, path, handler, false);
-                g.server.register(g.inner, .head, path, handler);
-            }
-            /// `Server.post` under this group.
-            pub fn post(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.post, path, handler, false);
-                g.server.register(g.inner, .post, path, handler);
-            }
-            /// `Server.put` under this group.
-            pub fn put(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.put, path, handler, false);
-                g.server.register(g.inner, .put, path, handler);
-            }
-            /// `Server.patch` under this group.
-            pub fn patch(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.patch, path, handler, false);
-                g.server.register(g.inner, .patch, path, handler);
-            }
-            /// `Server.delete` under this group.
-            pub fn delete(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.delete, path, handler, false);
-                g.server.register(g.inner, .delete, path, handler);
-            }
-            /// `Server.options` under this group.
-            pub fn options(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.options, path, handler, false);
-                g.server.register(g.inner, .options, path, handler);
-            }
-            /// `Server.query` under this group.
-            pub fn query(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.query, path, handler, false);
-                g.server.register(g.inner, .query, path, handler);
-            }
-            /// `Server.any` under this group.
-            pub fn any(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(null, path, handler, false);
-                g.server.register(g.inner, null, path, handler);
-            }
-            /// `Server.ws` under this group.
-            pub fn ws(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                g.wsWith(path, handler, .{});
-            }
-            /// `Server.wsWith` under this group.
-            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
-                if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
-            }
-            /// `Server.wsCallbacks` under this group.
-            pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
-                g.wsCallbacksWith(path, Handlers, .{});
-            }
-            /// `Server.wsCallbacksWith` under this group.
-            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
-                if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
-            }
-            /// `Server.webtransport` under this group.
-            pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                g.webtransportWith(path, handler, .{});
-            }
-            /// `Server.webtransportWith` under this group.
-            pub fn webtransportWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
-                if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.server.enableWebTransport();
-                g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
-            }
-            /// `Server.sse` under this group (the group's prefix goes before `path`).
-            pub fn sse(g: Group, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
-                if (comptime path.len > 0) comptime checkPattern("GET", path);
-                const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
-                data.* = .{ .topics = topics };
-                g.server.extras.sse_routes += 1;
-                g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
-            }
-            /// `Server.addRoute` under this group.
-            pub fn addRoute(g: Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
-                g.server.register(g.inner, method, path, handler);
-            }
-            /// `Server.static` under this group.
-            pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
-                g.inner.static(prefix, dir, opts);
-            }
-            /// `Server.staticDir` under this group.
-            pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
-                g.inner.static(prefix, try g.server.openDir(path), opts);
-            }
-            /// `Server.embedded` under this group.
-            pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
-                g.inner.embedded(path, data, opts);
-            }
-            /// `Server.grpc` behind this group's middleware (and the global
-            /// ones). The gRPC paths (`/pkg.Service/Method`) and the
-            /// transcoded REST paths come from the proto, so the group's
-            /// prefix does not apply to them; its middleware runs for both,
-            /// as for any route of the group.
-            ///
-            ///     const api = app.group("/v1", .{auth});
-            ///     api.grpc(pb.Users, users);          // /pkg.Users/Get and GET /v1/users/{id}, both behind auth
-            pub fn grpc(g: Group, comptime Service: anytype, impl: anytype) void {
-                g.grpcWith(Service, impl, .{});
-            }
-            /// `Server.grpcWith` under this group.
-            pub fn grpcWith(g: Group, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
-                g.server.grpcOn(g.inner, Service, impl, opts);
-            }
-        };
+        /// The router as a group with no prefix and no middleware: what
+        /// the server's own verbs go through, one implementation each.
+        const Root = GroupOf(true);
+
+        fn root(self: *Self) Root {
+            return .{ .server = self, .inner = self.router.group("", &.{}) };
+        }
+
+        /// `is_root`: the server's own flavour, whose paths are whole (a
+        /// group's prefix may hold parameters and may stand for the empty path).
+        fn GroupOf(comptime is_root: bool) type {
+            // The server's own methods name themselves `app.x` in the errors they give.
+            const app = if (is_root) "app." else "";
+            return struct {
+                const G = @This();
+                server: *Self,
+                /// The core router's group underneath.
+                inner: http.Router(Ctx).Group,
+
+                /// `Server.group`, nested: `prefix` after this group's, and
+                /// `middlewares` after its own.
+                pub fn group(g: G, prefix: []const u8, middlewares: anytype) Group {
+                    return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
+                }
+                /// Routes behind more middleware, with no further prefix.
+                pub fn with(g: G, middlewares: anytype) Group {
+                    return g.group("", middlewares);
+                }
+                /// `Server.get` under this group.
+                pub fn get(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.get, path, handler);
+                }
+                /// `Server.head` under this group.
+                pub fn head(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.head, path, handler);
+                }
+                /// `Server.post` under this group.
+                pub fn post(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.post, path, handler);
+                }
+                /// `Server.put` under this group.
+                pub fn put(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.put, path, handler);
+                }
+                /// `Server.patch` under this group.
+                pub fn patch(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.patch, path, handler);
+                }
+                /// `Server.delete` under this group.
+                pub fn delete(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.delete, path, handler);
+                }
+                /// `Server.options` under this group.
+                pub fn options(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.options, path, handler);
+                }
+                /// `Server.query` under this group.
+                pub fn query(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.query, path, handler);
+                }
+                /// `Server.any` under this group.
+                pub fn any(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(null, path, handler);
+                }
+                /// A group's own path is "" (its prefix); the root has no prefix to stand for, so it checks every pattern.
+                fn checkOwnPath(comptime path: []const u8) void {
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path);
+                }
+                fn verb(g: G, comptime method: ?http.Method, comptime path: []const u8, comptime handler: anytype) void {
+                    comptime typed.checkRoute(method, path, handler, is_root);
+                    g.server.register(g.inner, method, path, handler);
+                }
+                /// `Server.ws` under this group.
+                pub fn ws(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.wsWith(path, handler, .{});
+                }
+                /// `Server.wsWith` under this group.
+                pub fn wsWith(g: G, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
+                    if (comptime !features.websocket) @compileError(app ++ "ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                    checkOwnPath(path);
+                    g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
+                }
+                /// `Server.wsCallbacks` under this group.
+                pub fn wsCallbacks(g: G, comptime path: []const u8, comptime Handlers: type) void {
+                    g.wsCallbacksWith(path, Handlers, .{});
+                }
+                /// `Server.wsCallbacksWith` under this group.
+                pub fn wsCallbacksWith(g: G, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
+                    if (comptime !features.websocket) @compileError(app ++ "wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                    checkOwnPath(path);
+                    g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
+                }
+                /// `Server.webtransport` under this group.
+                pub fn webtransport(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.webtransportWith(path, handler, .{});
+                }
+                /// `Server.webtransportWith` under this group.
+                pub fn webtransportWith(g: G, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+                    if (comptime !features.http3) @compileError(app ++ "webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+                    checkOwnPath(path);
+                    g.server.enableWebTransport();
+                    g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
+                }
+                /// `Server.sse` under this group (the group's prefix goes before `path`).
+                pub fn sse(g: G, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+                    checkOwnPath(path);
+                    // A group's prefix may hold the {name}s, and its routes never went into the OpenAPI document (kept as it was).
+                    comptime if (is_root and !sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
+                    const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+                    data.* = .{ .topics = topics };
+                    g.server.extras.sse_routes += 1;
+                    if (comptime features.openapi and is_root) g.server.recordRoute(g.inner, .get, path, sseHandlerFor(route_options));
+                    g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
+                }
+                /// `Server.addRoute` under this group.
+                pub fn addRoute(g: G, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+                    g.server.register(g.inner, method, path, handler);
+                }
+                /// `Server.static` under this group.
+                pub fn static(g: G, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
+                    g.inner.static(prefix, dir, opts);
+                }
+                /// `Server.staticDir` under this group.
+                pub fn staticDir(g: G, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
+                    g.inner.static(prefix, try g.server.openDir(path), opts);
+                }
+                /// `Server.embedded` under this group.
+                pub fn embedded(g: G, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
+                    g.inner.embedded(path, data, opts);
+                }
+                /// `Server.grpc` behind this group's middleware (and the global
+                /// ones). The gRPC paths (`/pkg.Service/Method`) and the
+                /// transcoded REST paths come from the proto, so the group's
+                /// prefix does not apply to them; its middleware runs for both,
+                /// as for any route of the group.
+                ///
+                ///     const api = app.group("/v1", .{auth});
+                ///     api.grpc(pb.Users, users);          // /pkg.Users/Get and GET /v1/users/{id}, both behind auth
+                pub fn grpc(g: G, comptime Service: anytype, impl: anytype) void {
+                    g.grpcWith(Service, impl, .{});
+                }
+                /// `Server.grpcWith` under this group.
+                pub fn grpcWith(g: G, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+                    g.server.grpcOn(g.inner, Service, impl, opts);
+                }
+            };
+        }
 
         /// The server's outbound HTTP client, made with the server and
         /// shared by every handler; `anole.client(req)` finds the same one
@@ -2737,11 +2795,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `grpc`, with options for this registration (the message size
         /// limit, transcoding off).
         pub fn grpcWith(self: *Self, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
-            self.grpcOn(self.router, Service, impl, opts);
+            self.root().grpcWith(Service, impl, opts);
         }
 
-        /// `grpcWith` on a router or one of its groups (`Group.grpc`).
-        fn grpcOn(self: *Self, target: anytype, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+        /// `grpcWith` on a group (`Group.grpc`).
+        fn grpcOn(self: *Self, target: http.Router(Ctx).Group, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
             if (comptime !features.grpc) @compileError("app.grpc needs gRPC (-Dgrpc, on in the full profile)");
             const Svc = if (@TypeOf(Service) == type) Service else Service(grpc_mod.Call, anyerror);
             if (comptime features.openapi) self.recordGrpc(target, Svc, opts);
@@ -2761,7 +2819,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Keeps the documented operations of `Svc` for the OpenAPI document.
         /// Which forms appear (`Options.grpc`) is decided when it is built.
-        fn recordGrpc(self: *Self, target: anytype, comptime Svc: type, opts: grpc_mod.RegisterOptions) void {
+        fn recordGrpc(self: *Self, target: http.Router(Ctx).Group, comptime Svc: type, opts: grpc_mod.RegisterOptions) void {
             const ops = comptime openapi_mod.proto.serviceOperations(Svc);
             const a = self.arena.allocator();
             const chain = self.chainDocs(target);
@@ -2826,13 +2884,51 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return out;
         }
 
-        /// Hands the databases what the app observes with, once (`run` does
-        /// it too): the C ABI opens them before anything listens.
+        /// Takes `value` over: registered, and started now when `startConnectors`
+        /// ran (a connector made later would otherwise never start). A start
+        /// that fails is the caller's error; the connector stays registered and
+        /// is closed with the server, so what its start handed out (a health
+        /// check, a pointer) never dangles. If it cannot be registered it is
+        /// freed. The app is single-owner until `run`: no lock.
+        fn addConnector(self: *Self, comptime T: type, value: *T) !void {
+            const extras = self.extras;
+            const c = Connector.of(T, value);
+            extras.addObserved(self.arena.allocator(), T, value) catch |err| {
+                value.deinit();
+                return err;
+            };
+            if (extras.connectors_started) try extras.startOne(c);
+        }
+
+        /// The constructor prologue of the database and service connectors:
+        /// the app's `environ` when the options name none, SMTP's
+        /// `environment` default, `T.init` on the runtime's io, the lambda
+        /// deployment's `suppress_consumers` (NATS, Kafka), then `addConnector`.
+        /// Each quirk is the type's own field, read with `@hasField`.
+        fn makeConnector(self: *Self, comptime T: type, config: anytype) !*T {
+            var opts = config;
+            if (comptime @hasField(@TypeOf(opts), "environ")) {
+                if (opts.environ == null) if (self.process) |p| {
+                    opts.environ = p.environ;
+                };
+            }
+            if (comptime @hasField(@TypeOf(opts), "environment")) {
+                if (opts.environment == null) opts.environment = self.environment();
+            }
+            const created = try T.init(self.gpa, self.rt.io(), opts);
+            if (comptime @hasField(T, "suppress_consumers")) created.suppress_consumers = self.mode.deployment == .lambda;
+            try self.addConnector(T, created);
+            return created;
+        }
+
+        /// Hands the databases what the app observes with, once (`prepare`
+        /// does it too): the C ABI opens them before anything listens, in
+        /// any phase. The one writer of `connectors_started`.
         pub fn startConnectors(self: *Self) !void {
             const extras = self.extras;
             if (extras.connectors_started) return;
             extras.connectors_started = true;
-            for (extras.connectors.items) |c| c.start(c.context, extras.metrics, extras.exporter, extras.health) catch |err| {
+            for (extras.connectors.items) |c| extras.startOne(c) catch |err| {
                 extras.failed_system = c.name;
                 extras.failed_cause = @errorName(err);
                 return err;
@@ -2849,14 +2945,37 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
-        /// The routes `metrics` and `health` left for when serving starts.
-        fn addHelperRoutes(self: *Self) void {
-            const extras = self.extras;
-            if (extras.routes_added) return;
-            extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
-            if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
-            if (comptime features.openapi) self.serveOpenApi();
+        /// What `run`, Lambda INIT and `testing.client` each do before
+        /// serving, in this order: the helper routes (on the first prepare,
+        /// by the phase: `metrics` and `health` register theirs only now,
+        /// so `use` can still follow them), the OpenAPI document (`strict`
+        /// only: the test client serves without it), the conflict check,
+        /// `prepareStatic`, the connectors. Raw errors; each caller maps
+        /// them its way.
+        fn prepare(self: *Self, comptime strict: bool) !void {
+            const to = Phase.next(self.phase, .prepare).?;
+            const first = to != self.phase;
+            self.phase = to;
+            if (first) {
+                const extras = self.extras;
+                if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
+                if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
+                if (comptime features.openapi) self.serveOpenApi();
+            }
+            if (comptime strict and features.openapi) if (self.extras.openapi_failed) |err| return err;
+            // Only with `router.record_conflicts` (the C ABI, test builds): a
+            // route that conflicted with another, or that the helper routes
+            // collided with.
+            if (self.router.conflict != null) return error.RouteConflict;
+            // Before the HTTP/3 endpoint and the core `serve` start as tasks on
+            // other executors: it writes what their requests read.
+            try self.server.prepareStatic();
+            // A connector records its own cause; the resilience binding's
+            // failure (OutOfMemory) becomes the cause here.
+            self.startConnectors() catch |err| {
+                self.extras.failed_cause = self.extras.failed_cause orelse @errorName(err);
+                return error.DatabaseUnavailable;
+            };
         }
 
         /// Serves the OpenAPI document of this server's routes at
@@ -3079,16 +3198,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.health` (a ping behind `/readyz`) when the app has them,
         /// and it is closed with the server, after the drain. See
         /// `anole.pg`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Client {
             if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const d = try pg_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer d.deinit();
-            try self.extras.addObserved(self.arena.allocator(), pg_mod.Client, d);
-            return d;
+            return self.makeConnector(pg_mod.Client, config);
         }
 
         /// Opens a SQLite database (`anole.sqlite`), closed with the server:
@@ -3101,6 +3215,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     state.db = try app.sqlite("app.db");
         ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout = .fromSeconds(10) });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
@@ -3112,10 +3228,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try p.init(self.rt, .{});
                 self.blocking_pool = p;
             }
-            const d = try sqlite_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer d.deinit();
-            try self.extras.addObserved(self.arena.allocator(), sqlite_mod.Client, d);
-            return d;
+            return self.makeConnector(sqlite_mod.Client, opts);
         }
 
         /// A MongoDB client for the handlers, owned by the server:
@@ -3126,16 +3239,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.tracing` and `app.health` (a ping behind `/readyz`) when the
         /// app has them, and it is closed with the server, after the drain.
         /// See `anole.mongodb`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error. With `connect_at_start`, that includes opening a connection.
         pub fn mongodb(self: *Self, config: mongodb_mod.Options) !*mongodb_mod.Client {
             if (comptime !features.mongodb) @compileError("app.mongodb needs MongoDB (-Dmongodb, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const mongo = try mongodb_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer mongo.deinit();
-            try self.extras.addObserved(self.arena.allocator(), mongodb_mod.Client, mongo);
-            return mongo;
+            return self.makeConnector(mongodb_mod.Client, config);
         }
 
         /// A Redis or Valkey client for the handlers, owned by the server:
@@ -3146,16 +3254,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.tracing` and `app.health` (a PING behind `/readyz`) when
         /// the app has them, and it is closed with the server, after the
         /// drain. See `anole.redis`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn redis(self: *Self, config: redis_mod.Options) !*redis_mod.Client {
             if (comptime !features.redis) @compileError("app.redis needs Redis (-Dredis, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const r = try redis_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer r.deinit();
-            try self.extras.addObserved(self.arena.allocator(), redis_mod.Client, r);
-            return r;
+            return self.makeConnector(redis_mod.Client, config);
         }
 
         /// A NATS client for the handlers, owned by the server: `NATS_URL`
@@ -3165,17 +3268,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// is drained and closed with the server. Register handlers with
         /// `nc.handle(&app, subject, opts, fn)` before `run`. See
         /// `anole.nats`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error. That includes connecting (the first connection).
         pub fn nats(self: *Self, config: nats_mod.Options) !*nats_mod.Client {
             if (comptime !features.nats) @compileError("app.nats needs NATS (-Dnats, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const n = try nats_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer n.deinit();
-            n.suppress_consumers = self.mode.deployment == .lambda;
-            try self.extras.addObserved(self.arena.allocator(), nats_mod.Client, n);
-            return n;
+            return self.makeConnector(nats_mod.Client, config);
         }
 
         /// A Kafka client for the handlers, owned by the server:
@@ -3186,20 +3283,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// the app has them, joins the groups registered with `consume`,
         /// and at shutdown drains: records in flight finish, offsets are
         /// committed, the producer flushes. See `anole.kafka`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn kafka(self: *Self, config: kafka_mod.Options) !*kafka_mod.Client {
             if (comptime !features.kafka) @compileError("app.kafka needs Kafka (-Dkafka, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const k = try kafka_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer k.deinit();
-            k.suppress_consumers = self.mode.deployment == .lambda;
-            try self.extras.addObserved(self.arena.allocator(), kafka_mod.Client, k);
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(k);
-            if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return k;
+            return self.makeConnector(kafka_mod.Client, config);
         }
 
         /// Serves `handler` (callbacks or `fn (*Conn) !void`) on raw TCP at
@@ -3246,10 +3334,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn addRawListener(self: *Self, comptime what: []const u8, l: Options.Listener) errors.ServerError!void {
             if (comptime !features.net) @compileError("app." ++ what ++ " needs raw TCP and UDP servers (-Dnet, on in the web and full profiles)");
-            const opts = &(self.pending orelse {
+            if (Phase.next(self.phase, .configure) == null) {
                 errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); add it to .listeners, or leave both out of init", .{});
                 return error.ListenersAlreadySet;
-            });
+            }
+            const opts = &self.pending;
             const a = self.arena.allocator();
             const list = a.alloc(Options.Listener, opts.listeners.len + 1) catch return error.OutOfMemory;
             @memcpy(list[0..opts.listeners.len], opts.listeners);
@@ -3294,6 +3383,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// with serving, after its store, and is drained and closed with the
         /// server. Register handlers with `jobs.handle(&app, Args, .{}, fn)`
         /// before `run`. Under `deployment = lambda` it only enqueues.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn jobs(self: *Self, config: jobs_mod.Options) !*jobs_mod.Client {
             if (comptime !features.jobs) @compileError("app.jobs needs jobs (-Djobs, on in the web and full profiles)");
             switch (config.store) {
@@ -3310,13 +3401,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 },
             }
             const j = try jobs_mod.Client.init(self.gpa, self.rt.io(), config);
-            errdefer j.deinit();
             j.suppress_workers = self.mode.deployment == .lambda;
             j.drain_event = &self.server.draining;
-            try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(j);
-            if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            try self.addConnector(jobs_mod.Client, j);
             return j;
         }
 
@@ -3326,16 +3413,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     const hooks = try app.webhooks(.{ .jobs = jobs });
         ///     _ = try hooks.publish(req, .{ .owner = "acme", .type = "invoice.paid" }, .{ .id = 7 });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
             if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
             const w = try wh.Client.init(self.gpa, self.io(), config);
-            errdefer w.deinit();
-            try w.register(self);
-            try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(w);
-            if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            {
+                errdefer w.deinit();
+                try w.register(self);
+            }
+            try self.addConnector(wh.Client, w);
             return w;
         }
 
@@ -3349,7 +3437,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
             const v = wh.Verify.init(self.gpa, self.io(), config) catch |err| @panic(@errorName(err));
-            self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
+            self.addConnector(wh.Verify, v) catch |err| @panic(@errorName(err));
             return v;
         }
 
@@ -3361,12 +3449,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     const live = try app.sseTopics(.{});
         ///     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn sseTopics(self: *Self, topic_options: sse_mod.Topics.Options) !*sse_mod.Topics {
-            const topics = try sse_mod.Topics.create(self.gpa, topic_options);
-            errdefer topics.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(sse_mod.Topics, topics));
+            const topics = try sse_mod.Topics.create(self.gpa, self.io(), topic_options);
+            try self.addConnector(sse_mod.Topics, topics);
             topics._registerDrain(self.rt.io(), &self.server.drain_hooks);
-            if (self.extras.connectors_started) try topics.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return topics;
         }
 
@@ -3379,13 +3467,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });
         pub fn sse(self: *Self, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
-            comptime checkPattern("GET", path);
-            comptime if (!sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
-            const data = self.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
-            data.* = .{ .topics = topics };
-            self.extras.sse_routes += 1;
-            if (comptime features.openapi) self.recordRoute(self.router, .get, path, sseHandlerFor(route_options));
-            self.router.addRouteWith(.get, path, route(sseHandlerFor(route_options)), .{ .data = data });
+            self.root().sse(path, topics, route_options);
         }
 
         /// A development run with `app.sse` routes and only plain
@@ -3405,16 +3487,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     _ = try app.watch(.{ .postgres = .{ .client = db, .channels = &.{"orders"} } }, .{
         ///         .to = &.{.{ .sse = .{ .topics = live, .topic = "orders" } }},
         ///     });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn watch(self: *Self, source: watch_mod.Source, watch_options: watch_mod.Options) !*watch_mod.Watch {
             const w = try watch_mod.Watch.init(self.gpa, self.rt.io(), source, watch_options);
-            errdefer w.deinit();
             if (self.mode.deployment == .lambda) {
                 w.disabled = true;
                 std.log.scoped(.anole).info("watch \"{s}\": not started under the lambda deployment (a function holds no long-lived connection to a database)", .{w.name});
             }
-            try self.extras.connectors.append(self.arena.allocator(), .of(watch_mod.Watch, w));
+            try self.addConnector(watch_mod.Watch, w);
             w._registerDrain(&self.server.drain_hooks);
-            if (self.extras.connectors_started) try w.start(self.extras.metrics, null, null);
             return w;
         }
 
@@ -3432,19 +3514,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// source it tried). Once serving it reports to `app.metrics`,
         /// `app.tracing` and, with `readiness`, `app.health`, and it is
         /// drained and closed with the server. See `anole.s3`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn s3(self: *Self, config: s3_mod.Options) !*s3_mod.Client {
             if (comptime !features.s3) @compileError("app.s3 needs the S3 client (-Ds3, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const c = try s3_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer c.deinit();
-            try self.extras.addObserved(self.arena.allocator(), s3_mod.Client, c);
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(c);
-            if (self.extras.connectors_started) try c.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return c;
+            return self.makeConnector(s3_mod.Client, config);
         }
 
         const smtp_mod = if (features.smtp) @import("smtp/root.zig") else struct {
@@ -3461,20 +3535,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Once serving, it reports to `app.metrics`, `app.tracing` and
         /// `app.health` when the app has them, and is drained and closed with
         /// the server. See `anole.smtp`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn smtp(self: *Self, config: smtp_mod.Options) !*smtp_mod.Client {
             if (comptime !features.smtp) @compileError("app.smtp needs SMTP (-Dsmtp, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            if (opts.environment == null) opts.environment = self.environment();
-            const m = try smtp_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer m.deinit();
-            try self.extras.addObserved(self.arena.allocator(), smtp_mod.Client, m);
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(m);
-            if (self.extras.connectors_started) try m.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return m;
+            return self.makeConnector(smtp_mod.Client, config);
         }
 
         /// For the Lambda adapter: what `run` does before serving (the
@@ -3482,11 +3547,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// connectors), returning the error rather than logging it, so the
         /// adapter can report it to Lambda first.
         pub fn _lambdaPrepare(self: *Self) !void {
-            self.addHelperRoutes();
-            if (comptime features.openapi) if (self.extras.openapi_failed) |err| return err;
-            if (self.router.conflict != null) return error.RouteConflict;
-            try self.server.prepareStatic();
-            self.startConnectors() catch return error.DatabaseUnavailable;
+            return self.prepare(true);
         }
 
         /// Closes the idle connections of the outbound client and of every
@@ -3790,16 +3851,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn prepareInMemoryInner(self: *Self) !void {
-            self.addHelperRoutes();
-            if (self.router.conflict) |msg| {
-                // Printed, not logged: a test that provokes it must not fail on the log.
-                std.debug.print("anole: {s}\n", .{msg});
-                return self.failStart(error.RouteConflict);
-            }
-            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
-            self.startConnectors() catch |err| {
-                errors.log.err("a database connector could not start: {t}", .{err});
-                return self.failStart(error.DatabaseUnavailable);
+            self.prepare(false) catch |err| {
+                switch (err) {
+                    // Printed, not logged: a test that provokes it must not fail on the log.
+                    error.RouteConflict => if (self.router.conflict) |msg| std.debug.print("anole: {s}\n", .{msg}),
+                    error.DatabaseUnavailable => errors.log.err("a database connector could not start: {s}", .{self.extras.failed_cause orelse "unknown"}),
+                    else => {},
+                }
+                return self.failStart(errors.toServerError(err));
             };
         }
 
@@ -3814,7 +3873,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn runInner(self: *Self) !void {
-            if (self.pending) |opts| try self.configure(opts);
+            if (Phase.next(self.phase, .configure) != null) try self.configure(self.pending);
             // `zig build openapi` and `openapi-check`: before the banner, the
             // helper routes, any listener or connector.
             {
@@ -3838,19 +3897,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.sseNote();
             logBuildMode(self.mode.debug_production);
             self.logIoEngine();
-            self.addHelperRoutes();
-            if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
-                errors.log.err("openapi: the document can't be built: {t}", .{err});
+            self.prepare(true) catch |err| {
+                if (comptime features.openapi) if (self.extras.openapi_failed) |why| {
+                    errors.log.err("openapi: the document can't be built: {t}", .{why});
+                };
                 return self.failStart(errors.toServerError(err));
             };
-            // Only with `router.record_conflicts` (the C ABI, test builds): a
-            // route that conflicted with another, or that the helper routes
-            // collided with.
-            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
-            // Before the HTTP/3 endpoint and the core `serve` start as tasks on
-            // other executors: it writes what their requests read.
-            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
-            self.startConnectors() catch return self.failStart(error.DatabaseUnavailable);
+            self.phase = Phase.next(self.phase, .serve).?;
+            defer self.phase = Phase.next(self.phase, .end).?;
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
@@ -4700,13 +4754,37 @@ test "anole.Server: a second server on the same thread is refused, and one after
     second.deinit();
 }
 
+test "Phase.next: every state x event cell" {
+    const cells = [_]struct { Phase, Phase.Event, ?Phase }{
+        .{ .building, .configure, .configured }, .{ .building, .prepare, .staged },
+        .{ .building, .serve, null },            .{ .building, .end, null },
+        .{ .configured, .configure, null },      .{ .configured, .prepare, .prepared },
+        .{ .configured, .serve, null },          .{ .configured, .end, null },
+        .{ .staged, .configure, .prepared },     .{ .staged, .prepare, .staged },
+        .{ .staged, .serve, null },              .{ .staged, .end, null },
+        .{ .prepared, .configure, null },        .{ .prepared, .prepare, .prepared },
+        .{ .prepared, .serve, .serving },        .{ .prepared, .end, null },
+        .{ .serving, .configure, null },         .{ .serving, .prepare, .serving },
+        .{ .serving, .serve, .serving },         .{ .serving, .end, .stopped },
+        .{ .stopped, .configure, null },         .{ .stopped, .prepare, .stopped },
+        .{ .stopped, .serve, .serving },         .{ .stopped, .end, null },
+    };
+    comptime std.debug.assert(cells.len == std.enums.values(Phase).len * std.enums.values(Phase.Event).len);
+    for (cells) |c| {
+        errdefer std.debug.print("{t} x {t}\n", .{ c[0], c[1] });
+        try std.testing.expectEqual(c[2], Phase.next(c[0], c[1]));
+    }
+}
+
 test "anole.Server: http listens on 127.0.0.1:8080 when nothing is set, from run on" {
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{ .executors = .exact(1) }, {});
     defer app.deinit();
     // Left for `listen`, `listenTls` or `run`.
     try std.testing.expectEqual(@as(usize, 0), app.server.config.listeners.len);
-    try app.configure(app.pending.?);
+    try std.testing.expect(app.phase == .building);
+    try app.configure(app.pending);
+    try std.testing.expect(app.phase == .configured);
     const listeners = app.server.config.listeners;
     try std.testing.expectEqual(@as(usize, 1), listeners.len);
     const ip = listeners[0].address.ip;
@@ -5533,7 +5611,7 @@ test "console: addObserved gives a connector slot index + 1 and start keeps it" 
     try std.testing.expect(second.observer.metrics == null);
 }
 
-test "anole.Server: a connector added after the start whose start fails leaves no entry behind" {
+test "anole.Server: a connector added after the start whose start fails keeps its entry and is freed once" {
     if (comptime !features.s3) return error.SkipZigTest;
     const expected_log = @import("errors.zig").expectLog();
     defer expected_log.deinit();
@@ -5543,8 +5621,9 @@ test "anole.Server: a connector added after the start whose start fails leaves n
     try app.startConnectors();
     const before = app.extras.connectors.items.len;
     // A non-AWS endpoint and an empty environment: no credentials, the start fails.
+    // The entry stays (what the start handed out never dangles); the teardown frees it once.
     try std.testing.expectError(error.DatabaseUnavailable, app.s3(.{ .endpoint = "http://127.0.0.1:9", .bucket = "b", .environ = .empty }));
-    try std.testing.expectEqual(before, app.extras.connectors.items.len);
+    try std.testing.expectEqual(before + 1, app.extras.connectors.items.len);
 }
 
 test "console: each database and service connector keeps its /db system name" {
@@ -5563,4 +5642,81 @@ test "console: each database and service connector keeps its /db system name" {
     if (features.kafka) try std.testing.expectEqualStrings("kafka", Name.of(kafka_mod.Client));
     if (features.s3) try std.testing.expectEqualStrings("s3", Name.of(@import("s3/root.zig").Client));
     if (features.smtp) try std.testing.expectEqualStrings("smtp", Name.of(@import("smtp/root.zig").Client));
+}
+
+test "Server: a late connector gets the app's metrics and health, as one made before" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    const registry = app.metrics(.{});
+    const health = app.health(.{});
+    try app.startConnectors();
+    const expect = struct {
+        fn late(registry_: *observe.metrics.Registry, health_: *observe.Health, before: usize, comptime system: []const u8) !void {
+            var buf: [64 * 1024]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            try registry_.render(&w);
+            try std.testing.expect(std.mem.find(u8, w.buffered(), "anole_db_pool_connections{system=\"" ++ system ++ "\"") != null);
+            try std.testing.expectEqual(before + 1, health_.len);
+        }
+    };
+    if (comptime features.sqlite) {
+        const before = health.len;
+        _ = try app.sqlite(":memory:");
+        try expect.late(registry, health, before, "sqlite");
+    }
+    if (comptime features.postgres) {
+        const before = health.len;
+        _ = try app.postgres(.{ .url = "postgres://u@127.0.0.1:1/d", .environ = .empty });
+        try expect.late(registry, health, before, "postgresql");
+    }
+    if (comptime features.redis) {
+        const before = health.len;
+        _ = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
+        try expect.late(registry, health, before, "redis");
+    }
+}
+
+test "Server: a connector's late start runs through addConnector (stub rows)" {
+    const Stub = struct {
+        fail: bool,
+        starts: u32 = 0,
+        deinits: u32 = 0,
+        saw_args: bool = false,
+        fn start(self: *@This(), metrics_: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, health_: ?*observe.Health) !void {
+            self.starts += 1;
+            self.saw_args = metrics_ != null and health_ != null;
+            if (self.fail) return error.ServiceUnavailable;
+        }
+        fn deinit(self: *@This()) void {
+            self.deinits += 1;
+        }
+    };
+    const rows = [_]struct { name: []const u8, started_first: bool, fail: bool, want_starts: u32 }{
+        .{ .name = "before startConnectors: registered, not started", .started_first = false, .fail = false, .want_starts = 0 },
+        .{ .name = "after startConnectors: started once with the app's metrics and health", .started_first = true, .fail = false, .want_starts = 1 },
+        .{ .name = "after, start fails: error returned, entry stays, nothing freed", .started_first = true, .fail = true, .want_starts = 1 },
+    };
+    for (rows) |row| {
+        var app = try Server(void).init(std.testing.allocator, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+        _ = app.metrics(.{});
+        _ = app.health(.{});
+        var stub: Stub = .{ .fail = row.fail };
+        if (row.started_first) try app.startConnectors();
+        const result = app.addConnector(Stub, &stub);
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        if (row.fail) try std.testing.expectError(error.ServiceUnavailable, result) else try result;
+        try std.testing.expectEqual(row.want_starts, stub.starts);
+        try std.testing.expect(row.want_starts == 0 or stub.saw_args);
+        try std.testing.expectEqual(@as(usize, 1), app.extras.connectors.items.len);
+        try std.testing.expectEqual(@as(u32, 0), stub.deinits);
+        try std.testing.expect(app.extras.failed_system == null);
+        if (!row.started_first) {
+            try app.startConnectors();
+            try app.startConnectors();
+            try std.testing.expectEqual(@as(u32, 1), stub.starts);
+        }
+        app.deinit();
+        try std.testing.expectEqual(@as(u32, 1), stub.deinits);
+    }
 }

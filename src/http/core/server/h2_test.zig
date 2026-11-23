@@ -1381,7 +1381,7 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             // A stream window of zero (the client's SETTINGS): the server may
             // send the head, never the body.
             var client: TestClient = undefined;
-            try client.initOptions(std.testing.allocator, io, server.address.ip, .{ .initial_window = 0, .connection_window = harness.default_window });
+            try client.initOptions(std.testing.allocator, io, server.address.ip, .{ .http2 = .{ .stream_window = 0, .connection_window = harness.default_window } });
             defer client.deinit();
             // The request timeout (300 ms) ends the stream; without it, only the
             // keep-alive timeout (60 s) would, which only test-timing tells apart.

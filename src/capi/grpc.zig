@@ -877,8 +877,8 @@ fn freeRecord(rec: []align(8) u8) void {
 /// collected, not streamed).
 fn answerWhole(call: *Call, s: *Slot) !void {
     var buf: std.ArrayList(u8) = .empty;
-    call.impl.buffer = &buf;
-    defer call.impl.buffer = null;
+    call.impl.sink = .{ .collect = &buf };
+    defer call.impl.sink = .unset;
     const result = applyWhole(call, s);
     return serving.finish(call, result);
 }
@@ -963,7 +963,7 @@ fn stream(x: *Exec, si: u32, gen: u32, call: *Call) anyerror!void {
     const e = x.engine;
     const g = &s.grpc;
     var out_buf: [16 * 1024]u8 = undefined;
-    call.impl.out_buf = &out_buf;
+    call.impl.sink = .{ .armed = &out_buf };
     applyInitial(call, s) catch |err| {
         streamGone(x, si, gen);
         return serving.finish(call, err);
@@ -1112,12 +1112,12 @@ pub fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const call = s.grpc.call;
     const d = s.owner.take();
     var buf: std.ArrayList(u8) = .empty;
-    call.impl.buffer = &buf;
+    call.impl.sink = .{ .collect = &buf };
     const result = if (abandoning)
         serving.finish(call, call.fail(.unavailable, "the server is stopping"))
     else
         serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
-    call.impl.buffer = null;
+    call.impl.sink = .unset;
     d.finish(result);
     x.release(si);
 }

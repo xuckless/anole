@@ -13,7 +13,7 @@ const api_key_text = "ak_test_key_not_a_secret";
 fn start(state: *app_main.App) !Server {
     state.* = .{
         .db = undefined,
-        .rooms = .init(alloc, .{}),
+        .rooms = undefined,
         .live = undefined,
         .jobs = undefined,
         .jwt_keys = .{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = secret } }},
@@ -24,6 +24,7 @@ fn start(state: *app_main.App) !Server {
     std.crypto.hash.sha2.Sha256.hash(api_key_text, &state.api_key_digest, .{});
     var app = try Server.init(alloc, .{ .executors = .exact(2) }, state);
     errdefer app.deinit();
+    state.rooms = .init(alloc, app.io(), .{});
     state.db = try app.sqlite(":memory:");
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();

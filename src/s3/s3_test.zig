@@ -116,27 +116,29 @@ test "s3: put, get, head, delete round trip; content type from the extension; me
     const env = try Env.init(.{});
     defer env.deinit();
     errdefer env.why();
-    const stored = try env.client.put(env.c(), "docs/readme.txt", .{ .bytes = "hello s3" }, .{ .metadata = &.{.{ "Owner", "ada" }} });
+    const stored = try env.client.default().put(env.c(), "docs/readme.txt", .{ .bytes = "hello s3" }, .{ .metadata = &.{.{ "Owner", "ada" }} });
     try testing.expect(stored.etag.len > 2);
-    const obj = try env.client.get(env.c(), "docs/readme.txt", .{});
+    const obj = try env.client.default().get(env.c(), "docs/readme.txt", .{});
     try testing.expectEqualStrings("hello s3", obj.body);
     try testing.expect(std.mem.startsWith(u8, obj.meta.content_type.?, "text/plain"));
     try testing.expectEqualStrings("ada", obj.meta.meta("owner").?);
     try testing.expectEqual(@as(u64, 8), obj.meta.size);
-    const m = try env.client.head(env.c(), "docs/readme.txt", .{});
+    const m = try env.client.default().head(env.c(), "docs/readme.txt", .{});
     try testing.expectEqual(@as(u64, 8), m.content_length);
-    try testing.expect(try env.client.exists(env.c(), "docs/readme.txt"));
-    try env.client.delete(env.c(), "docs/readme.txt", .{});
-    try testing.expect(!(try env.client.exists(env.c(), "docs/readme.txt")));
+    try testing.expectEqualStrings("hello s3", (try env.client.bucket("b").get(env.c(), "docs/readme.txt", .{})).body);
+    try testing.expectEqual(m.content_length, (try env.client.with(.{}).head(env.c(), "docs/readme.txt", .{})).content_length);
+    try testing.expect(try env.client.default().exists(env.c(), "docs/readme.txt"));
+    try env.client.default().delete(env.c(), "docs/readme.txt", .{});
+    try testing.expect(!(try env.client.default().exists(env.c(), "docs/readme.txt")));
     try testing.expectEqual(@as(u32, 0), env.fake.signature_failures);
 }
 
 test "s3: a key with spaces and unicode is signed and stored" {
     const env = try Env.init(.{});
     defer env.deinit();
-    _ = try env.client.put(env.c(), "a b/é+c&d.bin", .{ .bytes = "x" }, .{});
+    _ = try env.client.default().put(env.c(), "a b/é+c&d.bin", .{ .bytes = "x" }, .{});
     try testing.expectEqualStrings("x", env.fake.getObject("b", "a b/é+c&d.bin").?);
-    try testing.expectEqualStrings("x", (try env.client.get(env.c(), "a b/é+c&d.bin", .{})).body);
+    try testing.expectEqualStrings("x", (try env.client.default().get(env.c(), "a b/é+c&d.bin", .{})).body);
     try testing.expectEqual(@as(u32, 0), env.fake.signature_failures);
 }
 
@@ -145,21 +147,21 @@ test "s3: get of a missing key is NotFound with lastError NoSuchKey; optional re
     defer env.deinit();
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.NotFound, env.client.get(env.c(), "nope", .{}));
+    try testing.expectError(error.NotFound, env.client.default().get(env.c(), "nope", .{}));
     try testing.expectEqualStrings("NoSuchKey", env.lastCode());
-    try testing.expect((try env.client.optional(env.c(), "nope", .{})) == null);
+    try testing.expect((try env.client.default().optional(env.c(), "nope", .{})) == null);
 }
 
 test "s3: get with max_bytes smaller than the object fails object_too_large; open streams it" {
     const env = try Env.init(.{});
     defer env.deinit();
     const data = try pattern(env.ctx.arena, 100_000, 3);
-    _ = try env.client.put(env.c(), "big.bin", .{ .bytes = data }, .{});
+    _ = try env.client.default().put(env.c(), "big.bin", .{ .bytes = data }, .{});
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.BadRequest, env.client.get(env.c(), "big.bin", .{ .max_bytes = 1000 }));
+    try testing.expectError(error.BadRequest, env.client.default().get(env.c(), "big.bin", .{ .max_bytes = 1000 }));
     try testing.expectEqualStrings("object_too_large", env.lastCode());
-    var dl = try env.client.open(env.c(), "big.bin", .{});
+    var dl = try env.client.default().open(env.c(), "big.bin", .{});
     defer dl.deinit();
     var out: std.Io.Writer.Allocating = .init(env.ctx.arena);
     const n = try dl.pipe(&out.writer);
@@ -170,42 +172,42 @@ test "s3: get with max_bytes smaller than the object fails object_too_large; ope
 test "s3: range 0-9 gives 206 with the whole size; a range past the end is BadRequest" {
     const env = try Env.init(.{});
     defer env.deinit();
-    _ = try env.client.put(env.c(), "r.txt", .{ .bytes = "0123456789abcdef" }, .{});
-    const obj = try env.client.get(env.c(), "r.txt", .{ .range = .{ .start = 0, .end = 9 } });
+    _ = try env.client.default().put(env.c(), "r.txt", .{ .bytes = "0123456789abcdef" }, .{});
+    const obj = try env.client.default().get(env.c(), "r.txt", .{ .range = .{ .start = 0, .end = 9 } });
     try testing.expectEqual(@as(u16, 206), obj.meta.status);
     try testing.expectEqualStrings("0123456789", obj.body);
     try testing.expectEqual(@as(u64, 10), obj.meta.content_length);
     try testing.expectEqual(@as(u64, 16), obj.meta.size);
-    const tail = try env.client.get(env.c(), "r.txt", .{ .range = .{ .start = 10 } });
+    const tail = try env.client.default().get(env.c(), "r.txt", .{ .range = .{ .start = 10 } });
     try testing.expectEqualStrings("abcdef", tail.body);
     try testing.expectEqual(@as(u64, 10), tail.meta.range_start);
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.BadRequest, env.client.get(env.c(), "r.txt", .{ .range = .{ .start = 100 } }));
+    try testing.expectError(error.BadRequest, env.client.default().get(env.c(), "r.txt", .{ .range = .{ .start = 100 } }));
     try testing.expectEqualStrings("InvalidRange", env.lastCode());
 }
 
 test "s3: if_none_match with the current etag is not_modified; if_match with another is Conflict" {
     const env = try Env.init(.{});
     defer env.deinit();
-    const stored = try env.client.put(env.c(), "c.txt", .{ .bytes = "x" }, .{});
-    const same = try env.client.get(env.c(), "c.txt", .{ .if_none_match = stored.etag });
+    const stored = try env.client.default().put(env.c(), "c.txt", .{ .bytes = "x" }, .{});
+    const same = try env.client.default().get(env.c(), "c.txt", .{ .if_none_match = stored.etag });
     try testing.expect(same.meta.not_modified);
     try testing.expectEqual(@as(u16, 304), same.meta.status);
     try testing.expectEqual(@as(usize, 0), same.body.len);
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.Conflict, env.client.get(env.c(), "c.txt", .{ .if_match = "\"other\"" }));
+    try testing.expectError(error.Conflict, env.client.default().get(env.c(), "c.txt", .{ .if_match = "\"other\"" }));
     try testing.expectEqualStrings("PreconditionFailed", env.lastCode());
 }
 
 test "s3: put if_absent twice: the second is Conflict" {
     const env = try Env.init(.{});
     defer env.deinit();
-    _ = try env.client.put(env.c(), "once", .{ .bytes = "1" }, .{ .if_absent = true });
+    _ = try env.client.default().put(env.c(), "once", .{ .bytes = "1" }, .{ .if_absent = true });
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.Conflict, env.client.put(env.c(), "once", .{ .bytes = "2" }, .{ .if_absent = true }));
+    try testing.expectError(error.Conflict, env.client.default().put(env.c(), "once", .{ .bytes = "2" }, .{ .if_absent = true }));
     try testing.expectEqualStrings("1", env.fake.getObject("b", "once").?);
 }
 
@@ -213,7 +215,7 @@ test "s3: put of 11 MiB goes up as three parts, completed in order" {
     const env = try Env.init(.{ .part_size = 5 * mib });
     defer env.deinit();
     const data = try pattern(env.ctx.arena, 11 * mib, 7);
-    const stored = try env.client.put(env.c(), "big/multi.bin", .{ .bytes = data }, .{});
+    const stored = try env.client.default().put(env.c(), "big/multi.bin", .{ .bytes = data }, .{});
     try testing.expectEqual(@as(u32, 3), stored.parts);
     // The result outlives the upload: its strings are the caller's, not the
     // upload's arena (freed when put returns; the test allocator poisons it).
@@ -230,7 +232,7 @@ test "s3: a body of exactly one part is one PUT, not multipart" {
     const env = try Env.init(.{ .part_size = 5 * mib });
     defer env.deinit();
     const data = try pattern(env.ctx.arena, 5 * mib, 1);
-    var up = try env.client.upload(env.c(), "exact.bin", .{});
+    var up = try env.client.default().upload(env.c(), "exact.bin", .{});
     defer up.deinit();
     var off: usize = 0;
     while (off < data.len) {
@@ -249,13 +251,13 @@ test "s3: put from a reader with a length: one PUT up to the threshold; a short 
     const env = try Env.init(.{});
     defer env.deinit();
     var r: std.Io.Reader = .fixed("twelve bytes");
-    const stored = try env.client.put(env.c(), "r.txt", .{ .reader = .{ .reader = &r, .len = 12 } }, .{});
+    const stored = try env.client.default().put(env.c(), "r.txt", .{ .reader = .{ .reader = &r, .len = 12 } }, .{});
     try testing.expectEqual(@as(u32, 0), stored.parts);
     try testing.expectEqualStrings("twelve bytes", env.fake.getObject("b", "r.txt").?);
     var short: std.Io.Reader = .fixed("abc");
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.BadRequest, env.client.put(env.c(), "s.txt", .{ .reader = .{ .reader = &short, .len = 10 } }, .{}));
+    try testing.expectError(error.BadRequest, env.client.default().put(env.c(), "s.txt", .{ .reader = .{ .reader = &short, .len = 10 } }, .{}));
     try testing.expectEqualStrings("short_body", env.lastCode());
 }
 
@@ -264,7 +266,7 @@ test "s3: put from a reader of unknown length streams it as parts" {
     defer env.deinit();
     const data = try pattern(env.ctx.arena, 7 * mib, 21);
     var r: std.Io.Reader = .fixed(data);
-    const stored = try env.client.put(env.c(), "stream.bin", .{ .reader = .{ .reader = &r } }, .{});
+    const stored = try env.client.default().put(env.c(), "stream.bin", .{ .reader = .{ .reader = &r } }, .{});
     try testing.expectEqual(@as(u32, 2), stored.parts);
     try testing.expectEqualSlices(u8, data, env.fake.getObject("b", "stream.bin").?);
 }
@@ -273,7 +275,7 @@ test "s3: push upload: ok to one part, busy past it, upload_full a part more" {
     const env = try Env.init(.{ .part_size = 5 * mib, .concurrency = 1 });
     defer env.deinit();
     env.fake.hold_parts = true;
-    var up = try env.client.upload(env.c(), "push.bin", .{});
+    var up = try env.client.default().upload(env.c(), "push.bin", .{});
     defer up.deinit();
     const chunk = try pattern(env.ctx.arena, mib, 5);
     // 5 MiB = concurrency * part_size: ok up to it.
@@ -297,7 +299,7 @@ test "s3: push upload: waitWritable returns after a part completes" {
     const env = try Env.init(.{ .part_size = 5 * mib, .concurrency = 1 });
     defer env.deinit();
     env.fake.hold_parts = true;
-    var up = try env.client.upload(env.c(), "push2.bin", .{});
+    var up = try env.client.default().upload(env.c(), "push2.bin", .{});
     defer up.deinit();
     const chunk = try pattern(env.ctx.arena, mib, 5);
     for (0..5) |_| _ = try up.write(env.c(), chunk);
@@ -318,7 +320,7 @@ test "s3: a finished upload gives all of its upload_memory back (c65fb0b)" {
     defer env.deinit();
     const chunk = try pattern(env.ctx.arena, mib, 6);
     {
-        var up = try env.client.upload(env.c(), "first.bin", .{});
+        var up = try env.client.default().upload(env.c(), "first.bin", .{});
         defer up.deinit();
         for (0..6) |_| {
             if (try up.write(env.c(), chunk) == .busy) try up.waitWritable(env.c(), null);
@@ -326,7 +328,7 @@ test "s3: a finished upload gives all of its upload_memory back (c65fb0b)" {
         const stored = try up.finish(env.c());
         try testing.expectEqual(@as(u32, 2), stored.parts);
     }
-    var again = try env.client.upload(env.c(), "again.bin", .{});
+    var again = try env.client.default().upload(env.c(), "again.bin", .{});
     defer again.deinit();
     for (0..10) |_| {
         if (try again.write(env.c(), chunk) == .busy) try again.waitWritable(env.c(), null);
@@ -341,7 +343,7 @@ test "s3: a part failing three times aborts the upload; later writes fail with i
     try env.fake.addFault(.{ .method = "PUT", .query = "partNumber", .remaining = 1000, .status = 500, .code = "InternalError" });
     const q = Quiet.on();
     defer q.done();
-    var up = try env.client.upload(env.c(), "fail.bin", .{});
+    var up = try env.client.default().upload(env.c(), "fail.bin", .{});
     defer up.deinit();
     const chunk = try pattern(env.ctx.arena, mib, 2);
     var failed = false;
@@ -374,7 +376,7 @@ test "s3: a part failing three times aborts the upload; later writes fail with i
 test "s3: deinit before finish aborts the multipart upload" {
     const env = try Env.init(.{ .part_size = 5 * mib });
     defer env.deinit();
-    var up = try env.client.upload(env.c(), "abandoned.bin", .{});
+    var up = try env.client.default().upload(env.c(), "abandoned.bin", .{});
     const data = try pattern(env.ctx.arena, 6 * mib, 4);
     _ = try up.write(env.c(), data);
     // A part request means the server knows the upload and so do we.
@@ -417,7 +419,7 @@ test "s3: upload lifecycle: calls after finish, a failure or abort; deinit in ea
         const q = Quiet.on();
         defer q.done();
         const data = try pattern(env.ctx.arena, 6 * mib, 7);
-        const up = try env.client.upload(env.c(), "life.bin", .{});
+        const up = try env.client.default().upload(env.c(), "life.bin", .{});
         for (row.steps) |s| {
             const r: anyerror!void = switch (s.op) {
                 .write => if (up.write(env.c(), data[0..1])) |_| {} else |e| e,
@@ -448,9 +450,9 @@ test "s3: upload lifecycle: calls after finish, a failure or abort; deinit in ea
 test "s3: upload_memory is shared: a second upload cannot take a buffer while the first holds it" {
     const env = try Env.init(.{ .part_size = 5 * mib, .upload_memory = 5 * mib });
     defer env.deinit();
-    var a = try env.client.upload(env.c(), "a", .{});
+    var a = try env.client.default().upload(env.c(), "a", .{});
     defer a.deinit();
-    var b = try env.client.upload(env.c(), "b", .{});
+    var b = try env.client.default().upload(env.c(), "b", .{});
     defer b.deinit();
     _ = try a.write(env.c(), "x");
     const q = Quiet.on();
@@ -459,7 +461,7 @@ test "s3: upload_memory is shared: a second upload cannot take a buffer while th
     try testing.expectEqualStrings("upload_full", env.lastCode());
     _ = try a.finish(env.c());
     a.deinit();
-    a = try env.client.upload(env.c(), "a2", .{});
+    a = try env.client.default().upload(env.c(), "a2", .{});
     // The memory is back.
     _ = try b.write(env.c(), "y");
     _ = try b.finish(env.c());
@@ -469,7 +471,7 @@ test "s3: retry: 503 SlowDown twice then 200 is three requests; with retry false
     const env = try Env.init(.{});
     defer env.deinit();
     try env.fake.addFault(.{ .method = "PUT", .remaining = 2 });
-    _ = try env.client.put(env.c(), "k", .{ .bytes = "v" }, .{});
+    _ = try env.client.default().put(env.c(), "k", .{ .bytes = "v" }, .{});
     try testing.expectEqual(@as(usize, 3), env.fake.count("PUT", "/b/k"));
 
     try env.fake.addFault(.{ .method = "PUT", .remaining = 1 });
@@ -486,9 +488,9 @@ test "s3: RequestTimeTooSkewed teaches the clock and the call is repeated once" 
     // The fake's clock is an hour ahead: the first request is refused and
     // repeated with the learned offset; the next call is right the first time.
     env.fake.clock_offset_s = 3600;
-    _ = try env.client.put(env.c(), "skew", .{ .bytes = "v" }, .{});
+    _ = try env.client.default().put(env.c(), "skew", .{ .bytes = "v" }, .{});
     try testing.expectEqual(@as(usize, 2), env.fake.count("PUT", "/b/skew"));
-    _ = try env.client.put(env.c(), "skew2", .{ .bytes = "v" }, .{});
+    _ = try env.client.default().put(env.c(), "skew2", .{ .bytes = "v" }, .{});
     try testing.expectEqual(@as(usize, 1), env.fake.count("PUT", "/b/skew2"));
 }
 
@@ -498,21 +500,21 @@ test "s3: refused connects open the breaker; the next call is ServiceUnavailable
     const q = Quiet.on();
     defer q.done();
     for (0..3) |_| {
-        try testing.expectError(error.ServiceUnavailable, env.client.get(env.c(), "k", .{}));
+        try testing.expectError(error.ServiceUnavailable, env.client.default().get(env.c(), "k", .{}));
         try testing.expectEqualStrings("transport", env.lastCode());
     }
-    try testing.expectError(error.ServiceUnavailable, env.client.get(env.c(), "k", .{}));
+    try testing.expectError(error.ServiceUnavailable, env.client.default().get(env.c(), "k", .{}));
     try testing.expectEqualStrings("circuit_open", env.lastCode());
 }
 
 test "s3: a 200 answer to CopyObject whose body is an Error is that error" {
     const env = try Env.init(.{ .retry = null });
     defer env.deinit();
-    _ = try env.client.put(env.c(), "src", .{ .bytes = "v" }, .{});
+    _ = try env.client.default().put(env.c(), "src", .{ .bytes = "v" }, .{});
     try env.fake.addFault(.{ .method = "PUT", .remaining = 1, .status = 200, .code = "InternalError" });
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.ServiceUnavailable, env.client.copy(env.c(), .{ .key = "src" }, "dst", .{}));
+    try testing.expectError(error.ServiceUnavailable, env.client.default().copy(env.c(), .{ .key = "src" }, "dst", .{}));
     try testing.expectEqualStrings("InternalError", env.lastCode());
 }
 
@@ -520,18 +522,18 @@ test "s3: list: pages through iterate, a delimiter gives prefixes, control chara
     const env = try Env.init(.{});
     defer env.deinit();
     for ([_][]const u8{ "a/1", "a/2", "b/1", "c", "d\ne" }) |k| try env.fake.putObject("b", k, "x", "text/plain");
-    var it = env.client.iterate(env.c(), .{ .max_keys = 2 });
+    var it = env.client.default().iterate(env.c(), .{ .max_keys = 2 });
     var keys: std.ArrayList([]const u8) = .empty;
     while (try it.next(env.c())) |e| try keys.append(env.ctx.arena, e.key);
     try testing.expectEqual(@as(usize, 5), keys.items.len);
     try testing.expectEqualStrings("a/1", keys.items[0]);
     try testing.expectEqualStrings("d\ne", keys.items[4]);
-    const page = try env.client.list(env.c(), .{ .delimiter = "/" });
+    const page = try env.client.default().list(env.c(), .{ .delimiter = "/" });
     try testing.expectEqual(@as(usize, 2), page.prefixes.len);
     try testing.expectEqual(@as(usize, 2), page.entries.len);
     try testing.expectEqualStrings("a/", page.prefixes[0]);
     try testing.expect(page.next == null);
-    const first = try env.client.list(env.c(), .{ .max_keys = 2 });
+    const first = try env.client.default().list(env.c(), .{ .max_keys = 2 });
     try testing.expect(first.next != null);
     try testing.expectEqual(@as(usize, 2), first.entries.len);
 }
@@ -542,7 +544,7 @@ test "s3: deleteMany sends 1000 keys per request with Content-MD5" {
     const keys = try env.ctx.arena.alloc([]const u8, 2500);
     for (keys, 0..) |*k, i| k.* = try std.fmt.allocPrint(env.ctx.arena, "k/{d}", .{i});
     try env.fake.putObject("b", "k/7", "x", "text/plain");
-    const r = try env.client.deleteMany(env.c(), keys);
+    const r = try env.client.default().deleteMany(env.c(), keys);
     try testing.expectEqual(@as(u32, 2500), r.deleted);
     try testing.expectEqual(@as(usize, 0), r.failed.len);
     try testing.expectEqual(@as(usize, 3), env.fake.count("POST", "delete"));
@@ -552,11 +554,11 @@ test "s3: deleteMany sends 1000 keys per request with Content-MD5" {
 test "s3: copy keeps the metadata unless replace_metadata is set" {
     const env = try Env.init(.{});
     defer env.deinit();
-    _ = try env.client.put(env.c(), "orig", .{ .bytes = "payload" }, .{ .metadata = &.{.{ "tag", "one" }} });
-    _ = try env.client.copy(env.c(), .{ .key = "orig" }, "copy1", .{});
-    try testing.expectEqualStrings("one", (try env.client.head(env.c(), "copy1", .{})).meta("tag").?);
-    _ = try env.client.copy(env.c(), .{ .key = "orig" }, "copy2", .{ .replace_metadata = true, .metadata = &.{.{ "tag", "two" }} });
-    try testing.expectEqualStrings("two", (try env.client.head(env.c(), "copy2", .{})).meta("tag").?);
+    _ = try env.client.default().put(env.c(), "orig", .{ .bytes = "payload" }, .{ .metadata = &.{.{ "tag", "one" }} });
+    _ = try env.client.default().copy(env.c(), .{ .key = "orig" }, "copy1", .{});
+    try testing.expectEqualStrings("one", (try env.client.default().head(env.c(), "copy1", .{})).meta("tag").?);
+    _ = try env.client.default().copy(env.c(), .{ .key = "orig" }, "copy2", .{ .replace_metadata = true, .metadata = &.{.{ "tag", "two" }} });
+    try testing.expectEqualStrings("two", (try env.client.default().head(env.c(), "copy2", .{})).meta("tag").?);
     try testing.expectEqualStrings("payload", env.fake.getObject("b", "copy2").?);
 }
 
@@ -576,7 +578,7 @@ fn rawPut(url: []const u8, headers: []const [2][]const u8, body: []const u8) !u1
 test "s3: a presigned PUT with content_length accepts that length and refuses another" {
     const env = try Env.init(.{});
     defer env.deinit();
-    const url = try env.client.presign(env.c(), .put, "up/presigned.txt", .{ .content_type = "text/plain", .content_length = 5 });
+    const url = try env.client.default().presign(env.c(), .put, "up/presigned.txt", .{ .content_type = "text/plain", .content_length = 5 });
     try testing.expectEqual(@as(u16, 200), try rawPut(url, &.{.{ "Content-Type", "text/plain" }}, "12345"));
     try testing.expectEqualStrings("12345", env.fake.getObject("b", "up/presigned.txt").?);
     // The browser sends another length: the signature does not cover it.
@@ -587,8 +589,8 @@ test "s3: a presigned PUT with content_length accepts that length and refuses an
 test "s3: a presigned GET is usable by anyone; a zero expiry is refused" {
     const env = try Env.init(.{});
     defer env.deinit();
-    _ = try env.client.put(env.c(), "pub.txt", .{ .bytes = "public" }, .{});
-    const url = try env.client.presign(env.c(), .get, "pub.txt", .{ .expires = .fromSeconds(60), .response_content_type = "text/x-test" });
+    _ = try env.client.default().put(env.c(), "pub.txt", .{ .bytes = "public" }, .{});
+    const url = try env.client.default().presign(env.c(), .get, "pub.txt", .{ .expires = .fromSeconds(60), .response_content_type = "text/x-test" });
     var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     var resp = try http.fetch(url, .{});
@@ -597,19 +599,19 @@ test "s3: a presigned GET is usable by anyone; a zero expiry is refused" {
     try testing.expectEqualStrings("public", (try resp.body()).?);
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.BadRequest, env.client.presign(env.c(), .get, "k", .{ .expires = .fromSeconds(0) }));
+    try testing.expectError(error.BadRequest, env.client.default().presign(env.c(), .get, "k", .{ .expires = .fromSeconds(0) }));
 }
 
 test "s3: multipart for browsers: create, presigned upload_part URLs, complete" {
     const env = try Env.init(.{});
     defer env.deinit();
-    const mp = env.client.multipart();
+    const mp = env.client.default().multipart();
     const id = try mp.create(env.c(), "browser.bin", .{ .content_type = "application/octet-stream" });
     const part1 = try pattern(env.ctx.arena, 5 * mib, 1);
     const part2 = "tail";
     var parts: [2]s3.Part = undefined;
     for ([_][]const u8{ part1, part2 }, 0..) |data, i| {
-        const url = try env.client.presign(env.c(), .upload_part, "browser.bin", .{ .upload_id = id, .part_number = @intCast(i + 1) });
+        const url = try env.client.default().presign(env.c(), .upload_part, "browser.bin", .{ .upload_id = id, .part_number = @intCast(i + 1) });
         var http = dusty.Client.init(testing.allocator, tio(), .{});
         defer http.deinit();
         var resp = try http.fetch(url, .{ .method = .put, .body = data, .decompress = false });
@@ -655,7 +657,7 @@ test "s3: drain: a new upload is ServiceUnavailable (draining)" {
     env.client.drain(std.Io.Clock.Timestamp.now(tio(), .awake));
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.ServiceUnavailable, env.client.upload(env.c(), "k", .{}));
+    try testing.expectError(error.ServiceUnavailable, env.client.default().upload(env.c(), "k", .{}));
     try testing.expectEqualStrings("draining", env.lastCode());
 }
 
@@ -671,7 +673,7 @@ test "s3: a call without a bucket is a BadRequest with a clear code; bucket(name
     var c: db.Ctx = .{ .io = tio(), .arena = arena.allocator() };
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.BadRequest, client.get(&c, "k", .{}));
+    try testing.expectError(error.BadRequest, client.default().get(&c, "k", .{}));
     try testing.expectEqualStrings("no_bucket", db.lastError(&c).?.code);
     _ = try client.bucket("other").put(&c, "k", .{ .bytes = "v" }, .{});
     try testing.expectEqualStrings("v", fake.getObject("other", "k").?);
@@ -698,7 +700,7 @@ const Gateway = struct {
     last_code_len: usize = 0,
 
     fn serve(self: *Gateway, req: *dusty.Request, res: *dusty.Response) !void {
-        _ = self.files.serve(req, res, req.params.get("rest") orelse "", .{}) catch |err| {
+        _ = self.files.default().serve(req, res, req.params.get("rest") orelse "", .{}) catch |err| {
             if (err == error.NotFound) {
                 res.status = .not_found;
                 res.body = "no such file";
@@ -709,7 +711,7 @@ const Gateway = struct {
     }
 
     fn upload(self: *Gateway, req: *dusty.Request, res: *dusty.Response) !void {
-        const stored = self.files.put(req, "uploaded.bin", .request, .{}) catch |err| {
+        const stored = self.files.default().put(req, "uploaded.bin", .request, .{}) catch |err| {
             if (db.lastError(req)) |d| {
                 const n = @min(d.code.len, self.last_code.len);
                 @memcpy(self.last_code[0..n], d.code[0..n]);
@@ -945,7 +947,7 @@ test "s3: anonymous credentials send unsigned requests (the fake refuses them)" 
     var c: db.Ctx = .{ .io = tio(), .arena = arena.allocator() };
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.Database, client.get(&c, "k", .{}));
+    try testing.expectError(error.Database, client.default().get(&c, "k", .{}));
     try testing.expectEqualStrings("SignatureDoesNotMatch", db.lastError(&c).?.code);
 }
 
