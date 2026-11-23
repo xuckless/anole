@@ -68,13 +68,20 @@ pub const Scope = union(enum) {
 /// What the server said about the last failed command, kept by the
 /// commands' `accepts` hook for the resume decision.
 const ErrInfo = struct {
-    have: bool = false,
-    code: i64 = 0,
-    resumable_label: bool = false,
-    non_resumable_label: bool = false,
+    code: i64,
+    /// The server's label; when it sends both, non-resumable wins.
+    label: enum { none, resumable, non_resumable },
 };
 
-const Mode = enum { none, resume_after, start_after, operation_time };
+/// Where a resume starts, which `$changeStream` option it takes (tokens
+/// are owned documents). Every transition is in `open`, `OpenCmd.result`,
+/// `takeToken`; `writeAggregate` reads it.
+const Resume = union(enum) {
+    none,
+    start_after: []u8,
+    resume_after: []u8,
+    at_time: bson.Timestamp,
+};
 
 /// A change stream over BSON events; `ChangeStream(T)` decodes them.
 pub const Stream = struct {
@@ -84,27 +91,27 @@ pub const Stream = struct {
     opts: ChangeStreamOptions,
     /// The user's stages after `$changeStream`: a BSON array, owned.
     stages: []u8,
-    /// The cursor.
-    id: i64 = 0,
-    server: *client_mod.Server = undefined,
-    session: ?*client_mod.Session = null,
-    /// The cursor's collection name for `getMore` (from the reply's `ns`).
-    more_collection: []u8 = &.{},
+    /// The server's cursor; null once it is exhausted, closed or failed.
+    cursor: ?Cursor = null,
     /// The current batch (a BSON array), owned, and the read position in it.
     buf: std.ArrayList(u8) = .empty,
     it: @TypeOf(bson.Array.empty.iterator()) = (bson.Array.empty).iterator(),
-    /// The resume token to use (an event's `_id` or a batch's
-    /// `postBatchResumeToken`), a document, owned.
-    token: ?[]u8 = null,
-    /// The batch's `postBatchResumeToken`, owned; becomes `token` once the
-    /// batch is read through.
+    /// The resume point: an event's `_id` or a batch's
+    /// `postBatchResumeToken` replace it as they are read.
+    @"resume": Resume = .none,
+    /// The batch's `postBatchResumeToken`, owned; becomes the resume token
+    /// once the batch is read through.
     pbrt: ?[]u8 = null,
-    initial: Mode = .none,
-    initial_time: ?bson.Timestamp = null,
-    /// The open's `operationTime`, for a resume before any token.
-    op_time: ?bson.Timestamp = null,
-    had_event: bool = false,
-    err: ErrInfo = .{},
+    /// The last failed command's error, for the resume decision.
+    err: ?ErrInfo = null,
+
+    const Cursor = struct {
+        id: i64,
+        server: *client_mod.Server,
+        session: ?*client_mod.Session,
+        /// The collection name for `getMore` (from the reply's `ns`), owned.
+        collection: []u8,
+    };
 
     /// Opens the stream (the `aggregate`) and reads the first batch.
     fn open(client: *Client, cx: Context, scope: Scope, pipeline_stages: bson.Array, opts: ChangeStreamOptions) Error!Stream {
@@ -118,22 +125,26 @@ pub const Stream = struct {
         errdefer s.deinitBuffers();
         s.stages = client.gpa.dupe(u8, pipeline_stages.doc.bytes) catch return error.OutOfMemory;
         if (opts.start_after) |d| {
-            s.token = client.gpa.dupe(u8, d.bytes) catch return error.OutOfMemory;
-            s.initial = .start_after;
+            try s.setToken(.start_after, d.bytes);
         } else if (opts.resume_after) |d| {
-            s.token = client.gpa.dupe(u8, d.bytes) catch return error.OutOfMemory;
-            s.initial = .resume_after;
+            try s.setToken(.resume_after, d.bytes);
         } else if (opts.start_at_operation_time) |t| {
-            s.initial = .operation_time;
-            s.initial_time = t;
+            s.@"resume" = .{ .at_time = t };
         }
-        try s.run(s.chooseMode());
+        const time = try s.run();
+        // Without a token the open's operationTime is the start of a resume.
+        switch (s.@"resume") {
+            .none, .at_time => if (time) |t| {
+                s.@"resume" = .{ .at_time = t };
+            },
+            .start_after, .resume_after => {},
+        }
         return s;
     }
 
     /// Ends the cursor on the server and frees the stream.
     pub fn deinit(s: *Stream) void {
-        s.killCursor();
+        s.closeCursor(true);
         s.deinitBuffers();
         s.* = undefined;
     }
@@ -141,14 +152,15 @@ pub const Stream = struct {
     fn deinitBuffers(s: *Stream) void {
         const gpa = s.client.gpa;
         if (s.stages.len > 0) gpa.free(s.stages);
-        if (s.token) |t| gpa.free(t);
+        switch (s.@"resume") {
+            .start_after, .resume_after => |t| gpa.free(t),
+            .none, .at_time => {},
+        }
         if (s.pbrt) |t| gpa.free(t);
-        if (s.more_collection.len > 0) gpa.free(s.more_collection);
         s.buf.deinit(gpa);
         s.stages = &.{};
-        s.token = null;
+        s.@"resume" = .none;
         s.pbrt = null;
-        s.more_collection = &.{};
     }
 
     /// The database a command goes to.
@@ -167,18 +179,9 @@ pub const Stream = struct {
         };
     }
 
-    fn chooseMode(s: *const Stream) Mode {
-        if (s.token != null) {
-            if (s.initial == .start_after and !s.had_event) return .start_after;
-            return .resume_after;
-        }
-        if (s.op_time != null or s.initial_time != null) return .operation_time;
-        return .none;
-    }
-
     // -- the commands ----------------------------------------------------
 
-    fn writeAggregate(s: *Stream, b: *bson.Builder, mode: Mode) !void {
+    fn writeAggregate(s: *Stream, b: *bson.Builder) !void {
         switch (s.scope) {
             .collection => |c| try b.append("aggregate", .{ .string = c.name }),
             else => try b.append("aggregate", .{ .int32 = 1 }),
@@ -197,11 +200,11 @@ pub const Stream = struct {
             .when_available => try b.append("fullDocumentBeforeChange", .{ .string = "whenAvailable" }),
             .required => try b.append("fullDocumentBeforeChange", .{ .string = "required" }),
         }
-        switch (mode) {
+        switch (s.@"resume") {
             .none => {},
-            .resume_after => try b.append("resumeAfter", .{ .document = .{ .bytes = s.token.? } }),
-            .start_after => try b.append("startAfter", .{ .document = .{ .bytes = s.token.? } }),
-            .operation_time => try b.append("startAtOperationTime", .{ .timestamp = s.op_time orelse s.initial_time.? }),
+            .resume_after => |t| try b.append("resumeAfter", .{ .document = .{ .bytes = t } }),
+            .start_after => |t| try b.append("startAfter", .{ .document = .{ .bytes = t } }),
+            .at_time => |t| try b.append("startAtOperationTime", .{ .timestamp = t }),
         }
         if (s.scope == .cluster) try b.append("allChangesForCluster", .{ .boolean = true });
         if (s.opts.show_expanded_events) try b.append("showExpandedEvents", .{ .boolean = true });
@@ -220,11 +223,11 @@ pub const Stream = struct {
     const OpenCmd = struct {
         pub const Result = void;
         s: *Stream,
-        mode: Mode,
-        got_cursor: bool = false,
+        /// The reply's `operationTime`.
+        time: ?bson.Timestamp = null,
 
         pub fn body(self: *OpenCmd, b: *bson.Builder, _: *Exchange) !void {
-            try self.s.writeAggregate(b, self.mode);
+            try self.s.writeAggregate(b);
         }
 
         pub fn result(self: *OpenCmd, x: *Exchange, reply: bson.Document) !void {
@@ -238,24 +241,22 @@ pub const Stream = struct {
                 else => return error.InvalidReply,
             };
             try s.takeBatch(batch, cur);
-            s.id = sdam.intOf(cur.get("id")) orelse 0;
-            s.server = x.server;
+            if (reply.get("operationTime")) |v| if (v == .timestamp) {
+                self.time = v.timestamp;
+            };
+            // A reply with no cursor id (an invalidate, exhausted) leaves nothing to kill.
+            if ((sdam.intOf(cur.get("id")) orelse 0) == 0) return;
             // The collection `getMore` names: the part of `ns` after the database.
             const ns = sdam.stringOf(cur.get("ns")) orelse "";
             const dot = std.mem.indexOfScalar(u8, ns, '.');
             const coll_name = if (dot) |d| ns[d + 1 ..] else "";
-            if (s.more_collection.len > 0) s.client.gpa.free(s.more_collection);
-            s.more_collection = try s.client.gpa.dupe(u8, if (coll_name.len > 0) coll_name else "$cmd.aggregate");
-            if (s.op_time == null and s.token == null) {
-                if (reply.get("operationTime")) |v| if (v == .timestamp) {
-                    s.op_time = v.timestamp;
-                };
-            }
-            if (s.id != 0) {
-                s.session = x.session;
-                x.keep_session = true;
-            }
-            self.got_cursor = true;
+            s.cursor = .{
+                .id = sdam.intOf(cur.get("id")).?,
+                .server = x.server,
+                .session = x.session,
+                .collection = try s.client.gpa.dupe(u8, if (coll_name.len > 0) coll_name else "$cmd.aggregate"),
+            };
+            x.keep_session = true;
         }
 
         pub fn accepts(self: *OpenCmd, se: conn_mod.ServerError) bool {
@@ -270,8 +271,9 @@ pub const Stream = struct {
 
         pub fn body(self: *MoreCmd, b: *bson.Builder, _: *Exchange) !void {
             const s = self.s;
-            try b.append("getMore", .{ .int64 = s.id });
-            try b.append("collection", .{ .string = s.more_collection });
+            const c = s.cursor.?;
+            try b.append("getMore", .{ .int64 = c.id });
+            try b.append("collection", .{ .string = c.collection });
             if (s.opts.batch_size) |n| try b.append("batchSize", .{ .int64 = n });
             if (s.opts.max_await) |d| try b.append("maxTimeMS", .{ .int64 = @max(1, d.toMilliseconds()) });
         }
@@ -287,7 +289,7 @@ pub const Stream = struct {
                 else => return error.InvalidReply,
             };
             try s.takeBatch(batch, cur);
-            s.id = sdam.intOf(cur.get("id")) orelse 0;
+            if ((sdam.intOf(cur.get("id")) orelse 0) == 0) s.closeCursor(false);
         }
 
         /// A failed getMore leaves no cursor to kill; the error is noted
@@ -315,10 +317,8 @@ pub const Stream = struct {
 
     fn noteError(s: *Stream, se: conn_mod.ServerError) void {
         s.err = .{
-            .have = true,
             .code = se.code orelse 0,
-            .resumable_label = se.hasLabel("ResumableChangeStreamError"),
-            .non_resumable_label = se.hasLabel("NonResumableChangeStreamError"),
+            .label = if (se.hasLabel("NonResumableChangeStreamError")) .non_resumable else if (se.hasLabel("ResumableChangeStreamError")) .resumable else .none,
         };
     }
 
@@ -335,10 +335,11 @@ pub const Stream = struct {
         };
     }
 
-    /// The aggregate, with `mode`'s resume option.
-    fn run(s: *Stream, mode: Mode) Error!void {
-        s.err = .{};
-        var cmd: OpenCmd = .{ .s = s, .mode = mode };
+    /// The aggregate, with the resume point's option; the reply's
+    /// `operationTime`.
+    fn run(s: *Stream) Error!?bson.Timestamp {
+        s.err = null;
+        var cmd: OpenCmd = .{ .s = s };
         const op: Operation = .{
             .name = "aggregate",
             .database = s.databaseName(),
@@ -348,21 +349,23 @@ pub const Stream = struct {
             .options = .{},
         };
         client_mod.execute(s.client, &s.cx, op, &cmd) catch |err| return s.mapOpenFailure(err);
+        return cmd.time;
     }
 
     /// One `getMore`, held by the server up to `max_await`.
     fn getMore(s: *Stream) Error!void {
-        s.err = .{};
+        s.err = null;
+        const c = s.cursor.?;
         var cmd: MoreCmd = .{ .s = s };
         const base: std.Io.Duration = internal.callTimeout(null, s.client.options.timeout) orelse .fromSeconds(30);
         const await_ms: i64 = if (s.opts.max_await) |d| d.toMilliseconds() else 1000;
         const op: Operation = .{
             .name = "getMore",
             .database = s.databaseName(),
-            .collection = s.more_collection,
+            .collection = c.collection,
             .kind = .command,
-            .server = s.server,
-            .lsid = if (s.session) |sess| sess.id else null,
+            .server = c.server,
+            .lsid = if (c.session) |sess| sess.id else null,
             .session = false,
             // The command carries its own maxTimeMS: the await.
             .max_time = false,
@@ -370,23 +373,25 @@ pub const Stream = struct {
         };
         client_mod.execute(s.client, &s.cx, op, &cmd) catch |err| {
             // A failed getMore leaves no cursor on the server to kill.
-            s.id = 0;
+            s.closeCursor(false);
             return err;
         };
     }
 
-    /// killCursors when the cursor is still open (best effort, whatever the
-    /// caller's deadline), then gives the session back.
-    fn killCursor(s: *Stream) void {
-        if (s.id != 0 and s.more_collection.len > 0) {
-            var cmd: KillCmd = .{ .collection = s.more_collection, .id = s.id };
+    /// Ends the cursor: killCursors when `kill` (best effort, whatever the
+    /// caller's deadline), then gives its session back and frees it.
+    fn closeCursor(s: *Stream, kill: bool) void {
+        const c = s.cursor orelse return;
+        s.cursor = null;
+        if (kill) {
+            var cmd: KillCmd = .{ .collection = c.collection, .id = c.id };
             const op: Operation = .{
                 .name = "killCursors",
                 .database = s.databaseName(),
-                .collection = s.more_collection,
+                .collection = c.collection,
                 .kind = .command,
-                .server = s.server,
-                .lsid = if (s.session) |sess| sess.id else null,
+                .server = c.server,
+                .lsid = if (c.session) |sess| sess.id else null,
                 .session = false,
                 .max_time = false,
                 .options = .{ .timeout = .fromSeconds(1) },
@@ -398,10 +403,9 @@ pub const Stream = struct {
             var quiet: db.Ctx = .{ .io = s.cx.io, .arena = fba.allocator() };
             const quiet_cx = client_mod.erase(&quiet);
             client_mod.execute(s.client, &quiet_cx, op, &cmd) catch {};
-            s.id = 0;
         }
-        if (s.session) |sess| client_mod.giveSession(s.client, sess, s.cx.io);
-        s.session = null;
+        if (c.session) |sess| client_mod.giveSession(s.client, sess, s.cx.io);
+        s.client.gpa.free(c.collection);
     }
 
     // -- errors and resume -----------------------------------------------
@@ -412,21 +416,21 @@ pub const Stream = struct {
 
     fn isResumable(s: *const Stream, err: anyerror) bool {
         if (err == error.Canceled or err == error.OutOfMemory) return false;
-        if (s.err.have) {
-            if (s.err.non_resumable_label) return false;
-            if (s.err.resumable_label) return true;
-            for (resumable_codes) |c| if (c == s.err.code) return true;
-            return false;
-        }
-        // No server error: the connection broke, or the server went away.
-        return err == error.ServiceUnavailable or err == error.GatewayTimeout;
+        const e = s.err orelse
+            // No server error: the connection broke, or the server went away.
+            return err == error.ServiceUnavailable or err == error.GatewayTimeout;
+        return switch (e.label) {
+            .non_resumable => false,
+            .resumable => true,
+            .none => std.mem.indexOfScalar(i64, &resumable_codes, e.code) != null,
+        };
     }
 
     /// A failure of the opening aggregate or a resume: the specification's
     /// fatal cases get a code of their own for `lastError`.
     fn mapOpenFailure(s: *Stream, err: Error) Error {
-        if (!s.err.have) return err;
-        switch (s.err.code) {
+        const e = s.err orelse return err;
+        switch (e.code) {
             40573 => return s.cx.fail(s.client.errors, .{
                 .system = .mongodb,
                 .class = .other,
@@ -454,11 +458,11 @@ pub const Stream = struct {
     /// token.
     fn resumeAfter(s: *Stream, failure: Error) Error!void {
         if (!s.isResumable(failure)) {
-            if (s.err.have and s.err.code == 286) return s.historyLost();
+            if (s.err) |e| if (e.code == 286) return s.historyLost();
             return failure;
         }
-        s.killCursor();
-        try s.run(s.chooseMode());
+        s.closeCursor(true);
+        _ = try s.run();
     }
 
     // -- reading ---------------------------------------------------------
@@ -469,7 +473,7 @@ pub const Stream = struct {
     pub fn nextDocument(s: *Stream) Error!?bson.Document {
         while (true) {
             if (try s.tryNextDocument()) |d| return d;
-            if (s.id == 0) return null;
+            if (s.cursor == null) return null;
         }
     }
 
@@ -478,7 +482,7 @@ pub const Stream = struct {
     /// (or the cursor is closed: `nextDocument` tells the two apart).
     pub fn tryNextDocument(s: *Stream) Error!?bson.Document {
         if (try s.fromBatch()) |d| return d;
-        if (s.id == 0) return null;
+        if (s.cursor == null) return null;
         s.getMore() catch |err| {
             try s.resumeAfter(err);
             return s.fromBatch();
@@ -505,30 +509,38 @@ pub const Stream = struct {
                     .table = s.collectionName(),
                 }),
             };
-            try s.setToken(id.bytes);
-            s.had_event = true;
+            try s.setToken(.resume_after, id.bytes);
             return v.document;
         }
         // The batch is read through: its post-batch token is the position.
         if (s.pbrt) |p| {
-            try s.setToken(p);
+            try s.setToken(if (s.@"resume" == .start_after) .start_after else .resume_after, p);
             s.client.gpa.free(p);
             s.pbrt = null;
         }
         return null;
     }
 
-    fn setToken(s: *Stream, bytes: []const u8) Error!void {
+    fn setToken(s: *Stream, kind: enum { start_after, resume_after }, bytes: []const u8) Error!void {
         const gpa = s.client.gpa;
         const copy = gpa.dupe(u8, bytes) catch return error.OutOfMemory;
-        if (s.token) |old| gpa.free(old);
-        s.token = copy;
+        switch (s.@"resume") {
+            .start_after, .resume_after => |old| gpa.free(old),
+            .none, .at_time => {},
+        }
+        s.@"resume" = switch (kind) {
+            .start_after => .{ .start_after = copy },
+            .resume_after => .{ .resume_after = copy },
+        };
     }
 
     /// The token to resume after the last event returned (or the last
     /// batch's `postBatchResumeToken`), copied into `arena`.
     pub fn resumeToken(s: *const Stream, arena: std.mem.Allocator) error{OutOfMemory}!?bson.Document {
-        const t = s.token orelse return null;
+        const t = switch (s.@"resume") {
+            .start_after, .resume_after => |t| t,
+            .none, .at_time => return null,
+        };
         return .{ .bytes = try arena.dupe(u8, t) };
     }
 };

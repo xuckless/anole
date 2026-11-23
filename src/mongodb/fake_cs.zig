@@ -355,6 +355,49 @@ test "change stream: startAfter is used again on a resume before any event, resu
     try testing.expectEqualStrings("start", tokenData(stage.get("startAfter").?.document));
 }
 
+test "change stream: a batch with only a postBatchResumeToken resumes with resumeAfter, whatever the open's options" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io, &.{
+        .{ .batch = .{ .pbrt = "p1" } },
+        .{ .fail = .{ .code = 91, .name = "ShutdownInProgress" } },
+        .{ .batch = .{} },
+    });
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    var s = try client.collection("users").watch(cs.ChangeEvent, &c, .{}, .{ .max_await = .fromMilliseconds(20) });
+    defer s.deinit();
+    try testing.expect((try s.tryNext()) == null);
+    try testing.expect((try s.tryNext()) == null);
+    const stage = pipelineStage(fake.command(io, 2), 0).get("$changeStream").?.document;
+    try testing.expectEqualStrings("p1", tokenData(stage.get("resumeAfter").?.document));
+}
+
+test "change stream: a reply with cursor id 0 leaves no cursor: no killCursors, and the stream ends" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io, &.{.{ .batch = .{ .ids = &.{1}, .cursor = 0 } }});
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    var s = try client.collection("users").watch(cs.ChangeEvent, &c, .{}, .{});
+    try testing.expectEqualStrings("t1", tokenData((try s.next()).?._id));
+    try testing.expect((try s.next()) == null);
+    s.deinit();
+    try testing.expectEqual(@as(u32, 0), fake.killed.load(.monotonic));
+}
+
 test "change stream: startAtOperationTime comes from the open's operationTime when there is no token" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
