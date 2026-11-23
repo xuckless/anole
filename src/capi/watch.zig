@@ -296,10 +296,18 @@ pub fn start(e: *Engine, app: *anole.App) !void {
     }
 }
 
+/// `anole_server_drain` (not the drain hook: stopping waits on the hub and
+/// the sinks): the watches stop reading and their listeners end before the
+/// call returns, whether or not a watch's own drain hook could start its
+/// stop task. Drains started elsewhere stop them through those hooks.
+pub fn draining(e: *Engine) void {
+    for (e.watch_state.entries) |en| en.w.stop();
+}
+
 /// The server stops: the watches are stopped and freed (their tasks are on
 /// the runtime, which is still up), their listeners end.
 pub fn close(e: *Engine) void {
-    for (e.watch_state.entries) |en| en.w.stop();
+    draining(e);
     for (e.watch_state.entries) |en| en.w.deinit();
     // The watches are gone: their entries stay (for stale lookups) but are
     // not used again.

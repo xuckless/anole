@@ -304,6 +304,8 @@ test "capi jobs: the drain ends a worker once with JOB_WORKER_DRAINED, however i
             .stop_server => r.e.testStopServer(),
             .stop_server_then_drain => {
                 r.e.testStopServer();
+                // The hook went first: `drain` loses the phase change.
+                _ = try r.ev.waitFor(.draining, 0, 5000);
                 try r.e.drain();
             },
             // The server's own hook fires after and loses the phase change.

@@ -2137,6 +2137,7 @@ pub const Engine = struct {
         const app = e.enter() orelse return;
         defer e.leave();
         e.beginDrain();
+        watch.draining(e);
         app.stop();
     }
 
@@ -2157,7 +2158,7 @@ pub const Engine = struct {
     /// winner of the phase change stops the areas that take new work. Never
     /// waits: the hook runs under the drain-hook registry's lock. Watches
     /// stop through their own drain hook (a task: stopping one waits on the
-    /// hub).
+    /// hub), and `drain` also stops them itself, off the hook.
     fn beginDrain(e: *Engine) void {
         const first = e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null;
         e.notifyDraining();

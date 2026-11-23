@@ -104,18 +104,16 @@ test "capi kafka: a drain the console starts (App.stop) tells every group to end
         .rebalance_timeout_ms = 1000,
     }, 5);
     var probe: engine_test.DrainProbe = .{ .e = r.e, .check = struct {
-        /// Every live group is draining, and there is one.
+        /// Every live group is draining (one that already ended has left
+        /// the table; `subscribe` added the group before the stop).
         fn draining(e: *engine.Engine) bool {
             const st = &e.kafka_state;
             st.groups.acquire();
             defer st.groups.release();
-            var live: usize = 0;
             for (st.groups.entries.items) |*entry| {
-                if (!entry.live) continue;
-                if (!entry.value.draining.load(.acquire)) return false;
-                live += 1;
+                if (entry.live and !entry.value.draining.load(.acquire)) return false;
             }
-            return live > 0;
+            return true;
         }
     }.draining };
     probe.add();

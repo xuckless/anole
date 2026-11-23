@@ -246,7 +246,13 @@ fn drainEndsListeners(how: engine_test.DrainStart) !void {
     const h = try engine.watch.listen(r.e, r.orders, r.rx.c, listenOpts(2, abi.WATCH_NATIVE), 77);
     const hj = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_JSON), 2);
     switch (how) {
-        .explicit => try r.e.drain(),
+        // Stopped before the call returns, not only by the watches' own
+        // hook tasks (which may fail to start).
+        .explicit => {
+            try r.e.drain();
+            try std.testing.expectEqual(anole.watch.Status.stopped, r.orders.w.status());
+            try std.testing.expectEqual(anole.watch.Status.stopped, r.feed.w.status());
+        },
         .stop_server => r.e.testStopServer(),
     }
     r.drained = true;
