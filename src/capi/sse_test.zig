@@ -138,6 +138,21 @@ pub const SseConsumer = struct {
     handles: [4]std.atomic.Value(u64) = @splat(.init(0)),
     /// Also answer the first subscribe by refusing it (when set).
     topic: []const u8 = "x",
+    /// How the next subscribes are answered (set by the claim before it
+    /// subscribes), and the `last` a `.chosen` accept asks for.
+    mode: std.atomic.Value(Mode) = .init(.accept),
+    last: std.atomic.Value(u32) = .init(0),
+
+    pub const Mode = enum(u8) {
+        /// Accepted into `topic`.
+        accept,
+        /// Accepted with the header `X-Chosen: 1` and `last`.
+        chosen,
+        /// `anole_ws_accept` on it is STATE first, then accepted.
+        cross,
+        /// Answered 403.
+        decline,
+    };
 
     pub fn run(self: *SseConsumer) void {
         var buf: [64 * 1024]u8 align(8) = undefined;
@@ -160,9 +175,17 @@ pub const SseConsumer = struct {
         const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
         switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
             .sse_subscribe => {
+                const mode = self.mode.load(.acquire);
+                switch (mode) {
+                    .decline => return engine.respond(self.e, ev.handle, 403, &.{}, "", false),
+                    .cross => if (comptime features.websocket) try std.testing.expectError(error.State, engine.wsAccept(self.e, ev.handle, "", &.{})),
+                    .accept, .chosen => {},
+                }
+                const chosen = mode == .chosen;
+                const headers: []const engine.CHeader = if (chosen) &.{.{ .name = .of("X-Chosen"), .value = .of("1") }} else &.{};
                 // The handle is stored before the count moves: a waiter on
                 // `subscribes` reads it set.
-                const sh = try engine.sseAccept(self.e, ev.handle, &.{self.topic}, &.{}, 0);
+                const sh = try engine.sseAccept(self.e, ev.handle, &.{self.topic}, headers, if (chosen) self.last.load(.acquire) else 0);
                 const i = self.subscribes.load(.monotonic);
                 if (i < self.handles.len) self.handles[i].store(sh, .release);
                 self.subscribes.store(i + 1, .release);
@@ -405,6 +428,63 @@ fn clientGone(a: *SseConsumer, port: u16, io: std.Io) !void {
     // The other one still lives.
     _ = try engine.sse.send(e, h2, "", "still");
     _ = try c2.until(&buf2, "data: still");
+}
+
+/// The accept's header and `last` reach the stream: `last` 2 replays the
+/// newest two events; `last` 0 keeps the route's (none).
+fn chosenAccept(a: *SseConsumer, port: u16, io: std.Io) !void {
+    const e = a.e;
+    var buf: [2048]u8 = undefined;
+    var c1: RawSse = undefined;
+    _ = try openSub(a, port, io, &c1, 1);
+    defer c1.close(io);
+    for ([_][]const u8{ "e1", "e2", "e3" }) |d| try engine.sse.publish(e, "x", "", d, 0);
+    _ = try c1.until(&buf, "data: e3");
+
+    a.last.store(2, .release);
+    a.mode.store(.chosen, .release);
+    var c2: RawSse = undefined;
+    _ = try openSub(a, port, io, &c2, 2);
+    defer c2.close(io);
+    try std.testing.expect(std.ascii.findIgnoreCase(c2.headText(), "X-Chosen: 1\r\n") != null);
+    const replay = try c2.until(&buf, "data: e3");
+    try std.testing.expect(std.mem.indexOf(u8, replay, "data: e2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "data: e1") == null);
+
+    a.mode.store(.accept, .release);
+    var c3: RawSse = undefined;
+    _ = try openSub(a, port, io, &c3, 3);
+    defer c3.close(io);
+    try std.testing.expect(std.ascii.findIgnoreCase(c3.headText(), "X-Chosen") == null);
+    try engine.sse.publish(e, "x", "", "e4", 0);
+    const live = try c3.until(&buf, "data: e4");
+    try std.testing.expect(std.mem.indexOf(u8, live, "data: e3") == null);
+}
+
+/// anole_ws_accept on a subscription is STATE and it is still owed (the
+/// accept after it opens it); a subscription answered 403 opens nothing.
+fn crossAndDecline(a: *SseConsumer, port: u16, io: std.Io) !void {
+    const hub = a.e.sse_state.topics.?;
+    a.mode.store(.cross, .release);
+    var c1: RawSse = undefined;
+    _ = try openSub(a, port, io, &c1, 1);
+    defer c1.close(io);
+
+    a.mode.store(.decline, .release);
+    var c2: RawSse = undefined;
+    try c2.open(io, port, "/me", "");
+    defer c2.close(io);
+    try std.testing.expect(std.mem.startsWith(u8, c2.headText(), "HTTP/1.1 403"));
+    try std.testing.expectEqual(@as(u32, 1), a.subscribes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hub.stats().subscribers);
+}
+
+test "capi engine: a consumer sse route: the headers and last the accept chose reach the stream" {
+    try consumerRun(chosenAccept);
+}
+
+test "capi engine: a consumer sse route: anole_ws_accept on a subscription is STATE and it is still owed; one answered 403 opens no subscriber" {
+    try consumerRun(crossAndDecline);
 }
 
 test "capi engine: a consumer sse route: anole_sse_send reaches only its subscriber, and a publish reaches the topics the accept named" {

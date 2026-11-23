@@ -70,33 +70,17 @@ pub const NetSlot = struct {
     fn release(s: *NetSlot) void {
         s.lock.unlock();
     }
-    fn gen(s: *const NetSlot) u32 {
-        return @intCast(s.word.load(.acquire) >> 32);
-    }
-    fn live(s: *const NetSlot, g: u32) bool {
-        return s.word.load(.acquire) == pack(g, .open);
-    }
-    fn handle(s: *const NetSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .net_conn, .slot = @intCast(s.index), .exec = s.exec.index });
-    }
 };
 
 fn freeWord(gen: u32) u64 {
     return pack(gen, .free);
 }
 
-const Slots = SlotTable(NetSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyConnections }, freeWord);
+const Slots = SlotTable(NetSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyConnections, .kind = .net_conn, .open = @backingInt(SlotState.open) }, freeWord);
 
 /// Per executor (`Exec.net`).
 pub const ExecState = struct {
     slots: Slots = .{},
-
-    /// The tasks it runs (the net drivers) belong to the server's group and
-    /// end with it.
-    pub fn cancel(st: *ExecState, io: std.Io) void {
-        _ = st;
-        _ = io;
-    }
 
     /// The highest generation handed out (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
@@ -157,16 +141,7 @@ pub const State = struct {
     udps: std.ArrayList(*UdpState) = .empty,
 
     pub fn init(s: *State, first_gen: u32) void {
-        s.* = .{ .first_gen = first_gen };
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(s: *State) u32 {
-        return s.first_gen;
-    }
-
-    pub fn deinit(s: *State) void {
-        _ = s;
+        s.first_gen = first_gen;
     }
 };
 
@@ -328,7 +303,7 @@ fn onOpen(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     const e = st.engine;
     const x = execOf(e) orelse return error.Unexpected;
     const slot = try x.net.slots.alloc(x);
-    const g = slot.gen();
+    const g = Slots.gen(slot);
     slot.acquire();
     slot.conn = conn;
     slot.release();
@@ -352,7 +327,7 @@ fn onOpen(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     const sni = conn.serverName() orelse "";
     const cert = conn.peerCertificate() orelse "";
     const size = abi.alignUp(@sizeOf(abi.NetOpenEvent) + listener.len + remote_text.len + alpn.len + sni.len + cert.len);
-    const rec = try engine.newRecord(size, .net_open, slot.handle(g));
+    const rec = try engine.newRecord(size, .net_open, Slots.handle(slot, g));
     const ev: *abi.NetOpenEvent = @ptrCast(rec.ptr);
     ev.handler_id = st.handler_id;
     ev.flags = (if (conn.isTls()) abi.NET_OPEN_F_TLS else 0) |
@@ -394,7 +369,7 @@ fn postData(x: *Exec, slot: *NetSlot, g: u32, frames: []const []const u8, framed
     for (frames) |f| total += f.len;
     const spans_off: u32 = @sizeOf(abi.NetDataEvent);
     const bytes_off = spans_off + frames.len * @sizeOf(abi.Span);
-    const rec = try engine.newRecord(bytes_off + total, .net_data, slot.handle(g));
+    const rec = try engine.newRecord(bytes_off + total, .net_data, Slots.handle(slot, g));
     const ev: *abi.NetDataEvent = @ptrCast(rec.ptr);
     ev.flags = if (framed) abi.NET_DATA_F_FRAMES else 0;
     ev.nframes = @intCast(frames.len);
@@ -419,7 +394,7 @@ fn onData(state: ?*anyopaque, conn: *net.Conn, input: net.Input) anyerror!void {
     _ = state;
     const slot = slotOfConn(conn) orelse return;
     const x = slot.exec;
-    const g = slot.gen();
+    const g = Slots.gen(slot);
     switch (input) {
         .bytes => |b| {
             var rest = b;
@@ -449,14 +424,14 @@ fn onData(state: ?*anyopaque, conn: *net.Conn, input: net.Input) anyerror!void {
 fn onEnd(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     _ = state;
     const slot = slotOfConn(conn) orelse return;
-    const rec = try engine.newRecord(@sizeOf(abi.Event), .net_end, slot.handle(slot.gen()));
+    const rec = try engine.newRecord(@sizeOf(abi.Event), .net_end, Slots.handle(slot, Slots.gen(slot)));
     slot.exec.postRecord(rec, true);
 }
 
 fn onWritable(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     _ = state;
     const slot = slotOfConn(conn) orelse return;
-    slot.exec.postEvent(.writable, slot.handle(slot.gen()));
+    slot.exec.postEvent(.writable, Slots.handle(slot, Slots.gen(slot)));
 }
 
 fn onSent(state: ?*anyopaque, conn: *net.Conn, token: u64) void {
@@ -465,7 +440,7 @@ fn onSent(state: ?*anyopaque, conn: *net.Conn, token: u64) void {
     // The record the borrowing call built: its header says how long it is.
     const first: [*]align(8) u8 = @ptrFromInt(token);
     const ev: *const abi.Event = @ptrCast(first);
-    slot.exec.postSentRec(slot.handle(slot.gen()), first[0..ev.len]);
+    slot.exec.postSentRec(Slots.handle(slot, Slots.gen(slot)), first[0..ev.len]);
 }
 
 fn reasonConst(r: net.CloseReason) u32 {
@@ -499,8 +474,8 @@ fn onClose(state: ?*anyopaque, conn: *net.Conn, reason: net.CloseReason) void {
     const slot = slotOfConn(conn) orelse return;
     const x = slot.exec;
     const e = x.engine;
-    const g = slot.gen();
-    const h = slot.handle(g);
+    const g = Slots.gen(slot);
+    const h = Slots.handle(slot, g);
     const totals = conn.totals();
     // Stale from here: the consumer's calls get ANOLE_E_GONE, or are over.
     slot.acquire();
@@ -533,7 +508,7 @@ fn onClose(state: ?*anyopaque, conn: *net.Conn, reason: net.CloseReason) void {
 /// connection may post that much more.
 pub fn polled(e: *Engine, hv: u64, len: u32) void {
     const slot, const g = slotOf(e, hv) catch return;
-    if (slot.gen() != g) return;
+    if (Slots.gen(slot) != g) return;
     // Saturating: a stale decrement must not wrap.
     var cur = slot.unpolled.load(.monotonic);
     while (true) {
@@ -584,13 +559,13 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
         if (frame) {
             var pbuf: [net.Framing.max_prefix]u8 = undefined;
             const p = st.net_framing.prefix(data.len, &pbuf) catch |err| {
-                if (s.gen() != g) return e.gone();
+                if (Slots.gen(s) != g) return e.gone();
                 return writeError(e, err);
             };
             want += p.len + st.net_framing.suffix().len;
         }
         if (want > st.write_max) {
-            if (s.gen() != g) return e.gone();
+            if (Slots.gen(s) != g) return e.gone();
             return writeError(e, error.TooLarge);
         }
     }
@@ -614,7 +589,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
         s.acquire();
         defer s.release();
         const conn = s.conn orelse return e.gone();
-        if (!s.live(g)) return e.gone();
+        if (!Slots.live(s, g)) return e.gone();
         var r: net.Conn.Sent = .ok;
         if (chunk) |c| {
             // Taken on success; refused, it stays `chunk`.
@@ -634,7 +609,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     // on the ABI's rule: anole_server_destroy overlaps nothing on its
     // server (anole.h), so no anole_net_* call is running then.
     for (kicks) |k| if (k) |kick| kick.run();
-    if (sent) |rec| if (copy) s.exec.postSentRec(s.handle(g), rec);
+    if (sent) |rec| if (copy) s.exec.postSentRec(Slots.handle(s, g), rec);
     return result == .busy;
 }
 
@@ -660,7 +635,7 @@ pub fn closeConn(e: *Engine, hv: u64, how: u32) AnswerError!void {
         s.acquire();
         defer s.release();
         const conn = s.conn orelse return error.Over;
-        if (!s.live(g)) return error.Over;
+        if (!Slots.live(s, g)) return error.Over;
         break :locked if (how == abi.NET_CLOSE_RESET) conn.resetKick() else conn.closeKick();
     };
     // After the unlock: see `write`'s kicks.
@@ -672,7 +647,7 @@ pub fn pause(e: *Engine, hv: u64, on: bool) AnswerError!void {
     s.acquire();
     defer s.release();
     const conn = s.conn orelse return e.gone();
-    if (!s.live(g)) return e.gone();
+    if (!Slots.live(s, g)) return e.gone();
     if (on) conn.pauseReading() else conn.resumeReading();
 }
 
@@ -681,7 +656,7 @@ pub fn setIdleTimeout(e: *Engine, hv: u64, ms: u32) AnswerError!void {
     s.acquire();
     defer s.release();
     const conn = s.conn orelse return e.gone();
-    if (!s.live(g)) return e.gone();
+    if (!Slots.live(s, g)) return e.gone();
     conn.setIdleTimeout(if (ms == 0) null else std.Io.Duration.fromMilliseconds(ms));
 }
 

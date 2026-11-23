@@ -7,6 +7,7 @@ const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const dusty = @import("dusty");
 const io_gate = @import("../io_gate.zig");
 const abi = engine.abi;
 const features = anole.features;
@@ -145,6 +146,7 @@ const routes =
     \\  {"method": "GET", "path": "/hold", "handler": 5},
     \\  {"method": "GET", "path": "/borrow", "handler": 6},
     \\  {"method": "GET", "path": "/short", "handler": 5, "timeout_ms": 100},
+    \\  {"method": "GET", "path": "/orphan", "handler": 5, "timeout_ms": 500},
     \\  {"method": "GET", "path": "/abort", "handler": 8},
     \\  {"method": "POST", "path": "/late", "handler": 7}
     \\]
@@ -411,11 +413,102 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             try std.testing.expectError(error.Gone, engine.respond(c.a.e, held, 200, &.{}, "", false));
             try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), c.a.last_abort_reason.load(.acquire));
         }
+
+        /// A request on `path` the client resets while a consumer answer
+        /// call holds it: the engine orphans it (its memory goes), and the
+        /// call fails and hands it back to `out`. Null when the route's
+        /// deadline ended it before the call could claim it (a slow
+        /// runner): there is nothing to orphan.
+        fn orphan(c: Ctx, path: []const u8) !?u64 {
+            c.a.held.store(0, .release);
+            const s = try open(c.conn, "GET", path, null);
+            defer s.release();
+            const held = try wait.waitNonZero(c.io, "the consumer holds the request", &c.a.held);
+            const aborted = c.a.e.aborted_count.load(.monotonic);
+            var hold: engine.TestPin = .{};
+            engine.test_answer_hold = &hold;
+            defer engine.test_answer_hold = null;
+            var fa: FailedAccept = .{ .e = c.a.e, .req = held, .hold = &hold };
+            const t = try std.Thread.spawn(.{}, FailedAccept.run, .{&fa});
+            var joined = false;
+            defer if (!joined) {
+                hold.release.store(true, .release);
+                t.join();
+            };
+            try wait.waitUntil(c.io, "the answer call holds the request, or failed", &fa, FailedAccept.heldOrDone);
+            if (!hold.held.load(.acquire)) {
+                t.join();
+                joined = true;
+                try std.testing.expectEqual(@as(?anyerror, error.Gone), fa.result);
+                return null;
+            }
+            s.cancel();
+            // `gone` is set only once the engine orphaned the slot (the
+            // count rises before it looks at the slot).
+            _, const sl, _ = try engine.slotOfKind(c.a.e, held, .request);
+            try wait.waitFlag(c.io, "the engine orphans the reset request", &sl.gone);
+            try std.testing.expect(c.a.e.aborted_count.load(.monotonic) >= aborted + 1);
+            hold.release.store(true, .release);
+            t.join();
+            joined = true;
+            try std.testing.expectEqual(@as(?anyerror, error.State), fa.result);
+            return held;
+        }
+
+        /// An orphan past its deadline (the sweeper, `out`): the consumer
+        /// hears ABORT CLIENT once, the handle is GONE, and it is not
+        /// counted as expired.
+        fn orphanDeadline(c: Ctx) !void {
+            const aborts = c.a.aborts.load(.acquire);
+            const expired = c.a.e.stats().expired;
+            const held = try orphan(c, "/orphan") orelse return;
+            try wait.waitEqual(c.io, "the consumer heard the orphan's ABORT", &c.a.last_abort, held);
+            try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), c.a.last_abort_reason.load(.acquire));
+            try std.testing.expectEqual(aborts + 1, c.a.aborts.load(.acquire));
+            try std.testing.expectError(error.Gone, engine.respond(c.a.e, held, 200, &.{}, "", false));
+            try std.testing.expectEqual(expired, c.a.e.stats().expired);
+        }
+
+        /// `destroy`'s first step on an orphan (`abandon`, the capi tasks'
+        /// `abandonAll`): released, the handle is GONE, the consumer hears
+        /// nothing.
+        fn orphanAbandon(c: Ctx) !void {
+            const e = c.a.e;
+            const aborts = c.a.aborts.load(.acquire);
+            const held = try orphan(c, "/hold") orelse return error.TestUnexpectedResult;
+            e.abandon.store(true, .release);
+            for (e.execs) |*x| x.setEvent(&x.kick);
+            try wait.waitEqual(c.io, "the orphaned request is released", &e.inflight, 0);
+            try std.testing.expectError(error.Gone, engine.respond(e, held, 200, &.{}, "", false));
+            try std.testing.expectEqual(aborts, c.a.aborts.load(.acquire));
+        }
     };
 }
 
 const H2 = Harness(.h2);
 const H3 = Harness(.h3);
+
+/// `engine.sseAccept` on a plain request, on a thread of its own: it claims
+/// the request (where `test_answer_hold` holds it in `responding`), then
+/// fails (`error.State`) and hands the slot back to `out`.
+const FailedAccept = struct {
+    e: *engine.Engine,
+    req: u64,
+    hold: *engine.TestPin,
+    result: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(fa: *FailedAccept) void {
+        _ = engine.sseAccept(fa.e, fa.req, &.{}, &.{}, 0) catch |err| {
+            fa.result = err;
+        };
+        fa.done.store(true, .release);
+    }
+
+    fn heldOrDone(fa: *FailedAccept) bool {
+        return fa.hold.held.load(.acquire) or fa.done.load(.acquire);
+    }
+};
 
 test "capi engine over HTTP/2: 24 concurrent requests on one connection are answered from the consumer thread, detached" {
     if (comptime !features.http2) return error.SkipZigTest;
@@ -507,6 +600,16 @@ test "capi engine over HTTP/2: a client reset is ABORT CLIENT and the handle is 
 test "capi engine over HTTP/3: a client reset is ABORT CLIENT and the handle is GONE" {
     if (comptime !features.http3) return error.SkipZigTest;
     try H3.run(H3.clientReset);
+}
+
+test "capi engine over HTTP/2: an orphaned request past its deadline is ABORT CLIENT and released" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try H2.run(H2.orphanDeadline);
+}
+
+test "capi engine over HTTP/2: destroy releases an orphaned request and the consumer hears nothing" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try H2.run(H2.orphanAbandon);
 }
 
 test "capi engine: made-up handles are refused, never followed, and so is a file range past the file's end" {
@@ -1984,8 +2087,52 @@ test "capi engine: /readyz honours readiness checks and the health listener" {
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
+/// How a test starts the drain: `anole_server_drain`, or `App.stop` as
+/// the console, a signal and a hand-off do (#220).
+pub const DrainStart = enum { explicit, stop_server };
+
+/// A drain hook added after the engine's own, so it runs right after it,
+/// on the draining task and before the server stops: `check` sees what the
+/// engine's drain start left, however the drain started (#220).
+pub const DrainProbe = struct {
+    hook: dusty.DrainHooks.Hook = .{ .callback = run },
+    e: *engine.Engine,
+    check: *const fn (*engine.Engine) bool,
+    seen: std.atomic.Value(Seen) = .init(.not_run),
+
+    const Seen = enum(u8) { not_run, held, missing };
+
+    /// On the running engine's server, after the engine's hook.
+    pub fn add(p: *DrainProbe) void {
+        const app = p.e.app.?;
+        app.server.drain_hooks.add(app.io(), &p.hook);
+    }
+
+    fn run(hook: *dusty.DrainHooks.Hook) void {
+        const p: *DrainProbe = @alignCast(@fieldParentPtr("hook", hook));
+        p.seen.store(if (p.check(p.e)) .held else .missing, .release);
+    }
+
+    fn ran(p: *const DrainProbe) bool {
+        return p.seen.load(.acquire) != .not_run;
+    }
+
+    /// Waits for the hook, then expects `check` held when it ran.
+    pub fn expectHeld(p: *const DrainProbe) !void {
+        try wait.waitUntil(engine.threadedIo(), "the drain probe ran", p, ran);
+        try std.testing.expectEqual(Seen.held, p.seen.load(.acquire));
+    }
+};
+
 test "capi engine: a request cut by the drain's deadline aborts with reason DRAIN" {
     if (comptime !features.http2) return error.SkipZigTest;
+    for (std.enums.values(DrainStart)) |how| {
+        errdefer std.debug.print("row: the drain starts {t}\n", .{how});
+        try abortReasonAfter(how);
+    }
+}
+
+fn abortReasonAfter(how: DrainStart) !void {
     const json = "{\"executors\": 2, \"timeouts\": {\"request_ms\": 10000, \"shutdown_ms\": 200}," ++
         "\"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}]," ++ routes ++ "}";
     var why_buf: [256]u8 = undefined;
@@ -2006,12 +2153,12 @@ test "capi engine: a request cut by the drain's deadline aborts with reason DRAI
     const rt = try zio.Runtime.init(alloc, .{});
     defer rt.deinit();
     const io = rt.io();
-    var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io });
+    var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io, how });
     try f.await(io);
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
-fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
+fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io, how: DrainStart) !void {
     const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
     defer conn.close();
     a.held.store(0, .release);
@@ -2022,7 +2169,10 @@ fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
     defer s.release();
     const held = try wait.waitNonZero(io, "the consumer holds the request", &a.held);
     // The drain's deadline (shutdown_ms) cuts the request nobody answered.
-    try e.drain();
+    switch (how) {
+        .explicit => try e.drain(),
+        .stop_server => e.testStopServer(),
+    }
     try wait.waitEqual(io, "the consumer heard the held request's ABORT", &a.last_abort, held);
     try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
 }
@@ -2078,6 +2228,37 @@ fn pipelinedBeforeHold(fx: *Fixture, io: std.Io) !void {
     try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nlate"));
 }
 
+test "capi engine over HTTP/1.1: an answer with as many headers as the limit allows is a valid response" {
+    var fx: Fixture = undefined;
+    try fx.start(Fixture.plain_listener);
+    defer fx.stop();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(fullTableAnswer, .{ &fx, io });
+    try f.await(io);
+    try fx.finish();
+}
+
+fn fullTableAnswer(fx: *Fixture, io: std.Io) !void {
+    const max = (anole.http.ServerConfig{}).response.max_header_count;
+    var headers: [max]abi.Header = undefined;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    for (&headers, 0..) |*h, i| h.* = .{ .name = .of(try std.fmt.allocPrint(arena.allocator(), "x-full-{d}", .{i})), .value = .of("v") };
+    fx.a.held.store(0, .release);
+    var get: RawGet = undefined;
+    try get.open(io, fx.e.port(0), "/hold");
+    defer get.close(io);
+    const held = try waitHeld(io, &fx.a.held);
+    try engine.respond(fx.e, held, 200, &headers, "ok", false);
+    var out: [4096]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    try readRest(&get.reader, &fw);
+    try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nok"));
+}
+
 test "capi: every ServerError and TlsLoadError name is an ABI error token" {
     // The server design's named error sets (`anole.ServerError`,
     // `anole.TlsLoadError`): their member names are the tokens verbatim.
@@ -2100,7 +2281,9 @@ test "capi: every ServerError and TlsLoadError name is an ABI error token" {
 
 /// A consumer for "accept": "consumer" routes. `/decide?accept`: accepts
 /// with the subprotocol "b" and a cookie and sends a message at once;
-/// `?refuse`: 401 with a body; `?silent`: holds the request until its 504.
+/// `?refuse`: 401 with a body; `?silent`: holds the request until its 504;
+/// `?bare`: accepts with no subprotocol and no headers; `?cross`: checks
+/// that an SSE accept is STATE, then answers 401.
 /// `/app` takes plain requests (route 11) and handshakes (route 12);
 /// `/plain` (route 13) holds its request for the test to answer.
 const WsDecider = struct {
@@ -2156,8 +2339,14 @@ const WsDecider = struct {
                     // arrive first, and the request handle is stale.
                     _ = try engine.ws.send(e, ws, abi.WS_TEXT, "first", false);
                     if (engine.respond(e, h, 200, &.{}, "", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                } else if (std.mem.eql(u8, query, "bare")) {
+                    _ = try engine.wsAccept(e, h, "", &.{});
                 } else if (std.mem.eql(u8, query, "refuse")) {
                     try engine.respond(e, h, 401, &.{.{ .name = .of("content-type"), .value = .of("text/plain") }}, "no thanks", false);
+                } else if (std.mem.eql(u8, query, "cross")) {
+                    try std.testing.expectError(error.State, engine.sseAccept(e, h, &.{}, &.{}, 0));
+                    // Nothing was taken: the handshake is still owed its answer.
+                    try engine.respond(e, h, 401, &.{}, "", false);
                 } else if (std.mem.eql(u8, query, "bad-subprotocol")) {
                     try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "zzz", &.{}));
                     try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "", &.{.{ .name = .of("Sec-WebSocket-Accept"), .value = .of("x") }}));
@@ -2350,6 +2539,30 @@ const WsDecideClaims = struct {
         try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
     }
 
+    /// No subprotocol and no extra headers: the 101 carries neither.
+    fn bare(a: *WsDecider, port: u16, io: std.Io) !void {
+        var buf: [256]u8 = undefined;
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?bare", "Sec-WebSocket-Protocol: a\r\n");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 101"));
+            try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Sec-WebSocket-Protocol") == null);
+            try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Set-Cookie") == null);
+            try c.send(0x8, &.{ 0x03, 0xe8 });
+            _ = try c.frame(&buf);
+        }
+        try waitAtLeast(io, &a.closes, 1);
+    }
+
+    /// WsDecider checks that anole_sse_accept is STATE, then answers 401.
+    fn cross(_: *WsDecider, port: u16, io: std.Io) !void {
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?cross", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
+    }
+
     /// WsDecider checks the INVALID answers, then answers 400.
     fn badArguments(_: *WsDecider, port: u16, io: std.Io) !void {
         var c: RawWs = undefined;
@@ -2504,6 +2717,16 @@ const WsDecideClaims = struct {
 test "capi engine: anole_ws_accept sends the chosen subprotocol and headers on the 101, a message sent right after the accept arrives first, no WS_OPEN, and the request handle is GONE" {
     if (comptime !features.websocket) return error.SkipZigTest;
     try wsDecideRun(WsDecideClaims.accept, 1, false);
+}
+
+test "capi engine: anole_ws_accept with no subprotocol and no headers sends a bare 101" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.bare, 1, false);
+}
+
+test "capi engine: anole_sse_accept on a WebSocket handshake is STATE, and the handshake is still owed its answer" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.cross, 1, false);
 }
 
 test "capi engine: a consumer's answer to a WebSocket handshake refuses it with its status" {
@@ -2691,6 +2914,25 @@ test "capi engine: anole_server_drain after a drain the console started posts no
     const e, const c = try ringEngine(8);
     defer e.destroy();
     e.testStopServer();
+    try e.drain();
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
+test "capi engine: a drain the console starts (App.stop) moves the phase to .draining; a later drain posts no second ANOLE_EV_DRAINING (#220)" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    var probe: DrainProbe = .{ .e = e, .check = struct {
+        fn draining(en: *engine.Engine) bool {
+            return en.phase.load(.acquire) == .draining;
+        }
+    }.draining };
+    probe.add();
+    e.testStopServer();
+    try probe.expectHeld();
     try e.drain();
     var counts: [64]u32 = @splat(0);
     try drainCounts(c, &counts, 2);
@@ -3065,4 +3307,35 @@ test {
     _ = @import("s3_test.zig");
     _ = @import("smtp_test.zig");
     _ = @import("lambda_test.zig");
+    _ = @import("failure.zig");
+}
+
+test "capi engine: Writer.put places bytes, an empty put is the empty span" {
+    var buf: [8]u8 = undefined;
+    var w: engine.Writer = .{ .rec = &buf, .at = 2 };
+    const rows = [_]struct { bytes: []const u8, off: u32, len: u32, at: usize }{
+        .{ .bytes = "", .off = 0, .len = 0, .at = 2 },
+        .{ .bytes = "abc", .off = 2, .len = 3, .at = 5 },
+        .{ .bytes = "", .off = 0, .len = 0, .at = 5 },
+        .{ .bytes = "xyz", .off = 5, .len = 3, .at = 8 },
+    };
+    for (rows) |r| {
+        const sp = w.put(r.bytes);
+        try std.testing.expectEqual(r.off, sp.off);
+        try std.testing.expectEqual(r.len, sp.len);
+        try std.testing.expectEqual(r.at, w.at);
+    }
+    try std.testing.expectEqualStrings("abcxyz", buf[2..8]);
+}
+
+test "capi engine: dupeStr copies, and an empty string allocates nothing" {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const empty = try engine.dupeStr(fa.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    fa.allocator().free(empty);
+    const src = "hello".*;
+    const copy = try engine.dupeStr(std.testing.allocator, abi.Str.of(&src));
+    defer std.testing.allocator.free(copy);
+    try std.testing.expectEqualStrings("hello", copy);
+    try std.testing.expect(copy.ptr != &src);
 }

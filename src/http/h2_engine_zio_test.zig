@@ -37,8 +37,7 @@ const Side = struct {
     connection: *dusty.Connection,
 
     fn serve(s: Side) anyerror!void {
-        var busy = false;
-        try E.serve(s.server, s.listener, false, s.connection, &busy);
+        try E.serve(s.server, s.listener, false, s.connection);
     }
 };
 
@@ -241,4 +240,38 @@ test "h2 engine on zio: a read that starts many handler tasks spawns them after 
     client.close(io);
     closed = true;
     try future.await(io);
+}
+
+test "Connection.shutdownBoth after a delivered cancel: the socket is shut and the cancel is not swallowed" {
+    // The engine's write failure (`writeFailed`) shuts the connection after a
+    // canceled write and only then passes the cancel on: the shutdown must
+    // not park with the cancel delivered (zio's debug_cancel fails the test).
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    var tcp = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{});
+    defer tcp.deinit(io);
+    const client = try tcp.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const server_end = try tcp.accept(io);
+    defer server_end.close(io);
+    var connection: dusty.Connection = .{ .io = io, .stream = server_end, .allocator = gpa, .buffers = &.{}, .read_buffer = &.{} };
+
+    const Canceled = struct {
+        fn run(c: *dusty.Connection, never: *std.Io.Event) std.Io.Cancelable!void {
+            never.wait(c.io) catch |err| {
+                c.shutdownBoth(c.io);
+                return err;
+            };
+        }
+    };
+    var never: std.Io.Event = .unset;
+    var future = try io.concurrent(Canceled.run, .{ &connection, &never });
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+
+    var buf: [1]u8 = undefined;
+    var r = client.reader(io, &buf);
+    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
 }

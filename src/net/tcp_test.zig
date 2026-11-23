@@ -661,15 +661,24 @@ test "net tcp: without a drain callback a drain ends this side, and a client tha
             try s.writer().writeAll("hi");
             try s.writer().flush();
             try expectRead(s, "hi");
+            // A raw connection is in flight for the drain until it closes.
+            try std.testing.expectEqual(1, a.server.busy.load(.acquire).count);
             var ended: std.atomic.Value(bool) = .init(false);
             var reading = try a.io().concurrent(readToEnd, .{ s, &ended });
             defer reading.cancel(a.io());
             a.stop();
             // The server's FIN, as a polite client sees it; it closes then.
             try wait.waitFlag(a.io(), "the server ended its side", &ended);
+            // The drain still waits for it.
+            try std.testing.expectEqual(1, a.server.busy.load(.acquire).count);
             halfClose(s);
             try waitFor(a.io(), &Echo.closed, 1);
             try std.testing.expectEqual(@backingInt(net.CloseReason.drain), Echo.last_reason.load(.acquire));
+            try wait.waitUntil(a.io(), "the closed connection gave its count back", a, struct {
+                fn idle(ap: *App) bool {
+                    return ap.server.busy.load(.acquire).count == 0;
+                }
+            }.idle);
         }
     };
     var checking = try app.io().concurrent(Run.run, .{&app});

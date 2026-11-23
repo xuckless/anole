@@ -1731,7 +1731,7 @@ pub fn Engine(comptime Ctx: type) type {
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
-                        conn.connection.stream.shutdown(conn.io, .both) catch {};
+                        conn.connection.shutdownBoth(conn.io);
                         return err;
                     };
                 }
@@ -1754,7 +1754,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// reader stops too, the streams waiting for room are told, and
             /// the token goes (nobody takes it again).
             fn writeFailed(conn: *Conn) void {
-                conn.connection.stream.shutdown(conn.io, .both) catch {};
+                conn.connection.shutdownBoth(conn.io);
                 conn.lock();
                 defer conn.unlock();
                 conn.writer = conn.writer.next(.fail);
@@ -1886,7 +1886,7 @@ pub fn Engine(comptime Ctx: type) type {
                     .running_parked, .parked => |p| p.peerGone(),
                     .detached_inline, .detached_tasked => |ex| {
                         // Attached or finished: its task or its end lets go.
-                        const d = ex.response.detached.?;
+                        const d = ex.response._detachment().?;
                         if (d.state != .detached) return;
                         d.abort();
                         ex.request._body_held.release();
@@ -2460,16 +2460,12 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         /// Takes `connection`, initialized, over for HTTP/2: it becomes the
-        /// server's `Adopter` (`connection.adopter`), which the caller then
+        /// server's `Adopter` (`connection.adopt`), which the caller then
         /// serves (`Server.serveAdopted`) until it closes or parks, and
-        /// releases once (`Adopter.release`). `busy` is the connection's
-        /// count in the server's in-flight requests, given back here: from
-        /// now on it counts while streams are open.
-        pub fn start(server: *Server, listener: *const Listener, secure: bool, connection: *Connection, busy: *bool) !void {
-            if (busy.*) {
-                busy.* = false;
-                server.finishRequest();
-            }
+        /// releases once (`Adopter.release`). The caller has given the
+        /// connection's in-flight count back (`Server.giveCount`): from now
+        /// on the engine counts while streams are open.
+        pub fn start(server: *Server, listener: *const Listener, secure: bool, connection: *Connection) !void {
             const io = server.io;
             const h = server.config.http2;
             const conn = try server.allocator.create(Conn);
@@ -2513,7 +2509,7 @@ pub fn Engine(comptime Ctx: type) type {
             probe.outHigh(&opts.limits);
             try conn.proto.initAt(server.allocator, conn, opts);
             if (comptime registered()) @field(server, Registry.field).add(conn);
-            connection.adopter = &conn.adopter;
+            connection.adopt(&conn.adopter);
         }
 
         /// `start`, then the connection served on the calling task as a
@@ -2521,13 +2517,10 @@ pub fn Engine(comptime Ctx: type) type {
         /// then released: for the tests and the test listener
         /// (`test_server.zig`), which run the engine on a connection of
         /// their own.
-        pub fn serve(server: *Server, listener: *const Listener, secure: bool, connection: *Connection, busy: *bool) !void {
-            try start(server, listener, secure, connection, busy);
-            const a = connection.adopter.?;
-            defer {
-                connection.adopter = null;
-                a.release(a);
-            }
+        pub fn serve(server: *Server, listener: *const Listener, secure: bool, connection: *Connection) !void {
+            try start(server, listener, secure, connection);
+            const a = connection.mode.adopter().?;
+            defer connection.releaseAdopter();
             var timer: Timer = .init(null);
             defer timer.clear(server.io);
             var burst: server_mod.Burst = .{ .connection = connection, .io = server.io, .timer = &timer, .park_after = null, .deadline = null };
@@ -2973,7 +2966,7 @@ pub fn Engine(comptime Ctx: type) type {
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
-                        conn.connection.stream.shutdown(conn.io, .both) catch {};
+                        conn.connection.shutdownBoth(conn.io);
                         return err;
                     };
                 }
@@ -3159,10 +3152,8 @@ pub fn Engine(comptime Ctx: type) type {
             defer if (!detached) response.deinit();
             response._request = request;
             request._response = response;
-            response._detach_engine = &detach_engine;
-            response._detach_ctx = &ex;
             // On its own task the response may detach only to be parked.
-            response._detach_park_only = timer != null;
+            response._offerDetach(&detach_engine, &ex, if (timer != null) .park_only else .full);
 
             request.method = parseMethod(es.method) orelse {
                 response.status = .not_implemented;
@@ -3254,7 +3245,7 @@ pub fn Engine(comptime Ctx: type) type {
             // A detached response is its owner's (or over already, a park
             // that failed having handled the error), whatever the handler
             // returned: the stack copy is not written or freed here.
-            if (response.detached) |d| {
+            if (response._detachment()) |d| {
                 detached = true;
                 conn.lock();
                 defer conn.unlock();
@@ -3306,7 +3297,6 @@ pub fn Engine(comptime Ctx: type) type {
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
-            ex.response._detach_ctx = ex;
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;

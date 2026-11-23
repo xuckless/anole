@@ -42,7 +42,7 @@ pub inline fn end(req: *Request, res: *Response, result: anytype, answered: ?any
     // `console_start_ns` of 0, which is `start_ns`.
     if (start_ns == 0 and !mayBe5xx(res, result)) return;
     // A detached response has no answer yet: `finished` reports it.
-    if (res.detached) |d| {
+    if (res._detachment()) |d| {
         d.console_start_ns = start_ns;
         return;
     }
