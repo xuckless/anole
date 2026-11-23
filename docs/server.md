@@ -252,7 +252,7 @@ pinned, every deadline is exact.
 `request`: `require_host` (true), `decompress` (true) and `keep_buffers`
 (false). `response`: `write_buffer_size` (16 KiB), `date` (true),
 `default_content_type` (`.text`), `max_header_count` (64) and
-`brotli_quality` (4).
+`brotli_quality` (4). A response that fills `max_header_count` is sent without its default Content-Type rather than dropped.
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;

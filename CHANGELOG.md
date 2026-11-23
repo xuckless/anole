@@ -5,7 +5,7 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
-S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes.
+S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247.
 
 ### Changed
 
@@ -18,9 +18,18 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
 - **`Detached.attach` takes the task function and its arguments** (`d.attach(func, args)`) and spawns the task itself, instead of returning a group for the caller to spawn into (#225, below). Code using `anole.http`'s detached responses directly needs the one-line change.
 - Performance neutral: fixed-count user-space instructions per request within +0.2% on h2c, unary gRPC, static-h2, h2 TLS, HTTP/3 and HTTP/1.1; RSS flat or lower on every cell of the A/B (bench/results/20261122-s3-batch1-ab, measured before the comptime-table commit).
 - Pins: pg.zig `anole` 8595bef (was 06ccba1).
+- **The HTTP/1 core's state as explicit enums and unions with declared tables** (S3 batch 2). No behaviour change beyond the two fixes below: wire bytes, error results and C ABI results are as before.
+  - Response: the body framing (`_body_mode`: buffered, chunked, streaming, declared length) and the body writer (`_body_writer`) are two enums instead of four booleans; the response's phase (building, head sent, writing, finished, parked) is one `Phase` enum with a comptime table, and its detach offer and detached handle one union.
+  - Request body: `req.body()` and `req.reader()` share one union (unread, reader taken, cached) and each form one optional instead of a map plus a flag; a failed form parse publishes nothing.
+  - Idle park: a shelf entry's lifecycle is one phase enum with a comptime table (the never-read `shelf` back pointer is gone).
+  - Client: a pooled connection's role (HTTP/1, a dialed HTTP/2 session, an origin's HTTP/2 carrier, a view on a shared session) is one `Kind` union and an HTTP/2 origin's list membership one state; the dials in flight and the HTTP/1-only memory are one `Dials` type with its table; a response body is one `BodyState` union (unread, reader taken, cached).
+  - WebSocket: a connection's flush-batch membership and flusher task and the write backstop are explicit states with declared tables; the four send variants go through one `sendFrame`, and the fragmentation state is one optional.
+- **`Response.detached` is gone** (`anole.http` users): ask `res.isDetached()`; the engines read `res._detachment()`. `Response.WriteError` no longer contains `HeaderError` (`write()` can't fail on a full header table any more, #246).
 
 ### Fixed
 
+- **A response whose headers fill `response.max_header_count` is answered** (#246), without the Content-Type that has no room, instead of dropping the HTTP/1.1 connection (logged as `Malformed request: TooManyHeaders`) or resetting the HTTP/2 or HTTP/3 stream. The 500 for a handler that tries to add one header past the limit is now sent too.
+- **HTTP/1.x header values lose their trailing spaces and tabs** (#247, RFC 9110 5.5), in requests and in client responses: `X-Trim: spaced   ` reached the handler with its spaces, and `Content-Length: 5 ` read as no length. HTTP/2 and HTTP/3 already refuse or drop such values.
 - **A detached response's task could be spawned into a connection group that was already joined** (#225): `Detached.attach` checked the connection under its lock, let go of the lock, and the caller spawned afterwards, so on `std.Io.Threaded` a teardown could join the group in between and the task outlived the connection. The spawn now happens under the connection's lock in both engines. HTTP/2 refuses an attach once its tasks are over; HTTP/3 never needs to, because its teardown aborts every still-detached response before it joins the group.
 - **Stopping a PostgreSQL watch no longer writes Terminate into a socket another task is writing to** (#221): the watch hub stops a connection with the pg.zig fork's new `Listener.interrupt` (a shutdown without Terminate), so a LISTEN, UNLISTEN or ping in flight can't be interleaved with it or blocked behind it. A listener says goodbye on close only if it was never interrupted.
 - The C ABI test of a WebSocket handshake past its deadline no longer races (#234): it runs on one executor, so a barrier request orders the check after the handshake's record instead of waiting for a delivery that may never come.

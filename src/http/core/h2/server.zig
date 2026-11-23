@@ -1886,7 +1886,7 @@ pub fn Engine(comptime Ctx: type) type {
                     .running_parked, .parked => |p| p.peerGone(),
                     .detached_inline, .detached_tasked => |ex| {
                         // Attached or finished: its task or its end lets go.
-                        const d = ex.response.detached.?;
+                        const d = ex.response._detachment().?;
                         if (d.state != .detached) return;
                         d.abort();
                         ex.request._body_held.release();
@@ -3159,10 +3159,8 @@ pub fn Engine(comptime Ctx: type) type {
             defer if (!detached) response.deinit();
             response._request = request;
             request._response = response;
-            response._detach_engine = &detach_engine;
-            response._detach_ctx = &ex;
             // On its own task the response may detach only to be parked.
-            response._detach_park_only = timer != null;
+            response._offerDetach(&detach_engine, &ex, if (timer != null) .park_only else .full);
 
             request.method = parseMethod(es.method) orelse {
                 response.status = .not_implemented;
@@ -3254,7 +3252,7 @@ pub fn Engine(comptime Ctx: type) type {
             // A detached response is its owner's (or over already, a park
             // that failed having handled the error), whatever the handler
             // returned: the stack copy is not written or freed here.
-            if (response.detached) |d| {
+            if (response._detachment()) |d| {
                 detached = true;
                 conn.lock();
                 defer conn.unlock();
@@ -3306,7 +3304,6 @@ pub fn Engine(comptime Ctx: type) type {
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
-            ex.response._detach_ctx = ex;
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;

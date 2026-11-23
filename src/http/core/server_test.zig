@@ -919,6 +919,52 @@ test "Server: keepalive with request buffers given back between requests" {
     try std.testing.expectEqualStrings("third", resp3.body);
 }
 
+test "Server: header values reach the handler without trailing whitespace" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.post("/trim", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const body = (try req.body()) orelse "no body";
+            res.body = try std.fmt.allocPrint(res.arena, "{s}|{}|{any}|{s}", .{
+                req.headers.get("X-Trim") orelse "missing",
+                req.content_type == .json,
+                req.content_length,
+                body,
+            });
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+
+    var status: [64]u8 = undefined;
+    var body: [64]u8 = undefined;
+
+    try w.writeAll("POST /trim HTTP/1.1\r\nHost: localhost  \r\nX-Trim: spaced   \r\nContent-Type: application/json  \r\nContent-Length: 5  \r\n\r\nhello");
+    try w.flush();
+    const resp = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectEqualStrings("spaced|true|5|hello", resp.body);
+}
+
 /// Serves `/a`, `/b` and `/c` with their names, `/b` from its request body
 /// and `/a` for any method without reading one. What a pipelining test
 /// needs: enough routes to tell the responses apart, and bodies read and
@@ -4686,6 +4732,65 @@ test "listenIp: an IPv6-only listener it opens itself hands TCP_NODELAY to accep
     const accepted = try listener.accept(io);
     defer accepted.close(io);
     try std.testing.expect(try tcpNoDelay(accepted.socket.handle));
+}
+
+test "Server: a response with as many headers as the limit allows is answered, and the connection carries on" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    // One past the limit is the handler's own error: a 500 that is sent.
+    const guard = dusty.expect_log.expect();
+    defer guard.deinit();
+    const max = (dusty.ServerConfig{}).response.max_header_count;
+    server.router.get("/full", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            for (0..max) |i| try res.header(try std.fmt.allocPrint(res.arena, "X-Header-{d}", .{i}), "v");
+            res.body = "ok";
+        }
+    }.handle);
+    server.router.get("/over", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            for (0..max + 1) |i| try res.header(try std.fmt.allocPrint(res.arena, "X-Header-{d}", .{i}), "v");
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            const rows = [_]struct { path: []const u8, status: []const u8 }{
+                .{ .path = "/full", .status = "HTTP/1.1 200 OK\r\n" },
+                .{ .path = "/over", .status = "HTTP/1.1 500 " },
+            };
+            for (rows) |row| {
+                const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+                defer stream.close(_io);
+                var write_buf: [512]u8 = undefined;
+                var writer = stream.writer(_io, &write_buf);
+                try writer.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\n\r\nGET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{ row.path, row.path });
+                try writer.interface.flush();
+                var read_buf: [1024]u8 = undefined;
+                var reader = stream.reader(_io, &read_buf);
+                var out: [16384]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&out);
+                _ = reader.interface.streamRemaining(&w) catch {};
+                const resp = w.buffered();
+                errdefer std.debug.print("row {s}: {s}\n", .{ row.path, resp });
+                // Both pipelined requests are answered, neither with a Content-Type.
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, resp, row.status));
+                try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Type") == null);
+                try std.testing.expect(std.mem.indexOf(u8, resp, "X-Header-63: v\r\n") != null);
+            }
+        }
+    }.run, .{ &server, io });
+    try client_future.await(io);
 }
 
 test "Server: a response can carry more headers than a request may" {

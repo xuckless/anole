@@ -38,7 +38,7 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
                     const B = @TypeOf(batch);
                     test_wait.waitUntil(req.io, "the socket's flusher sent the echo and ended", batch, struct {
                         fn ended(b: B) bool {
-                            return !b.deferred.load(.monotonic) and !b.started;
+                            return !b.isHeld() and b.task == .none;
                         }
                     }.ended) catch |err| switch (err) {
                         error.Canceled => return,

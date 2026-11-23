@@ -180,7 +180,7 @@ pub fn Chain(comptime Ctx: type) type {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];
                 self.index += 1;
-                if (!mw.detach_safe) self.res._detach_blocked = true;
+                if (!mw.detach_safe) self.res._blockDetach();
                 return mw.execute(self.req, self.res, self);
             }
 
@@ -485,11 +485,7 @@ fn makeTestResponse(conn: *Connection) Response {
         .content_type = null,
         .arena = undefined,
         ._conn = conn,
-        ._written = false,
-        ._headers_written = false,
         .keepalive = true,
-        ._chunked = false,
-        ._streaming = false,
     };
 }
 
@@ -700,7 +696,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
     var res = makeTestResponse(&connection);
     // Simulate a response that already started (e.g. a streamed/chunked body
     // or a WebSocket upgrade) before the handler failed.
-    res._headers_written = true;
+    res._phase = .head_sent;
 
     var chain = Chain(void){
         .req = &req,
