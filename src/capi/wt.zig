@@ -343,7 +343,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const xi = placement.currentExecutor(req.io) orelse return error.InternalServerError;
     const x = &e.execs[xi];
     if (x.consumer == null) return res.fail(.service_unavailable, "no consumer");
-    const opts = route.wt.?;
+    const opts = route.kind.webtransport;
     const session = (try webtransport.accept(req, res, opts.accept)) orelse
         return res.fail(.bad_request, "this endpoint speaks WebTransport over HTTP/3");
     defer session.deinit();

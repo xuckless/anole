@@ -133,14 +133,14 @@ pub fn endTied(x: *Exec, i: u32, cut: bool) void {
 }
 
 /// Whether the request or call `h` is still there to serve. On `h`'s
-/// executor only: an orphaned slot (`Slot.orphan`, executor-local) is not,
+/// executor only: an orphaned slot (`Slot.owner`, executor-local) is not,
 /// though a consumer call that failed may have handed it back to `out`:
 /// its request's memory went with its stream.
 pub fn slotLive(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
-    if (sl.orphan) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
+    if (sl.owner == .orphan) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {
@@ -162,7 +162,7 @@ pub fn slotLive(x: *Exec, h: Handle) bool {
 fn stillOwed(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {

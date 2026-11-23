@@ -62,6 +62,7 @@ test "webhooks: bad webhook_verify settings are refused with the key named" {
 // Endpoint management through anole_jobs_admin ("webhooks.*")
 
 const engine = @import("engine.zig");
+const engine_test = @import("engine_test.zig");
 const alloc = std.testing.allocator;
 
 /// Runs one admin request and returns its answer (status, http status and
@@ -128,6 +129,21 @@ const AdminRig = struct {
         return error.TimedOut;
     }
 };
+
+test "capi webhooks: a drain the console starts (App.stop) stops new sends while the server drains (#220)" {
+    if (comptime !(features.webhooks and features.sqlite)) return error.SkipZigTest;
+    var r: AdminRig = undefined;
+    try r.create();
+    defer r.deinit();
+    var probe: engine_test.DrainProbe = .{ .e = r.e, .check = struct {
+        fn draining(e: *engine.Engine) bool {
+            return e.webhooks_state.draining.load(.acquire);
+        }
+    }.draining };
+    probe.add();
+    r.e.testStopServer();
+    try probe.expectHeld();
+}
 
 test "capi webhooks: admin errors: a bad URL is 400 E_INVALID, an unknown endpoint 404, a broken request 400" {
     if (comptime !(features.webhooks and features.sqlite)) return error.SkipZigTest;

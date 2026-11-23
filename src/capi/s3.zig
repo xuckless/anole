@@ -78,13 +78,7 @@ pub const State = struct {
     first_gen: u32 = 1,
 
     pub fn init(s: *State, first_gen: u32) void {
-        s.* = .{ .first_gen = first_gen };
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
+        s.first_gen = first_gen;
     }
 
     pub fn deinit(s: *State) void {
@@ -305,8 +299,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): no new upload starts;
-/// those in flight finish.
+/// The drain started (however it started; once; never waits): no new
+/// upload starts; those in flight finish.
 pub fn draining(e: *Engine) void {
     if (comptime !features.s3) return;
     for (e.s3_state.stores) |*st| if (st.client) |c| c.draining.store(true, .release);
@@ -1463,7 +1457,7 @@ const BodyReader = struct {
             // Orphaned: the stream went while a consumer call held the
             // slot, and with it what the pipe held (executor-local, read
             // on the executor).
-            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and !s.orphan;
+            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and s.owner != .orphan;
             if (!mine or s.in.failed) {
                 s.in.release();
                 self.failed = true;

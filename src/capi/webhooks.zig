@@ -49,17 +49,6 @@ pub const State = struct {
     watcher_ud: u64 = 0,
     draining: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(s: *State, first_gen: u32) void {
-        _ = first_gen;
-        s.* = .{};
-    }
-
-    /// No handles of its own: nothing to bound.
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
-    }
-
     pub fn deinit(s: *State) void {
         s.client = if (features.webhooks) null else {};
     }
@@ -71,15 +60,6 @@ pub const ExecState = struct {
 
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
-    }
-
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
     }
 };
 
@@ -133,7 +113,7 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     e.jobs_state.webhooks_admin = &adminOp;
 }
 
-/// The drain started (`anole_server_drain`, once).
+/// The drain started (however it started; once; never waits).
 pub fn draining(e: *Engine) void {
     e.webhooks_state.draining.store(true, .release);
 }

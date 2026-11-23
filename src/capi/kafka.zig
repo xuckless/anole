@@ -92,8 +92,6 @@ pub const ExecState = struct {
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
     }
-
-    pub fn deinit(_: *ExecState) void {}
 };
 
 pub const CallError = error{ Invalid, State, Again, OutOfMemory, Unsupported, Gone };
@@ -796,8 +794,8 @@ pub fn groupClose(e: *Engine, hv: u64) void {
     e.setEvent(&g.wake);
 }
 
-/// The drain started: every group finishes up and ends with
-/// `ANOLE_BROKER_END_DRAINED`.
+/// The drain started (however it started; once; never waits): every group
+/// finishes up and ends with `ANOLE_BROKER_END_DRAINED`.
 pub fn draining(e: *Engine) void {
     const st = &e.kafka_state;
     st.groups.acquire();

@@ -47,18 +47,6 @@ pub const State = struct {
     mails: []Mail = &.{},
     made: bool = false,
 
-    pub fn init(s: *State, first_gen: u32) void {
-        _ = s;
-        _ = first_gen;
-    }
-
-    /// The highest generation handed out (`Engine.destroy`): none, a mail
-    /// server has no handles.
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
-    }
-
     pub fn deinit(s: *State) void {
         if (s.mails.len > 0) gpa.free(s.mails);
         s.mails = &.{};
@@ -87,16 +75,6 @@ pub const ExecState = struct {
 
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
     }
 };
 
@@ -184,8 +162,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): no new send is taken;
-/// those in flight finish, and the client closes with the server.
+/// The drain started (however it started; once; never waits): no new send
+/// is taken; those in flight finish, and the client closes with the server.
 pub fn draining(e: *Engine) void {
     if (comptime !features.smtp) return;
     for (e.smtp_state.mails) |*m| if (m.client) |c| c.stopAccepting();
@@ -194,11 +172,6 @@ pub fn draining(e: *Engine) void {
 /// The server stops: nothing new starts from here.
 pub fn close(e: *Engine) void {
     for (e.smtp_state.mails) |*m| m.open.store(false, .release);
-}
-
-/// `anole_server_destroy`: frees what a stopped server still holds.
-pub fn destroy(e: *Engine) void {
-    _ = e;
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Mail {

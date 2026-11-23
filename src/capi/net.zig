@@ -91,13 +91,6 @@ const Slots = SlotTable(NetSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full 
 pub const ExecState = struct {
     slots: Slots = .{},
 
-    /// The tasks it runs (the net drivers) belong to the server's group and
-    /// end with it.
-    pub fn cancel(st: *ExecState, io: std.Io) void {
-        _ = st;
-        _ = io;
-    }
-
     /// The highest generation handed out (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
         return st.slots.maxGen();
@@ -157,16 +150,7 @@ pub const State = struct {
     udps: std.ArrayList(*UdpState) = .empty,
 
     pub fn init(s: *State, first_gen: u32) void {
-        s.* = .{ .first_gen = first_gen };
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(s: *State) u32 {
-        return s.first_gen;
-    }
-
-    pub fn deinit(s: *State) void {
-        _ = s;
+        s.first_gen = first_gen;
     }
 };
 
