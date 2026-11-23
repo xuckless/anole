@@ -97,11 +97,20 @@ pub const Session = struct {
     broken: bool = false,
     /// Taken idle from the pool.
     reused: bool = false,
-    /// The final "." of the current message was sent and no answer came:
-    /// the server may have kept the message.
-    after_dot: bool = false,
-    /// MAIL FROM of the current message was accepted.
-    mail_accepted: bool = false,
+    /// How far the current message got. idle: nothing accepted yet (a
+    /// failure here may be a dead idle connection, safe to retry);
+    /// mail_accepted: MAIL FROM accepted, and it stays so after the dot was
+    /// answered (the outcome is known, but it was not a dead idle
+    /// connection); dot_sent: the final "." may have reached the server and
+    /// no answer is known, so it may have kept the message.
+    txn: Txn = .idle,
+
+    pub const Txn = enum { idle, mail_accepted, dot_sent };
+
+    /// The one place `broken` is set.
+    pub fn markBroken(self: *Session) void {
+        self.broken = true;
+    }
 
     pub fn close(self: *Session, polite: bool) void {
         if (polite and !self.broken) self.quit();
@@ -224,7 +233,7 @@ pub const Session = struct {
     fn read(self: *Session, ctx: *const Ctx, map: db.ErrorMap) anyerror!Reply {
         return reply_mod.read(self.stream.reader(), ctx.arena) catch |err| switch (err) {
             error.MalformedReply => {
-                self.broken = true;
+                self.markBroken();
                 return ctx.failCode(map, .unavailable, "protocol_error", "the server sent something that is not an SMTP reply", .{});
             },
             else => |e| return e,
@@ -237,7 +246,7 @@ pub const Session = struct {
     fn refused(self: *Session, ctx: *const Ctx, map: db.ErrorMap, stage: Stage, r: Reply) db.Error {
         const text = r.joined(ctx.arena) catch r.first();
         const code_text = r.enhanced() orelse std.fmt.allocPrint(ctx.arena, "{d}", .{r.code}) catch "";
-        if (r.code == 421) self.broken = true;
+        if (r.code == 421) self.markBroken();
         var class: db.Class = .other;
         var code: []const u8 = code_text;
         if (r.code == 421) {
@@ -269,11 +278,10 @@ pub const Session = struct {
     };
 
     /// Sends `c`: MAIL FROM, every RCPT TO, DATA and the body. Returns when
-    /// the server has answered the final "." (`after_dot` says it has been
-    /// sent, for the caller to know a failure may still have delivered).
+    /// the server has answered the final "." (`txn == .dot_sent` after a failure
+    /// says a failure may still have delivered).
     pub fn transact(self: *Session, ctx: *const Ctx, map: db.ErrorMap, io: std.Io, c: *const mime.Composed, max_bytes: u64) anyerror!Sent {
-        self.after_dot = false;
-        self.mail_accepted = false;
+        self.txn = .idle;
         if (c.utf8 and !self.caps.smtputf8)
             return ctx.failCode(map, .invalid, "smtputf8_unsupported", "an address is not ASCII and the server does not offer SMTPUTF8", .{});
         if (self.caps.size > 0 and c.size > self.caps.size)
@@ -292,7 +300,7 @@ pub const Session = struct {
             try w.flush();
             mail_reply = try self.read(ctx, map);
             if (mail_reply.?.code != 250) return self.refused(ctx, map, .mail, mail_reply.?);
-            self.mail_accepted = true;
+            self.txn = .mail_accepted;
         }
         var accepted: std.ArrayList([]const u8) = .empty;
         var rejected: std.ArrayList(Rejected) = .empty;
@@ -314,7 +322,7 @@ pub const Session = struct {
             }
             if (accepted.items.len == 0) {
                 self.resetTransaction(ctx);
-                return self.noRecipients(ctx, map, deferred, first_rejection, rejected.items);
+                return noRecipients(ctx, map, deferred, first_rejection, rejected.items);
             }
             try w.writeAll("DATA\r\n");
             try w.flush();
@@ -338,7 +346,7 @@ pub const Session = struct {
                 // The rest were answered "bad sequence".
                 return self.refused(ctx, map, .mail, mail_reply.?);
             }
-            self.mail_accepted = true;
+            self.txn = .mail_accepted;
             if (accepted.items.len == 0) {
                 if (d.code == 354) {
                     // The server wants a body after all: end it empty.
@@ -346,7 +354,7 @@ pub const Session = struct {
                     try w.flush();
                     _ = try self.read(ctx, map);
                 } else self.resetTransaction(ctx);
-                return self.noRecipients(ctx, map, deferred, first_rejection, rejected.items);
+                return noRecipients(ctx, map, deferred, first_rejection, rejected.items);
             }
             if (d.code != 354) {
                 self.resetTransaction(ctx);
@@ -357,12 +365,12 @@ pub const Session = struct {
         // The body, then the final dot.
         var stuffer: mime.Stuffer = .{ .normalize = c.normalize };
         try mime.writeMessage(c, io, w, &stuffer);
-        self.after_dot = true;
+        self.txn = .dot_sent;
         try stuffer.finish(w);
         try w.flush();
         const final = try self.read(ctx, map);
         // The server answered: whatever it said, the outcome is known.
-        self.after_dot = false;
+        self.txn = .mail_accepted;
         if (final.code != 250) return self.refused(ctx, map, .body, final);
         self.messages += 1;
         return .{
@@ -387,16 +395,13 @@ pub const Session = struct {
             try accepted.append(ctx.arena, rcpt);
             return;
         }
-        if (r.code == 421) {
-            self.broken = true;
-        }
+        if (r.code == 421) self.markBroken();
         if (r.code >= 400 and r.code < 500) deferred.* = true;
         if (first_rejection.* == null) first_rejection.* = r;
         try rejected.append(ctx.arena, .{ .address = rcpt, .code = r.code, .message = r.joined(ctx.arena) catch r.first() });
     }
 
-    fn noRecipients(self: *Session, ctx: *const Ctx, map: db.ErrorMap, deferred: bool, first: ?Reply, rejected: []const Rejected) db.Error {
-        _ = self;
+    fn noRecipients(ctx: *const Ctx, map: db.ErrorMap, deferred: bool, first: ?Reply, rejected: []const Rejected) db.Error {
         const f = first.?;
         const detail = std.fmt.allocPrint(ctx.arena, "{d} {s} (recipient {s})", .{ f.code, rejected[0].message, rejected[0].address }) catch "every recipient was refused";
         if (f.code == 421) return ctx.fail(map, .{ .system = .smtp, .class = .unavailable, .code = "service_unavailable", .message = detail });
@@ -408,20 +413,15 @@ pub const Session = struct {
     /// connection is not used again.
     fn resetTransaction(self: *Session, ctx: *const Ctx) void {
         if (self.broken) return;
+        self.rset(ctx) catch self.markBroken();
+    }
+
+    fn rset(self: *Session, ctx: *const Ctx) anyerror!void {
         const w = self.stream.writer();
-        w.writeAll("RSET\r\n") catch {
-            self.broken = true;
-            return;
-        };
-        w.flush() catch {
-            self.broken = true;
-            return;
-        };
-        const r = reply_mod.read(self.stream.reader(), ctx.arena) catch {
-            self.broken = true;
-            return;
-        };
-        if (r.code != 250) self.broken = true;
+        try w.writeAll("RSET\r\n");
+        try w.flush();
+        const r = try reply_mod.read(self.stream.reader(), ctx.arena);
+        if (r.code != 250) return error.BadReply;
     }
 
     /// EHLO and QUIT on a fresh connection: whether the server answers
