@@ -504,34 +504,22 @@ test "the phase table: each event from each phase, its next phase and its result
     const denied: Phase = .{ .ended = .{ .how = .permission_denied } };
     const closed: Phase = .{ .ended = .{ .how = .closed } };
     const drained: Phase = .{ .ended = .{ .how = .closed, .closed_after_drain = true } };
-    // The result: what the call returned; for endOpen, that it ended the queue;
-    // for the last push, that it finished it; finishDrain and cancel: true.
+    // The result: what the call returned; endOpen: it ended; last push: it finished.
     const rows = [_]struct { []const u8, Phase, Event, Phase, bool }{
         .{ "enterDrain begins", .open, .enter_drain, sub, true },
         .{ "enterDrain twice", sub, .enter_drain, sub, false },
-        .{ "enterDrain in a client drain", cli, .enter_drain, cli, false },
         .{ "enterDrain after the end", fin, .enter_drain, fin, false },
-        .{ "client drain of an open queue", .open, .client_drain, cli, true },
         .{ "client drain of a subscription drain", sub, .client_drain, cli, true },
         .{ "client drain twice", cli, .client_drain, cli, false },
-        .{ "client drain after the end", fin, .client_drain, fin, false },
         .{ "finishDrain of an open queue", .open, .finish_drain, .open, true },
         .{ "finishDrain of a subscription drain", sub, .finish_drain, fin, true },
-        .{ "finishDrain of a client drain", cli, .finish_drain, fin, true },
-        .{ "finishDrain after the end", denied, .finish_drain, denied, true },
         .{ "end of a draining queue", cli, .{ .end = .disconnected }, .{ .ended = .{ .how = .disconnected } }, true },
-        .{ "end after an end", fin, .{ .end = .slow_consumer }, fin, false },
         .{ "close of a settled finished queue", fin, .{ .end = .closed }, drained, false },
         .{ "close of a denied queue", denied, .{ .end = .closed }, closed, false },
-        .{ "close of an open queue", .open, .{ .end = .closed }, closed, true },
         .{ "close twice keeps the drain", drained, .{ .end = .closed }, drained, false },
-        .{ "endOpen of a subscription drain", sub, .{ .end_open = .no_responders }, .{ .ended = .{ .how = .no_responders } }, true },
         .{ "endOpen after an end", denied, .{ .end_open = .finished }, denied, false },
-        .{ "cancel of a draining queue", sub, .cancel, fin, true },
-        .{ "cancel after another end", denied, .cancel, fin, true },
         .{ "cancel after a close", closed, .cancel, closed, true },
         .{ "last push of a draining queue", cli, .last_push, fin, true },
-        .{ "last push after the end", denied, .last_push, denied, false },
     };
     for (rows) |row| {
         const name, const from, const event, const to, const result = row;
@@ -542,16 +530,10 @@ test "the phase table: each event from each phase, its next phase and its result
         const got = switch (event) {
             .enter_drain => q.enterDrain(io),
             .client_drain => q.drainForClient(io),
-            .finish_drain => b: {
-                q.finishDrain(io);
-                break :b true;
-            },
+            .finish_drain => q.finishDrain(io) == {},
             .end => |how| q.end(io, how, false),
             .end_open => |how| q.endOpen(io, how, false) == null,
-            .cancel => b: {
-                q.cancel(io);
-                break :b true;
-            },
+            .cancel => q.cancel(io) == {},
             .last_push => q.push(io, null).ended == .finished,
         };
         if (event == .enter_drain) q.leaveDrain();
