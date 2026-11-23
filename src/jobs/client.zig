@@ -86,8 +86,8 @@ const CronEntry = struct {
     opts: root.CronOptions,
     kind: []const u8,
     args_json: []const u8,
-    zone: cron_mod.Zone = .utc,
-    zone_loaded: bool = false,
+    /// Null until loadZone: a cron entry without a tz runs in UTC.
+    zone: ?cron_mod.Zone = null,
 };
 
 pub const Client = struct {
@@ -223,8 +223,7 @@ pub const Client = struct {
         self.gpa.free(self.queues);
         self.handlers.deinit(self.gpa);
         for (self.crons.items) |c| {
-            var z = c.zone;
-            z.deinit();
+            if (c.zone) |*z| z.deinit();
             self.gpa.destroy(c);
         }
         self.crons.deinit(self.gpa);
@@ -384,13 +383,12 @@ pub const Client = struct {
     }
 
     fn loadZone(self: *Client, c: *CronEntry) !void {
-        if (c.zone_loaded) return;
+        if (c.zone != null) return;
         const name = c.opts.tz orelse "UTC";
         c.zone = cron_mod.Zone.load(self.gpa, self.io, name) catch |e| {
             log.err("cron \"{s}\": time zone \"{s}\" failed: {t}", .{ c.name, name, e });
             return error.InvalidOptions;
         };
-        c.zone_loaded = true;
     }
 
     fn kickFromStore(context: ?*anyopaque, queue: []const u8) void {
@@ -1061,19 +1059,6 @@ pub const Client = struct {
 
     // ---- background tasks
 
-    fn cloneRow(a: std.mem.Allocator, r: store.Row) !store.Row {
-        var out = r;
-        out.queue = try a.dupe(u8, r.queue);
-        out.kind = try a.dupe(u8, r.kind);
-        out.args_json = try a.dupe(u8, r.args_json);
-        out.meta_json = try a.dupe(u8, r.meta_json);
-        if (r.worker) |w| out.worker = try a.dupe(u8, w);
-        const errs = try a.alloc(root.ErrorEntry, r.errors.len);
-        for (r.errors, errs) |s, *d| d.* = .{ .attempt = s.attempt, .at = s.at, .@"error" = try a.dupe(u8, s.@"error"), .message = try a.dupe(u8, s.message) };
-        out.errors = errs;
-        return out;
-    }
-
     fn waitSignal(self: *Client, sig: *placement.Signal, d: Duration) std.Io.Cancelable!void {
         const dl: dusty.Deadline = .init(self.io, .{ .duration = .{ .raw = d, .clock = .awake } });
         dl.run(placement.Signal.wait, .{ sig, self.io }) catch |e| switch (e) {
@@ -1118,7 +1103,7 @@ pub const Client = struct {
     fn spawnJob(self: *Client, q: *Queue, r: store.Row) void {
         const box = self.gpa.create(JobBox) catch return self.putBack(r);
         box.* = .{ .client = self, .queue = q, .arena_state = .init(self.gpa), .row = undefined };
-        box.row = cloneRow(box.arena_state.allocator(), r) catch {
+        box.row = store.copyRow(box.arena_state.allocator(), r) catch {
             box.arena_state.deinit();
             self.gpa.destroy(box);
             return self.putBack(r);
@@ -1407,7 +1392,8 @@ pub const Client = struct {
             return;
         }
         var ticks: [1000]Time = undefined;
-        const n = e.schedule.between(row.?.last_tick.?, t, &e.zone, &ticks);
+        const zone: cron_mod.Zone = e.zone orelse .utc;
+        const n = e.schedule.between(row.?.last_tick.?, t, &zone, &ticks);
         if (n == 0) return;
         const latest = ticks[n - 1];
         switch (e.opts.missed) {
@@ -1488,7 +1474,7 @@ pub const Client = struct {
                 .tz = e.opts.tz orelse "UTC",
                 .kind = e.kind,
                 .last_tick = last,
-                .next_tick = e.schedule.next(last orelse t, &e.zone),
+                .next_tick = e.schedule.next(last orelse t, &(e.zone orelse cron_mod.Zone.utc)),
                 .registered = true,
             });
         }
@@ -1549,7 +1535,7 @@ pub const Client = struct {
                     again = true;
                     var box: JobBox = .{ .client = self, .queue = q, .arena_state = .init(self.gpa), .row = undefined };
                     defer box.arena_state.deinit();
-                    box.row = cloneRow(box.arena_state.allocator(), r) catch return error.OutOfMemory;
+                    box.row = store.copyRow(box.arena_state.allocator(), r) catch return error.OutOfMemory;
                     self.prepare(&box);
                     try self.hold(&box);
                     const out = self.runJob(&box);
