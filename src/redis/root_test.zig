@@ -406,6 +406,18 @@ test "redis: a connection released twice is never handed to two holders" {
     _ = try y.incr(&c, "n");
     x.release();
     y.release();
+    // Retired while another holder has the other place: a second release
+    // touches neither the freed connection nor the pool.
+    const pool = &client.pools.pools[0];
+    const a = try client.acquire(&c);
+    const h = try client.acquire(&c);
+    a.conn.broken = true;
+    a.release();
+    a.release();
+    try testing.expectEqual(@as(usize, 1), pool.open);
+    try testing.expectEqual(@as(usize, 0), pool.idle_len);
+    h.release();
+    try testing.expectEqual(@as(usize, 1), pool.idle_len);
 }
 
 test "redis: a connection released twice after it broke reads no freed memory" {
@@ -679,6 +691,7 @@ const BreakNext = struct {
 
 test "redis: a pooled connection that breaks before sending, while the server is gone, fails the call and is freed once" {
     const zio = @import("zio");
+    const wait = @import("anole_test_wait");
     const gpa = testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -694,7 +707,7 @@ test "redis: a pooled connection that breaks before sending, while the server is
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
-    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1, .acquire_timeout = wait.deadline() });
     defer client.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -719,6 +732,25 @@ test "redis: a pooled connection that breaks before sending, while the server is
     // connection was closed and freed once.
     try testing.expectError(error.ServiceUnavailable, client.incr(&c, "n"));
     try testing.expect(!BreakNext.armed.load(.acquire));
+    const pool = &client.pools.pools[0];
+    try testing.expectEqual(@as(usize, 0), pool.open);
+    // A failed dial gives its place back and wakes the call waiting for it:
+    // a 503 for both from a refused dial, never a pool_timeout.
+    const Other = struct {
+        fn incr(cl: *Client, o_io: std.Io) !void {
+            var o_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer o_arena.deinit();
+            var o_c: db.Ctx = .{ .io = o_io, .arena = o_arena.allocator() };
+            try testing.expectError(error.ServiceUnavailable, cl.incr(&o_c, "n"));
+            try testing.expectStringStartsWith(db.lastError(&o_c).?.message, "cannot connect to");
+        }
+    };
+    var other = try io.concurrent(Other.incr, .{ client, io });
+    defer other.cancel(io) catch {};
+    try testing.expectError(error.ServiceUnavailable, client.incr(&c, "n"));
+    try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to");
+    try other.await(io);
+    try testing.expectEqual(@as(usize, 0), pool.open);
 }
 
 test "redis: a server that cannot be reached is a 503, and /readyz says so" {

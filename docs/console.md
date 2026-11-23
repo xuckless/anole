@@ -41,7 +41,7 @@ terminal, 8 not available on this OS.
 | `/requests [sort=] [window=10s\|60s]` | per route: req/s, p50, p99, 4xx/s, 5xx/s |
 | `/errors [route=]` | the last 256 5xx answers; Enter jumps to `/logs id=...` |
 | `/conns` | per executor: connections, streams, tasks, run queue; listeners |
-| `/db [name]` | per database: pool size, open, idle, in use |
+| `/db [name]` | per database: pool size, open, idle, in use, calls per second, p50, p99 (past 32 connectors the rest share one row) |
 | `/ws` | open WebSockets by protocol, WebTransport sessions, rooms (members, queued bytes, members closed as slow), SSE topics (subscribers) |
 | `/h3` | per HTTP/3 endpoint counters |
 | `/runtime` | RSS, CPU, threads, descriptors, versions, the binding's language metrics |

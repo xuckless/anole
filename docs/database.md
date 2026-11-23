@@ -409,7 +409,9 @@ try tx.commit(req); // under the request's deadline, like every call
   coroutine, never the thread. Don't mark such routes `anole.noWait`.
 - **Raw access.** `app.db.acquire(req)` hands over pg.zig's connection
   (`conn.raw`: `query`, `row`, `prepare`...) for what the calls above do
-  not cover; `conn.release()` gives it back. `app.db.listener()` opens a
+  not cover; `conn.release()` gives it back, once (a second call does
+  nothing and is logged), and before the arena of the request or `Ctx`
+  given to `acquire` is reset or freed. `app.db.listener()` opens a
   connection for `LISTEN`/`NOTIFY` (channel names up to 63 bytes,
   PostgreSQL's limit).
 - **Session state.** What a call left in its connection's session with
@@ -677,7 +679,9 @@ has, whatever the order of the calls: `anole_db_*` metrics with
 zig-sqlite (user functions, blobs, backups): `conn.run(func, args)` runs
 `func(driver_db, args...)` on the writer thread; `conn.release()` gives it
 back once (a second call does nothing; don't call anything on it after
-`release()`). `anole.sqlite.c` is the C API.
+`release()`). Release it before the arena of the request or `Ctx` given to
+`acquire` is reset or freed: the checkout record lives there.
+`anole.sqlite.c` is the C API.
 
 ## MongoDB
 
@@ -1035,6 +1039,9 @@ const stock = try conn.one(i64, req, .{ "GET", key });
 const r = try conn.pipeline(req, .{ .{"MULTI"}, .{ "SET", key, stock - 1 }, .{"EXEC"} });
 if (r[2] == .nil) return error.Conflict; // the key changed: nothing was set
 ```
+
+Release the connection before the arena of the request or `Ctx` given to
+`acquire` is reset or freed: the pool's record of it lives there.
 
 A connection that a call leaves inside MULTI or WATCH, on another
 database (SELECT), subscribed, or with other connection state (`CLIENT

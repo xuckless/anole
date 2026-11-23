@@ -320,6 +320,18 @@ pub const Message = struct {
 pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void else void = if (builtin.is_test) null else {};
 
 /// The pool of one executor: idle connections, and how many are open.
+/// Each of its `max` places is in one of these states:
+///
+/// | place   | where                          | event -> next                                   |
+/// |---------|--------------------------------|-------------------------------------------------|
+/// | free    | not counted in `open`          | `takeFrom` miss, `open < max` -> dialing        |
+/// | dialing | in `open`, no `Connection` yet | ok -> taken; fails -> free (`vacate`)           |
+/// | taken   | one holder (`Conn` or a call)  | `give` reusable -> idle; else `retire` -> free  |
+/// | idle    | in `idle`                      | `takeFrom` hit -> taken; expired or `closeIdle` |
+/// |         |                                | -> `retire` -> free; `deinit` -> closed          |
+///
+/// `retire` frees the connection's memory before the place goes back and a
+/// waiter is woken; the mutex guards only `idle`, `idle_len` and `open`.
 const Pool = struct {
     mutex: std.Io.Mutex = .init,
     /// Signalled when a connection goes back, or a place frees up.
@@ -330,13 +342,6 @@ const Pool = struct {
     /// Idle, in use, being opened or being closed.
     open: usize = 0,
     max: usize,
-    /// `max` slots; the first `spare_len` hold the memory of closed
-    /// connections, which the next dial reuses. A pooled `Connection` is
-    /// freed only in `deinit` (process-wide): a `Conn` from an earlier
-    /// checkout reads a lease, never freed memory. Every one is
-    /// counted in `open` or here, so there are `max` at most.
-    spare: []*Connection,
-    spare_len: usize = 0,
 };
 
 /// One connection to the server, and its RESP parser.
@@ -344,7 +349,7 @@ const Connection = struct {
     gpa: std.mem.Allocator,
     stream: *ClientStream,
     parser: *hiredis.redisReader,
-    /// Null for a subscriber's. Set once, when the memory is made.
+    /// Null for a subscriber's. Set once, at creation.
     pool: ?*Pool,
     idle_since: std.Io.Clock.Timestamp = undefined,
     state: State = .{},
@@ -357,10 +362,6 @@ const Connection = struct {
     /// `stream.bytesSent()` when it was taken: unchanged after a failure,
     /// nothing of the call reached the server.
     sent: u64 = 0,
-    /// Bumped by every give-back, under its pool's `mutex`: a `Conn` from
-    /// an earlier checkout gives nothing back (as pgxpool's
-    /// idempotent `Release`). Read without the lock only by its holder.
-    lease: u32 = 0,
 
     /// What the commands sent so far have left on the connection.
     const State = struct {
@@ -423,8 +424,8 @@ const Connection = struct {
         self.stream.close();
     }
 
-    /// Closes it and frees its memory: a subscriber's, or a pooled one in
-    /// `deinit`.
+    /// Closes it and frees its memory: a subscriber's, or a pooled one at
+    /// `retire` or in `deinit`.
     fn close(self: *Connection) void {
         self.shut();
         self.gpa.destroy(self);
@@ -580,17 +581,12 @@ pub const Client = struct {
         self.pools = try .init(gpa, io);
         var made: usize = 0;
         errdefer {
-            for (self.pools.pools[0..made]) |*p| {
-                gpa.free(p.idle);
-                gpa.free(p.spare);
-            }
+            for (self.pools.pools[0..made]) |*p| gpa.free(p.idle);
             self.pools.deinit(gpa);
         }
         for (self.pools.pools, 0..) |*p, i| {
             const max = self.pools.share(total, i);
-            const idle = try gpa.alloc(*Connection, max);
-            errdefer gpa.free(idle);
-            p.* = .{ .idle = idle, .spare = try gpa.alloc(*Connection, max), .max = max };
+            p.* = .{ .idle = try gpa.alloc(*Connection, max), .max = max };
             made += 1;
         }
         log.info("redis \"{s}\": {f}, up to {d} connections over {d} executors", .{ self.name, s, @max(total, executors), executors });
@@ -608,10 +604,8 @@ pub const Client = struct {
         self.guard.deinit();
         for (self.pools.pools) |*p| {
             for (p.idle[0..p.idle_len]) |conn| conn.close();
-            for (p.spare[0..p.spare_len]) |conn| gpa.destroy(conn);
             if (p.open > p.idle_len) log.warn("redis \"{s}\": {d} connections were still taken at deinit", .{ self.name, p.open - p.idle_len });
             gpa.free(p.idle);
-            gpa.free(p.spare);
         }
         self.pools.deinit(gpa);
         self.arena.deinit();
@@ -624,7 +618,7 @@ pub const Client = struct {
     /// `app.health`. With `connect_at_start`, it opens a connection per
     /// executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        self.observer = try .init(.redis, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
@@ -691,11 +685,15 @@ pub const Client = struct {
 
     /// A connection taken from the executor's pool until `release`, for
     /// WATCH and MULTI/EXEC across round trips, or anything else that must
-    /// stay on one connection. It has the same calls.
+    /// stay on one connection. It has the same calls. Its release record
+    /// lives in the arena of `c`: don't reset or free that arena before
+    /// `release`.
     pub fn acquire(self: *Client, c: anytype) Error!Conn {
         const ctx = erase(c);
+        const checkout = ctx.arena.create(internal.Checkout) catch return error.OutOfMemory;
+        checkout.* = .{};
         const conn = self.take(&ctx) catch |err| return self.narrow(&ctx, err);
-        return .{ .client = self, .conn = conn, .lease = conn.lease };
+        return .{ .client = self, .conn = conn, .checkout = checkout };
     }
 
     /// The shared SUBSCRIBE connection of `anole.watch` (internal): one per
@@ -733,11 +731,7 @@ pub const Client = struct {
         var b = Builder.init(ctx.arena) catch return error.OutOfMemory;
         b.add(.{ verb, names }) catch |err| return self.narrow(&ctx, err);
         const batch = b.finish();
-        const slot = newSlot(self.gpa, null) catch return error.OutOfMemory;
-        const conn = self.dial(&ctx, slot) catch |err| {
-            self.gpa.destroy(slot);
-            return self.narrow(&ctx, err);
-        };
+        const conn = self.dial(&ctx, null) catch |err| return self.narrow(&ctx, err);
         const sub = self.gpa.create(Subscriber) catch {
             conn.close();
             return error.OutOfMemory;
@@ -996,25 +990,9 @@ pub const Client = struct {
             }
             if (pool.open < pool.max) {
                 pool.open += 1;
-                const spare: ?*Connection = if (pool.spare_len > 0) blk: {
-                    pool.spare_len -= 1;
-                    break :blk pool.spare[pool.spare_len];
-                } else null;
                 pool.mutex.unlock(io);
-                const slot = spare orelse newSlot(self.gpa, pool) catch |err| {
-                    pool.mutex.lockUncancelable(io);
-                    pool.open -= 1;
-                    pool.returned.signal(io);
-                    pool.mutex.unlock(io);
-                    return err;
-                };
-                const conn = self.dial(ctx, slot) catch |err| {
-                    pool.mutex.lockUncancelable(io);
-                    pool.spare[pool.spare_len] = slot;
-                    pool.spare_len += 1;
-                    pool.open -= 1;
-                    pool.returned.signal(io);
-                    pool.mutex.unlock(io);
+                const conn = self.dial(ctx, pool) catch |err| {
+                    self.vacate(pool);
                     return err;
                 };
                 self.observer.connections(0, 1);
@@ -1072,30 +1050,15 @@ pub const Client = struct {
     /// Gives a connection the caller holds back to its pool, or closes it
     /// when it is broken or left in a state the next call must not inherit.
     fn give(self: *Client, conn: *Connection) void {
-        self.giveLease(conn, conn.lease);
-    }
-
-    /// `give`, when `lease` is the checkout that holds `conn` now; a lease
-    /// given back already (a second `release`, or one after the connection
-    /// was taken again) gives nothing back and logs.
-    fn giveLease(self: *Client, conn: *Connection, lease: u32) void {
         const io = self.io;
-        const pool = conn.pool.?;
-        pool.mutex.lockUncancelable(io);
-        if (conn.lease != lease) {
-            pool.mutex.unlock(io);
-            log.err("redis \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.name});
-            return;
-        }
-        conn.lease +%= 1;
-        // Read after the lease check: the connection is still this
-        // caller's, no one else's.
+        // Read without the lock: the caller holds it, no one else.
         if (!conn.reusable()) {
-            pool.mutex.unlock(io);
             self.observer.connections(0, -1);
             self.retire(conn);
             return;
         }
+        const pool = conn.pool.?;
+        pool.mutex.lockUncancelable(io);
         conn.idle_since = .now(io, .awake);
         pool.idle[pool.idle_len] = conn;
         pool.idle_len += 1;
@@ -1105,36 +1068,29 @@ pub const Client = struct {
     }
 
     /// Closes a pooled connection no one holds, which still counts in its
-    /// pool's `open`, and frees its place. Its memory stays in the pool as a
-    /// spare until `deinit` (see `Pool.spare`).
+    /// pool's `open`, frees its memory, then frees its place.
     fn retire(self: *Client, conn: *Connection) void {
-        const io = self.io;
         const pool = conn.pool.?;
-        conn.shut();
+        conn.close();
+        self.vacate(pool);
+    }
+
+    /// Gives a place of `pool` back (a retired connection, or a failed
+    /// dial) and wakes a waiter.
+    fn vacate(self: *Client, pool: *Pool) void {
+        const io = self.io;
         pool.mutex.lockUncancelable(io);
-        pool.spare[pool.spare_len] = conn;
-        pool.spare_len += 1;
         pool.open -= 1;
         pool.returned.signal(io);
         pool.mutex.unlock(io);
     }
 
-    /// The memory of a new connection of `pool` (null: a subscriber's),
-    /// with its pool and its first lease set; `open` fills in the rest.
-    fn newSlot(gpa: std.mem.Allocator, pool: ?*Pool) error{OutOfMemory}!*Connection {
-        const conn = try gpa.create(Connection);
-        conn.pool = pool;
-        conn.lease = 0;
-        return conn;
-    }
-
-    /// Opens a connection into `slot` (from `newSlot` or a pool's spares)
-    /// and logs in, within `connect_timeout`. On a failure `slot` is the
-    /// caller's to keep or free.
-    fn dial(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
+    /// Opens a connection of `pool` (null: a subscriber's) and logs in,
+    /// within `connect_timeout`. A failure leaves nothing behind.
+    fn dial(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
         const timeout: std.Io.Timeout = if (self.connect_timeout) |t| .{ .duration = .{ .raw = t, .clock = .awake } } else .none;
         const deadline: dusty.Deadline = .init(ctx.io, timeout);
-        return deadline.run(open, .{ self, ctx, slot }) catch |err| {
+        return deadline.run(open, .{ self, ctx, pool }) catch |err| {
             // Recorded already: the server refused the login.
             inline for (@typeInfo(db.Error).error_set.error_names.?) |name| {
                 if (err == @field(db.Error, name)) return err;
@@ -1147,23 +1103,16 @@ pub const Client = struct {
         };
     }
 
-    fn open(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
+    fn open(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
         const stream = try ClientStream.connect(self.gpa, ctx.io, self.stream_options);
         errdefer stream.close();
         const parser = hiredis.redisReaderCreate() orelse return error.OutOfMemory;
         errdefer hiredis.redisReaderFree(parser);
         // `convert` (and hiredis's freeReplyObject) recurse once per level.
         parser.*.maxdepth = max_reply_depth;
-        const conn = slot;
-        // Field by field: `pool` and `lease` stay, and a stale `Conn` may
-        // read the lease (under the pool's lock) meanwhile.
-        conn.gpa = self.gpa;
-        conn.stream = stream;
-        conn.parser = parser;
-        conn.state = .{};
-        conn.broken = false;
-        conn.reused = false;
-        conn.sent = 0;
+        const conn = try self.gpa.create(Connection);
+        errdefer self.gpa.destroy(conn);
+        conn.* = .{ .gpa = self.gpa, .stream = stream, .parser = parser, .pool = pool };
         if (self.login.count > 0) {
             const replies = conn.transfer(ctx.arena, &self.login) catch |err| return switch (err) {
                 error.ReadFailed => stream.readError() orelse err,
@@ -1406,18 +1355,25 @@ fn rest(args: anytype) Rest(@TypeOf(args)) {
 ///     const stock = try conn.one(i64, req, .{ "GET", key });
 ///     const r = try conn.pipeline(req, .{ .{"MULTI"}, .{ "SET", key, stock - 1 }, .{"EXEC"} });
 ///     if (r[2] == .nil) return error.Conflict; // the key changed: EXEC did nothing
+///
+/// Every copy shares one release record in the arena `acquire` was given,
+/// which must outlive `release`.
 pub const Conn = struct {
     client: *Client,
     conn: *Connection,
-    /// `conn.lease` when it was acquired.
-    lease: u32,
+    checkout: *internal.Checkout,
 
     /// Gives the connection back; one left inside MULTI or WATCH, on
     /// another database or subscribed, or broken, is closed instead. A
-    /// second call does nothing (it logs). Don't call anything on it after
+    /// second call (on this value or a copy) does nothing but log, and
+    /// never touches the connection. Don't call anything on it after
     /// `release`.
     pub fn release(self: *const Conn) void {
-        self.client.giveLease(self.conn, self.lease);
+        if (!self.checkout.once()) {
+            log.err("redis \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.client.name});
+            return;
+        }
+        self.client.give(self.conn);
     }
 
     /// `Client.command`, on this connection.
@@ -1798,11 +1754,35 @@ const Effect = struct {
 
     const Change = enum { keep, set, clear };
 
-    /// Commands after which a connection must not serve another call as it
-    /// is.
-    const tainting = [_][]const u8{ "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE" };
+    /// What one command does to each flag.
+    const Delta = struct { multi: Change = .keep, watching: Change = .keep, tainted: Change = .keep };
+    const taints: Delta = .{ .tainted = .set };
+
+    /// Every command that touches a flag, by upper-cased name; extend by
+    /// adding a row. The tainting ones leave a connection that must not serve
+    /// another call as it is. CLIENT depends on its subcommand: see
+    /// `client_taints`.
+    const by_name = std.StaticStringMap(Delta).initComptime(.{
+        .{ "MULTI", Delta{ .multi = .set } },
+        .{ "EXEC", Delta{ .multi = .clear, .watching = .clear } },
+        .{ "DISCARD", Delta{ .multi = .clear, .watching = .clear } },
+        .{ "WATCH", Delta{ .watching = .set } },
+        .{ "UNWATCH", Delta{ .watching = .clear } },
+        .{ "SELECT", taints },
+        .{ "SUBSCRIBE", taints },
+        .{ "PSUBSCRIBE", taints },
+        .{ "SSUBSCRIBE", taints },
+        .{ "MONITOR", taints },
+        .{ "HELLO", taints },
+        .{ "AUTH", taints },
+        .{ "RESET", taints },
+        .{ "READONLY", taints },
+        .{ "READWRITE", taints },
+    });
     /// CLIENT's subcommands that change the connection.
-    const tainting_client = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH" };
+    const client_taints = std.StaticStringMap(void).initComptime(.{
+        .{"SETNAME"}, .{"SETINFO"}, .{"TRACKING"}, .{"CACHING"}, .{"REPLY"}, .{"NO-EVICT"}, .{"NO-TOUCH"},
+    });
 
     fn apply(self: Effect, s: Connection.State) Connection.State {
         return .{
@@ -1823,22 +1803,13 @@ const Effect = struct {
     /// The command named `name` comes next, `sub` its first argument (both
     /// upper-cased).
     fn add(self: *Effect, name: []const u8, sub: []const u8) void {
-        const eql = std.mem.eql;
-        if (eql(u8, name, "MULTI")) {
-            self.multi = .set;
-        } else if (eql(u8, name, "EXEC") or eql(u8, name, "DISCARD")) {
-            self.multi = .clear;
-            self.watching = .clear;
-        } else if (eql(u8, name, "WATCH")) {
-            self.watching = .set;
-        } else if (eql(u8, name, "UNWATCH")) {
-            self.watching = .clear;
-        } else if (eql(u8, name, "CLIENT")) {
-            for (tainting_client) |t| if (eql(u8, sub, t)) {
-                self.tainted = .set;
-            };
-        } else for (tainting) |t| {
-            if (eql(u8, name, t)) self.tainted = .set;
+        if (std.mem.eql(u8, name, "CLIENT")) {
+            if (client_taints.has(sub)) self.tainted = .set;
+            return;
+        }
+        const d = by_name.get(name) orelse return;
+        inline for (@typeInfo(Delta).@"struct".field_names) |f| {
+            if (@field(d, f) != .keep) @field(self, f) = @field(d, f);
         }
     }
 };
@@ -2224,6 +2195,53 @@ test "redis: a batch that leaves MULTI open or changes the session taints its co
     try testing.expect(!b3.finish().effect.apply(.{}).tainted);
     try b3.add(.{ "client", "setname", "worker" });
     try testing.expect(b3.finish().effect.apply(.{}).tainted);
+}
+
+test "redis: Effect.add equals the old if-chain for every name, subcommand and starting state" {
+    const Old = struct {
+        fn add(self: *Effect, name: []const u8, sub: []const u8) void {
+            const eql = std.mem.eql;
+            const tainting = [_][]const u8{ "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE" };
+            const tainting_client = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH" };
+            if (eql(u8, name, "MULTI")) {
+                self.multi = .set;
+            } else if (eql(u8, name, "EXEC") or eql(u8, name, "DISCARD")) {
+                self.multi = .clear;
+                self.watching = .clear;
+            } else if (eql(u8, name, "WATCH")) {
+                self.watching = .set;
+            } else if (eql(u8, name, "UNWATCH")) {
+                self.watching = .clear;
+            } else if (eql(u8, name, "CLIENT")) {
+                for (tainting_client) |t| if (eql(u8, sub, t)) {
+                    self.tainted = .set;
+                };
+            } else for (tainting) |t| {
+                if (eql(u8, name, t)) self.tainted = .set;
+            }
+        }
+    };
+    const names = [_][]const u8{ "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH", "CLIENT", "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE", "GET", "SET", "", "MULTIX", "EXE", "ABCDEFGHIJKLMNOP" };
+    const subs = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH", "ID", "", "SETNAMEX", "WATCH" };
+    for (names) |name| for (subs) |sub| for (std.enums.values(Effect.Change)) |m| for (std.enums.values(Effect.Change)) |w| for (std.enums.values(Effect.Change)) |t| {
+        var old: Effect = .{ .multi = m, .watching = w, .tainted = t };
+        var new = old;
+        Old.add(&old, name, sub);
+        new.add(name, sub);
+        testing.expectEqual(old, new) catch |err| {
+            std.debug.print("name '{s}' sub '{s}' from {any}\n", .{ name, sub, new });
+            return err;
+        };
+    };
+    var fx: Effect = .{};
+    fx.add("EXEC", "");
+    try testing.expectEqual(Effect{ .multi = .clear, .watching = .clear }, fx);
+    fx = .{};
+    fx.add("CLIENT", "SETNAME");
+    try testing.expectEqual(Effect{ .tainted = .set }, fx);
+    fx = .{};
+    fx.add("CLIENT", "ID");
+    try testing.expectEqual(Effect{}, fx);
 }
 
 test "redis: settings from a URL and REDIS_URL" {

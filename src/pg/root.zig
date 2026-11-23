@@ -748,7 +748,7 @@ pub const Client = struct {
     /// `app.tracing` and `app.health`. With `connect_at_start`, it opens
     /// a connection per executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        self.observer = try .init(.postgresql, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
@@ -880,8 +880,10 @@ pub const Client = struct {
     /// back with `release`. Failures of its calls are pg.zig's errors.
     pub fn acquire(self: *Client, c: anytype) Error!Conn {
         var ctx = erase(c);
+        const checkout = try ctx.arena.create(internal.Checkout);
+        checkout.* = .{};
         const lease = try self.take(&ctx);
-        return .{ .db = self, .io = c.io, .lease = lease, .raw = lease.conn };
+        return .{ .db = self, .io = c.io, .lease = lease, .raw = lease.conn, .checkout = checkout };
     }
 
     /// The shared LISTEN connection of `anole.watch` (internal): one per
@@ -1521,17 +1523,23 @@ pub const TxQuery = struct {
     }
 };
 
-/// A connection of pg.zig's own (`Client.acquire`).
+/// A connection of pg.zig's own (`Client.acquire`). Release it before
+/// the request whose arena acquired it ends.
 pub const Conn = struct {
     db: *Client,
     io: std.Io,
     lease: Lease,
     /// pg.zig's connection: `query`, `row`, `exec`, `prepare`...
     raw: *pg.Conn,
+    /// Shared by every copy, in the acquiring call's arena: the
+    /// connection goes back once (pgxpool's idempotent Release).
+    checkout: *internal.Checkout,
 
     /// Gives the connection back; a statement it left running is
-    /// canceled, and the connection closed.
+    /// canceled, and the connection closed. A second release (also
+    /// through a copy) is logged and does nothing.
     pub fn release(self: *const Conn) void {
+        if (!self.checkout.once()) return log.err("pg \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.db.name});
         if (self.lease.conn._state == .query) stopBackend(self.io, self.lease.conn);
         rollbackLeftOpen(self.io, self.lease.conn, "acquire(): the connection was given back inside a transaction; rolled back");
         self.db.give(self.lease);
@@ -1545,23 +1553,26 @@ pub fn Rows(comptime T: type) type {
 
         db: *Client,
         ctx: Ctx,
-        /// Null in a transaction (the transaction's connection).
-        lease: ?Lease,
-        tx: ?*Tx,
+        /// A call's own connection (given back by `deinit`), or the
+        /// transaction's (the `Tx` gives it back).
+        owner: union(enum) { call: Lease, tx: *Tx },
         conn: *pg.Conn,
         result: *pg.Result,
         columns: Columns(T),
-        done: bool = false,
+        /// `streaming` until the last row, a failure or `finish` (which
+        /// drains what is left); `drained` answers `next` with null. A
+        /// failure is not a phase of its own: it behaves as `drained`.
+        phase: enum { streaming, drained } = .streaming,
 
         /// The next row, or null after the last.
         pub fn next(self: *Self) Error!?T {
-            if (self.done) return null;
-            const row = self.result.next() catch |err| {
-                self.done = true;
-                return self.db.failed(&self.ctx, self.leased(), err, self.tx);
-            } orelse {
-                self.done = true;
-                if (self.lease) |l| try self.db.leftOpen(&self.ctx, l);
+            if (self.phase == .drained) return null;
+            const row = (self.result.next() catch |err| return self.fail(err)) orelse {
+                self.phase = .drained;
+                switch (self.owner) {
+                    .call => |l| try self.db.leftOpen(&self.ctx, l),
+                    .tx => {},
+                }
                 return null;
             };
             return decodeRow(T, &row, &self.columns, &self.ctx, self.db.errors) catch |err| {
@@ -1570,28 +1581,37 @@ pub fn Rows(comptime T: type) type {
             };
         }
 
-        /// Reads past the rows not taken and gives the connection back.
+        /// Reads past the rows not taken and gives a call's connection back.
         pub fn deinit(self: *Self) void {
             self.finish();
             self.result.deinit();
-            if (self.lease) |l| {
-                rollbackLeftOpen(self.ctx.io, self.conn, "the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back");
-                self.db.give(l);
+            switch (self.owner) {
+                .call => |l| {
+                    rollbackLeftOpen(self.ctx.io, self.conn, "the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back");
+                    self.db.give(l);
+                },
+                .tx => {},
             }
             self.* = undefined;
         }
 
         fn finish(self: *Self) void {
-            if (self.done) return;
-            self.done = true;
+            if (self.phase == .drained) return;
+            self.phase = .drained;
             self.result.drain() catch |err| {
                 if (err == error.Canceled) stopBackend(self.ctx.io, self.conn);
                 self.conn._state = .fail;
             };
         }
 
-        fn leased(self: *const Self) Lease {
-            return self.lease orelse self.tx.?.lease;
+        /// The rows failed (cold: kept out of `next`'s per-row path).
+        noinline fn fail(self: *Self, err: anyerror) Error {
+            @branchHint(.cold);
+            self.phase = .drained;
+            return switch (self.owner) {
+                .call => |l| self.db.failed(&self.ctx, l, err, null),
+                .tx => |t| self.db.failed(&self.ctx, t.lease, err, t),
+            };
         }
     };
 }
@@ -1718,8 +1738,7 @@ fn Fetch(comptime T: type, comptime mode: Mode, comptime Args: type) type {
             var rows: Rows(T) = .{
                 .db = d,
                 .ctx = ctx.*,
-                .lease = if (tx == null) lease else null,
-                .tx = tx,
+                .owner = if (tx) |t| .{ .tx = t } else .{ .call = lease },
                 .conn = lease.conn,
                 .result = result,
                 .columns = undefined,
@@ -1738,7 +1757,6 @@ fn Fetch(comptime T: type, comptime mode: Mode, comptime Args: type) type {
                 .all => {
                     var list: std.ArrayList(T) = .empty;
                     while (try rows.next()) |row| try list.append(ctx.arena, row);
-                    if (tx == null) try d.leftOpen(ctx, lease);
                     return list.items;
                 },
                 .one, .optional => {

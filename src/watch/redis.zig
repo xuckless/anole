@@ -358,7 +358,12 @@ fn streamSession(r: *StreamReader, first: bool) !void {
     var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
     defer arena_state.deinit();
     var ctx: db.Ctx = .{ .io = r.io, .arena = arena_state.allocator() };
-    var conn = cfg.client.acquire(&ctx) catch |err| return err;
+    // `acquire`'s release record must outlive `release`: an arena of its
+    // own, never reset like `arena_state` below.
+    var held_arena: std.heap.ArenaAllocator = .init(r.gpa);
+    defer held_arena.deinit();
+    var held: db.Ctx = .{ .io = r.io, .arena = held_arena.allocator() };
+    var conn = cfg.client.acquire(&held) catch |err| return err;
     defer conn.release();
 
     // Where each key starts: a `new` watch begins after the newest entry.

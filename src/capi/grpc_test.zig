@@ -655,14 +655,28 @@ fn checkDeadline(x: *Ctx) anyerror!void {
 
 /// A call the client cancels: ABORT at the consumer, and the handle is gone.
 fn checkCancel(x: *Ctx) anyerror!void {
+    const base = grpcCalls();
     var s = try x.echo().stream("Unary", x.arena, .{});
     try s.send(.{ .message = "hold" });
     try s.closeSend();
     const held = try waitUntil(x.io, &x.a.held, null);
+    // In flight on /conns while the consumer holds it; not once released.
+    try std.testing.expect(grpcCalls() >= base + 1);
     s.cancel();
     s.deinit();
     _ = try waitUntil(x.io, &x.a.last_abort, held);
     try std.testing.expectError(error.Gone, grpc_capi.send(x.a.e, held, "", false, true));
+    try wait.waitUntil(x.io, "the call released off /conns", base, grpcCallsAtMost);
+}
+
+fn grpcCalls() i64 {
+    var n: i64 = 0;
+    for (0..dusty.gauges.max_executors) |i| n += dusty.gauges.get(.grpc_calls, i);
+    return n;
+}
+
+fn grpcCallsAtMost(base: i64) bool {
+    return grpcCalls() <= base;
 }
 
 fn checkConnectJson(x: *Ctx) anyerror!void {
@@ -699,8 +713,10 @@ fn checkTranscoding(x: *Ctx) anyerror!void {
 /// consumer on the connection's task, with the first one's answer corked
 /// behind it unless it goes out first (`Response.flushOwed` at the C ABI's
 /// gRPC entry points). The first answer must arrive while the second is
-/// held; then the consumer answers the second with `late`.
-fn pipelinedBeforeHeld(x: *Ctx, requests: []const u8, first: []const u8, late: []const u8, late_body: []const u8) !void {
+/// held; then the consumer answers the second with `late`. While held it
+/// counts `in_flight` on `/conns` `grpc` (a transcoded call is REST, 0).
+fn pipelinedBeforeHeld(x: *Ctx, requests: []const u8, first: []const u8, late: []const u8, late_body: []const u8, in_flight: i64) !void {
+    const base = grpcCalls();
     const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", x.port)).connect(x.io, .{ .mode = .stream });
     defer stream.close(x.io);
     var wbuf: [512]u8 = undefined;
@@ -712,6 +728,8 @@ fn pipelinedBeforeHeld(x: *Ctx, requests: []const u8, first: []const u8, late: [
     try std.testing.expectEqualStrings(first, try readHttp1Body(&r.interface));
     // Only now does the consumer answer the held call.
     const held = try waitUntil(x.io, &x.a.held, null);
+    try wait.waitUntil(x.io, "the first call released off /conns", base + in_flight, grpcCallsAtMost);
+    try std.testing.expect(grpcCalls() >= base + in_flight);
     _ = try grpc_capi.send(x.a.e, held, late, false, true);
     try std.testing.expectEqualStrings(late_body, try readHttp1Body(&r.interface));
 }
@@ -740,6 +758,7 @@ fn checkPipelinedConnect(x: *Ctx) anyerror!void {
         "{\"message\":\"json\"}",
         try Consumer.encode(x.arena, pb.EchoResponse{ .message = "late" }),
         "{\"message\":\"late\"}",
+        1,
     );
 }
 
@@ -750,6 +769,7 @@ fn checkPipelinedTranscoded(x: *Ctx) anyerror!void {
         "{\"name\":\"abc\",\"title\":\"T\",\"pages\":\"7\"}",
         try Consumer.encode(x.arena, tpb.Book{ .name = "late" }),
         "{\"name\":\"late\"}",
+        0,
     );
 }
 

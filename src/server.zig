@@ -1038,6 +1038,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             fn startOne(self: *const Extras, c: Connector) !void {
                 return c.start(c.context, self.metrics, self.exporter, self.health);
             }
+
+            /// Appends a connector; one with an `observer` (a database or
+            /// service) gets its console slot, its index plus one: the `i`
+            /// of its `/db` entry and of its `Stats.db` row. Entries never
+            /// leave before the teardown (a late start that fails keeps its
+            /// entry, see `addConnector`), so an index never shifts.
+            fn addObserved(self: *Extras, gpa: std.mem.Allocator, comptime T: type, value: *T) !void {
+                try self.connectors.append(gpa, .of(T, value));
+                if (comptime @hasField(T, "observer")) value.observer.console_slot = @intCast(self.connectors.items.len);
+            }
         };
 
         /// A database connector the server made: when serving starts it
@@ -2883,7 +2893,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn addConnector(self: *Self, comptime T: type, value: *T) !void {
             const extras = self.extras;
             const c = Connector.of(T, value);
-            extras.connectors.append(self.arena.allocator(), c) catch |err| {
+            extras.addObserved(self.arena.allocator(), T, value) catch |err| {
                 value.deinit();
                 return err;
             };
@@ -5559,6 +5569,61 @@ test "console: a Connector's describe goes through consoleInfo (real target, no 
     const out = w.buffered();
     try std.testing.expect(std.mem.find(u8, out, "\"target\":\"127.0.0.1:6380/2\"") != null);
     try std.testing.expect(std.mem.find(u8, out, "hunter2") == null);
+}
+
+test "console: addObserved gives a connector slot index + 1 and start keeps it" {
+    const S = Server(void);
+    const gpa = std.testing.allocator;
+    const Fake = struct {
+        observer: @import("db/observe.zig").Observer = .{ .system = .sqlite, .name = "fake" },
+        fn start(self: *@This(), registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {
+            try self.observer.attach(registry, tracer);
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const Plain = struct {
+        fn start(_: *@This(), _: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {}
+        fn deinit(_: *@This()) void {}
+    };
+    // Only `connectors` is used by addObserved.
+    var extras: S.Extras = undefined;
+    extras.connectors = .empty;
+    defer extras.connectors.deinit(gpa);
+    var plain: Plain = .{};
+    var first: Fake = .{};
+    var second: Fake = .{};
+    try extras.connectors.append(gpa, .of(Plain, &plain));
+    try extras.addObserved(gpa, Fake, &first);
+    try extras.addObserved(gpa, Fake, &second);
+    // slot - 1 is the index collectDatabases writes as `/db` `i`.
+    for ([_]*Fake{ &first, &second }) |f| {
+        const i = f.observer.console_slot - 1;
+        try std.testing.expectEqual(@as(*anyopaque, f), extras.connectors.items[i].context);
+    }
+    try std.testing.expectEqual(@as(u32, 2), first.observer.console_slot);
+    var registry = observe.metrics.Registry.init(gpa, std.testing.io);
+    defer registry.deinit();
+    try extras.connectors.items[2].start(extras.connectors.items[2].context, &registry, null, null);
+    try std.testing.expectEqual(@as(u32, 3), second.observer.console_slot);
+    try std.testing.expect(second.observer.metrics != null);
+    try extras.connectors.items[2].start(extras.connectors.items[2].context, null, null, null);
+    try std.testing.expectEqual(@as(u32, 3), second.observer.console_slot);
+    try std.testing.expect(second.observer.metrics == null);
+}
+
+test "anole.Server: a connector added after the start whose start fails keeps its entry and is freed once" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    try app.startConnectors();
+    const before = app.extras.connectors.items.len;
+    // A non-AWS endpoint and an empty environment: no credentials, the start fails.
+    // The entry stays (what the start handed out never dangles); the teardown frees it once.
+    try std.testing.expectError(error.DatabaseUnavailable, app.s3(.{ .endpoint = "http://127.0.0.1:9", .bucket = "b", .environ = .empty }));
+    try std.testing.expectEqual(before + 1, app.extras.connectors.items.len);
 }
 
 test "console: each database and service connector keeps its /db system name" {
