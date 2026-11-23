@@ -77,7 +77,7 @@ fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.Ech
             fn started(cl: *grpc.Call) !bool {
                 try cl.impl.write_lock.lock(cl.io);
                 defer cl.impl.write_lock.unlock(cl.io);
-                return cl.impl.out != null;
+                return cl.impl.sink == .stream;
             }
         }.started);
         const late: []const u8 = if (call.addHeader("x-late", "yes")) |_| "added" else |err| @errorName(err);
@@ -867,7 +867,7 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         var n: usize = 0;
         while (try s.receive()) |m| : (n += 1) try std.testing.expectEqual(@as(i32, @intCast(n)), m.index);
         try std.testing.expectEqual(@as(usize, 4), n);
-        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+        try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
     }
     {
         var s = try client.stream("ClientStream", arena, .{ .compression = if (features.compression) .gzip else .identity });
@@ -877,7 +877,7 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         const reply = (try s.receive()).?;
         try std.testing.expectEqualStrings("xyz", reply.message);
         try std.testing.expect(try s.receive() == null);
-        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+        try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
     }
     {
         // Bidi in lock step: each reply before the next request.
@@ -891,8 +891,39 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         }
         try s.closeSend();
         try std.testing.expect(try s.receive() == null);
-        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+        try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
     }
+}
+
+test "gRPC client: how a call ends (status, then null for ever)" {
+    try withEchoServer(.{}, struct {
+        fn run(env: *EchoEnv) !void {
+            const h2 = @import("anole_h2_client");
+            const conn = try h2.ClientConnection.connect(env.gpa, env.io, .{ .host = "127.0.0.1", .port = env.port });
+            defer conn.close();
+            var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+            const client: grpc.Client(Echo) = .{ .channel = &channel };
+            const rows = [_]struct { name: []const u8, method: []const u8, message: []const u8, messages: usize, code: grpc.Code }{
+                .{ .name = "head ok then status", .method = "Unary", .message = "x", .messages = 1, .code = .ok },
+                .{ .name = "trailers-only error", .method = "Unary", .message = "fail", .messages = 0, .code = .not_found },
+            };
+            inline for (rows) |row| {
+                errdefer std.debug.print("row: {s}\n", .{row.name});
+                var s = try client.stream(row.method, env.arena, .{});
+                defer s.deinit();
+                try s.send(.{ .message = row.message });
+                try s.closeSend();
+                try std.testing.expect(s.status() == null);
+                var n: usize = 0;
+                while (try s.receive()) |_| n += 1;
+                try std.testing.expectEqual(row.messages, n);
+                try std.testing.expectEqual(row.code, s.status().?.code);
+                // Ended is absorbing: nothing more, status unchanged.
+                try std.testing.expect(try s.receive() == null);
+                try std.testing.expectEqual(row.code, s.status().?.code);
+            }
+        }
+    }.run);
 }
 
 test "gRPC client: max_received_bytes ends a server stream with RESOURCE_EXHAUSTED" {
@@ -913,7 +944,7 @@ test "gRPC client: max_received_bytes ends a server stream with RESOURCE_EXHAUST
             var n: usize = 0;
             while (try s.receive()) |_| n += 1;
             try std.testing.expect(n > 0 and n < 40);
-            try std.testing.expectEqual(grpc.Code.resource_exhausted, s.status.?.code);
+            try std.testing.expectEqual(grpc.Code.resource_exhausted, s.status().?.code);
         }
     }.run);
 }
@@ -1337,7 +1368,7 @@ test "gRPC client: cancel() ends the call CANCELLED without a task cancel" {
             try wait.waitFlag(env.io, "the sleeping handler started", &Sleeper.started);
             s.cancel();
             try std.testing.expect(try s.receive() == null);
-            try std.testing.expectEqual(grpc.Code.cancelled, s.status.?.code);
+            try std.testing.expectEqual(grpc.Code.cancelled, s.status().?.code);
         }
     }.body);
 }

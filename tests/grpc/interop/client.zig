@@ -59,7 +59,7 @@ fn clientStreaming(client: Client, arena: std.mem.Allocator) !void {
     try expect(reply != null, "a response");
     try expect(reply.?.aggregated_payload_size == 74922, "aggregated size");
     try expect(try s.receive() == null, "one response");
-    try expectOk(s.status.?);
+    try expectOk(s.status().?);
 }
 
 fn serverStreaming(client: Client, arena: std.mem.Allocator) !void {
@@ -75,7 +75,7 @@ fn serverStreaming(client: Client, arena: std.mem.Allocator) !void {
         try expect(i < sizes.len and m.payload.?.body.len == @as(usize, @intCast(sizes[i])), "response size");
     }
     try expect(i == sizes.len, "response count");
-    try expectOk(s.status.?);
+    try expectOk(s.status().?);
 }
 
 fn pingPong(client: Client, arena: std.mem.Allocator) !void {
@@ -91,7 +91,7 @@ fn pingPong(client: Client, arena: std.mem.Allocator) !void {
     }
     try s.closeSend();
     try expect(try s.receive() == null, "end of stream");
-    try expectOk(s.status.?);
+    try expectOk(s.status().?);
 }
 
 fn emptyStream(client: Client, arena: std.mem.Allocator) !void {
@@ -99,7 +99,7 @@ fn emptyStream(client: Client, arena: std.mem.Allocator) !void {
     defer s.deinit();
     try s.closeSend();
     try expect(try s.receive() == null, "no responses");
-    try expectOk(s.status.?);
+    try expectOk(s.status().?);
 }
 
 fn statusCodeAndMessage(client: Client, arena: std.mem.Allocator, message: []const u8) !void {
@@ -111,8 +111,8 @@ fn statusCodeAndMessage(client: Client, arena: std.mem.Allocator, message: []con
     try s.send(.{ .response_status = .{ .code = 2, .message = message } });
     try s.closeSend();
     while (try s.receive()) |_| {}
-    try expect(s.status.?.code == .unknown, "streaming status code");
-    try expect(std.mem.eql(u8, s.status.?.message, message), "streaming status message");
+    try expect(s.status().?.code == .unknown, "streaming status code");
+    try expect(std.mem.eql(u8, s.status().?.message, message), "streaming status message");
 }
 
 fn customMetadata(client: Client, arena: std.mem.Allocator) !void {
@@ -138,7 +138,7 @@ fn timeoutOnSleepingServer(client: Client, arena: std.mem.Allocator) !void {
     defer s.deinit();
     s.send(.{ .payload = try zeros(arena, 27182) }) catch {};
     while (try s.receive()) |_| {}
-    try expect(s.status.?.code == .deadline_exceeded, "DEADLINE_EXCEEDED");
+    try expect(s.status().?.code == .deadline_exceeded, "DEADLINE_EXCEEDED");
 }
 
 fn unimplementedMethod(client: Client, arena: std.mem.Allocator) !void {

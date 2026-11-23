@@ -92,7 +92,7 @@ test "grpc over a unix socket: all four call modes, socket mode 0660, a stale so
                 var n: usize = 0;
                 while (try s.receive()) |_| n += 1;
                 try std.testing.expectEqual(@as(usize, 4), n);
-                try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+                try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
             }
             {
                 var s = try client.stream("ClientStream", arena, .{});
@@ -111,7 +111,7 @@ test "grpc over a unix socket: all four call modes, socket mode 0660, a stale so
                 }
                 try s.closeSend();
                 try std.testing.expect(try s.receive() == null);
-                try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+                try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
             }
         }
     }.run);

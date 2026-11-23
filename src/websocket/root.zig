@@ -337,7 +337,7 @@ pub const Socket = struct {
     /// over HTTP/1.1 elsewhere and off zio.
     _task: ?placement.Task = null,
     /// Over HTTP/1.1 from `upgrade` (a handler's own loop): the reader's
-    /// window, sized to the load. Unused otherwise.
+    /// window, sized to the load. Mode `none` otherwise.
     _read: UpgradedWindow = .{},
 
     /// Which protocol a socket runs on. The sockets it points at are
@@ -377,8 +377,9 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        if (self._read.conn != null) {
-            self._read.between(self._conn.h1.transport.reader);
+        switch (self._read.mode) {
+            .none => {},
+            else => self._read.between(self._conn.h1.transport.reader),
         }
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
@@ -428,19 +429,26 @@ pub const Socket = struct {
     /// the socket's own handler from other tasks (`Rooms.broadcast`).
     /// A text message must be valid UTF-8; that is the caller's to keep.
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
+        return self.sendMsg(msg_type, data, true);
+    }
+
+    /// One body for `send` and `_sendDeferred`: they differ only in the leaf
+    /// call, chosen at comptime by `flush`.
+    inline fn sendMsg(self: *Socket, msg_type: MessageType, data: []const u8, comptime flush: bool) !void {
         try self._send_mutex.lock(self.io);
         defer self._send_mutex.unlock(self.io);
         if (comptime features.compression) {
             if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
                 const packed_data = try d.compress(data);
                 return switch (self._conn) {
-                    .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
-                    .stream => |ws| ws.sendMessage(msg_type, packed_data, true),
+                    .h1 => |ws| if (flush) ws.sendCompressed(msg_type, packed_data) else ws.sendCompressedNoFlush(msg_type, packed_data),
+                    .stream => |ws| if (flush) ws.sendMessage(msg_type, packed_data, true) else ws.sendNoFlush(msg_type, packed_data, true),
                 };
             };
         }
         return switch (self._conn) {
-            inline else => |ws| ws.send(msg_type, data),
+            .h1 => |ws| if (flush) ws.send(msg_type, data) else ws.sendNoFlush(msg_type, data),
+            .stream => |ws| if (flush) ws.send(msg_type, data) else ws.sendNoFlush(msg_type, data, false),
         };
     }
 
@@ -448,21 +456,7 @@ pub const Socket = struct {
     /// them with one `_flushOut`, so they leave together (a room's sender, the
     /// C ABI's). Internal.
     pub fn _sendDeferred(self: *Socket, msg_type: MessageType, data: []const u8) !void {
-        try self._send_mutex.lock(self.io);
-        defer self._send_mutex.unlock(self.io);
-        if (comptime features.compression) {
-            if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
-                const packed_data = try d.compress(data);
-                return switch (self._conn) {
-                    .h1 => |ws| ws.sendCompressedNoFlush(msg_type, packed_data),
-                    .stream => |ws| ws.sendNoFlush(msg_type, packed_data, true),
-                };
-            };
-        }
-        return switch (self._conn) {
-            .h1 => |ws| ws.sendNoFlush(msg_type, data),
-            .stream => |ws| ws.sendNoFlush(msg_type, data, false),
-        };
+        return self.sendMsg(msg_type, data, false);
     }
 
     /// Sends what `_sendDeferred` left. Internal.
@@ -540,8 +534,9 @@ pub const Socket = struct {
         }
         if (self._close_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
-        if (self._read.conn != null) {
-            self._read.release(self._conn.h1.transport.reader);
+        switch (self._read.mode) {
+            .none => {},
+            else => self._read.release(self._conn.h1.transport.reader),
         }
         switch (self._conn) {
             inline else => |ws| ws.deinit(),
@@ -1249,17 +1244,10 @@ const ReadWindow = struct {
         if (!loaded(r)) return;
         w.busy = busy_reads;
         if (w.block != null) return;
-        const buffered = r.buffered();
-        // Only a first run's window, in the request's buffers, can hold so
-        // much; it reads on in them.
-        if (buffered.len >= read_block_len) return;
-        // Out of memory: the window still works, a little slower.
-        const b = read_blocks.take() orelse return;
-        @memcpy(b[0..buffered.len], buffered);
-        r.buffer = b;
-        r.seek = 0;
-        r.end = buffered.len;
-        w.block = b;
+        // Only a first run's window, in the request's buffers, can hold a
+        // block's worth; it reads on in them. Out of memory: the window
+        // still works, a little slower.
+        w.block = read_blocks.fill(r);
     }
 
     /// Whether the reads since the last wait brought at least a window's
@@ -1336,26 +1324,58 @@ const ReadWindow = struct {
 /// reader pointed at its small window again first; a handler that never
 /// deinits its socket leaks the block, never frees it under the reader.
 const UpgradedWindow = struct {
-    conn: ?*dusty.Connection = null,
     /// The reader's view as `shrinkForUpgrade` left it (as the last
     /// narrowing did): what it goes back to.
     small: []u8 = &.{},
-    how: enum { widen, block } = .widen,
-    /// The reader reads into the widened view or the block.
-    grown: bool = false,
-    block: ?[]u8 = null,
     /// Waits for the peer left before the window narrows again.
     busy: u8 = 0,
     /// Times the window narrowed again after a busy spell (each one
     /// madvise): for diagnostics and tests.
     narrowed: u32 = 0,
+    mode: Mode = .none,
+
+    /// How the window grows, fixed by `init` (widen when the request's
+    /// read buffer holds a block's worth past the view, else a block), and
+    /// whether it has. Every transition is a cell here, in `grow`, `shrink`
+    /// and `release`; a new behaviour is a state or a cell, not a flag.
+    ///
+    /// | state         | grow (loaded, not grown)                           | shrink (8th quiet wait, grown)                        | release (`Socket.deinit`)                                   |
+    /// |---------------|----------------------------------------------------|-------------------------------------------------------|-------------------------------------------------------------|
+    /// | `none`        | never called (`receive` skips)                     | never called                                          | never called (`deinit` skips)                               |
+    /// | `widen_small` | `widenUpgradedReader` -> `widen_wide`; false: stay | -                                                     | nothing                                                     |
+    /// | `widen_wide`  | -                                                  | `narrowUpgradedReader`, small = view -> `widen_small` | nothing: the view stays, the buffers go with the connection |
+    /// | `block_small` | `read_blocks.fill` -> `block_held`; null: stay     | -                                                     | nothing                                                     |
+    /// | `block_held`  | -                                                  | reader on small, block back -> `block_small`          | what fits kept in small, block back -> `block_small`        |
+    ///
+    /// A shrink also counts `narrowed`.
+    const Mode = union(enum) {
+        /// Not an upgraded HTTP/1.1 socket: HTTP/2 and HTTP/3 streams,
+        /// callback sockets (`ReadWindow`), no connection (in-memory tests).
+        none,
+        widen_small: *dusty.Connection,
+        widen_wide: *dusty.Connection,
+        block_small,
+        block_held: []u8,
+    };
+
+    /// Whether the reader reads into the widened view or a block.
+    const grown_states = std.EnumArray(std.meta.Tag(Mode), bool).init(.{
+        .none = false,
+        .widen_small = false,
+        .widen_wide = true,
+        .block_small = false,
+        .block_held = true,
+    });
 
     fn init(conn: *dusty.Connection, r: *std.Io.Reader) UpgradedWindow {
         return .{
-            .conn = conn,
             .small = r.buffer,
-            .how = if (conn.upgradedReaderRoom() >= read_block_len) .widen else .block,
+            .mode = if (conn.upgradedReaderRoom() >= read_block_len) .{ .widen_small = conn } else .block_small,
         };
+    }
+
+    fn grown(w: *const UpgradedWindow) bool {
+        return grown_states.get(std.meta.activeTag(w.mode));
     }
 
     /// Before each message: grows the window if the socket is busy, and at
@@ -1364,12 +1384,12 @@ const UpgradedWindow = struct {
     fn between(w: *UpgradedWindow, r: *std.Io.Reader) void {
         if (loaded(r, w.small.len)) {
             w.busy = ReadWindow.busy_reads;
-            if (!w.grown) w.grow(r);
+            if (!w.grown()) w.grow(r);
         }
         if (r.bufferedLen() != 0) return;
         r.seek = 0;
         r.end = 0;
-        if (!w.grown) return;
+        if (!w.grown()) return;
         if (w.busy > 1) {
             w.busy -= 1;
             return;
@@ -1387,56 +1407,55 @@ const UpgradedWindow = struct {
     }
 
     fn grow(w: *UpgradedWindow, r: *std.Io.Reader) void {
-        switch (w.how) {
-            .widen => w.grown = w.conn.?.widenUpgradedReader(),
-            .block => {
-                const buffered = r.buffered();
-                if (buffered.len >= read_block_len) return;
-                // Out of memory: the small window still works.
-                const b = read_blocks.take() orelse return;
-                @memcpy(b[0..buffered.len], buffered);
-                r.buffer = b;
-                r.seek = 0;
-                r.end = buffered.len;
-                w.block = b;
-                w.grown = true;
+        switch (w.mode) {
+            .widen_small => |conn| if (conn.widenUpgradedReader()) {
+                w.mode = .{ .widen_wide = conn };
             },
+            // Out of memory: the small window still works.
+            .block_small => if (read_blocks.fill(r)) |b| {
+                w.mode = .{ .block_held = b };
+            },
+            .none, .widen_wide, .block_held => {},
         }
     }
 
     /// With nothing buffered: the small window back.
     fn shrink(w: *UpgradedWindow, r: *std.Io.Reader) void {
         std.debug.assert(r.bufferedLen() == 0);
-        w.grown = false;
-        w.narrowed += 1;
-        switch (w.how) {
-            .widen => {
-                w.conn.?.narrowUpgradedReader();
+        switch (w.mode) {
+            .widen_wide => |conn| {
+                conn.narrowUpgradedReader();
                 w.small = r.buffer;
+                w.mode = .{ .widen_small = conn };
             },
-            .block => {
+            .block_held => |b| {
                 r.buffer = w.small;
                 r.seek = 0;
                 r.end = 0;
-                read_blocks.give(w.block.?);
-                w.block = null;
+                read_blocks.give(b);
+                w.mode = .block_small;
             },
+            .none, .widen_small, .block_small => return,
         }
+        w.narrowed += 1;
     }
 
     /// As the socket goes: a block back, the reader on its small window
     /// with what fits of what it held. A widened view stays: the request's
     /// buffers go back to their pool with the connection.
     fn release(w: *UpgradedWindow, r: *std.Io.Reader) void {
-        const b = w.block orelse return;
-        const keep = r.buffered()[0..@min(r.bufferedLen(), w.small.len)];
-        std.mem.copyForwards(u8, w.small[0..keep.len], keep);
-        r.buffer = w.small;
-        r.seek = 0;
-        r.end = keep.len;
-        w.block = null;
-        w.grown = false;
-        read_blocks.give(b);
+        switch (w.mode) {
+            .block_held => |b| {
+                const keep = r.buffered()[0..@min(r.bufferedLen(), w.small.len)];
+                std.mem.copyForwards(u8, w.small[0..keep.len], keep);
+                r.buffer = w.small;
+                r.seek = 0;
+                r.end = keep.len;
+                read_blocks.give(b);
+                w.mode = .block_small;
+            },
+            .none, .widen_small, .widen_wide, .block_small => {},
+        }
     }
 };
 
@@ -1487,6 +1506,20 @@ const read_blocks = struct {
         // first, 0xAA in ReleaseSafe, and the allocator is Zig code, so the
         // store isn't dropped as dead.
         std.heap.smp_allocator.rawFree(b, .@"1", @returnAddress());
+    }
+
+    /// Moves the reader to a block taken here, what it buffers with it;
+    /// null, the reader as it was, when it buffers a block's worth already
+    /// or the pool is out of memory.
+    fn fill(r: *std.Io.Reader) ?[]u8 {
+        const buffered = r.buffered();
+        if (buffered.len >= read_block_len) return null;
+        const b = take() orelse return null;
+        @memcpy(b[0..buffered.len], buffered);
+        r.buffer = b;
+        r.seek = 0;
+        r.end = buffered.len;
+        return b;
     }
 };
 
@@ -2085,6 +2118,52 @@ test "websocket: a read block from an empty pool is new and counted while held" 
     for (more) |m| read_blocks.give(m);
     try std.testing.expectEqual(read_blocks.cap, read_blocks.free_len);
     try std.testing.expectEqual(held, _readBlocksHeld());
+}
+
+test "websocket: the upgraded window grows, narrows and releases in each mode" {
+    // name, request read buffer, reader's view in it, mode small, grown, released
+    const Tag = std.meta.Tag(UpgradedWindow.Mode);
+    const rows = [_]struct { []const u8, usize, usize, Tag, Tag, Tag }{
+        .{ "widen: the read buffer holds a block", 4 * read_block_len, 2048, .widen_small, .widen_wide, .widen_wide },
+        .{ "block: the read buffer is too small to widen", 4096, 2048, .block_small, .block_held, .block_small },
+        .{ "widen: a view already at the end stays", 4 * read_block_len, 4 * read_block_len, .widen_small, .widen_small, .widen_small },
+    };
+    for (rows) |row| {
+        const name, const buffer_len, const view_len, const small, const wide, const released = row;
+        errdefer std.debug.print("row: {s}\n", .{name});
+        const buffer = try std.heap.page_allocator.alloc(u8, buffer_len);
+        defer std.heap.page_allocator.free(buffer);
+        var r: std.Io.Reader = .fixed(buffer[0..view_len]);
+        var conn: dusty.Connection = undefined;
+        conn.read_buffer = buffer;
+        conn.reader = &r;
+        const held = _readBlocksHeld();
+        var w: UpgradedWindow = .init(&conn, &r);
+        try std.testing.expectEqual(small, std.meta.activeTag(w.mode));
+        r.end = r.buffer.len; // a read filled the window
+        w.between(&r);
+        try std.testing.expectEqual(wide, std.meta.activeTag(w.mode));
+        try std.testing.expectEqual(@intFromBool(wide == .block_held), _readBlocksHeld() - held);
+        // Seven quiet waits keep it grown, the eighth narrows it.
+        for (0..8) |i| {
+            r.end = 0;
+            w.between(&r);
+            try std.testing.expectEqual(if (i < 7) wide else small, std.meta.activeTag(w.mode));
+        }
+        try std.testing.expectEqual(@intFromBool(wide != small), w.narrowed);
+        try std.testing.expectEqual(w.small.len, r.buffer.len);
+        // Grown again, then released as the socket goes with 3 bytes buffered.
+        r.end = r.buffer.len;
+        w.between(&r);
+        @memcpy(r.buffer[0..3], "abc");
+        r.end = 3;
+        const view = r.buffer;
+        w.release(&r);
+        try std.testing.expectEqual(held, _readBlocksHeld());
+        try std.testing.expectEqual(released, std.meta.activeTag(w.mode));
+        try std.testing.expectEqual(if (released == small) w.small.ptr else view.ptr, r.buffer.ptr);
+        try std.testing.expectEqualStrings("abc", r.buffered());
+    }
 }
 
 test "websocket: isUpgrade accepts a version-13 GET, or an extended CONNECT with :protocol websocket, and nothing else" {

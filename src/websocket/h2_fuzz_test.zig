@@ -420,3 +420,69 @@ test "H2Socket: a message past the 64 KiB kept is refused 1013 before its memory
     // Close 1013.
     try std.testing.expectEqualStrings("\x88\x02\x03\xf5", sock.out.interface.buffered());
 }
+
+/// The Wire a drain writes to: the H2 socket holds a copy of the writer, so it cannot find its parent.
+var current: *Wire = undefined;
+const Wire = struct {
+    interface: std.Io.Writer,
+    buf: [256]u8 = undefined,
+    got: [256]u8 = undefined,
+    n: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self = current;
+        const parts: [2][]const u8 = .{ w.buffer[0..w.end], data[0] };
+        for (parts) |d| {
+            @memcpy(self.got[self.n..][0..d.len], d);
+            self.n += d.len;
+        }
+        w.end = 0;
+        std.debug.assert(data.len == 1 and splat == 1);
+        return data[0].len;
+    }
+};
+
+test "Socket: send flushes, _sendDeferred holds until _flushOut, RSV1 only on a compressed text over min_length" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]bool{ false, true }) |is_stream| for ([_]bool{ false, true }) |flush| for ([_]struct { len: usize, rsv1: bool }{
+        .{ .len = 2, .rsv1 = false },
+        .{ .len = 63, .rsv1 = false },
+        .{ .len = 64, .rsv1 = true },
+    }) |c| {
+        var wire: Wire = .{ .interface = .{ .vtable = &.{ .drain = Wire.drain }, .buffer = &.{} } };
+        wire.interface.buffer = &wire.buf;
+        current = &wire;
+        const sock = try sendSocket(arena);
+        sock.out.interface = wire.interface;
+        defer sock.batch.deinit(std.testing.io);
+        defer sock.message.deinit(std.heap.c_allocator);
+        var ws = dusty.WebSocket.init(std.testing.io, .{ .writer = &wire.interface, .reader = undefined }, arena, 0);
+        defer ws.deinit();
+        ws.rsv1_allowed = true;
+        var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
+        defer if (features.compression) d.deinit();
+        var socket: websocket.Socket = .{
+            ._conn = if (is_stream) .{ .stream = sock } else .{ .h1 = &ws },
+            ._allocator = arena,
+            .io = std.testing.io,
+            .max_message_size = max_message_size,
+        };
+        if (comptime features.compression) socket._deflate = &d;
+        const data: [64]u8 = @splat('a');
+        if (flush) try socket.send(.text, data[0..c.len]) else try socket._sendDeferred(.text, data[0..c.len]);
+        // Held: nothing has left the buffer yet.
+        try std.testing.expectEqual(!flush, wire.n == 0);
+        try socket._flushOut();
+        const rsv1 = features.compression and c.rsv1;
+        try std.testing.expectEqual(rsv1, wire.got[0] == 0xc1);
+        try std.testing.expect(rsv1 or wire.got[0] == 0x81);
+        if (!rsv1) try std.testing.expectEqualStrings(data[0..c.len], wire.got[2..][0..c.len]);
+        if (is_stream) {
+            // Only `send` takes a ping on a stream: the deferred leaf is text/binary.
+            const ping = if (flush) socket.send(.ping, "") else socket._sendDeferred(.ping, "");
+            try if (flush) ping else std.testing.expectError(error.InvalidOpcode, ping);
+        }
+    };
+}

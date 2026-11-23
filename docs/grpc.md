@@ -668,13 +668,13 @@ try s.closeSend();
 while (try s.receive()) |reply| {
     // ...
 }
-const status = s.status.?; // set once receive returns null
+const status = s.status().?; // set once receive returns null
 ```
 
 `s.cancel()` resets the call; `receive` then returns null with status
 CANCELLED. When the task waiting on a call is canceled, `receive`, `send` and
 `closeSend` return `error.Canceled` instead: the call is reset (RST_STREAM
-CANCEL over HTTP/2, H3_REQUEST_CANCELLED over HTTP/3), `s.status` is
+CANCEL over HTTP/2, H3_REQUEST_CANCELLED over HTTP/3), `s.status()` is
 CANCELLED, and the cancel goes on up the task. A unary call canceled that way
 does not count as a failure for the channel's breaker or retry throttle.
 `anole.grpc.openCall` opens a call by path, for
