@@ -2334,16 +2334,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return handlers.adapt(Ctx, handler);
         }
 
-        /// Adds `handler` at `path` on `target` (the router, or a group),
+        /// Adds `handler` at `path` on `target` (a group; the server's own verbs use its root group),
         /// behind a `ResponseCache` of its own when it is `anole.cached`.
-        fn register(self: *Self, target: anytype, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+        fn register(self: *Self, target: http.Router(Ctx).Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
             const H = @TypeOf(handler);
             if (comptime features.openapi) if (method) |m| self.recordRoute(target, m, path, handler);
             if (comptime handlers.isCached(H)) {
                 var settings: ResponseCache.Options = H.cache_options;
                 // Named by its route in metrics.
                 if (settings.name == null) settings.name = std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{
-                    if (@TypeOf(target) == *http.Router(Ctx)) "" else target.prefix, path,
+                    target.prefix, path,
                 }) catch @panic("OOM");
                 const cache = self.responseCache(settings);
                 const g = target.group("", &.{http.Middleware(Ctx).init(cache)});
@@ -2354,12 +2354,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Keeps the route for the OpenAPI document: its comptime-built
         /// operation, its path and the documented middleware of its chain.
-        fn recordRoute(self: *Self, target: anytype, method: http.Method, path: []const u8, comptime handler: anytype) void {
+        fn recordRoute(self: *Self, target: http.Router(Ctx).Group, method: http.Method, path: []const u8, comptime handler: anytype) void {
             if (comptime handlers.routeDoc(handler).hidden) return;
             const verb = std.meta.stringToEnum(openapi_mod.operation.Verb, @tagName(method)) orelse return;
             const a = self.arena.allocator();
-            const prefix = if (comptime @TypeOf(target) == *http.Router(Ctx)) "" else target.prefix;
-            const joined = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, path }) catch @panic("OOM");
+            const joined = std.fmt.allocPrint(a, "{s}{s}", .{ target.prefix, path }) catch @panic("OOM");
             const op = comptime &openapi_mod.operation.forHandler(handler);
             self.extras.doc_entries.append(a, .{
                 .verb = verb,
@@ -2371,11 +2370,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// The OpenAPI declarations of the middleware a route on `target`
         /// runs behind, the server's first.
-        fn chainDocs(self: *Self, target: anytype) []const *const openapi_mod.mw.Info {
+        fn chainDocs(self: *Self, target: http.Router(Ctx).Group) []const *const openapi_mod.mw.Info {
             const a = self.arena.allocator();
             var out: std.ArrayList(*const openapi_mod.mw.Info) = .empty;
-            const groups: []const http.Middleware(Ctx) = if (comptime @TypeOf(target) == *http.Router(Ctx)) &.{} else target.middlewares;
-            for ([_][]const http.Middleware(Ctx){ self.router.middlewares, groups }) |list| {
+            for ([_][]const http.Middleware(Ctx){ self.router.middlewares, target.middlewares }) |list| {
                 for (list) |m| if (m.openapi) |p| out.append(a, @ptrCast(@alignCast(p))) catch @panic("OOM");
             }
             return out.items;
@@ -2388,7 +2386,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.addRoute(.get, cfg.health_path, health);
         pub fn addRoute(self: *Self, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
-            self.register(self.router, method, path, handler);
+            self.root().addRoute(method, path, handler);
         }
 
         /// A `ResponseCache` owned by the server, for `with`, `group` or
@@ -2414,50 +2412,41 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.get("/users/:id", getUser);
         pub fn get(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.get, path, handler, true);
-            self.register(self.router, .get, path, handler);
+            self.root().get(path, handler);
         }
         /// As `get`, for HEAD.
         pub fn head(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.head, path, handler, true);
-            self.register(self.router, .head, path, handler);
+            self.root().head(path, handler);
         }
         /// As `get`, for POST.
         pub fn post(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.post, path, handler, true);
-            self.register(self.router, .post, path, handler);
+            self.root().post(path, handler);
         }
         /// As `get`, for PUT.
         pub fn put(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.put, path, handler, true);
-            self.register(self.router, .put, path, handler);
+            self.root().put(path, handler);
         }
         /// As `get`, for PATCH.
         pub fn patch(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.patch, path, handler, true);
-            self.register(self.router, .patch, path, handler);
+            self.root().patch(path, handler);
         }
         /// As `get`, for DELETE.
         pub fn delete(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.delete, path, handler, true);
-            self.register(self.router, .delete, path, handler);
+            self.root().delete(path, handler);
         }
         /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
         /// without one.)
         pub fn options(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.options, path, handler, true);
-            self.register(self.router, .options, path, handler);
+            self.root().options(path, handler);
         }
         /// The HTTP QUERY method (a GET with a body).
         pub fn query(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(.query, path, handler, true);
-            self.register(self.router, .query, path, handler);
+            self.root().query(path, handler);
         }
         /// As `get`, for every method; a route for a specific method at a
         /// path wins over it.
         pub fn any(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
-            comptime typed.checkRoute(null, path, handler, true);
-            self.register(self.router, null, path, handler);
+            self.root().any(path, handler);
         }
 
         /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
@@ -2488,9 +2477,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// arena, so options built at run time (e.g. from `anole.config.load`)
         /// need not outlive registration.
         pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
-            if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-            comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
+            self.root().wsWith(path, handler, upgrade);
         }
 
         /// A WebSocket endpoint at `path` served through callbacks:
@@ -2512,9 +2499,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `wsCallbacks` with upgrade options (copied into the server's arena,
         /// as with `wsWith`).
         pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
-            if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-            comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
+            self.root().wsCallbacksWith(path, Handlers, upgrade);
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -2540,10 +2525,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// `webtransport` with accept options (the drain's close, timeout).
         pub fn webtransportWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
-            if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-            comptime checkPattern("GET", path);
-            self.enableWebTransport();
-            self.router.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
+            self.root().webtransportWith(path, handler, accept);
         }
 
         /// The HTTP/3 listener speaks WebTransport, now or once it is set
@@ -2626,137 +2608,151 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Routes registered under a prefix and behind middleware; see
         /// `Server.group`. Groups nest: a nested group's prefix and
-        /// middleware come after its parent's.
-        pub const Group = struct {
-            server: *Self,
-            /// The core router's group underneath.
-            inner: http.Router(Ctx).Group,
+        pub const Group = GroupOf(false);
 
-            /// `Server.group`, nested: `prefix` after this group's, and
-            /// `middlewares` after its own.
-            pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
-                return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
-            }
-            /// Routes behind more middleware, with no further prefix.
-            pub fn with(g: Group, middlewares: anytype) Group {
-                return g.group("", middlewares);
-            }
-            /// `Server.get` under this group.
-            pub fn get(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.get, path, handler, false);
-                g.server.register(g.inner, .get, path, handler);
-            }
-            /// `Server.head` under this group.
-            pub fn head(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.head, path, handler, false);
-                g.server.register(g.inner, .head, path, handler);
-            }
-            /// `Server.post` under this group.
-            pub fn post(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.post, path, handler, false);
-                g.server.register(g.inner, .post, path, handler);
-            }
-            /// `Server.put` under this group.
-            pub fn put(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.put, path, handler, false);
-                g.server.register(g.inner, .put, path, handler);
-            }
-            /// `Server.patch` under this group.
-            pub fn patch(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.patch, path, handler, false);
-                g.server.register(g.inner, .patch, path, handler);
-            }
-            /// `Server.delete` under this group.
-            pub fn delete(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.delete, path, handler, false);
-                g.server.register(g.inner, .delete, path, handler);
-            }
-            /// `Server.options` under this group.
-            pub fn options(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.options, path, handler, false);
-                g.server.register(g.inner, .options, path, handler);
-            }
-            /// `Server.query` under this group.
-            pub fn query(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(.query, path, handler, false);
-                g.server.register(g.inner, .query, path, handler);
-            }
-            /// `Server.any` under this group.
-            pub fn any(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                comptime typed.checkRoute(null, path, handler, false);
-                g.server.register(g.inner, null, path, handler);
-            }
-            /// `Server.ws` under this group.
-            pub fn ws(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                g.wsWith(path, handler, .{});
-            }
-            /// `Server.wsWith` under this group.
-            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
-                if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
-            }
-            /// `Server.wsCallbacks` under this group.
-            pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
-                g.wsCallbacksWith(path, Handlers, .{});
-            }
-            /// `Server.wsCallbacksWith` under this group.
-            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
-                if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
-            }
-            /// `Server.webtransport` under this group.
-            pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
-                g.webtransportWith(path, handler, .{});
-            }
-            /// `Server.webtransportWith` under this group.
-            pub fn webtransportWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
-                if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.server.enableWebTransport();
-                g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
-            }
-            /// `Server.sse` under this group (the group's prefix goes before `path`).
-            pub fn sse(g: Group, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
-                if (comptime path.len > 0) comptime checkPattern("GET", path);
-                const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
-                data.* = .{ .topics = topics };
-                g.server.extras.sse_routes += 1;
-                g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
-            }
-            /// `Server.addRoute` under this group.
-            pub fn addRoute(g: Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
-                g.server.register(g.inner, method, path, handler);
-            }
-            /// `Server.static` under this group.
-            pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
-                g.inner.static(prefix, dir, opts);
-            }
-            /// `Server.staticDir` under this group.
-            pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
-                g.inner.static(prefix, try g.server.openDir(path), opts);
-            }
-            /// `Server.embedded` under this group.
-            pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
-                g.inner.embedded(path, data, opts);
-            }
-            /// `Server.grpc` behind this group's middleware (and the global
-            /// ones). The gRPC paths (`/pkg.Service/Method`) and the
-            /// transcoded REST paths come from the proto, so the group's
-            /// prefix does not apply to them; its middleware runs for both,
-            /// as for any route of the group.
-            ///
-            ///     const api = app.group("/v1", .{auth});
-            ///     api.grpc(pb.Users, users);          // /pkg.Users/Get and GET /v1/users/{id}, both behind auth
-            pub fn grpc(g: Group, comptime Service: anytype, impl: anytype) void {
-                g.grpcWith(Service, impl, .{});
-            }
-            /// `Server.grpcWith` under this group.
-            pub fn grpcWith(g: Group, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
-                g.server.grpcOn(g.inner, Service, impl, opts);
-            }
-        };
+        /// The router as a group with no prefix and no middleware: what
+        /// the server's own verbs go through, one implementation each.
+        const Root = GroupOf(true);
+
+        fn root(self: *Self) Root {
+            return .{ .server = self, .inner = self.router.group("", &.{}) };
+        }
+
+        /// `is_root`: the server's own flavour, whose paths are whole (a
+        /// group's prefix may hold parameters and may stand for the empty path).
+        fn GroupOf(comptime is_root: bool) type {
+            // The server's own methods name themselves `app.x` in the errors they give.
+            const app = if (is_root) "app." else "";
+            return struct {
+                const G = @This();
+                server: *Self,
+                /// The core router's group underneath.
+                inner: http.Router(Ctx).Group,
+
+                /// `Server.group`, nested: `prefix` after this group's, and
+                /// `middlewares` after its own.
+                pub fn group(g: G, prefix: []const u8, middlewares: anytype) Group {
+                    return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
+                }
+                /// Routes behind more middleware, with no further prefix.
+                pub fn with(g: G, middlewares: anytype) Group {
+                    return g.group("", middlewares);
+                }
+                /// `Server.get` under this group.
+                pub fn get(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.get, path, handler);
+                }
+                /// `Server.head` under this group.
+                pub fn head(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.head, path, handler);
+                }
+                /// `Server.post` under this group.
+                pub fn post(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.post, path, handler);
+                }
+                /// `Server.put` under this group.
+                pub fn put(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.put, path, handler);
+                }
+                /// `Server.patch` under this group.
+                pub fn patch(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.patch, path, handler);
+                }
+                /// `Server.delete` under this group.
+                pub fn delete(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.delete, path, handler);
+                }
+                /// `Server.options` under this group.
+                pub fn options(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.options, path, handler);
+                }
+                /// `Server.query` under this group.
+                pub fn query(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(.query, path, handler);
+                }
+                /// `Server.any` under this group.
+                pub fn any(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.verb(null, path, handler);
+                }
+                fn verb(g: G, comptime method: ?http.Method, comptime path: []const u8, comptime handler: anytype) void {
+                    comptime typed.checkRoute(method, path, handler, is_root);
+                    g.server.register(g.inner, method, path, handler);
+                }
+                /// `Server.ws` under this group.
+                pub fn ws(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.wsWith(path, handler, .{});
+                }
+                /// `Server.wsWith` under this group.
+                pub fn wsWith(g: G, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
+                    if (comptime !features.websocket) @compileError(app ++ "ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
+                }
+                /// `Server.wsCallbacks` under this group.
+                pub fn wsCallbacks(g: G, comptime path: []const u8, comptime Handlers: type) void {
+                    g.wsCallbacksWith(path, Handlers, .{});
+                }
+                /// `Server.wsCallbacksWith` under this group.
+                pub fn wsCallbacksWith(g: G, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
+                    if (comptime !features.websocket) @compileError(app ++ "wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
+                }
+                /// `Server.webtransport` under this group.
+                pub fn webtransport(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.webtransportWith(path, handler, .{});
+                }
+                /// `Server.webtransportWith` under this group.
+                pub fn webtransportWith(g: G, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+                    if (comptime !features.http3) @compileError(app ++ "webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    g.server.enableWebTransport();
+                    g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
+                }
+                /// `Server.sse` under this group (the group's prefix goes before `path`).
+                pub fn sse(g: G, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path);
+                    // A group's prefix may hold the {name}s, and its routes never went into the OpenAPI document (kept as it was).
+                    comptime if (is_root and !sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
+                    const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+                    data.* = .{ .topics = topics };
+                    g.server.extras.sse_routes += 1;
+                    if (comptime features.openapi and is_root) g.server.recordRoute(g.inner, .get, path, sseHandlerFor(route_options));
+                    g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
+                }
+                /// `Server.addRoute` under this group.
+                pub fn addRoute(g: G, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+                    g.server.register(g.inner, method, path, handler);
+                }
+                /// `Server.static` under this group.
+                pub fn static(g: G, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
+                    g.inner.static(prefix, dir, opts);
+                }
+                /// `Server.staticDir` under this group.
+                pub fn staticDir(g: G, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
+                    g.inner.static(prefix, try g.server.openDir(path), opts);
+                }
+                /// `Server.embedded` under this group.
+                pub fn embedded(g: G, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
+                    g.inner.embedded(path, data, opts);
+                }
+                /// `Server.grpc` behind this group's middleware (and the global
+                /// ones). The gRPC paths (`/pkg.Service/Method`) and the
+                /// transcoded REST paths come from the proto, so the group's
+                /// prefix does not apply to them; its middleware runs for both,
+                /// as for any route of the group.
+                ///
+                ///     const api = app.group("/v1", .{auth});
+                ///     api.grpc(pb.Users, users);          // /pkg.Users/Get and GET /v1/users/{id}, both behind auth
+                pub fn grpc(g: G, comptime Service: anytype, impl: anytype) void {
+                    g.grpcWith(Service, impl, .{});
+                }
+                /// `Server.grpcWith` under this group.
+                pub fn grpcWith(g: G, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+                    g.server.grpcOn(g.inner, Service, impl, opts);
+                }
+            };
+        }
 
         /// The server's outbound HTTP client, made with the server and
         /// shared by every handler; `anole.client(req)` finds the same one
@@ -2784,11 +2780,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `grpc`, with options for this registration (the message size
         /// limit, transcoding off).
         pub fn grpcWith(self: *Self, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
-            self.grpcOn(self.router, Service, impl, opts);
+            self.root().grpcWith(Service, impl, opts);
         }
 
-        /// `grpcWith` on a router or one of its groups (`Group.grpc`).
-        fn grpcOn(self: *Self, target: anytype, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+        /// `grpcWith` on a group (`Group.grpc`).
+        fn grpcOn(self: *Self, target: http.Router(Ctx).Group, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
             if (comptime !features.grpc) @compileError("app.grpc needs gRPC (-Dgrpc, on in the full profile)");
             const Svc = if (@TypeOf(Service) == type) Service else Service(grpc_mod.Call, anyerror);
             if (comptime features.openapi) self.recordGrpc(target, Svc, opts);
@@ -2808,7 +2804,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Keeps the documented operations of `Svc` for the OpenAPI document.
         /// Which forms appear (`Options.grpc`) is decided when it is built.
-        fn recordGrpc(self: *Self, target: anytype, comptime Svc: type, opts: grpc_mod.RegisterOptions) void {
+        fn recordGrpc(self: *Self, target: http.Router(Ctx).Group, comptime Svc: type, opts: grpc_mod.RegisterOptions) void {
             const ops = comptime openapi_mod.proto.serviceOperations(Svc);
             const a = self.arena.allocator();
             const chain = self.chainDocs(target);
@@ -3456,13 +3452,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });
         pub fn sse(self: *Self, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
-            comptime checkPattern("GET", path);
-            comptime if (!sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
-            const data = self.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
-            data.* = .{ .topics = topics };
-            self.extras.sse_routes += 1;
-            if (comptime features.openapi) self.recordRoute(self.router, .get, path, sseHandlerFor(route_options));
-            self.router.addRouteWith(.get, path, route(sseHandlerFor(route_options)), .{ .data = data });
+            self.root().sse(path, topics, route_options);
         }
 
         /// A development run with `app.sse` routes and only plain

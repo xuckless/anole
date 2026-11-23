@@ -1025,3 +1025,38 @@ test "In path fields under a group prefix are checked at registration" {
     try std.testing.expect(std.mem.indexOf(u8, message, "route GET /v1/users/:id") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "\"uid\"") != null);
 }
+
+test "Server verbs: app.<verb> and with(.{}).<verb> register the same routes, once" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    const verbs = .{ "get", "head", "post", "put", "patch", "delete", "options", "query", "any" };
+    inline for (verbs) |v| {
+        @field(App, v)(&app, "/a" ++ v, AppRoutes.hello);
+        @field(App.Group, v)(app.with(.{}), "/b" ++ v, AppRoutes.hello);
+    }
+    if (features.websocket) {
+        app.wsCallbacks("/acb", AppRoutes.EchoCallbacks);
+        app.with(.{}).wsCallbacks("/bcb", AppRoutes.EchoCallbacks);
+    }
+    const routes = app.router.routes.items;
+    var i: usize = 0;
+    while (i < routes.len) : (i += 2) {
+        const x, const y = .{ routes[i], routes[i + 1] };
+        try std.testing.expectEqual(x.method, y.method);
+        try std.testing.expectEqual(x.kind, y.kind);
+        try std.testing.expectEqual(x.no_wait, y.no_wait);
+        try std.testing.expectEqualStrings(x.info.path[2..], y.info.path[2..]);
+        try std.testing.expectEqual(x.middlewares.len, y.middlewares.len);
+    }
+    if (features.openapi) try std.testing.expectEqual(@as(usize, 14), app.extras.doc_entries.items.len);
+    try std.testing.expect(app.routeConflict() == null);
+    // A group's own path is its prefix, and groups nest.
+    app.group("/v1", .{}).post("", AppRoutes.hello);
+    app.group("/a", .{}).group("/b", .{}).get("/c", AppRoutes.hello);
+    const all = app.router.routes.items;
+    try std.testing.expectEqualStrings("/v1", all[all.len - 2].info.path);
+    try std.testing.expectEqualStrings("/a/b/c", all[all.len - 1].info.path);
+    // A route is a duplicate across entry points.
+    app.with(.{}).get("/aget", AppRoutes.hello);
+    try std.testing.expectEqualStrings("route GET /aget is registered twice", app.routeConflict().?);
+}
