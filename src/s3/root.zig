@@ -770,7 +770,7 @@ pub const Client = struct {
     /// tried when none has keys), starts the renewal task. `app` calls it.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         if (self.started) return;
-        self.observer = try .init(.s3, self.label, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         if (registry) |r| {
             const bytes = try r.counter("anole_s3_bytes_total", "Object bytes moved to and from the store.", &.{ "db", "direction" });

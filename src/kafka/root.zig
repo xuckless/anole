@@ -337,7 +337,7 @@ pub const Client = struct {
             defer self.consumers_mutex.unlock(self.io);
             if (self.phase != .idle) return;
         }
-        self.observer = try db.Observer.init(.kafka, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         if (registry) |r| {
             self.telemetry = try Telemetry.init(r, self.name);
             self.producer.tel.store(&self.telemetry.?, .release);

@@ -262,6 +262,10 @@ test "service: a stats subscription carries the requests counted so far" {
     try h.stats.ensureTables();
     h.stats.count(0, 1, 200, 20_000);
     h.stats.count(1, 1, 503, 40_000);
+    // Database slots: index + 1, so slot 1 is i = 0 and slot 3 i = 2.
+    h.stats.countDb(0, 1, 20_000, false);
+    h.stats.countDb(1, 1, 40_000, true);
+    h.stats.countDb(null, 3, 20_000, false);
     _ = try c.subscribeStats(250);
     try c.flush();
     _ = try waitFor(&c, a, .res);
@@ -274,6 +278,15 @@ test "service: a stats subscription carries the requests counted so far" {
         try std.testing.expectEqual(@as(u32, 1), r.s5);
     };
     try std.testing.expect(seen);
+    // Only the slots with calls, joined on the `/db` index.
+    try std.testing.expectEqual(@as(usize, 2), f.db.len);
+    try std.testing.expectEqual(@as(u32, 0), f.db[0].i);
+    try std.testing.expectEqual(@as(u32, 2), f.db[0].n);
+    try std.testing.expectEqual(@as(u32, 1), f.db[0].e);
+    try std.testing.expectEqualSlices([2]u32, &.{ .{ stats_mod.bucketOf(20_000), 1 }, .{ stats_mod.bucketOf(40_000), 1 } }, f.db[0].h);
+    try std.testing.expectEqual(@as(u32, 2), f.db[1].i);
+    try std.testing.expectEqual(@as(u32, 1), f.db[1].n);
+    try std.testing.expectEqual(@as(u32, 0), f.db[1].e);
 }
 
 test "service: 5xx entries stream to a subscriber" {

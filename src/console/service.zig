@@ -860,6 +860,13 @@ pub const Service = struct {
         return (f(self.host.ctx, index) orelse return "").pattern;
     }
 
+    /// A histogram's non-zero buckets as `[bucket, count]` pairs.
+    fn nonZeroBuckets(a: std.mem.Allocator, h: *const [stats_mod.bucket_count]u32) ![]const [2]u32 {
+        var out: std.ArrayList([2]u32) = .empty;
+        for (h, 0..) |count, b| if (count != 0) try out.append(a, .{ @intCast(b), count });
+        return out.items;
+    }
+
     fn statsFrame(self: *Service, a: std.mem.Allocator, sub: u32, seq: u64, now: i64) !protocol.Stats {
         var routes: std.ArrayList(protocol.RouteStat) = .empty;
         const st = self.stats;
@@ -867,9 +874,7 @@ pub const Service = struct {
         while (slot < st.route_slots) : (slot += 1) {
             const s = st.sum(slot);
             if (s.n == 0) continue;
-            var h: std.ArrayList([2]u32) = .empty;
-            for (s.h, 0..) |count, b| if (count != 0) try h.append(a, .{ @intCast(b), count });
-            var rs: protocol.RouteStat = .{ .i = slot, .n = s.n, .s2 = s.s2, .s3 = s.s3, .s4 = s.s4, .s5 = s.s5, .h = h.items };
+            var rs: protocol.RouteStat = .{ .i = slot, .n = s.n, .s2 = s.s2, .s3 = s.s3, .s4 = s.s4, .s5 = s.s5, .h = try nonZeroBuckets(a, &s.h) };
             if (slot == 0) {
                 rs.p = "(no route)";
             } else if (slot == st.max_routes + 1) {
@@ -881,6 +886,14 @@ pub const Service = struct {
                 }
             }
             try routes.append(a, rs);
+        }
+        var dbs: std.ArrayList(protocol.DbStat) = .empty;
+        var db_slot: u32 = 1;
+        while (db_slot < stats_mod.db_slots) : (db_slot += 1) {
+            const s = st.sumDb(db_slot);
+            if (s.n == 0) continue;
+            // i: the connector's index, the `/db` entry's `i`.
+            try dbs.append(a, .{ .i = db_slot - 1, .n = s.n, .e = s.e, .h = try nonZeroBuckets(a, &s.h) });
         }
         const n_exec = @min(self.host.executors, dusty.gauges.max_executors);
         var execs = try a.alloc([2]u32, n_exec);
@@ -896,6 +909,7 @@ pub const Service = struct {
             .seq = seq,
             .mono_ms = now,
             .routes = routes.items,
+            .db = dbs.items,
             .conns = .{ .total = total, .executors = execs },
             .err_seq = st.errors.current(),
         };

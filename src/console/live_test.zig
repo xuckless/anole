@@ -296,6 +296,11 @@ fn connsBoth(d: protocol.ConnsData) bool {
     return n >= 2;
 }
 
+fn dbCounted(c: *Console) bool {
+    const st = c.last_stats orelse return false;
+    return st.db.len >= 1 and st.db[0].n >= 1;
+}
+
 fn poolIdle(d: protocol.DbData) bool {
     for (d.databases) |db| if (std.mem.eql(u8, db.system, "sqlite")) {
         var in_use: u32 = 0;
@@ -423,6 +428,13 @@ const Check = struct {
         try std.testing.expectEqual(@as(u32, 3), total.max);
         try std.testing.expectEqual(@as(u32, 3), total.open);
         try std.testing.expectEqual(@as(u32, 3), total.idle);
+        // Its calls (the read of /notes/7) on the same `i` in the stats frames.
+        try c.until("the SQLite read in a stats frame", dbCounted);
+        const dbs = c.last_stats.?.db;
+        try std.testing.expectEqual(@as(usize, 1), dbs.len);
+        try std.testing.expectEqual(db.i, dbs[0].i);
+        try std.testing.expect(dbs[0].n >= 1);
+        try std.testing.expectEqual(@as(u32, 0), dbs[0].e);
 
         // /routes: each route with its method and kind; the numbers of
         // /requests are keyed by the same index.

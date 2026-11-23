@@ -106,6 +106,11 @@ pub const Metrics = struct {
 /// when it traces. Without either, every call is a no-op.
 pub const Observer = struct {
     system: db.System,
+    /// The console's slot for this database: its index in the server's
+    /// connectors plus one (`Extras.addObserved`); 0: not counted (an
+    /// observer no app registered). Written once, before the connector is
+    /// used; `attach` keeps it.
+    console_slot: u32 = 0,
     /// The database's name: the `db` label, and `db.namespace` on spans.
     name: []const u8,
     metrics: ?Metrics = null,
@@ -123,6 +128,13 @@ pub const Observer = struct {
             .metrics = if (registry) |r| try Metrics.init(r, system, name) else null,
             .tracer = tracer,
         };
+    }
+
+    /// Hooks the observer to the app's metrics and tracer (`start` of a
+    /// connector), keeping its system, name and console slot.
+    pub fn attach(self: *Observer, registry: ?*metrics.Registry, tracer: ?*observe.trace.Exporter) !void {
+        self.metrics = if (registry) |r| try Metrics.init(r, self.system, self.name) else null;
+        self.tracer = tracer;
     }
 
     /// Which spans it makes: database, messaging (NATS, Kafka), rpc (S3) or
@@ -160,6 +172,18 @@ pub const Observer = struct {
     }
 };
 
+/// The console's per-database counter (`console/stats.zig`), installed
+/// before a console can raise `dusty.hooks.collecting` and cleared after it
+/// falls, like `dusty.hooks.request_end`: called for each call ended on an
+/// observer with a `console_slot` while a console collects. `exec` is the
+/// calling task's executor, null off the runtime; `ns` the call's duration.
+pub var console_call: ?*const fn (slot: u32, exec: ?usize, ns: u64, failed: bool) void = null;
+
+comptime {
+    // R2 of #128: the console slot sits in padding, an Observer is no bigger.
+    std.debug.assert(@sizeOf(Observer) == 120);
+}
+
 /// One call in progress, from `Observer.start`.
 pub const Call = struct {
     observer: *const Observer,
@@ -191,9 +215,18 @@ pub const Call = struct {
     /// `end`, with `detail` on the span (S3, SMTP).
     pub fn endWith(self: Call, c: anytype, operation: []const u8, target: ?[]const u8, err: ?anyerror, detail: Detail) void {
         const o = self.observer;
-        if (o.metrics) |m| {
-            m.query.observeDuration(self.awake.durationTo(.now(c.io, .awake)).raw);
-            if (err) |e| m.errors.with(&.{ m.system, m.name, @errorName(e) }).inc();
+        // No console collecting: the slot test and one relaxed load, no clock read.
+        const counted = o.console_slot != 0 and dusty.hooks.collecting.load(.monotonic) != 0;
+        if (o.metrics != null or counted) {
+            const took = self.awake.durationTo(.now(c.io, .awake)).raw;
+            if (o.metrics) |m| {
+                m.query.observeDuration(took);
+                if (err) |e| m.errors.with(&.{ m.system, m.name, @errorName(e) }).inc();
+            }
+            if (counted) {
+                @branchHint(.unlikely);
+                if (console_call) |f| f(o.console_slot, dusty.placement.currentExecutor(c.io), @intCast(@max(0, took.nanoseconds)), err != null);
+            }
         }
         const exporter = o.tracer orelse return;
         const req = internal.requestOf(c) orelse return;
@@ -519,4 +552,38 @@ test "Observer: S3 spans follow the AWS SDK conventions, SMTP spans carry recipi
     // The bucket-only call has no key, and no span has database attributes.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "aws.s3.key"));
     try testing.expect(std.mem.indexOf(u8, body, "db.system.name") == null);
+}
+
+test "Call.endWith reaches the console hook only while collecting" {
+    const Hook = struct {
+        var calls: u32 = 0;
+        var last: struct { slot: u32 = 0, failed: bool = false } = .{};
+        fn call(slot: u32, _: ?usize, _: u64, failed: bool) void {
+            calls += 1;
+            last = .{ .slot = slot, .failed = failed };
+        }
+    };
+    const saved = console_call;
+    console_call = Hook.call;
+    defer console_call = saved;
+    const rows = [_]struct { name: []const u8, slot: u32, collecting: u32, err: ?anyerror, calls: u32 }{
+        .{ .name = "slot 0, collecting", .slot = 0, .collecting = 1, .err = null, .calls = 0 },
+        .{ .name = "slot 3, not collecting", .slot = 3, .collecting = 0, .err = null, .calls = 0 },
+        .{ .name = "slot 3, collecting, ok", .slot = 3, .collecting = 1, .err = null, .calls = 1 },
+        .{ .name = "slot 3, collecting, failed", .slot = 3, .collecting = 1, .err = error.Boom, .calls = 1 },
+    };
+    var ctx: db.Ctx = .{ .io = testing.io, .arena = testing.allocator };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        Hook.calls = 0;
+        const o: Observer = .{ .system = .sqlite, .name = "t", .console_slot = r.slot };
+        _ = dusty.hooks.collecting.fetchAdd(r.collecting, .monotonic);
+        o.start(&ctx).end(&ctx, "SELECT", null, r.err);
+        _ = dusty.hooks.collecting.fetchSub(r.collecting, .monotonic);
+        try testing.expectEqual(r.calls, Hook.calls);
+        if (r.calls == 1) {
+            try testing.expectEqual(r.slot, Hook.last.slot);
+            try testing.expectEqual(r.err != null, Hook.last.failed);
+        }
+    }
 }
