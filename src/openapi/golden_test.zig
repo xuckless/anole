@@ -329,6 +329,7 @@ test "ANOLE_OPENAPI_OUT writes the file and ANOLE_OPENAPI_CHECK compares it" {
         todosApp(&app);
         app._openapi_env = .{ .out = file };
         try app.run(); // returns without binding anything
+        try std.testing.expect(app.phase == .configured); // nor preparing
         expected = try app.openapiDocument(alloc);
     }
     defer alloc.free(expected);

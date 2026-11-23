@@ -503,6 +503,7 @@ test "anole.Server(State): listen after init's listeners is ListenersAlreadySet,
     var app = try Server(State).init(alloc, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, &state);
     defer app.deinit();
     // The listeners came from init's options...
+    try std.testing.expect(app.phase == .configured);
     try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
     // ...and `run` still serves them.
     const Check = struct {
@@ -516,6 +517,7 @@ test "anole.Server(State): listen after init's listeners is ListenersAlreadySet,
     defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
+    try std.testing.expect(app.phase == .stopped);
 }
 
 test "anole.Server(State): (req, res) and (state, req, res) handlers, state middleware and gRPC methods on a value are served" {
@@ -988,6 +990,10 @@ test "route conflicts in a test build: run fails with RouteConflict and routeCon
     const message = app.routeConflict() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, message, ":name conflicts with :id") != null);
     try std.testing.expectError(error.RouteConflict, app.run());
+    // The failed run configured and prepared: listeners are set, a retry reports again.
+    try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
+    try std.testing.expectError(error.RouteConflict, app.run());
+    try std.testing.expect(app.phase == .prepared);
 }
 
 test "addRoute takes a run-time path and checks it at registration" {
@@ -1018,4 +1024,46 @@ test "In path fields under a group prefix are checked at registration" {
     const message = app.routeConflict() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, message, "route GET /v1/users/:id") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "\"uid\"") != null);
+}
+
+test "Server verbs: app.<verb> and with(.{}).<verb> register the same routes, once" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.use(AppRoutes.stamp);
+    const verbs = .{ "get", "head", "post", "put", "patch", "delete", "options", "query", "any" };
+    inline for (verbs) |v| {
+        @field(App, v)(&app, "/a" ++ v, AppRoutes.hello);
+        @field(App.Group, v)(app.with(.{}), "/b" ++ v, AppRoutes.hello);
+    }
+    app.get("/acached", handlers.cached(.{}, AppRoutes.hello));
+    app.with(.{}).get("/bcached", handlers.cached(.{}, AppRoutes.hello));
+    if (features.websocket) {
+        app.wsCallbacks("/acb", AppRoutes.EchoCallbacks);
+        app.with(.{}).wsCallbacks("/bcb", AppRoutes.EchoCallbacks);
+        app.ws("/aws", AppRoutes.echo);
+        app.with(.{}).ws("/bws", AppRoutes.echo);
+    }
+    const routes = app.router.routes.items;
+    var i: usize = 0;
+    while (i < routes.len) : (i += 2) {
+        const x, const y = .{ routes[i], routes[i + 1] };
+        try std.testing.expectEqual(x.method, y.method);
+        try std.testing.expectEqual(x.kind, y.kind);
+        try std.testing.expectEqual(x.no_wait, y.no_wait);
+        try std.testing.expectEqualStrings(x.info.path[2..], y.info.path[2..]);
+        try std.testing.expectEqual(x.middlewares.len, y.middlewares.len);
+        try std.testing.expect(x.middlewares.len >= 1); // app.use(stamp) is kept; cached adds its group
+        if (x.kind == .ws) try std.testing.expect(x.info.data != null and y.info.data != null);
+    }
+    if (features.openapi) try std.testing.expectEqual(@as(usize, 16), app.extras.doc_entries.items.len);
+    try std.testing.expect(app.routeConflict() == null);
+    // A group's own path is its prefix, and groups nest.
+    app.group("/v1", .{}).post("", AppRoutes.hello);
+    app.group("/a", .{}).group("/b", .{}).get("/c", AppRoutes.hello);
+    const all = app.router.routes.items;
+    try std.testing.expectEqualStrings("/v1", all[all.len - 2].info.path);
+    try std.testing.expectEqualStrings("/a/b/c", all[all.len - 1].info.path);
+    // A route is a duplicate across entry points.
+    app.with(.{}).get("/aget", AppRoutes.hello);
+    try std.testing.expectEqualStrings("route GET /aget is registered twice", app.routeConflict().?);
 }

@@ -8,13 +8,13 @@ The shape is the one the database connectors have: a handle in your App state, e
 const files = try app.s3(.{});    // AWS_* variables, S3_BUCKET
 
 fn upload(state: *State, req: *anole.Request, res: *anole.Response) !void {
-    const stored = try state.files.put(req, "avatars/1.png", .request, .{}); // the request body goes to S3
+    const stored = try state.files.default().put(req, "avatars/1.png", .request, .{}); // the request body goes to S3
     res.status = .created;
     try res.json(.{ .etag = stored.etag });
 }
 
 fn avatar(state: *State, req: *anole.Request, res: *anole.Response) !void {
-    _ = try state.files.serve(req, res, "avatars/1.png", .{}); // Range, ETag and 304 included
+    _ = try state.files.default().serve(req, res, "avatars/1.png", .{}); // Range, ETag and 304 included
 }
 ```
 
