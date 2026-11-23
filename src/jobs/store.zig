@@ -160,3 +160,18 @@ pub const Backend = struct {
     /// The connector client behind the store, to check a transaction belongs to it.
     owner: ?*anyopaque = null,
 };
+
+/// `r` with its strings in `arena`: `table` rows live in the scratch arena of
+/// the call, and the caller's arena outlives it.
+pub fn copyRow(arena: std.mem.Allocator, r: Row) !Row {
+    var out = r;
+    out.queue = try arena.dupe(u8, r.queue);
+    out.kind = try arena.dupe(u8, r.kind);
+    out.args_json = try arena.dupe(u8, r.args_json);
+    out.meta_json = try arena.dupe(u8, r.meta_json);
+    if (r.worker) |x| out.worker = try arena.dupe(u8, x);
+    const errs = try arena.alloc(root.ErrorEntry, r.errors.len);
+    for (r.errors, errs) |s, *d| d.* = .{ .attempt = s.attempt, .at = s.at, .@"error" = try arena.dupe(u8, s.@"error"), .message = try arena.dupe(u8, s.message) };
+    out.errors = errs;
+    return out;
+}

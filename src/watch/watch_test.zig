@@ -387,6 +387,91 @@ test "watch: stop: a running handler finishes, a listener ends after what it has
     try std.testing.expectError(error.Stopped, w.listen(&c, .{}));
 }
 
+/// Counts a sink's `ended` calls, by `failed`.
+const Ends = struct {
+    n: [2]u32 = .{ 0, 0 },
+    sink: root.Sink = undefined,
+
+    fn attach(e: *Ends, w: *Watch) void {
+        e.sink = .{ .ctx = e, .deliver = deliver, .gap = gap, .status = status, .ended = ended };
+        w.addSink(&e.sink);
+    }
+    fn deliver(_: *anyopaque, _: *const root.Event) void {}
+    fn gap(_: *anyopaque, _: []const u8) void {}
+    fn status(_: *anyopaque, _: bool, _: []const u8) void {}
+    fn ended(ctx: *anyopaque, failed: bool, _: []const u8) void {
+        const e: *Ends = @ptrCast(@alignCast(ctx));
+        e.n[@intFromBool(failed)] += 1;
+    }
+};
+
+test "watch: phase table" {
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const Op = enum { start, stop, fail, fail_oom, ask_stop, connected };
+    const Row = struct { name: []const u8, idle: bool = false, ops: []const Op, status: root.Status, stopped: bool = true, ended_ok: u32 = 0, ended_failed: u32 = 0 };
+    const rows = [_]Row{
+        .{ .name = "running", .ops = &.{}, .status = .connected, .stopped = false },
+        .{ .name = "start on a running watch: no-op (no registration)", .ops = &.{.start}, .status = .connected, .stopped = false },
+        .{ .name = "stop twice: one end", .ops = &.{ .stop, .stop }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "fail then stop: stays failed", .ops = &.{ .fail, .stop }, .status = .failed, .ended_failed = 1 },
+        .{ .name = "fail twice: one end", .ops = &.{ .fail, .fail }, .status = .failed, .ended_failed = 1 },
+        .{ .name = "stop then fail: the first end wins", .ops = &.{ .stop, .fail }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "a reader's status after stop is ignored", .ops = &.{ .stop, .connected }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "a reader's status after fail is ignored", .ops = &.{ .fail, .connected }, .status = .failed, .ended_failed = 1 },
+        .{ .name = "start after stop: no-op", .ops = &.{ .stop, .start }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "askStop (drain task not started): stopped, teardown owed", .ops = &.{.ask_stop}, .status = .connected },
+        .{ .name = "askStop then stop: teardown done", .ops = &.{ .ask_stop, .stop }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "askStop then fail", .ops = &.{ .ask_stop, .fail }, .status = .failed, .ended_failed = 1 },
+        .{ .name = "askStop then start: no-op", .ops = &.{ .ask_stop, .start }, .status = .connected },
+        .{ .name = "idle", .idle = true, .ops = &.{}, .status = .starting, .stopped = false },
+        .{ .name = "idle stop", .idle = true, .ops = &.{.stop}, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "idle fail", .idle = true, .ops = &.{.fail}, .status = .failed, .ended_failed = 1 },
+        .{ .name = "idle askStop then stop", .idle = true, .ops = &.{ .ask_stop, .stop }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "fail out of memory: still failed", .idle = true, .ops = &.{ .fail_oom, .stop }, .status = .failed, .ended_failed = 1 },
+    };
+    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    defer topics.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var ends: Ends = .{};
+        // Idle rows' watches allocate through `fa`; `fail_oom` makes its next
+        // allocation fail.
+        var fa: std.testing.FailingAllocator = .init(gpa, .{});
+        const w = if (row.idle)
+            try Watch.init(fa.allocator(), io, .{ .postgres = .{ .client = stubClient(), .channels = &.{"orders"} } }, .{})
+        else
+            try newWatch(&topics, "t", &.{});
+        defer w.deinit();
+        ends.attach(w);
+        defer w.removeSink(&ends.sink);
+        for (row.ops) |op| switch (op) {
+            .start => try w.start(null, null, null),
+            .stop => w.stop(),
+            .fail => w.fail("test failure", .{}),
+            .fail_oom => {
+                fa.fail_index = fa.alloc_index;
+                w.fail("test failure", .{});
+            },
+            .ask_stop => w.askStop(),
+            .connected => w.setStatus(.connected),
+        };
+        try std.testing.expectEqual(row.status, w.status());
+        try std.testing.expectEqual(row.stopped, w.isStopped());
+        try std.testing.expectEqual([2]u32{ row.ended_ok, row.ended_failed }, ends.n);
+        if (w.listen(&c, .{})) |l| {
+            try std.testing.expect(!row.stopped);
+            l.close();
+        } else |err| {
+            try std.testing.expectEqual(error.Stopped, err);
+            try std.testing.expect(row.stopped);
+        }
+    }
+}
+
 /// The watch the hub's hook ends and frees (#157), and how often it ran.
 const FreedOnHub = struct {
     var w: ?*Watch = null;
@@ -395,16 +480,12 @@ const FreedOnHub = struct {
     fn endAndFree() void {
         const x = w.?;
         w = null;
-        // What the C ABI engine test did: `_fake()` on a started watch
-        // (it sets `fake`, which kept `stop` from unregistering), then the
-        // owner frees it.
-        x._fake();
         x.deinit();
         _ = ran.fetchAdd(1, .acq_rel);
     }
 };
 
-test "watch redis: a started watch made fake and freed is out of its Pub/Sub hub before the hub's next status round (#157)" {
+test "watch redis: a started watch freed by its owner is out of its Pub/Sub hub before the hub's next status round (#157)" {
     if (comptime !@import("build_options").redis) return error.SkipZigTest;
     const zio = @import("zio");
     const redis = @import("../redis/root.zig");
@@ -421,8 +502,8 @@ test "watch redis: a started watch made fake and freed is out of its Pub/Sub hub
     (try client._pubsubHub()).backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1) };
     const w = try Watch.init(gpa, rio, .{ .redis = .{ .client = client, .channels = &.{"orders"} } }, .{});
     try w.start(null, null, null);
-    // The hub's next status round first makes the watch fake and frees
-    // it, as its owner may at any time, then goes over the watches it lists.
+    // The hub's next status round first frees the watch (stop + deinit),
+    // as its owner may at any time, then goes over the watches it lists.
     FreedOnHub.ran.store(0, .release);
     FreedOnHub.w = w;
     hub.test_before_status.store(&FreedOnHub.endAndFree, .release);

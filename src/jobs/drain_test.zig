@@ -20,7 +20,7 @@ fn drainNow(client: *root.Client, io: std.Io) void {
 fn interruptedRun(client: *root.Client, io: std.Io) bool {
     client.held_mutex.lockUncancelable(io);
     defer client.held_mutex.unlock(io);
-    for (client.held.values()) |b| if (b.interrupted.load(.acquire)) return true;
+    for (client.held.values()) |b| if (b.stopped() == .interrupted) return true;
     return false;
 }
 
@@ -124,7 +124,11 @@ const LateDrain = struct {
         // delivered at the next cancellation point after it).
         const prev = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(prev);
-        wait.waitFlag(io, "the run was interrupted", job.interrupted_flag.?) catch return error.NeverInterrupted;
+        wait.waitUntil(io, "the run was interrupted", job, struct {
+            fn set(j: *const root.Job) bool {
+                return j.stopReason() == .interrupted;
+            }
+        }.set) catch return error.NeverInterrupted;
     }
 };
 
@@ -653,4 +657,89 @@ const StartFails = struct {
 
 test "jobs: app.jobs failing to start while serving leaves no connector entry behind" {
     if (comptime anole.features.sqlite) try StartFails.body() else return error.SkipZigTest;
+}
+
+/// Counts the drains that run: each drain releases leadership, and every
+/// call below starts out leading. `drain_pair` starts a second drain from
+/// inside the first one's body (phase draining) and holds the first until the
+/// second either waits for `drained` (right) or runs a body of its own (counted).
+const Drains = struct {
+    var vt: store.VTable = undefined;
+    var runs: std.atomic.Value(u32) = .init(0);
+    var pair: ?struct { client: *root.Client, io: std.Io, second: ?std.Io.Future(root.Client.Phase) = null, decided: std.Io.Event = .unset } = null;
+
+    fn leaderRelease(_: *anyopaque, _: []const u8) anyerror!void {
+        _ = runs.fetchAdd(1, .acq_rel);
+        const p = if (pair) |*p| p else return;
+        if (p.second != null) return p.decided.set(p.io);
+        p.second = try p.io.concurrent(secondDrain, .{ p.client, p.io });
+        p.decided.waitUncancelable(p.io);
+    }
+
+    fn waits(_: *root.Client) void {
+        pair.?.decided.set(pair.?.io);
+    }
+
+    /// Leads, so a body of its own would count; returns the phase it saw on return.
+    fn secondDrain(client: *root.Client, io: std.Io) root.Client.Phase {
+        client.is_leader.store(true, .release);
+        drainNow(client, io);
+        return client.phase.load(.acquire);
+    }
+
+    const Call = enum { start, drain, stop, drain_pair };
+    const Row = struct { name: []const u8, calls: []const Call, phase: root.Client.Phase, drains: u32 };
+    const rows = [_]Row{
+        .{ .name = "start twice", .calls = &.{ .start, .start }, .phase = .serving, .drains = 0 },
+        .{ .name = "stopWork before start: no drain", .calls = &.{.stop}, .phase = .stopped, .drains = 0 },
+        .{ .name = "start, stopWork: one drain", .calls = &.{ .start, .stop }, .phase = .stopped, .drains = 1 },
+        .{ .name = "a drain after drained returns", .calls = &.{ .start, .drain, .drain }, .phase = .drained, .drains = 1 },
+        .{ .name = "a drain while one runs waits for drained, runs no body", .calls = &.{ .start, .drain_pair }, .phase = .drained, .drains = 1 },
+        .{ .name = "stopWork after a drain: no second drain", .calls = &.{ .start, .drain, .stop }, .phase = .stopped, .drains = 1 },
+        .{ .name = "start after stopWork is a no-op", .calls = &.{ .stop, .start }, .phase = .stopped, .drains = 0 },
+        .{ .name = "stopWork twice", .calls = &.{ .stop, .stop }, .phase = .stopped, .drains = 0 },
+        .{ .name = "start, stopWork twice", .calls = &.{ .start, .stop, .stop }, .phase = .stopped, .drains = 1 },
+        .{ .name = "drain after a stopWork that never drained returns", .calls = &.{ .stop, .drain }, .phase = .stopped, .drains = 0 },
+        .{ .name = "drain before start, then start is a no-op", .calls = &.{ .drain, .start }, .phase = .drained, .drains = 1 },
+    };
+
+    fn check(io: std.Io) !void {
+        for (rows) |row| {
+            errdefer std.debug.print("row: {s}\n", .{row.name});
+            const client = try root.Client.init(gpa, io, .{ .store = .memory, .run = .manual });
+            defer client.deinit();
+            vt = client.backend.vt.*;
+            vt.leaderRelease = leaderRelease;
+            client.backend.vt = &vt;
+            runs.store(0, .release);
+            for (row.calls) |call| {
+                client.is_leader.store(true, .release);
+                switch (call) {
+                    .start => try client.start(null, null, null),
+                    .drain => drainNow(client, io),
+                    .stop => client.stopWork(),
+                    .drain_pair => {
+                        pair = .{ .client = client, .io = io };
+                        client.test_on_drain_wait = waits;
+                        defer {
+                            pair = null;
+                            client.test_on_drain_wait = null;
+                        }
+                        drainNow(client, io);
+                        try std.testing.expectEqual(.drained, pair.?.second.?.await(io));
+                    },
+                }
+            }
+            try std.testing.expectEqual(row.phase, client.phase.load(.acquire));
+            try std.testing.expectEqual(row.drains, runs.load(.acquire));
+        }
+    }
+};
+
+test "jobs: lifecycle phases" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(Drains.check, .{io});
+    try f.await(io);
 }

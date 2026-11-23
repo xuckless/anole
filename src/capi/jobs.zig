@@ -515,12 +515,12 @@ fn abiRun(ctx: ?*anyopaque, job: *J.Job) anyerror!void {
         slot.finished = true;
         t.release();
         if (!already) {
-            const reason: u32 = if (job.interrupted_flag != null and job.interrupted_flag.?.load(.acquire))
-                abi.JOB_CANCEL_DRAIN
-            else if (job.lost_flag != null and job.lost_flag.?.load(.acquire))
-                (if (job.admin_cancelled.load(.acquire)) abi.JOB_CANCEL_ADMIN else abi.JOB_CANCEL_LEASE_LOST)
-            else
-                abi.JOB_CANCEL_TIMEOUT;
+            const reason = std.EnumArray(anole.jobs.Stop, u32).init(.{
+                .none = abi.JOB_CANCEL_TIMEOUT,
+                .interrupted = abi.JOB_CANCEL_DRAIN,
+                .lost = abi.JOB_CANCEL_LEASE_LOST,
+                .admin_cancelled = abi.JOB_CANCEL_ADMIN,
+            }).get(job.stopReason());
             if (cancelRecord(slot.handle, w.user_data, job.id, reason)) |r| w.x.postRecord(r, false) else |_| {}
             return error.Canceled;
         }

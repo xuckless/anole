@@ -27,6 +27,7 @@ const Duration = root.Duration;
 const Id = root.Id;
 const Kind = root.Kind;
 const Job = root.Job;
+const Stop = root.Stop;
 const Options = root.Options;
 const Error = root.Error;
 const Enqueued = root.Enqueued;
@@ -75,8 +76,16 @@ const JobBox = struct {
     seq: u64 = 0,
     task: ?placement.Task = null,
     started: std.Io.Clock.Timestamp = undefined,
-    lost: std.atomic.Value(bool) = .init(false),
-    interrupted: std.atomic.Value(bool) = .init(false),
+    /// A `Stop`, written only by `stopWith`.
+    stop: std.atomic.Value(u8) = .init(@backingInt(Stop.none)),
+
+    fn stopWith(box: *JobBox, s: Stop) void {
+        _ = box.stop.fetchMax(@backingInt(s), .acq_rel);
+    }
+
+    pub fn stopped(box: *const JobBox) Stop {
+        return @fromBackingInt(@intCast(box.stop.load(.acquire)));
+    }
 };
 
 const CronEntry = struct {
@@ -86,8 +95,8 @@ const CronEntry = struct {
     opts: root.CronOptions,
     kind: []const u8,
     args_json: []const u8,
-    zone: cron_mod.Zone = .utc,
-    zone_loaded: bool = false,
+    /// Null until loadZone: a cron entry without a tz runs in UTC.
+    zone: ?cron_mod.Zone = null,
 };
 
 pub const Client = struct {
@@ -113,10 +122,10 @@ pub const Client = struct {
     next_seq: u64 = 0,
     group: std.Io.Group = .init,
     maint_signal: placement.Signal = .{},
-    draining: std.atomic.Value(bool) = .init(false),
-    /// Set when the drain has ended; a later `drain` waits for it.
+    /// The lifecycle; changed only by `advance`.
+    phase: std.atomic.Value(Phase) = .init(.new),
+    /// Set after `phase` reaches `drained`; a second `drain` waits for it.
     drained: std.Io.Event = .unset,
-    started: bool = false,
     is_leader: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
     last_prune: i64 = 0,
@@ -134,20 +143,55 @@ pub const Client = struct {
     /// with nothing allocated (`Exporter.close`).
     tracer: ?*observe.trace.Exporter = null,
     last_gauges: i64 = 0,
-    /// Set before the tasks are canceled (drain, deinit).
-    closing: std.atomic.Value(bool) = .init(false),
     /// When the drain stops waiting for the runs it canceled (awake clock,
-    /// ns); maxInt while not draining. Bounds the outcome writes.
+    /// ns); valid from `draining`, maxInt before. Bounds the outcome writes.
     drain_gives_up_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
     /// Wake-ups from the store's listener, the one it sends once it listens
     /// included: a test waits for the first before it counts on a wake.
     wake_kicks: std.atomic.Value(u32) = .init(0),
     /// Tests only: runs on a run's task right after `hold` has published it.
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
-    /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
-    work_stopped: bool = false,
     /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
+    /// Tests only: runs in a `drain` that found another under way, right before it waits for `drained`.
+    test_on_drain_wait: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
+
+    /// The client's lifecycle. `stopWork` runs on the owner's thread only;
+    /// `drain` may race it (the server's drainWatcher). Every cell:
+    ///
+    /// | phase    | start           | drain(deadline)                  | stopWork                               |
+    /// |----------|-----------------|----------------------------------|----------------------------------------|
+    /// | new      | -> serving      | -> draining, runs it, -> drained | -> closing, no drain, cancel, waits for a drain that raced in, -> stopped |
+    /// | serving  | no-op           | -> draining, runs it, -> drained | -> closing, drain(now + 10 s), cancel, -> stopped |
+    /// | closing  | no-op           | -> draining, runs it, -> drained | no-op (stopWork under way)             |
+    /// | draining | no-op           | waits for `drained`              | waits for the drain, cancel, -> stopped |
+    /// | drained  | no-op           | returns                          | cancel, -> stopped                     |
+    /// | stopped  | no-op           | returns                          | no-op                                  |
+    ///
+    /// A failure inside `start` leaves it serving: `stopWork` cleans up.
+    /// Every phase past `new` counts as started: `addQueue`, `cron*`,
+    /// `handle*` and `step` (which starts a `new` client) see it so.
+    /// `drained` is set after the phase reaches `drained` (notify last).
+    pub const Phase = enum(u8) { new, serving, closing, draining, drained, stopped };
+
+    /// `wakeTask` ends: `stopWork` or a drain began.
+    const closing_or_later: std.EnumArray(Phase, bool) = .init(.{ .new = false, .serving = false, .closing = true, .draining = true, .drained = true, .stopped = true });
+    /// The fetchers, heartbeat and maintenance end: a drain began.
+    const winding_down: std.EnumArray(Phase, bool) = .init(.{ .new = false, .serving = false, .closing = false, .draining = true, .drained = true, .stopped = true });
+
+    /// The one writer of `phase`: moves it to `to` if it is in `from`, and
+    /// returns the phase it left (null: it was in none of them).
+    fn advance(self: *Client, comptime from: []const Phase, to: Phase) ?Phase {
+        var cur = self.phase.load(.acquire);
+        while (std.mem.indexOfScalar(Phase, from, cur) != null) {
+            cur = self.phase.cmpxchgWeak(cur, to, .acq_rel, .acquire) orelse return cur;
+        }
+        return null;
+    }
+
+    fn windingDown(self: *Client) bool {
+        return winding_down.get(self.phase.load(.acquire));
+    }
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -202,18 +246,22 @@ pub const Client = struct {
     /// run may use any of them; `deinit` calls it first.
     /// Outside an app, call it before freeing what the handlers use.
     pub fn stopWork(self: *Client) void {
-        if (self.work_stopped) return;
-        self.work_stopped = true;
+        const left = self.advance(&.{ .new, .serving }, .closing) orelse self.phase.load(.acquire);
+        switch (left) {
+            .closing, .stopped => return,
+            .new, .serving, .draining, .drained => {},
+        }
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
-        self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
         // Pre-existing: if drainWatcher has not started the server's drain
         // yet, this one wins and uses 10 s, not drain_timeout. On the owner's
         // thread (no executor), so nothing here yields.
-        if (self.started) {
+        if (left != .new) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
         self.group.cancel(self.io);
+        // Never started, a drain may still race in from `closing`: wait for it.
+        while (self.advance(&.{ .closing, .drained }, .stopped) == null) self.drained.waitUncancelable(self.io);
     }
 
     pub fn deinit(self: *Client) void {
@@ -223,8 +271,7 @@ pub const Client = struct {
         self.gpa.free(self.queues);
         self.handlers.deinit(self.gpa);
         for (self.crons.items) |c| {
-            var z = c.zone;
-            z.deinit();
+            if (c.zone) |*z| z.deinit();
             self.gpa.destroy(c);
         }
         self.crons.deinit(self.gpa);
@@ -327,8 +374,7 @@ pub const Client = struct {
     /// Migrates, loads cron state, starts fetchers, heartbeat, wakes, leader (per `run`).
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         _ = health;
-        if (self.started) return;
-        self.started = true;
+        if (self.advance(&.{.new}, .serving) == null) return;
         self.tracer = tracer;
         if (registry) |r| {
             const mm = try self.gpa.create(metrics_mod.Series);
@@ -369,7 +415,7 @@ pub const Client = struct {
     /// its delivery queue this way). A queue that exists is left as it is.
     pub fn addQueue(self: *Client, q: root.QueueOptions) !void {
         if (self.queueIndex(q.name) != null) return;
-        if (self.started) {
+        if (self.phase.load(.acquire) != .new) {
             log.err("jobs: queue \"{s}\" must be in Options.queues (it is needed after the queue started)", .{q.name});
             return error.InvalidOptions;
         }
@@ -384,13 +430,12 @@ pub const Client = struct {
     }
 
     fn loadZone(self: *Client, c: *CronEntry) !void {
-        if (c.zone_loaded) return;
+        if (c.zone != null) return;
         const name = c.opts.tz orelse "UTC";
         c.zone = cron_mod.Zone.load(self.gpa, self.io, name) catch |e| {
             log.err("cron \"{s}\": time zone \"{s}\" failed: {t}", .{ c.name, name, e });
             return error.InvalidOptions;
         };
-        c.zone_loaded = true;
     }
 
     fn kickFromStore(context: ?*anyopaque, queue: []const u8) void {
@@ -407,11 +452,11 @@ pub const Client = struct {
     fn wakeTask(self: *Client) std.Io.Cancelable!void {
         const backoff: resilience.Backoff = .{ .base = .fromSeconds(1), .max = .fromSeconds(30), .jitter = .equal };
         var failures: u32 = 0;
-        while (!self.closing.load(.acquire)) {
+        while (!closing_or_later.get(self.phase.load(.acquire))) {
             if (self.backend.vt.runWake.?(self.backend.ptr, self.io, .{ .context = self, .kick = kickFromStore })) |_| {
                 return;
             } else |err| {
-                if (self.closing.load(.acquire)) {
+                if (closing_or_later.get(self.phase.load(.acquire))) {
                     // The cancel may have been taken by the listener's read.
                     self.io.recancel();
                     return error.Canceled;
@@ -440,12 +485,18 @@ pub const Client = struct {
     /// Stops claiming; running jobs finish by `deadline`, then are put back
     /// (J14). A call while a drain runs waits for that one to end.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
-        self.closing.store(true, .release);
-        if (self.draining.swap(true, .acq_rel)) {
-            self.drained.waitUncancelable(self.io);
+        if (self.advance(&.{ .new, .serving, .closing }, .draining) == null) {
+            // Stopped without a drain: nothing sets `drained`.
+            if (self.phase.load(.acquire) != .stopped) {
+                if (builtin.is_test) if (self.test_on_drain_wait) |f| f(self);
+                self.drained.waitUncancelable(self.io);
+            }
             return;
         }
-        defer self.drained.set(self.io);
+        defer {
+            _ = self.advance(&.{.draining}, .drained);
+            self.drained.set(self.io);
+        }
         // On the awake clock, whatever clock the deadline is on.
         const to_deadline = std.Io.Clock.Timestamp.now(self.io, deadline.clock).durationTo(deadline);
         const gives_up = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = to_deadline.raw, .clock = .awake }).addDuration(.{ .raw = cancel_grace, .clock = .awake });
@@ -460,7 +511,7 @@ pub const Client = struct {
         if (self.runningTotal() > 0) {
             self.held_mutex.lockUncancelable(self.io);
             for (self.held.values()) |b| {
-                b.interrupted.store(true, .release);
+                b.stopWith(.interrupted);
                 if (b.task) |t| placement.cancelTask(t);
             }
             self.held_mutex.unlock(self.io);
@@ -765,7 +816,7 @@ pub const Client = struct {
         };
         try self.handlers.append(self.gpa, .{ .kind = kind, .state = state, .run = run });
         // Added after `start` (behind a gate): the fetcher's filter learns it.
-        if (self.started) try self.queues[self.queueIndex(kind.queue).?].kinds.append(self.gpa, self.handlers.items[self.handlers.items.len - 1].kind.name);
+        if (self.phase.load(.acquire) != .new) try self.queues[self.queueIndex(kind.queue).?].kinds.append(self.gpa, self.handlers.items[self.handlers.items.len - 1].kind.name);
     }
 
     fn handlerFor(self: *Client, kind: []const u8) ?*const Handler {
@@ -790,7 +841,7 @@ pub const Client = struct {
 
     /// Handlers may still be added: not started, or started behind a gate that has not opened.
     fn registrable(self: *Client) bool {
-        if (!self.started) return true;
+        if (self.phase.load(.acquire) == .new) return true;
         const g = self.options.gate orelse return false;
         return !g.is_open(g.context);
     }
@@ -836,8 +887,7 @@ pub const Client = struct {
             .client = self,
         };
         box.job.cron_name = cronNameOf(a, row.meta_json);
-        box.job.lost_flag = &box.lost;
-        box.job.interrupted_flag = &box.interrupted;
+        box.job.stop = &box.stop;
         box.job.timeout_ms = row.timeout_ms;
     }
 
@@ -922,43 +972,25 @@ pub const Client = struct {
         const job = &box.job;
         const row = box.row;
         const t = self.now();
-        const base: store.Finish = .{ .id = row.id, .attempt = row.attempt, .to = .completed, .finished_at = t };
-        var plan: Plan = .{ .f = base, .outcome = .completed };
-        const o = job.outcome;
-        const interrupted = box.interrupted.load(.acquire);
-        const lost = box.lost.load(.acquire);
         if (job.completed_in and result != error.Canceled) {
             if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, .completed, took(self, box));
             return .completed;
         }
 
-        if (lost) {
-            log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
-            return .lost;
-        }
         // A handler that returned before the drain's cancel reached it has
         // finished: its outcome stands.
-        const failed = if (result) |_| false else |_| true;
-        if (interrupted and failed) {
-            plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
-            log.info("{s} interrupted by shutdown; put back", .{job.id_text});
-        } else if (result) |_| {
-            switch (o.kind) {
-                .none => {},
-                .snooze => plan = self.planSnooze(row, t, o.delay),
-                .discard => plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = "Discarded", .message = o.reason } }, .outcome = .dead },
-                .retry_in => plan = self.planFailure(row, def, t, "RetryRequested", o.explanation, o.delay),
-            }
-        } else |err| {
-            const err_name = errorType(err);
-            switch (o.kind) {
-                .discard => plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = err_name, .message = if (o.reason.len > 0) o.reason else o.explanation } }, .outcome = .dead },
-                .snooze => plan = self.planSnooze(row, t, o.delay),
-                else => plan = self.planFailure(row, def, t, err_name, o.explanation, if (o.kind == .retry_in) o.delay else null),
-            }
+        const stop = box.stopped();
+        switch (stop) {
+            .lost, .admin_cancelled => {
+                log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
+                return .lost;
+            },
+            .none, .interrupted => {},
         }
+        const failure: ?anyerror = if (result) |_| null else |e| e;
+        const decided = self.plan(row, def, t, job.outcome, failure, stop);
 
-        switch (self.writeOutcome(plan.f, job.id_text)) {
+        switch (self.writeOutcome(decided.f, job.id_text)) {
             .saved => {},
             .not_held => {
                 log.info("{s}: no longer held; its result was dropped", .{job.id_text});
@@ -966,25 +998,12 @@ pub const Client = struct {
             },
             .failed => {
                 if (self.metrics) |mm| mm.onUnsaved(row.queue, row.kind);
-                return plan.outcome;
+                return decided.outcome;
             },
         }
-        if (self.metrics) |mm| {
-            const label: metrics_mod.Outcome = if (result) |_| switch (plan.outcome) {
-                .completed => .completed,
-                .retried => .retried,
-                .dead => .dead,
-                .snoozed => .snoozed,
-                else => .interrupted,
-            } else |err| if (err == error.Timeout or err == error.Canceled) .timeout else switch (plan.outcome) {
-                .retried => .retried,
-                .dead => .dead,
-                .snoozed => .snoozed,
-                else => .interrupted,
-            };
-            mm.onFinished(row.queue, row.kind, label, took(self, box));
-        }
-        if (plan.outcome == .dead) {
+        if (decided.outcome == .interrupted) log.info("{s} interrupted by shutdown; put back", .{job.id_text});
+        if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, label(decided.outcome, failure), took(self, box));
+        if (decided.outcome == .dead) {
             // Tests expect dead jobs; an error line would fail them.
             if (builtin.is_test) log.info("{s} {s} is dead after {d} attempts", .{ job.id_text, row.kind, row.attempt }) else log.err("{s} {s} is dead after {d} attempts", .{ job.id_text, row.kind, row.attempt });
             if (self.options.on_dead) |hook| {
@@ -992,11 +1011,45 @@ pub const Client = struct {
                     if (rowToInfo(box.arena_state.allocator(), dead_row)) |info| hook.call(hook.context, &info) else |_| {}
                 }
             }
-        } else if (plan.outcome == .retried) {
+        } else if (decided.outcome == .retried) {
             log.warn("{s} {s} failed (attempt {d} of {d}); next try scheduled", .{ job.id_text, row.kind, row.attempt, row.max_attempts });
         }
-        return plan.outcome;
+        return decided.outcome;
     }
+
+    /// What a finished run becomes: a pure decision, no store, metrics or log.
+    fn plan(self: *Client, row: store.Row, def: Kind, t: Time, o: Job.Outcome, failure: ?anyerror, stop: Stop) Plan {
+        const err = failure orelse {
+            return switch (o.kind) {
+                .none => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .completed, .finished_at = t }, .outcome = .completed },
+                .snooze => self.planSnooze(row, t, o.delay),
+                .discard => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = "Discarded", .message = o.reason } }, .outcome = .dead },
+                .retry_in => self.planFailure(row, def, t, "RetryRequested", o.explanation, o.delay),
+            };
+        };
+        if (stop == .interrupted) return .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
+        const err_name = errorType(err);
+        return switch (o.kind) {
+            .discard => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = err_name, .message = if (o.reason.len > 0) o.reason else o.explanation } }, .outcome = .dead },
+            .snooze => self.planSnooze(row, t, o.delay),
+            .none, .retry_in => self.planFailure(row, def, t, err_name, o.explanation, if (o.kind == .retry_in) o.delay else null),
+        };
+    }
+
+    /// The metrics label of a run: a timeout or cancel error says `timeout`
+    /// whatever was planned, else the plan's outcome (a lost write counts as interrupted).
+    fn label(outcome: Outcome, failure: ?anyerror) metrics_mod.Outcome {
+        if (failure) |e| if (e == error.Timeout or e == error.Canceled) return .timeout;
+        return label_of.get(outcome);
+    }
+    const label_of: std.EnumArray(Outcome, metrics_mod.Outcome) = .init(.{
+        .completed = .completed,
+        .retried = .retried,
+        .dead = .dead,
+        .snoozed = .snoozed,
+        .interrupted = .interrupted,
+        .lost = .interrupted,
+    });
 
     const Written = enum { saved, not_held, failed };
 
@@ -1061,19 +1114,6 @@ pub const Client = struct {
 
     // ---- background tasks
 
-    fn cloneRow(a: std.mem.Allocator, r: store.Row) !store.Row {
-        var out = r;
-        out.queue = try a.dupe(u8, r.queue);
-        out.kind = try a.dupe(u8, r.kind);
-        out.args_json = try a.dupe(u8, r.args_json);
-        out.meta_json = try a.dupe(u8, r.meta_json);
-        if (r.worker) |w| out.worker = try a.dupe(u8, w);
-        const errs = try a.alloc(root.ErrorEntry, r.errors.len);
-        for (r.errors, errs) |s, *d| d.* = .{ .attempt = s.attempt, .at = s.at, .@"error" = try a.dupe(u8, s.@"error"), .message = try a.dupe(u8, s.message) };
-        out.errors = errs;
-        return out;
-    }
-
     fn waitSignal(self: *Client, sig: *placement.Signal, d: Duration) std.Io.Cancelable!void {
         const dl: dusty.Deadline = .init(self.io, .{ .duration = .{ .raw = d, .clock = .awake } });
         dl.run(placement.Signal.wait, .{ sig, self.io }) catch |e| switch (e) {
@@ -1084,7 +1124,7 @@ pub const Client = struct {
     }
 
     fn fetcherTask(self: *Client, q: *Queue) std.Io.Cancelable!void {
-        while (!self.draining.load(.acquire)) {
+        while (!self.windingDown()) {
             if (self.gated() or (q.kinds.items.len == 0 and q.catch_all == null)) {
                 try self.waitSignal(&q.signal, self.options.poll_interval);
                 continue;
@@ -1118,7 +1158,7 @@ pub const Client = struct {
     fn spawnJob(self: *Client, q: *Queue, r: store.Row) void {
         const box = self.gpa.create(JobBox) catch return self.putBack(r);
         box.* = .{ .client = self, .queue = q, .arena_state = .init(self.gpa), .row = undefined };
-        box.row = cloneRow(box.arena_state.allocator(), r) catch {
+        box.row = store.copyRow(box.arena_state.allocator(), r) catch {
             box.arena_state.deinit();
             self.gpa.destroy(box);
             return self.putBack(r);
@@ -1186,7 +1226,7 @@ pub const Client = struct {
         while (true) {
             self.io.sleep(every, .awake) catch return error.Canceled;
             try self.heartbeatOnce();
-            if (self.draining.load(.acquire) and self.runningTotal() == 0) return;
+            if (self.windingDown() and self.runningTotal() == 0) return;
         }
     }
 
@@ -1240,9 +1280,7 @@ pub const Client = struct {
         defer self.held_mutex.unlock(self.io);
         for (lost.items, cancelled) |l, c| {
             const b = self.held.get(l.seq) orelse continue;
-            // Set before `lost`, which the run may see and return on.
-            if (c) b.job.admin_cancelled.store(true, .release);
-            b.lost.store(true, .release);
+            b.stopWith(if (c) .admin_cancelled else .lost);
             if (b.task) |t| placement.cancelTask(t);
         }
     }
@@ -1261,7 +1299,7 @@ pub const Client = struct {
     }
 
     fn maintenanceTask(self: *Client) std.Io.Cancelable!void {
-        while (!self.draining.load(.acquire)) {
+        while (!self.windingDown()) {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             var report: StepReport = .{};
@@ -1349,7 +1387,7 @@ pub const Client = struct {
     }
 
     pub fn cronRaw(self: *Client, name: []const u8, spec: []const u8, kind: []const u8, args_json: []const u8, opts: root.CronOptions) !void {
-        if (self.started) {
+        if (self.phase.load(.acquire) != .new) {
             log.err("cron \"{s}\": schedules are registered before serving starts", .{name});
             return error.InvalidOptions;
         }
@@ -1407,7 +1445,8 @@ pub const Client = struct {
             return;
         }
         var ticks: [1000]Time = undefined;
-        const n = e.schedule.between(row.?.last_tick.?, t, &e.zone, &ticks);
+        const zone: cron_mod.Zone = e.zone orelse .utc;
+        const n = e.schedule.between(row.?.last_tick.?, t, &zone, &ticks);
         if (n == 0) return;
         const latest = ticks[n - 1];
         switch (e.opts.missed) {
@@ -1488,7 +1527,7 @@ pub const Client = struct {
                 .tz = e.opts.tz orelse "UTC",
                 .kind = e.kind,
                 .last_tick = last,
-                .next_tick = e.schedule.next(last orelse t, &e.zone),
+                .next_tick = e.schedule.next(last orelse t, &(e.zone orelse cron_mod.Zone.utc)),
                 .registered = true,
             });
         }
@@ -1526,7 +1565,7 @@ pub const Client = struct {
     /// every due job of every handled kind, until none is due at the clock's now.
     pub fn step(self: *Client, c: anytype) Error!StepReport {
         var report: StepReport = .{};
-        if (!self.started) self.start(null, null, null) catch return error.ServiceUnavailable;
+        if (self.phase.load(.acquire) == .new) self.start(null, null, null) catch return error.ServiceUnavailable;
         try self.maintain(c.arena, &report);
         // maintain's stage ran before the cron jobs; stage again so a tick that is due now runs now.
         _ = self.backend.vt.stage(self.backend.ptr, self.now()) catch 0;
@@ -1549,7 +1588,7 @@ pub const Client = struct {
                     again = true;
                     var box: JobBox = .{ .client = self, .queue = q, .arena_state = .init(self.gpa), .row = undefined };
                     defer box.arena_state.deinit();
-                    box.row = cloneRow(box.arena_state.allocator(), r) catch return error.OutOfMemory;
+                    box.row = store.copyRow(box.arena_state.allocator(), r) catch return error.OutOfMemory;
                     self.prepare(&box);
                     try self.hold(&box);
                     const out = self.runJob(&box);
@@ -1669,7 +1708,7 @@ test "jobs: a heartbeat waiting on the store does not hold up a run's start" {
             release.set(io_);
             try beat.await(io_);
             // The lookup was the lost run's: the heartbeat marked it lost.
-            try std.testing.expect(lost.lost.load(.acquire));
+            try std.testing.expectEqual(Stop.lost, lost.stopped());
         }
     };
     const zio = @import("zio");
@@ -1740,7 +1779,7 @@ test "jobs: an admin cancel the heartbeat finds at a run's start reaches the run
         }
 
         fn handler(_: ?*anyopaque, job: *Job) anyerror!void {
-            seen = job.admin_cancelled.load(.acquire);
+            seen = job.stopReason() == .admin_cancelled;
             return job.io.checkCancel();
         }
 
@@ -1804,6 +1843,25 @@ test "jobs: a run's end leaves a newer run of the same job held" {
     try HeldStub.run(T.check);
 }
 
+test "jobs: a run's stop only rises: the most severe cause wins in any order" {
+    const rows = [_]struct { name: []const u8, calls: []const Stop, want: Stop }{
+        .{ .name = "never stopped", .calls = &.{}, .want = .none },
+        .{ .name = "drain, then lost lease", .calls = &.{ .interrupted, .lost }, .want = .lost },
+        .{ .name = "lost lease, then drain", .calls = &.{ .lost, .interrupted }, .want = .lost },
+        .{ .name = "admin cancel, then drain", .calls = &.{ .admin_cancelled, .interrupted }, .want = .admin_cancelled },
+        .{ .name = "admin cancel, then lost lease", .calls = &.{ .admin_cancelled, .lost }, .want = .admin_cancelled },
+        .{ .name = "drain twice", .calls = &.{ .interrupted, .interrupted }, .want = .interrupted },
+    };
+    for (rows) |r| {
+        var box: JobBox = .{ .client = undefined, .queue = undefined, .arena_state = undefined, .row = undefined };
+        for (r.calls) |c| box.stopWith(c);
+        std.testing.expectEqual(r.want, box.stopped()) catch |e| {
+            std.debug.print("row: {s}\n", .{r.name});
+            return e;
+        };
+    }
+}
+
 test "jobs: the heartbeat stops a lost run whose job was claimed again" {
     const T = struct {
         fn check(io: std.Io) anyerror!void {
@@ -1830,8 +1888,75 @@ test "jobs: the heartbeat stops a lost run whose job was claimed again" {
             // The store renews only the newer claim.
             HeldStub.renew = &[_]store.Held{.{ .id = 7, .attempt = 2 }};
             try client.heartbeatOnce();
-            try std.testing.expect(old.lost.load(.acquire));
-            try std.testing.expect(!new.lost.load(.acquire));
+            try std.testing.expectEqual(Stop.lost, old.stopped());
+            try std.testing.expectEqual(Stop.none, new.stopped());
+        }
+    };
+    try HeldStub.run(T.check);
+}
+
+test "jobs: settle plan and label" {
+    const T = struct {
+        const Row = struct {
+            name: []const u8,
+            o: Job.Outcome = .{},
+            failure: ?anyerror = null,
+            stop: Stop = .none,
+            attempt: u16 = 1,
+            to: store.State,
+            outcome: Client.Outcome,
+            label: metrics_mod.Outcome,
+            delta: i8 = 0,
+            err: ?[]const u8 = null,
+            message: []const u8 = "",
+        };
+        const rows = [_]Row{
+            .{ .name = "ok", .to = .completed, .outcome = .completed, .label = .completed },
+            .{ .name = "ok snooze 0", .o = .{ .kind = .snooze }, .to = .available, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "ok snooze 5s", .o = .{ .kind = .snooze, .delay = .fromSeconds(5) }, .to = .scheduled, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "ok discard", .o = .{ .kind = .discard, .reason = "why" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Discarded", .message = "why" },
+            .{ .name = "ok retry_in", .o = .{ .kind = .retry_in, .delay = .fromSeconds(5), .explanation = "x" }, .to = .retrying, .outcome = .retried, .label = .retried, .err = "RetryRequested", .message = "x" },
+            .{ .name = "ok retry_in at max", .o = .{ .kind = .retry_in }, .attempt = 3, .to = .dead, .outcome = .dead, .label = .dead, .err = "RetryRequested" },
+            .{ .name = "err", .failure = error.Boom, .to = .retrying, .outcome = .retried, .label = .retried, .err = "Boom" },
+            .{ .name = "err at max", .failure = error.Boom, .attempt = 3, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom" },
+            .{ .name = "err discard reason", .failure = error.Boom, .o = .{ .kind = .discard, .reason = "r", .explanation = "e" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom", .message = "r" },
+            .{ .name = "err discard explanation", .failure = error.Boom, .o = .{ .kind = .discard, .explanation = "e" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom", .message = "e" },
+            .{ .name = "err snooze", .failure = error.Boom, .o = .{ .kind = .snooze, .delay = .fromSeconds(5) }, .to = .scheduled, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "err retry_in", .failure = error.Boom, .o = .{ .kind = .retry_in, .delay = .fromSeconds(7) }, .to = .retrying, .outcome = .retried, .label = .retried, .err = "Boom" },
+            .{ .name = "err timeout", .failure = error.Timeout, .to = .retrying, .outcome = .retried, .label = .timeout, .err = "Timeout" },
+            .{ .name = "err timeout at max", .failure = error.Timeout, .attempt = 3, .to = .dead, .outcome = .dead, .label = .timeout, .err = "Timeout" },
+            .{ .name = "drain + err", .failure = error.Boom, .stop = .interrupted, .to = .available, .outcome = .interrupted, .label = .interrupted, .delta = -1 },
+            .{ .name = "drain + canceled", .failure = error.Canceled, .stop = .interrupted, .to = .available, .outcome = .interrupted, .label = .timeout, .delta = -1 },
+            .{ .name = "drain + ok", .stop = .interrupted, .to = .completed, .outcome = .completed, .label = .completed },
+        };
+
+        fn check(io: std.Io) anyerror!void {
+            var vt: store.VTable = undefined;
+            const client = try HeldStub.client(io, &vt);
+            defer client.deinit();
+            const t: Time = .fromMillis(1000);
+            const def: Kind = .{ .name = "t" };
+            for (rows) |r| {
+                errdefer std.debug.print("row: {s}\n", .{r.name});
+                var row = HeldStub.row(7, r.attempt);
+                row.max_attempts = 3;
+                const p = client.plan(row, def, t, r.o, r.failure, r.stop);
+                try std.testing.expectEqual(r.to, p.f.to);
+                try std.testing.expectEqual(r.outcome, p.outcome);
+                try std.testing.expectEqual(r.delta, p.f.attempt_delta);
+                try std.testing.expectEqual(r.label, Client.label(p.outcome, r.failure));
+                if (r.to == .retrying or r.to == .scheduled) try std.testing.expect(p.f.run_at.?.toMillis() > t.toMillis());
+                if (r.to == .available) try std.testing.expect(p.f.run_at.?.toMillis() == t.toMillis());
+                const e = p.f.add_error orelse {
+                    try std.testing.expect(r.err == null);
+                    continue;
+                };
+                try std.testing.expectEqualStrings(r.err.?, e.@"error");
+                try std.testing.expectEqualStrings(r.message, e.message);
+            }
+            try std.testing.expectEqual(metrics_mod.Outcome.interrupted, Client.label(.lost, null));
+            try std.testing.expectEqual(metrics_mod.Outcome.timeout, Client.label(.dead, error.Timeout));
+            try std.testing.expectEqual(metrics_mod.Outcome.dead, Client.label(.dead, error.Boom));
         }
     };
     try HeldStub.run(T.check);

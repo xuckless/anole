@@ -228,6 +228,12 @@ pub const Clock = struct {
 
 pub const HandleOptions = struct {};
 
+/// Why a run was stopped from outside, in severity order: the drain
+/// interrupts it, the heartbeat loses its lease, or finds it cancelled
+/// through the admin API. Only rises: the most severe cause wins, whatever
+/// the order the drain and the heartbeat get to the run in.
+pub const Stop = enum(u8) { none, interrupted, lost, admin_cancelled };
+
 /// One job run, a context like a request (`io`, `arena`, `locals`): connectors take it.
 pub const Job = struct {
     io: std.Io,
@@ -255,11 +261,8 @@ pub const Job = struct {
     cron_name: ?[]const u8 = null,
     /// Set by `completeIn`: the run already completed the job in its own transaction.
     completed_in: bool = false,
-    /// Set by the heartbeat when the job was cancelled through the admin API.
-    admin_cancelled: std.atomic.Value(bool) = .init(false),
-    /// Set while the run is going: the heartbeat lost it, or the drain put it back.
-    lost_flag: ?*const std.atomic.Value(bool) = null,
-    interrupted_flag: ?*const std.atomic.Value(bool) = null,
+    /// Why the run was stopped (a `Stop`), set by `prepare` to the run's box.
+    stop: ?*const std.atomic.Value(u8) = null,
     /// The run's time limit in ms, or null.
     timeout_ms: ?u32 = null,
     /// The run's own span (`process <queue>`) when it is traced, as a
@@ -292,6 +295,11 @@ pub const Job = struct {
                 return error.ValidationFailed;
             },
         }
+    }
+    /// Why the run was stopped from outside so far; `.none` when it was not.
+    pub fn stopReason(self: *const Job) Stop {
+        const s = self.stop orelse return .none;
+        return @fromBackingInt(@intCast(s.load(.acquire)));
     }
     /// The handler then returns normally (`return job.snooze(.fromSeconds(300));`):
     /// run again later, the attempt not counted.

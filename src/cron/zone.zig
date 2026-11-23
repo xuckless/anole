@@ -60,18 +60,15 @@ const RuleDate = struct {
 
 const Rule = struct {
     std_off: i32,
-    dst_off: i32 = 0,
-    has_dst: bool = false,
-    start: RuleDate = undefined,
-    end: RuleDate = undefined,
+    dst: ?struct { off: i32, start: RuleDate, end: RuleDate } = null,
 
     fn offsetAt(self: Rule, t: i64) i32 {
-        if (!self.has_dst) return self.std_off;
+        const dst = self.dst orelse return self.std_off;
         const year = civilFromDays(@divFloor(t + self.std_off, 86400)).year;
-        const s = self.start.wall(year) - self.std_off;
-        const e = self.end.wall(year) - self.dst_off;
-        const dst = if (s < e) (t >= s and t < e) else (t >= s or t < e);
-        return if (dst) self.dst_off else self.std_off;
+        const s = dst.start.wall(year) - self.std_off;
+        const e = dst.end.wall(year) - dst.off;
+        const in_dst = if (s < e) (t >= s and t < e) else (t >= s or t < e);
+        return if (in_dst) dst.off else self.std_off;
     }
 };
 
@@ -153,19 +150,18 @@ fn parseRule(s: []const u8) ?Rule {
     var i: usize = 0;
     if (!parseName(s, &i)) return null;
     const so = parseHms(s, &i) orelse return null;
-    var r: Rule = .{ .std_off = -so };
-    if (i >= s.len) return r;
+    const std_off = -so;
+    if (i >= s.len) return .{ .std_off = std_off };
     if (!parseName(s, &i)) return null;
-    r.has_dst = true;
-    r.dst_off = r.std_off + 3600;
-    if (i < s.len and s[i] != ',') r.dst_off = -(parseHms(s, &i) orelse return null);
+    var off = std_off + 3600;
+    if (i < s.len and s[i] != ',') off = -(parseHms(s, &i) orelse return null);
     if (i >= s.len or s[i] != ',') return null;
     i += 1;
-    r.start = parseRuleDate(s, &i) orelse return null;
+    const start = parseRuleDate(s, &i) orelse return null;
     if (i >= s.len or s[i] != ',') return null;
     i += 1;
-    r.end = parseRuleDate(s, &i) orelse return null;
-    return r;
+    const end = parseRuleDate(s, &i) orelse return null;
+    return .{ .std_off = std_off, .dst = .{ .off = off, .start = start, .end = end } };
 }
 
 pub const Zone = struct {
