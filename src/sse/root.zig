@@ -910,7 +910,7 @@ pub const Topics = struct {
     /// A sender stuck on an ending subscriber past `close_after` is
     /// canceled, which aborts the stream. Under the mutex.
     fn checkStuck(self: *Topics, sub: *Subscriber, now: i64) void {
-        if (sub.life != .ending or sub.life.ending.sender != .running) return;
+        if (sub.life != .ending or sub.life.sender() != .running) return;
         const since = sub.sending_since_ms orelse return;
         if (now - since < self.options.close_after.toMilliseconds()) return;
         _ = sub.transition(.abort_end);
@@ -1107,13 +1107,13 @@ pub const Topics = struct {
     fn awaitSender(self: *Topics, io: std.Io, sub: *Subscriber) bool {
         var canceled = false;
         const deadline = placement.graceDeadline(io, self.options.leave_grace);
-        while (sub.life.left.sender == .running) {
+        while (sub.life.sender() == .running) {
             self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
                 if (err == error.Canceled) canceled = true;
                 break;
             };
         }
-        if (sub.life.left.sender == .running) {
+        if (sub.life.sender() == .running) {
             if (sub.task) |t| {
                 placement.cancelTask(t);
             } else if (sub.mode == .hub_sender) {
@@ -1125,7 +1125,7 @@ pub const Topics = struct {
                 self.mutex.lockUncancelable(io);
             }
         }
-        while (sub.life.left.sender == .running) self.idle.waitUncancelable(io, &self.mutex);
+        while (sub.life.sender() == .running) self.idle.waitUncancelable(io, &self.mutex);
         return canceled;
     }
 
@@ -1600,13 +1600,10 @@ pub const Subscriber = struct {
         return ends_when_over.get(sub.life);
     }
 
-    /// Whether it still takes events (and a `close`). Under the hub's mutex.
+    /// Whether it still takes events (and a `close`): where `step` takes
+    /// `end_queued`, so the rule lives in the table once. Under the hub's mutex.
     fn accepts(sub: *const Subscriber) bool {
-        return switch (sub.life) {
-            .open => true,
-            .opening => |e| e == null,
-            else => false,
-        };
+        return Life.step(sub.life, .end_queued) != null;
     }
 
     /// Under the hub's mutex.
