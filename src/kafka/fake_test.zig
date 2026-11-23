@@ -1237,6 +1237,38 @@ test "kafka: a consumer added once a drain began is refused" {
     try wait.waitFlag(io, "the drain returned", &drained);
 }
 
+test "kafka consumer: start, stop and join by phase; memberGone only for members that ended while running" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    const Row = struct { group: []const u8, stop_first: bool, stop: bool, spawned: usize, gone: bool };
+    for ([_]Row{
+        // A start after a stop spawns nothing; the join has nothing to wait for.
+        .{ .group = "stop-before-start", .stop_first = true, .stop = true, .spawned = 0, .gone = false },
+        // The members exit on the stop: the join returns on the last one.
+        .{ .group = "start-stop-join", .stop_first = false, .stop = true, .spawned = 1, .gone = false },
+        // No stop, deadline now: the join cancels the running member.
+        .{ .group = "join-at-deadline", .stop_first = false, .stop = false, .spawned = 1, .gone = true },
+    }) |row| {
+        errdefer std.debug.print("row {s}\n", .{row.group});
+        // Serving has not started: the consumer waits for its own start.
+        const c = try client.consumeRaw(.{ .group = row.group, .topics = &.{"phases"}, .heartbeat_interval = .fromMilliseconds(100) }, Joined.on, null);
+        if (row.stop_first) c.stop();
+        try c.start();
+        try c.start();
+        try testing.expectEqual(row.spawned, c.members.len);
+        if (row.stop) c.stop();
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        c.join(if (row.stop) now.addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }) else now);
+        try testing.expectEqual(@as(u32, 0), c.active.load(.acquire));
+        try testing.expectEqual(row.gone, c.memberGone());
+    }
+}
+
 /// A waiting append on the executor: `err` is its failure.
 fn appendTask(client: *kafka.Client, value: []const u8, partition: i32, out: *TaskResult) std.Io.Cancelable!void {
     defer out.finish();

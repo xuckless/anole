@@ -342,9 +342,16 @@ pub const Consumer = struct {
     arena: std.heap.ArenaAllocator,
     group: std.Io.Group = .init,
     members: []Member = &.{},
-    stopping: std.atomic.Value(bool) = .init(false),
-    started: bool = false,
+    phase: std.atomic.Value(Phase) = .init(.created),
+    /// Member tasks not yet ended; the one that takes it to zero sets
+    /// `members_done` (`membersEnded`).
     active: std.atomic.Value(u32) = .init(0),
+    members_done: std.Io.Event = .unset,
+
+    /// created -> running (`start`), any -> stopping (`stop`); a start
+    /// after a stop spawns nothing. `Client` never runs a start
+    /// concurrently with a stop (its drain waits for the starts).
+    const Phase = enum(u8) { created, running, stopping };
 
     /// The client's telemetry, once `Client.start` set it: stored once with
     /// release (the producer's `tel`, #159), so a consumer made before the
@@ -385,14 +392,16 @@ pub const Consumer = struct {
 
     /// Joins the group: spawns the member tasks.
     pub fn start(c: *Consumer) !void {
-        if (c.started) return;
-        c.started = true;
+        if (c.phase.load(.acquire) != .created) return;
         c.members = try c.host.gpa.alloc(Member, c.opts.members);
         for (c.members, 0..) |*m, i| m.* = .{ .consumer = c, .index = i };
-        for (c.members) |*m| {
-            _ = c.active.fetchAdd(1, .acq_rel);
+        // Counted before the phase says running, so `memberGone` never sees
+        // running with members still to spawn.
+        _ = c.active.fetchAdd(@intCast(c.members.len), .acq_rel);
+        c.phase.store(.running, .release);
+        for (c.members, 0..) |*m, i| {
             placement.concurrent(&c.group, c.host.io, .{ .executor = m.index }, memberMain, .{m}) catch {
-                _ = c.active.fetchSub(1, .acq_rel);
+                c.membersEnded(@intCast(c.members.len - i));
                 return error.OutOfMemory;
             };
             test_hold.testHold(c.host.io, .member_spawned);
@@ -402,17 +411,37 @@ pub const Consumer = struct {
     /// Asks the members to finish: records in flight finish, offsets are
     /// committed, the group is left. Returns at once; `join` waits.
     pub fn stop(c: *Consumer) void {
-        c.stopping.store(true, .release);
+        c.phase.store(.stopping, .release);
         for (c.members) |*m| m.wake.set(c.host.io);
     }
 
     /// Waits for the members to be gone, until `deadline`; then cancels.
     pub fn join(c: *Consumer, deadline: Timestamp) void {
         const io = c.host.io;
-        while (c.active.load(.acquire) > 0 and Timestamp.now(io, .awake).compare(.lt, deadline)) {
-            io.sleep(.fromMilliseconds(10), .awake) catch break;
-        }
+        // A start never ran (or spawned nothing): nothing to wait for.
+        if (c.members.len > 0) while (!c.members_done.isSet() and Timestamp.now(io, .awake).compare(.lt, deadline)) {
+            // A Timeout can be spurious: the loop looks at the deadline.
+            c.members_done.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => {
+                    io.recancel();
+                    break;
+                },
+            };
+        };
         c.group.cancel(io);
+    }
+
+    /// The member tasks ended on their own while running (a fenced
+    /// instance id): no stop asked for it.
+    pub fn memberGone(c: *const Consumer) bool {
+        return c.phase.load(.acquire) == .running and c.active.load(.acquire) == 0;
+    }
+
+    /// `n` member tasks ended (or were never spawned); the last sets
+    /// `members_done`.
+    fn membersEnded(c: *Consumer, n: u32) void {
+        if (c.active.fetchSub(n, .acq_rel) == n) c.members_done.set(c.host.io);
     }
 
     fn instanceFor(c: *Consumer, m: *const Member, buf: []u8) ?[]const u8 {
@@ -424,10 +453,10 @@ pub const Consumer = struct {
 
 fn memberMain(m: *Member) std.Io.Cancelable!void {
     const c = m.consumer;
-    defer _ = c.active.fetchSub(1, .acq_rel);
+    defer c.membersEnded(1);
     const io = c.host.io;
     var failures: u32 = 0;
-    while (!c.stopping.load(.acquire)) {
+    while (c.phase.load(.acquire) != .stopping) {
         runSession(m) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Rebalance => {
@@ -503,7 +532,7 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
     const tmp = tmp_state.allocator();
     var join_attempts: u32 = 0;
     const joined: protocol.Joined = while (true) : (join_attempts += 1) {
-        if (c.stopping.load(.acquire)) return;
+        if (c.phase.load(.acquire) == .stopping) return;
         if (join_attempts > 30) return error.GroupError;
         _ = tmp_state.reset(.retain_capacity);
         var sub: protocol.Enc = .init(tmp);
@@ -608,7 +637,7 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
             return err;
         };
         m.wake.reset();
-        if (c.stopping.load(.acquire) or sess.end.load(.acquire) != .none) break;
+        if (c.phase.load(.acquire) == .stopping or sess.end.load(.acquire) != .none) break;
     }
     sess.stop.store(true, .release);
     endSession(&sess);

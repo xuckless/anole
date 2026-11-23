@@ -856,7 +856,7 @@ fn groupTask(x: *Exec, g: *Group) std.Io.Cancelable!void {
                 reason = if (g.draining.load(.acquire)) abi.BROKER_END_DRAINED else abi.BROKER_END_CLOSED;
                 break;
             }
-            if (kc.started and kc.active.load(.acquire) == 0) {
+            if (kc.memberGone()) {
                 reason = abi.BROKER_END_FAILED;
                 message = "the group member stopped (its instance id is in use, or it failed)";
                 break;
