@@ -409,7 +409,9 @@ try tx.commit(req); // under the request's deadline, like every call
   coroutine, never the thread. Don't mark such routes `anole.noWait`.
 - **Raw access.** `app.db.acquire(req)` hands over pg.zig's connection
   (`conn.raw`: `query`, `row`, `prepare`...) for what the calls above do
-  not cover; `conn.release()` gives it back. `app.db.listener()` opens a
+  not cover; `conn.release()` gives it back, once (a second call does
+  nothing and is logged), and before the arena of the request or `Ctx`
+  given to `acquire` is reset or freed. `app.db.listener()` opens a
   connection for `LISTEN`/`NOTIFY` (channel names up to 63 bytes,
   PostgreSQL's limit).
 - **Session state.** What a call left in its connection's session with
