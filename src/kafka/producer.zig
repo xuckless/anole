@@ -416,12 +416,10 @@ pub const Producer = struct {
     stopping: bool = false,
 
     /// The producer id, under `mutex`. One InitProducerId at a time (the
-    /// keyring shape: `pid_fetching` and `pid_ready`), never a lock held
-    /// across the round trip.
-    pid: i64 = -1,
-    epoch: i16 = -1,
+    /// keyring shape: `.fetching` and `pid_ready`), never a lock held
+    /// across the round trip. `generation` counts the ids installed.
+    ids: IdState = .none,
     generation: u32 = 0,
-    pid_fetching: bool = false,
     pid_ready: std.Io.Condition = .init,
 
     /// The waiting callers' slots.
@@ -1157,7 +1155,10 @@ pub const Producer = struct {
             testHold(self.io, .ids_taken);
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.pid != ids.id or self.generation != ids.generation) continue;
+            switch (self.ids) {
+                .ready => |r| if (r.id != ids.id or self.generation != ids.generation) continue,
+                .none, .fetching => continue,
+            }
             pid = ids.id;
             epoch = ids.epoch;
             generation = ids.generation;
@@ -1397,6 +1398,7 @@ pub const Producer = struct {
     // -----------------------------------------------------------------------
     // Producer id
 
+    const IdState = union(enum) { none, fetching, ready: struct { id: i64, epoch: i16 } };
     const Ids = struct { id: i64, epoch: i16, generation: u32 };
 
     /// The producer id, asking for one when there is none. One task asks at
@@ -1408,23 +1410,26 @@ pub const Producer = struct {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             while (true) {
-                if (self.pid >= 0) return .{ .id = self.pid, .epoch = self.epoch, .generation = self.generation };
-                if (!self.pid_fetching) break;
-                try self.pid_ready.wait(self.io, &self.mutex);
+                switch (self.ids) {
+                    .ready => |r| return .{ .id = r.id, .epoch = r.epoch, .generation = self.generation },
+                    .fetching => try self.pid_ready.wait(self.io, &self.mutex),
+                    .none => break,
+                }
             }
-            self.pid_fetching = true;
+            self.ids = .fetching;
         }
         const got = fetchPid(self, conn, arena);
-        // The flag is cleared on every exit, a cancel included.
+        // `.fetching` ends on every exit, a cancel included; waiters wake after.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.pid_fetching = false;
-        self.pid_ready.broadcast(self.io);
-        const r = try got;
-        self.pid = r.id;
-        self.epoch = r.epoch;
+        defer self.pid_ready.broadcast(self.io);
+        const r = got catch |e| {
+            self.ids = .none;
+            return e;
+        };
+        self.ids = .{ .ready = .{ .id = r.id, .epoch = r.epoch } };
         self.generation +%= 1;
-        return .{ .id = self.pid, .epoch = self.epoch, .generation = self.generation };
+        return .{ .id = r.id, .epoch = r.epoch, .generation = self.generation };
     }
 
     fn fetchPid(self: *Producer, conn: *cluster_mod.Conn, arena: std.mem.Allocator) cluster_mod.ConnError!struct { id: i64, epoch: i16 } {
@@ -1447,8 +1452,8 @@ pub const Producer = struct {
     /// synchronized step). Ignored when `seen` is not the current
     /// generation (someone already did).
     fn resetPidLocked(self: *Producer, seen: u32) void {
-        if (self.generation != seen or self.pid < 0) return;
-        self.pid = -1;
+        if (self.generation != seen or self.ids != .ready) return;
+        self.ids = .none;
         var ti = self.topics.valueIterator();
         while (ti.next()) |t| for (t.*.parts) |maybe| if (maybe) |a| {
             a.next_seq = 0;
@@ -1545,6 +1550,31 @@ const WaitRace = struct {
         }
     }
 };
+
+test "kafka producer: resetPidLocked clears only a ready id of the seen generation" {
+    const ready: Producer.IdState = .{ .ready = .{ .id = 7, .epoch = 1 } };
+    const rows = [_]struct { state: Producer.IdState, seen: u32, cleared: bool }{
+        .{ .state = ready, .seen = 3, .cleared = true },
+        .{ .state = ready, .seen = 2, .cleared = false },
+        .{ .state = .fetching, .seen = 3, .cleared = false },
+        .{ .state = .none, .seen = 3, .cleared = false },
+    };
+    for (rows) |row| {
+        var p: Producer = .{
+            .gpa = testing.allocator,
+            .io = testing.io,
+            // SAFETY: resetPidLocked never reaches the cluster.
+            .cluster = undefined,
+            .cfg = .{},
+            .gens = try .init(testing.allocator),
+            .ids = row.state,
+            .generation = 3,
+        };
+        defer p.gens.deinit(testing.allocator);
+        p.resetPidLocked(row.seen);
+        try testing.expectEqual(row.cleared, (p.ids == .none) != (row.state == .none));
+    }
+}
 
 test "kafka producer: [stress] waits, completions and abandons race" {
     try test_wait.requireStress();
