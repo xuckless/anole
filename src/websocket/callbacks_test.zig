@@ -746,32 +746,36 @@ test "WebSocket loop: small messages around a 64 KiB one arrive whole and in ord
 }
 
 test "WebSocket loop: after the peer goes quiet the reader's window is narrow again" {
-    const gpa = std.testing.allocator;
-    var f: Fixture = undefined;
-    try f.start(gpa, false, quick);
-    defer f.deinit(gpa);
+    // A widened view, and with small request buffers a read block.
+    for ([_]dusty.ServerConfig{ quick, .{ .timeout = quick.timeout, .request = .{ .buffer_size = 4096 } } }) |config| {
+        const gpa = std.testing.allocator;
+        var f: Fixture = undefined;
+        try f.start(gpa, false, config);
+        defer f.deinit(gpa);
 
-    var c: Client = undefined;
-    try c.open(f.io, f.server.address.ip, false, "/watched-loop");
-    defer c.close(f.io);
-    // A 64 KiB message among the small ones: its header announces more than
-    // the narrow window holds, so the window widens whatever its size (to
-    // the end of a page: 16 KiB on arm64 macOS, more than the small
-    // messages ever fill).
-    const big = try gpa.alloc(u8, 64 * 1024);
-    defer gpa.free(big);
-    @memset(big, 'b');
-    try burst(&c, 200, big);
-    try std.testing.expect(widest_window.load(.acquire) > first_window.load(.acquire));
-    // One small message at a time, each answered before the next: twice as
-    // many waits for the peer as a busy socket keeps its room for (8).
-    for (0..16) |_| {
-        try c.send(0x1, "quiet");
-        try c.expectText("quiet");
+        var c: Client = undefined;
+        try c.open(f.io, f.server.address.ip, false, "/watched-loop");
+        defer c.close(f.io);
+        // A 64 KiB message among the small ones: its header announces more than
+        // the narrow window holds, so the window widens whatever its size (to
+        // the end of a page: 16 KiB on arm64 macOS, more than the small
+        // messages ever fill).
+        const big = try gpa.alloc(u8, 64 * 1024);
+        defer gpa.free(big);
+        @memset(big, 'b');
+        try burst(&c, 200, big);
+        try std.testing.expect(widest_window.load(.acquire) > first_window.load(.acquire));
+        // One small message at a time, each answered before the next: twice as
+        // many waits for the peer as a busy socket keeps its room for (8).
+        for (0..16) |_| {
+            try c.send(0x1, "quiet");
+            try c.expectText("quiet");
+        }
+        try std.testing.expectEqual(first_window.load(.acquire), last_window.load(.acquire));
+        // Narrowed (one madvise) once for the busy spell, not per message.
+        try std.testing.expectEqual(1, last_narrowed.load(.acquire));
+        try std.testing.expectEqual(0, websocket._readBlocksHeld());
     }
-    try std.testing.expectEqual(first_window.load(.acquire), last_window.load(.acquire));
-    // Narrowed (one madvise) once for the busy spell, not per message.
-    try std.testing.expectEqual(1, last_narrowed.load(.acquire));
 }
 
 /// Peers that go away without a close frame, each way: a FIN or a RST,
