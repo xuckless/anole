@@ -13,7 +13,7 @@
 //!     try s.send(.{ .message = "a" });
 //!     try s.closeSend();
 //!     while (try s.receive()) |reply| { ... }
-//!     const status = s.status.?;
+//!     const status = s.status().?;
 //!
 //! Over HTTP/3 give the channel the connection instead (`.h3 = conn`), or
 //! let `Channel.connect` own it (`.http = .h3`, or `.auto` to start on
@@ -598,10 +598,10 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         stream: wire.Stream,
         arena: std.mem.Allocator,
         compression: Compression,
-        /// Set once the response has ended: from the trailers, or from the
-        /// headers of a trailers-only response.
-        status: ?Status = null,
-        head_checked: bool = false,
+        /// A call awaits its response head, streams messages, then ends
+        /// once with its status (from the trailers, or the headers of a
+        /// trailers-only response); `ended` is absorbing.
+        phase: Phase = .awaiting_head,
         /// The call's deadline, when it has one: a call that ends without a
         /// status past it ended for that reason.
         deadline: ?std.Io.Clock.Timestamp = null,
@@ -609,8 +609,31 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         /// received so far.
         max_received_bytes: usize = std.math.maxInt(usize),
         received: usize = 0,
-        /// The connection went before any response head came.
-        lost_before_head: bool = false,
+
+        const Phase = union(enum) {
+            awaiting_head,
+            streaming,
+            ended: Ended,
+        };
+
+        const Ended = struct {
+            status: Status,
+            /// The connection went before any response head came.
+            lost_before_head: bool = false,
+        };
+
+        /// Set once the response has ended: from the trailers, or from the
+        /// headers of a trailers-only response.
+        pub fn status(self: *const Self) ?Status {
+            return switch (self.phase) {
+                .ended => |e| e.status,
+                .awaiting_head, .streaming => null,
+            };
+        }
+
+        fn end(self: *Self, st: Status) void {
+            self.phase = .{ .ended = .{ .status = st } };
+        }
 
         /// The HTTP version that carries this call.
         pub fn transport(self: *const Self) Transport {
@@ -645,7 +668,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         /// is reset and ends CANCELLED, and the caller passes the cancel on.
         fn taskCanceled(self: *Self, err: h2.StreamError) bool {
             if (err != error.Canceled or self.stream.canceledLocally()) return false;
-            self.status = .init(.cancelled, "cancelled");
+            self.end(.init(.cancelled, "cancelled"));
             // RST_STREAM CANCEL / H3_REQUEST_CANCELLED, as grpc aio and Go do.
             self.stream.cancel();
             return true;
@@ -676,57 +699,64 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             self.stream.closeSend() catch return self.writeFailed();
         }
 
-        /// The next response, or null at the end of the call, when `status`
+        /// The next response, or null at the end of the call, when `status()`
         /// is set. `error.Canceled` when the calling task is canceled: the
-        /// call is reset, and `status` is CANCELLED.
+        /// call is reset, and `status()` is CANCELLED.
         pub fn receive(self: *Self) !?Resp {
-            if (self.status != null) return null;
-            if (!self.head_checked) {
-                self.head_checked = true;
-                self.stream.waitHead() catch |err| {
-                    if (self.taskCanceled(err)) return error.Canceled;
-                    self.lost_before_head = err == error.ConnectionClosed;
-                    self.status = self.transportStatus(err);
-                    return null;
-                };
-                switch (self.stream) {
-                    .h2 => if (self.stream.header("alt-svc")) |v| self.channel.learn(v),
-                    .h3 => self.channel.h3Worked(),
-                }
-                if (self.stream.status() != 200) {
-                    self.status = .init(httpStatusCode(self.stream.status()), "HTTP status");
-                    return null;
-                }
-                // Trailers-only: the status is in the headers.
-                if (self.stream.header("grpc-status")) |_| {
-                    self.status = try self.statusFromFields(.headers);
-                    return null;
-                }
+            switch (self.phase) {
+                .ended => return null,
+                .streaming => {},
+                .awaiting_head => {
+                    self.stream.waitHead() catch |err| {
+                        if (self.taskCanceled(err)) return error.Canceled;
+                        self.phase = .{ .ended = .{
+                            .status = self.transportStatus(err),
+                            .lost_before_head = err == error.ConnectionClosed,
+                        } };
+                        return null;
+                    };
+                    // Streaming before the checks below: an OOM in the
+                    // trailers-only status leaves the call un-ended, as ever.
+                    self.phase = .streaming;
+                    switch (self.stream) {
+                        .h2 => if (self.stream.header("alt-svc")) |v| self.channel.learn(v),
+                        .h3 => self.channel.h3Worked(),
+                    }
+                    if (self.stream.status() != 200) {
+                        self.end(.init(httpStatusCode(self.stream.status()), "HTTP status"));
+                        return null;
+                    }
+                    // Trailers-only: the status is in the headers.
+                    if (self.stream.header("grpc-status")) |_| {
+                        self.end(try self.statusFromFields(.headers));
+                        return null;
+                    }
+                },
             }
             const encoding: Compression = if (self.stream.header("grpc-encoding")) |e| Compression.parse(e) orelse .identity else .identity;
             // Read and inflated outside the arena, freed once decoded.
             const msg = frame.readMessage(self.stream.reader(), server.scratch, self.channel.max_message_size, encoding) catch |err| {
                 if (err == error.ReadFailed) if (self.stream.readError()) |e| if (self.taskCanceled(e)) return error.Canceled;
-                self.status = switch (err) {
+                self.end(switch (err) {
                     error.ReadFailed => if (self.stream.readError()) |e| self.transportStatus(e) else self.transportStatus(error.StreamReset),
                     error.MessageTooLarge => .init(.resource_exhausted, "message larger than the limit"),
                     else => .init(.internal, @errorName(err)),
-                };
+                });
                 return null;
             } orelse {
-                self.status = try self.statusFromFields(.trailers);
+                self.end(try self.statusFromFields(.trailers));
                 return null;
             };
             defer server.scratch.free(msg.payload);
             self.received +|= msg.payload.len + server.per_message_charge;
             if (self.received > self.max_received_bytes) {
-                self.status = .init(.resource_exhausted, "response messages over the call's limit");
+                self.end(.init(.resource_exhausted, "response messages over the call's limit"));
                 self.stream.cancel();
                 return null;
             }
             var reader: std.Io.Reader = .fixed(msg.payload);
             return Resp.decode(&reader, self.arena) catch {
-                self.status = .init(.internal, "response did not decode");
+                self.end(.init(.internal, "response did not decode"));
                 self.stream.cancel();
                 return null;
             };
@@ -869,7 +899,11 @@ fn unaryTry(comptime M: type, channel: *Channel, method_path: []const u8, arena:
     const message = try s.receive();
     // Drain to the trailers.
     if (message != null) while (try s.receive()) |_| {};
-    const st = s.status orelse Status.init(.internal, "no status");
+    const ended: Stream(M.Request, M.Response).Ended = switch (s.phase) {
+        .ended => |e| e,
+        .awaiting_head, .streaming => .{ .status = Status.init(.internal, "no status") },
+    };
+    const st = ended.status;
     return .{
         .result = .{
             .status = st,
@@ -882,7 +916,7 @@ fn unaryTry(comptime M: type, channel: *Channel, method_path: []const u8, arena:
         },
         .unprocessed = st.code == .unavailable and s.stream.unprocessed(),
         .transport = s.transport(),
-        .lost_before_head = s.lost_before_head,
+        .lost_before_head = ended.lost_before_head,
     };
 }
 

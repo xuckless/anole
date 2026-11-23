@@ -179,7 +179,7 @@ test "grpc over h3: the four call modes with the typed client" {
                 var n: usize = 0;
                 while (try s.receive()) |m| : (n += 1) try std.testing.expectEqual(@as(i32, @intCast(n)), m.index);
                 try std.testing.expectEqual(@as(usize, 5), n);
-                try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+                try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
             }
             {
                 var s = try client.stream("ClientStream", arena, .{});
@@ -189,7 +189,7 @@ test "grpc over h3: the four call modes with the typed client" {
                 const reply = (try s.receive()).?;
                 try std.testing.expectEqualStrings("xyz", reply.message);
                 try std.testing.expect(try s.receive() == null);
-                try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+                try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
             }
             {
                 var s = try client.stream("Bidi", arena, .{});
@@ -202,7 +202,7 @@ test "grpc over h3: the four call modes with the typed client" {
                 }
                 try s.closeSend();
                 try std.testing.expect(try s.receive() == null);
-                try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+                try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
             }
         }
     }.run);
@@ -282,7 +282,7 @@ test "grpc over h3: a client stream the server finishes early" {
             const reply = (try s.receive()).?;
             try std.testing.expectEqualStrings("early", reply.message);
             try std.testing.expect(try s.receive() == null);
-            try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+            try std.testing.expectEqual(grpc.Code.ok, s.status().?.code);
         }
     }.run);
 }
@@ -323,7 +323,7 @@ test "grpc over h3: client cancel cancels the handler" {
             s.cancel();
             try wait.waitEvent(env.io, "the handler's wait was canceled", &Probe.canceled);
             try std.testing.expect(try s.receive() == null);
-            try std.testing.expectEqual(grpc.Code.cancelled, s.status.?.code);
+            try std.testing.expectEqual(grpc.Code.cancelled, s.status().?.code);
         }
     }.run);
 }
