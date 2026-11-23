@@ -499,8 +499,11 @@ rules:
 - A variable that ends in `**` keeps a trailing slash: with
   `/v1/{name=shelves/*/**}`, `/v1/shelves/s1/` binds `name` to
   `shelves/s1/`.
-- The router picks a route before the binding is asked: of `/v1/{name}:x`
-  and `/v1/{name=**}`, `/v1/abc` reaches the first's route and is a 404.
+- When a transcoding route's own bindings all decline a path (for example
+  `/v1/abc` reaching `/v1/{name}:x`), less-specific transcoding bindings
+  that match it (such as `/v1/{name=**}` or `/v1/{a}/{b}`) are tried as
+  fallbacks in router precedence order (`static > param > wildcard`), as
+  long as they share the route's HTTP method and middleware chain.
 
 ### The request
 

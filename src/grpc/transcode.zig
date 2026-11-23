@@ -790,8 +790,9 @@ pub fn errorBody(arena: std.mem.Allocator, code: u32, message: []const u8) ![]co
 pub const ServeFn = fn (ctx: ?*anyopaque, req: *dusty.Request, res: *dusty.Response, captures: []const Capture, options: *const server.RegisterOptions) anyerror!void;
 
 /// The bindings that share one router route, tried in turn: exact ones
-/// with a verb first, then exact ones without, then the `.rest_prefix`
-/// ones, each group in the order it was registered (`insert`).
+/// with a verb first, then exact ones without, then `.rest_prefix` ones,
+/// then `.fallback` ones (attached by `Router.finish` in router precedence
+/// order), each group in the order it was added.
 const Binding = struct {
     template: *const Template,
     serve: *const ServeFn,
@@ -799,6 +800,7 @@ const Binding = struct {
     where: []const u8,
     /// Set when the binding is made and never changed.
     role: Role,
+    no_wait: bool = false,
     next: ?*Binding = null,
 
     const Role = enum {
@@ -812,6 +814,11 @@ const Binding = struct {
         /// `any` route that would conflict) wants the prefix it is left
         /// out, with no conflict reported: nobody asked for this route.
         rest_prefix,
+        /// Attached by `Router.finish` to a more specific transcoding route
+        /// whose own bindings can all decline (verb after `*` or `**`), in
+        /// router precedence order (`static > param > wildcard`), so a
+        /// declined path falls through without touching router lookup.
+        fallback,
     };
 
     /// Its group in the route's list: lower goes first.
@@ -819,6 +826,7 @@ const Binding = struct {
         return switch (b.role) {
             .exact => if (b.template.verb.len > 0) 0 else 1,
             .rest_prefix => 2,
+            .fallback => 3,
         };
     }
 };
@@ -898,9 +906,12 @@ pub fn addBinding(
     const router = server.routerOf(Ctx, target);
     const alloc = router.arena.allocator();
     const binding = alloc.create(Binding) catch @panic("OOM");
-    binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .exact };
+    binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .exact, .no_wait = no_wait };
     const segments = template.segments();
-    attach(Ctx, target, method, template, segments.len, binding, no_wait);
+    attach(Ctx, target, method, template, segments.len, binding);
+
+    const finish = Finish(Ctx).of(router);
+    finish.methods[@backingInt(method)] = true;
 
     // `**` matches zero or more segments, but the router's wildcard needs
     // one: the prefix gets a route of its own, with its own copy of the
@@ -911,38 +922,181 @@ pub fn addBinding(
     // a request could reach.
     if (segments.len > 0 and segments[segments.len - 1] == .rest and !(segments.len == 1 and template.verb.len > 0)) {
         const prefix_binding = alloc.create(Binding) catch @panic("OOM");
-        prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .rest_prefix };
-        const later = alloc.create(PrefixRoute(Ctx)) catch @panic("OOM");
+        prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .rest_prefix, .no_wait = no_wait };
         const R = dusty.Router(Ctx);
-        later.* = .{
+        finish.prefixes.append(alloc, .{
             .group = if (@TypeOf(target) == *R) .{ .router = target, .prefix = "", .middlewares = &.{} } else target,
             .method = method,
             .binding = prefix_binding,
-            .no_wait = no_wait,
-        };
-        router.addDeferred(.{ .context = later, .run = PrefixRoute(Ctx).run });
+        }) catch @panic("OOM");
     }
 }
 
-/// The route for the prefix of a `**` template, waiting for `Router.finish`.
-fn PrefixRoute(comptime Ctx: type) type {
+/// Pending transcoding work for `Router.finish`: `**` prefix routes first,
+/// then attaching fallback bindings to every declining transcoding route.
+fn Finish(comptime Ctx: type) type {
     return struct {
-        /// Where the binding was registered: the router itself is a group
-        /// with no prefix and no middleware of its own.
-        group: dusty.Router(Ctx).Group,
-        method: dusty.Method,
-        binding: *Binding,
-        no_wait: bool,
+        const Prefix = struct {
+            /// Where the binding was registered: the router itself is a group
+            /// with no prefix and no middleware of its own.
+            group: dusty.Router(Ctx).Group,
+            method: dusty.Method,
+            binding: *Binding,
+        };
+
+        prefixes: std.ArrayList(Prefix) = .empty,
+        methods: [256]bool = @splat(false),
+
+        fn of(router: *dusty.Router(Ctx)) *@This() {
+            for (router.deferred.items) |d| {
+                if (d.run == &run) return @ptrCast(@alignCast(d.context));
+            }
+            const self = router.arena.allocator().create(@This()) catch @panic("OOM");
+            self.* = .{};
+            router.addDeferred(.{ .context = self, .run = run });
+            return self;
+        }
 
         fn run(router: *dusty.Router(Ctx), context: *anyopaque) void {
-            // SAFETY: `addBinding` passed a `*PrefixRoute(Ctx)` as the context.
+            // SAFETY: `of` passed a `*Finish(Ctx)` as the context.
             const self: *@This() = @ptrCast(@alignCast(context));
-            var group = self.group;
-            group.router = router;
-            const template = self.binding.template;
-            attach(Ctx, group, self.method, template, template.segments().len - 1, self.binding, self.no_wait);
+            for (self.prefixes.items) |p| {
+                var group = p.group;
+                group.router = router;
+                const template = p.binding.template;
+                attach(Ctx, group, p.method, template, template.segments().len - 1, p.binding);
+            }
+            for (self.methods, 0..) |active, m| {
+                if (!active) continue;
+                const root = router.trees[m] orelse continue;
+                attachFallbacks(Ctx, router, root);
+            }
         }
     };
+}
+
+/// Attaches less-specific transcoding bindings as `.fallback`s on every
+/// transcoding route in `root` that can decline a path (verb after `*` or
+/// `**`), in router precedence order (`static > param > wildcard`).
+fn attachFallbacks(comptime Ctx: type, router: *dusty.Router(Ctx), root: anytype) void {
+    const NodePtr = @TypeOf(root);
+    const Entry = struct {
+        route: *const dusty.Router(Ctx).Route,
+        bindings: *Bindings,
+        nodes: []const NodePtr,
+    };
+    const alloc = router.arena.allocator();
+    var entries: std.ArrayList(Entry) = .empty;
+    var stack: [max_segments]NodePtr = undefined;
+
+    const collect = struct {
+        fn walk(a: std.mem.Allocator, out: *std.ArrayList(Entry), path: *[max_segments]NodePtr, depth: usize, node: NodePtr) void {
+            if (node.route) |opaque_route| {
+                const route: *const dusty.Router(Ctx).Route = @ptrCast(@alignCast(opaque_route));
+                if (route.action == &Dispatch(Ctx).handle) {
+                    out.append(a, .{
+                        .route = route,
+                        .bindings = @ptrCast(@alignCast(@constCast(route.info.data.?))),
+                        .nodes = a.dupe(NodePtr, path[0..depth]) catch @panic("OOM"),
+                    }) catch @panic("OOM");
+                }
+            }
+            if (depth == max_segments) return;
+            var child = node.static_children;
+            while (child) |c| : (child = c.next_sibling) {
+                path[depth] = c;
+                walk(a, out, path, depth + 1, c);
+            }
+            if (node.param_child) |c| {
+                path[depth] = c;
+                walk(a, out, path, depth + 1, c);
+            }
+            if (node.wildcard_child) |c| {
+                path[depth] = c;
+                walk(a, out, path, depth + 1, c);
+            }
+        }
+    }.walk;
+    collect(alloc, &entries, &stack, 0, root);
+
+    for (entries.items) |target| {
+        if (target.nodes.len == 0 or target.nodes[target.nodes.len - 1].kind == .static) continue;
+
+        // Drop any `.fallback` nodes from an earlier `finish()` pass and check
+        // whether any own binding is verbless (in which case this route never declines).
+        var tail = &target.bindings.first;
+        var declines = true;
+        while (tail.*) |b| {
+            if (b.role == .fallback) {
+                tail.* = b.next;
+                continue;
+            }
+            if (b.template.verb.len == 0) declines = false;
+            tail = &b.next;
+        }
+        if (!declines) continue;
+
+        for (entries.items) |source| {
+            if (source.route == target.route) continue;
+            if (!sameChain(Ctx, target.route.middlewares, source.route.middlewares)) continue;
+            var it = source.bindings.first;
+            while (it) |b| : (it = b.next) {
+                if (b.role != .exact) continue;
+                if (!shadows(target.nodes, b.template)) continue;
+                const copy = alloc.create(Binding) catch @panic("OOM");
+                copy.* = .{
+                    .template = b.template,
+                    .serve = b.serve,
+                    .options = b.options,
+                    .where = b.where,
+                    .role = .fallback,
+                    .no_wait = b.no_wait,
+                };
+                if (!copy.no_wait) @constCast(target.route).no_wait = false;
+                tail.* = copy;
+                tail = &copy.next;
+            }
+        }
+    }
+}
+
+/// Whether a declining route at `nodes` (whose last node is `.param` or
+/// `.wildcard`) intercepts some path that `template` matches, ahead of
+/// `template`'s own route in the router's `static > param > wildcard` order.
+fn shadows(nodes: anytype, template: *const Template) bool {
+    const m = nodes.len;
+    const last_is_wild = nodes[m - 1].kind == .wildcard;
+    const segs = template.segments();
+    const has_rest = segs.len > 0 and segs[segs.len - 1] == .rest;
+    const fixed = if (has_rest) segs.len - 1 else segs.len;
+
+    if (!last_is_wild and !has_rest and m != fixed) return false;
+    if (!last_is_wild and has_rest and m < fixed) return false;
+    if (last_is_wild and !has_rest and fixed < m) return false;
+
+    const prefix_nodes = if (last_is_wild) m - 1 else m;
+    const check_len = @min(prefix_nodes, fixed);
+    for (nodes[0..check_len], segs[0..check_len]) |n, s| {
+        if (n.kind == .static and s == .literal and !std.mem.eql(u8, n.segment, s.literal)) return false;
+    }
+
+    const node_rank = comptime std.EnumArray(@TypeOf(nodes[0].kind), u2).init(.{
+        .static = 0,
+        .param = 1,
+        .wildcard = 2,
+    });
+    const seg_rank = comptime std.EnumArray(std.meta.Tag(Segment), u2).init(.{
+        .literal = 0,
+        .one = 1,
+        .rest = 2,
+    });
+    const cmp_len = @min(m, segs.len);
+    for (nodes[0..cmp_len], segs[0..cmp_len]) |n, s| {
+        const nk = node_rank.get(n.kind);
+        const sk = seg_rank.get(std.meta.activeTag(s));
+        if (nk != sk) return nk < sk;
+    }
+    return false;
 }
 
 /// Joins `binding` to the route for the first `count` segments of `template`,
@@ -954,7 +1108,6 @@ fn attach(
     template: *const Template,
     count: usize,
     binding: *Binding,
-    no_wait: bool,
 ) void {
     const router = server.routerOf(Ctx, target);
     const alloc = router.arena.allocator();
@@ -1016,7 +1169,7 @@ fn attach(
         }
         // A route is no_wait only if every binding on it is; registration is
         // before serving, and the one `Route` is what every lookup reads.
-        if (!no_wait) @constCast(route).no_wait = false;
+        if (!binding.no_wait) @constCast(route).no_wait = false;
         const bindings: *Bindings = @ptrCast(@alignCast(@constCast(route.info.data.?)));
         insert(bindings, binding, method);
         return;
@@ -1025,7 +1178,7 @@ fn attach(
     if (binding.role == .rest_prefix and router.conflictsWithAny(path.items, method)) return;
     const bindings = alloc.create(Bindings) catch @panic("OOM");
     bindings.* = .{ .first = binding };
-    server.addRoute(Ctx, target, method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = no_wait });
+    server.addRoute(Ctx, target, method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = binding.no_wait });
 }
 
 /// Whether two middleware chains are the same handles in the same order.
@@ -1380,5 +1533,295 @@ test "addBinding: an any() route the prefix of a ** template would conflict with
         try std.testing.expect((try routeFor(&router, a, "/files/x/a")).?.action == &Dispatch(void).handle);
         // The prefix route is left out altogether: it would shadow the any() route.
         try std.testing.expect((try routeFor(&router, a, "/files/y")) == null);
+    }
+}
+
+fn tagServe(_: ?*anyopaque, _: *dusty.Request, res: *dusty.Response, _: []const Capture, options: *const server.RegisterOptions) anyerror!void {
+    const tag: *const []const u8 = @ptrCast(@alignCast(options.data.?));
+    res.body = tag.*;
+}
+
+/// Dispatches `method` + `url` through `router` and returns the winning
+/// binding's tag, or null on 404 (no route or every binding declined).
+fn dispatchTag(router: *const dusty.Router(void), arena: std.mem.Allocator, method: dusty.Method, url: []const u8) !?[]const u8 {
+    // SAFETY: `findHandler` and `Dispatch.handle` read neither parser nor transport.
+    var req: dusty.Request = .{ .method = method, .url = url, .arena = arena, ._parser = undefined, ._transport = undefined };
+    const route = (try router.findHandler(&req)) orelse return null;
+    var res: dusty.Response = .{ .arena = arena };
+    route.action(&req, &res) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return res.body;
+}
+
+test "addBinding: declining transcoding routes fall through to overlapping bindings in both registration orders" {
+    const R = dusty.Router(void);
+    const Spec = struct { tag: []const u8, method: dusty.Method = .get, pattern: []const u8 };
+    const Check = struct { method: dusty.Method = .get, url: []const u8, want: ?[]const u8 };
+    const Scenario = struct {
+        name: []const u8,
+        specs: []const Spec,
+        checks: []const Check,
+    };
+
+    const scenarios = [_]Scenario{
+        .{
+            .name = "param+verb vs **",
+            .specs = &.{
+                .{ .tag = "verb", .pattern = "/v1/{name}:x" },
+                .{ .tag = "rest", .pattern = "/v1/{name=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/abc:x", .want = "verb" },
+                .{ .url = "/v1/abc", .want = "rest" },
+                .{ .url = "/v1/abc:y", .want = "rest" },
+                .{ .url = "/v1/:x", .want = "rest" },
+                .{ .url = "/v1", .want = "rest" },
+                .{ .url = "/v1/a/b", .want = "rest" },
+                .{ .url = "/v2/abc", .want = null },
+            },
+        },
+        .{
+            .name = "literal+param+verb vs **",
+            .specs = &.{
+                .{ .tag = "cancel", .pattern = "/v1/items/{id}:cancel" },
+                .{ .tag = "rest", .pattern = "/v1/{path=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/items/123:cancel", .want = "cancel" },
+                .{ .url = "/v1/items/123", .want = "rest" },
+                .{ .url = "/v1/other/123", .want = "rest" },
+                .{ .url = "/v1", .want = "rest" },
+            },
+        },
+        .{
+            .name = "literal prefix+verb vs param+param",
+            .specs = &.{
+                .{ .tag = "verb", .pattern = "/v1/a/{x}:verb" },
+                .{ .tag = "two", .pattern = "/v1/{a}/{b}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/a/foo:verb", .want = "verb" },
+                .{ .url = "/v1/a/foo", .want = "two" },
+                .{ .url = "/v1/b/foo", .want = "two" },
+                .{ .url = "/v1/a/foo/bar", .want = null },
+            },
+        },
+        .{
+            .name = "literal prefix+verb vs param+later literal",
+            .specs = &.{
+                .{ .tag = "v1", .pattern = "/v1/a/{x}:v1" },
+                .{ .tag = "lit", .pattern = "/v1/{y}/b" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/a/b:v1", .want = "v1" },
+                .{ .url = "/v1/a/b", .want = "lit" },
+                .{ .url = "/v1/a/c", .want = null },
+            },
+        },
+        .{
+            .name = "two verbs on different router paths",
+            .specs = &.{
+                .{ .tag = "v1", .pattern = "/v1/a/{x}:v1" },
+                .{ .tag = "v2", .pattern = "/v1/{a}/{b}:v2" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/a/foo:v1", .want = "v1" },
+                .{ .url = "/v1/a/foo:v2", .want = "v2" },
+                .{ .url = "/v1/a/foo", .want = null },
+            },
+        },
+        .{
+            .name = "wildcard+verb vs fixed-length param route",
+            .specs = &.{
+                .{ .tag = "wild", .pattern = "/v1/a/{p=**}:v1" },
+                .{ .tag = "fixed", .pattern = "/v1/{x}/{y}/{z}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/a/b/c:v1", .want = "wild" },
+                .{ .url = "/v1/a/b/c", .want = "fixed" },
+                .{ .url = "/v1/a/b", .want = null },
+            },
+        },
+        .{
+            .name = "declining rest_prefix route vs **",
+            .specs = &.{
+                .{ .tag = "stat", .pattern = "/v1/*/{p=**}:v1" },
+                .{ .tag = "rest", .pattern = "/v1/{path=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/foo:v1", .want = "stat" },
+                .{ .url = "/v1/foo", .want = "rest" },
+                .{ .url = "/v1/foo/bar:v1", .want = "stat" },
+                .{ .url = "/v1/foo/bar", .want = "rest" },
+            },
+        },
+        .{
+            .name = "literal+verb vs param and **",
+            .specs = &.{
+                .{ .tag = "lit", .pattern = "/v1/foo:bar" },
+                .{ .tag = "one", .pattern = "/v1/{name}" },
+                .{ .tag = "rest", .pattern = "/v1/{name=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/foo:bar", .want = "lit" },
+                .{ .url = "/v1/foo", .want = "one" },
+                .{ .url = "/v1/foo:baz", .want = "one" },
+                .{ .url = "/v1/foo/bar", .want = "rest" },
+            },
+        },
+        .{
+            .name = "multi-level precedence: static > param+verb > param > **",
+            .specs = &.{
+                .{ .tag = "v1", .pattern = "/v1/a/{x}:v1" },
+                .{ .tag = "lit", .pattern = "/v1/{a}/b" },
+                .{ .tag = "v2", .pattern = "/v1/{a}/{b}:v2" },
+                .{ .tag = "two", .pattern = "/v1/{a}/{b}" },
+                .{ .tag = "rest", .pattern = "/v1/{p=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/a/b:v1", .want = "v1" },
+                .{ .url = "/v1/a/b", .want = "lit" },
+                .{ .url = "/v1/a/c:v2", .want = "v2" },
+                .{ .url = "/v1/a/c", .want = "two" },
+                .{ .url = "/v1/a/b/c", .want = "rest" },
+            },
+        },
+        .{
+            .name = "root ** fallback",
+            .specs = &.{
+                .{ .tag = "sub", .pattern = "/v1/{name}:x" },
+                .{ .tag = "top", .pattern = "/{name}:x" },
+                .{ .tag = "all", .pattern = "/{p=**}" },
+            },
+            .checks = &.{
+                .{ .url = "/v1/abc:x", .want = "sub" },
+                .{ .url = "/v1/abc", .want = "all" },
+                .{ .url = "/abc:x", .want = "top" },
+                .{ .url = "/abc", .want = "all" },
+            },
+        },
+        .{
+            .name = "HTTP method isolation",
+            .specs = &.{
+                .{ .tag = "get_verb", .method = .get, .pattern = "/v1/{name}:x" },
+                .{ .tag = "post_rest", .method = .post, .pattern = "/v1/{name=**}" },
+            },
+            .checks = &.{
+                .{ .method = .get, .url = "/v1/abc:x", .want = "get_verb" },
+                .{ .method = .get, .url = "/v1/abc", .want = null },
+                .{ .method = .post, .url = "/v1/abc", .want = "post_rest" },
+            },
+        },
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (scenarios) |sc| {
+        for ([_]bool{ false, true }) |reverse| {
+            var router = R.init(std.testing.allocator);
+            defer router.deinit();
+            const n = sc.specs.len;
+            var templates: [8]Template = undefined;
+            var opts: [8]server.RegisterOptions = undefined;
+            for (0..n) |idx| {
+                const i = if (reverse) n - 1 - idx else idx;
+                templates[i] = try Template.parse(sc.specs[i].pattern);
+                opts[i] = .{ .data = @ptrCast(@constCast(&sc.specs[i].tag)) };
+                addBinding(void, &router, sc.specs[i].method, &templates[i], tagServe, &opts[i], sc.specs[i].tag, false);
+            }
+            router.finish();
+            try std.testing.expect(router.conflict == null);
+
+            for (sc.checks) |c| {
+                const got = try dispatchTag(&router, a, c.method, c.url);
+                if (c.want) |w| {
+                    std.testing.expectEqualStrings(w, got orelse "<404>") catch |err| {
+                        std.debug.print("scenario={s} reverse={} url={s}\n", .{ sc.name, reverse, c.url });
+                        return err;
+                    };
+                } else {
+                    std.testing.expectEqual(@as(?[]const u8, null), got) catch |err| {
+                        std.debug.print("scenario={s} reverse={} url={s} got={s}\n", .{ sc.name, reverse, c.url, got.? });
+                        return err;
+                    };
+                }
+            }
+        }
+    }
+}
+
+test "addBinding: fallbacks respect middleware chains, no_wait, and repeated finish()" {
+    const R = dusty.Router(void);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 1. Different middleware chains do not share fallbacks.
+    {
+        const Mw = struct {
+            pub fn execute(_: *const @This(), _: *dusty.Request, _: *dusty.Response, _: *dusty.Chain(void)) !void {}
+        };
+        var mw: Mw = .{};
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        const t_verb = try Template.parse("/v1/{name}:x");
+        const t_rest = try Template.parse("/v1/{name=**}");
+        var verb_tag: []const u8 = "verb";
+        var rest_tag: []const u8 = "rest";
+        const verb_opts: server.RegisterOptions = .{ .data = @ptrCast(&verb_tag) };
+        const rest_opts: server.RegisterOptions = .{ .data = @ptrCast(&rest_tag) };
+        addBinding(void, router.group("", &.{dusty.Middleware(void).init(&mw)}), .get, &t_verb, tagServe, &verb_opts, "verb", false);
+        addBinding(void, &router, .get, &t_rest, tagServe, &rest_opts, "rest", false);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expectEqual(@as(?[]const u8, null), try dispatchTag(&router, a, .get, "/v1/abc"));
+        try std.testing.expectEqualStrings("rest", (try dispatchTag(&router, a, .get, "/v1/a/b")).?);
+    }
+
+    // 2. no_wait turns off when a non-no_wait fallback attaches, stays on when all are no_wait or route never declines.
+    {
+        const t_verb = try Template.parse("/v1/{name}:x");
+        const t_static = try Template.parse("/v1/foo:bar");
+        const t_rest = try Template.parse("/v1/{name=**}");
+        const opts: server.RegisterOptions = .{};
+        for ([_]bool{ true, false }) |rest_no_wait| {
+            var router = R.init(std.testing.allocator);
+            defer router.deinit();
+            addBinding(void, &router, .get, &t_verb, noServe, &opts, "verb", true);
+            addBinding(void, &router, .get, &t_static, noServe, &opts, "static", true);
+            addBinding(void, &router, .get, &t_rest, noServe, &opts, "rest", rest_no_wait);
+            router.finish();
+            try std.testing.expect(router.conflict == null);
+            try std.testing.expectEqual(rest_no_wait, router.noWait(.get, "/v1/abc"));
+            try std.testing.expect(router.noWait(.get, "/v1/foo:bar"));
+        }
+    }
+
+    // 3. Repeated finish() after adding a more specific binding keeps precedence and does not duplicate.
+    {
+        var router = R.init(std.testing.allocator);
+        defer router.deinit();
+        const t_verb = try Template.parse("/v1/a/{x}:v1");
+        const t_rest = try Template.parse("/v1/{p=**}");
+        const t_two = try Template.parse("/v1/{a}/{b}");
+        var verb_tag: []const u8 = "verb";
+        var rest_tag: []const u8 = "rest";
+        var two_tag: []const u8 = "two";
+        const verb_opts: server.RegisterOptions = .{ .data = @ptrCast(&verb_tag) };
+        const rest_opts: server.RegisterOptions = .{ .data = @ptrCast(&rest_tag) };
+        const two_opts: server.RegisterOptions = .{ .data = @ptrCast(&two_tag) };
+        addBinding(void, &router, .get, &t_verb, tagServe, &verb_opts, "verb", false);
+        addBinding(void, &router, .get, &t_rest, tagServe, &rest_opts, "rest", false);
+        router.finish();
+        try std.testing.expectEqualStrings("rest", (try dispatchTag(&router, a, .get, "/v1/a/foo")).?);
+
+        addBinding(void, &router, .get, &t_two, tagServe, &two_opts, "two", false);
+        router.finish();
+        try std.testing.expect(router.conflict == null);
+        try std.testing.expectEqualStrings("two", (try dispatchTag(&router, a, .get, "/v1/a/foo")).?);
     }
 }
