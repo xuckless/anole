@@ -253,6 +253,9 @@ fn parkAndResume(secure: bool, executors: usize) !void {
     for (0..3) |_| {
         for (&clients) |*c| try std.testing.expectEqual(200, try c.get("/"));
         try f.waitParked(clients.len);
+        // A parked connection holds no in-flight count: the drain does not
+        // wait for it.
+        try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
     }
     // Two requests in one write, to a parked connection: both answered.
     try clients[0].send("GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -347,6 +350,9 @@ fn reparkAfterLongPark(secure: bool) !void {
             return fx.server.parkedConnections() == 1;
         }
     }.one);
+    // It gave back the count of the request that woke it, though it
+    // parked without waiting for the next one.
+    try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
     // Back after a short park: the task stays for the delay (checked at a
     // sixth of it).
     try std.testing.expectEqual(200, try c.get("/"));

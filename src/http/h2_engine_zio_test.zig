@@ -37,8 +37,7 @@ const Side = struct {
     connection: *dusty.Connection,
 
     fn serve(s: Side) anyerror!void {
-        var busy = false;
-        try E.serve(s.server, s.listener, false, s.connection, &busy);
+        try E.serve(s.server, s.listener, false, s.connection);
     }
 };
 
