@@ -290,41 +290,40 @@ pub const Service = struct {
         }
     }
 
-    /// Tells the peer on `fd` that the console is busy, and closes it.
-    fn refuseBusy(fd: sys.fd_t) error{Busy} {
+    /// Tells the peer on `fd` that the console is busy; the caller closes it.
+    fn tellBusy(fd: sys.fd_t) void {
         var buf: [256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         protocol.encode(.{ .err = .{ .code = protocol.code_busy, .message = "4 consoles are attached already" } }, &w) catch {};
         sys.writeAll(fd, w.buffered()) catch {};
-        sys.close(fd);
-        return error.Busy;
-    }
-
-    fn liveCount(self: *Service) usize {
-        self.lock.lock();
-        defer self.lock.unlock();
-        var n: usize = 0;
-        for (self.clients.items) |c| {
-            if (!c.done.load(.acquire)) n += 1;
-        }
-        return n;
     }
 
     /// Adds an already connected stream (the in-process console's socketpair
-    /// end, or an accepted socket). The service owns `fd` from here.
+    /// end, or an accepted socket). The service owns `fd` from here. The live
+    /// cap is counted and the client appended in one lock section, so two
+    /// concurrent adopts cannot both pass it.
     pub fn adopt(self: *Service, fd: sys.fd_t) !void {
         self.reap();
-        if (self.liveCount() >= protocol.max_clients) return refuseBusy(fd);
         errdefer sys.close(fd);
         const c = try self.gpa.create(Client);
         c.* = .{ .service = self, .fd = fd };
         errdefer self.gpa.destroy(c);
-        sys.setNonblock(fd);
-        {
+        const admitted = admitted: {
             self.lock.lock();
             defer self.lock.unlock();
+            var live: usize = 0;
+            for (self.clients.items) |x| {
+                if (!x.done.load(.acquire)) live += 1;
+            }
+            if (live >= protocol.max_clients) break :admitted false;
             try self.clients.append(self.gpa, c);
+            break :admitted true;
+        };
+        if (!admitted) {
+            tellBusy(fd);
+            return error.Busy;
         }
+        sys.setNonblock(fd);
         _ = self.attached.fetchAdd(1, .monotonic);
         c.thread = std.Thread.spawn(.{}, clientMain, .{c}) catch {
             _ = self.attached.fetchSub(1, .monotonic);
