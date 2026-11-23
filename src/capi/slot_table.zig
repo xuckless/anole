@@ -167,10 +167,10 @@ test "accessors: live, stale generation, wrapped generation, handle kind and byt
 
 test "slot sizes unchanged since 1e5e86c7 (64-bit)" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
-    const sizes = .{
-        .{ @import("ws.zig").WsSlot, 200 },
-        .{ @import("wt.zig").SessionSlot, 192 },
-        .{ @import("wt.zig").StreamSlot, 184 },
+    const features = @import("../root.zig").features;
+    // ws and wt exist only with their features (engine.ws/engine.wt are empty otherwise).
+    const sizes = (if (features.websocket) .{.{ engine.ws.WsSlot, 200 }} else .{}) ++
+        (if (features.http3) .{ .{ engine.wt.SessionSlot, 192 }, .{ engine.wt.StreamSlot, 184 } } else .{}) ++ .{
         .{ @import("net.zig").NetSlot, 56 },
         .{ @import("sse.zig").SseSlot, 88 },
         .{ @import("s3.zig").TSlot, 72 },
