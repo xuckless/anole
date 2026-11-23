@@ -808,7 +808,7 @@ pub fn BodyReader(comptime Parser: type) type {
                         // A final response has started, and 100 can no
                         // longer precede it. The peer may still be holding
                         // the body, so the flag stays.
-                        if (!res._headers_written) {
+                        if (!res.headersSent()) {
                             req._expects_continue = false;
                             // A write, on a read: the caller asked for the body
                             // and this is what unblocks the peer from sending it.

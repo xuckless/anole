@@ -368,14 +368,13 @@ test "readBody: bind's contract, answered 400 by the server" {
     defer arena_state.deinit();
     var req: dusty.Request = .{ .arena = arena_state.allocator(), ._parser = undefined, ._transport = undefined };
     const T = struct { name: []const u8 };
-    req._body_read = true;
-    req._body = null;
+    req._body_state = .{ .cached = null };
     try std.testing.expectError(error.MissingBody, readBody(T, &req));
-    req._body = "{\"name\":\"ann\",\"extra\":1}";
+    req._body_state = .{ .cached = "{\"name\":\"ann\",\"extra\":1}" };
     try std.testing.expectEqualStrings("ann", (try readBody(T, &req)).name);
-    req._body = "{\"name\":7}";
+    req._body_state = .{ .cached = "{\"name\":7}" };
     try std.testing.expectError(error.InvalidJsonBody, readBody(T, &req));
-    req._body = "{";
+    req._body_state = .{ .cached = "{" };
     try std.testing.expectError(error.InvalidJsonBody, readBody(T, &req));
     try std.testing.expectEqual(dusty.Status.bad_request, dusty.errorStatus(error.InvalidJsonBody).?);
     try std.testing.expectEqual(dusty.Status.bad_request, dusty.errorStatus(error.MissingBody).?);

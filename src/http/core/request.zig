@@ -176,16 +176,20 @@ pub const Request = struct {
     /// The server refused this request for its own load (a body over the
     /// budget): its 503 is logged at debug, not as a handler error.
     _shed: bool = false,
-    _body: ?[]const u8 = null,
-    _body_read: bool = false,
+    /// The body's one lifecycle; `_reset` returns every state to `unread`.
+    ///
+    /// | state \\ event | `reader()`                     | `body()`                    |
+    /// |----------------|-------------------------------|-----------------------------|
+    /// | `unread`       | decode set up -> `reader_taken` (setup fails: stays) | via `reader()`, read whole -> `cached` (empty: `null`); too big, shed or a read error: stays `reader_taken` |
+    /// | `reader_taken` | `error.BodyReaderTaken`       | `error.BodyReaderTaken`     |
+    /// | `cached`       | a fixed reader over the bytes, state kept | the bytes       |
+    _body_state: union(enum) { unread, reader_taken, cached: ?[]const u8 } = .unread,
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*RequestBodyReader.Decode = null,
-    _body_reader_taken: bool = false,
-    _fd: std.StringHashMapUnmanaged([]const u8) = .{},
-    _fd_read: bool = false,
-    _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
-    _mfd_read: bool = false,
+    /// Published only by a parse that succeeded; any error leaves `unparsed`.
+    _form: union(enum) { unparsed, parsed: std.StringHashMapUnmanaged([]const u8) } = .unparsed,
+    _multipart: union(enum) { unparsed, parsed: std.StringHashMapUnmanaged(MultipartForm.Entry) } = .unparsed,
     /// The signed-cookie session `middleware.Session` loads and saves;
     /// empty without it. (`anole.session` has its own stores.)
     session: SessionData = .{},
@@ -345,15 +349,17 @@ pub const Request = struct {
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
-        if (self._body_read) {
-            r.interface = .fixed(self._body orelse &.{});
-            return r;
+        switch (self._body_state) {
+            .cached => |bytes| {
+                r.interface = .fixed(bytes orelse &.{});
+                return r;
+            },
+            // The buffer belongs to the caller, so a second reader starts
+            // empty and whatever the first one had buffered is unreachable
+            // -- bytes off the body, with nothing to say they went missing.
+            .reader_taken => return error.BodyReaderTaken,
+            .unread => {},
         }
-
-        // The buffer belongs to the caller, so a second reader starts empty
-        // and whatever the first one had buffered is unreachable -- bytes off
-        // the body, with nothing to say they went missing.
-        if (self._body_reader_taken) return error.BodyReaderTaken;
 
         r.request = self;
         if (self._decode) |decode| {
@@ -367,7 +373,7 @@ pub const Request = struct {
         // Claimed only once there is a reader to claim it for. A coding we
         // cannot undo fails above, and nothing was read; a caller that
         // handles that error has to be able to ask again.
-        self._body_reader_taken = true;
+        self._body_state = .reader_taken;
         return r;
     }
 
@@ -390,8 +396,9 @@ pub const Request = struct {
     /// `100 Continue`), one of unknown length (chunked, or decoded) when
     /// the budget runs out partway.
     pub fn body(self: *Request) !?[]const u8 {
-        if (self._body_read) {
-            return self._body;
+        switch (self._body_state) {
+            .cached => |bytes| return bytes,
+            .reader_taken, .unread => {},
         }
 
         const budget: ?admission.Budget = if (self._config._admission) |a| .{ .state = a, .held = &self._body_held, .io = self.io } else null;
@@ -414,13 +421,9 @@ pub const Request = struct {
             else => |e| return e,
         };
 
-        self._body_read = true;
-        if (result.len == 0) {
-            self._body = null;
-            return null;
-        }
-        self._body = result;
-        return result;
+        const kept: ?[]const u8 = if (result.len == 0) null else result;
+        self._body_state = .{ .cached = kept };
+        return kept;
     }
 
     /// The answer to a body the buffer budget refused: 503 with a jittered
@@ -684,24 +687,25 @@ pub const Request = struct {
     /// req.formData()).get("email")`. Parsed once; later calls return the
     /// same map.
     pub fn formData(self: *Request) !*std.StringHashMapUnmanaged([]const u8) {
-        if (self._fd_read) {
-            return &self._fd;
+        switch (self._form) {
+            .parsed => |*map| return map,
+            .unparsed => {},
         }
 
         if (self.content_type == null or self.content_type != .form) {
             return error.NotForm;
         }
 
+        // Built apart and published on success, so a failed parse leaves nothing.
         const buffer = try self.body() orelse {
-            self._fd_read = true;
-
-            return &self._fd;
+            self._form = .{ .parsed = .{} };
+            return &self._form.parsed;
         };
-
+        var map: std.StringHashMapUnmanaged([]const u8) = .{};
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
-            if (self._fd.count() >= self._config.max_form_count) {
+            if (map.count() >= self._config.max_form_count) {
                 return error.TooManyFormFields;
             }
 
@@ -709,23 +713,23 @@ pub const Request = struct {
                 const key = try Request.urlUnescape(self.arena, entry[0..separator]);
                 const value = try Request.urlUnescape(self.arena, entry[separator + 1 ..]);
 
-                try self._fd.put(self.arena, key, value);
+                try map.put(self.arena, key, value);
             } else {
-                try self._fd.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
+                try map.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
             }
         }
 
-        self._fd_read = true;
-
-        return &self._fd;
+        self._form = .{ .parsed = map };
+        return &self._form.parsed;
     }
 
     /// The body as a `multipart/form-data` form (file uploads), by field
     /// name, in the request's arena. Parsed once; later calls return the
     /// same map.
     pub fn multiFormData(self: *Request) !*std.StringHashMapUnmanaged(MultipartForm.Entry) {
-        if (self._mfd_read) {
-            return &self._mfd;
+        switch (self._multipart) {
+            .parsed => |*map| return map,
+            .unparsed => {},
         }
 
         if (self.content_type == null or self.content_type != .multipart_form) {
@@ -733,9 +737,8 @@ pub const Request = struct {
         }
 
         const buffer = try self.body() orelse {
-            self._mfd_read = true;
-
-            return &self._mfd;
+            self._multipart = .{ .parsed = .{} };
+            return &self._multipart.parsed;
         };
 
         // The following chunk of code is from https://github.com/karlseguin/http.zig, see LICENSE for more details.
@@ -777,22 +780,21 @@ pub const Request = struct {
 
         {
             // We expect the body to begin with a boundary
-            const first = entry_it.next() orelse {
-                self._mfd_read = true;
-                return &self._mfd;
-            };
+            // (`splitSequence` always yields a first item.)
+            const first = entry_it.next().?;
             if (first.len != 0) {
                 return error.InvalidMultiPartEncoding;
             }
         }
 
+        var map: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{};
         while (entry_it.next()) |entry| {
             // body ends with -- after a final boundary
             if (entry.len == 4 and entry[0] == '-' and entry[1] == '-' and entry[2] == '\r' and entry[3] == '\n') {
                 break;
             }
 
-            if (self._mfd.count() >= self._config.max_multiform_count) {
+            if (map.count() >= self._config.max_multiform_count) {
                 return error.TooManyMultiFormFields;
             }
 
@@ -800,14 +802,13 @@ pub const Request = struct {
 
             // [2..] to skip our boundary's trailing line terminator
             const field = try MultipartForm.parseMultiPartEntry(entry[2..]);
-            try self._mfd.put(self.arena, field.name, field.value);
+            try map.put(self.arena, field.name, field.value);
         }
 
         // End of chunk.
 
-        self._mfd_read = true;
-
-        return &self._mfd;
+        self._multipart = .{ .parsed = map };
+        return &self._multipart.parsed;
     }
 
     /// Decodes a URL-encoded string: %XX sequences to bytes and '+' to a
@@ -1210,14 +1211,14 @@ test "Request._reset: per-request state back to its defaults, the session emptie
     req.url = "/a";
     req.id = "rid";
     req.content_length = 5;
-    req._body_read = true;
+    req._body_state = .reader_taken;
     req._violations_truncated = true;
     try req.session.set("user", "ann");
     req._reset();
     try std.testing.expectEqualStrings("", req.url);
     try std.testing.expectEqualStrings("", req.id);
     try std.testing.expectEqual(@as(?usize, null), req.content_length);
-    try std.testing.expect(!req._body_read);
+    try std.testing.expect(req._body_state == .unread);
     try std.testing.expect(!req._violations_truncated);
     try std.testing.expectEqual(@as(usize, 0), req.session.items().len);
     try std.testing.expect(!req.session.modified);
@@ -2663,4 +2664,167 @@ test "invalid/addViolation: appended in order, at most 100, ValidationFailed ret
     for (0..150) |_| req.addViolation(null, "users.many", "m");
     try std.testing.expectEqual(@as(usize, 100), req.violations().items.len);
     try std.testing.expect(req.violations().truncated);
+}
+
+test "Request._body_state: every (state, event) cell" {
+    const Tag = std.meta.Tag(@FieldType(Request, "_body_state"));
+    const Event = enum { reader, body };
+    const Outcome = enum { ok, taken, too_big };
+    const Row = struct {
+        name: []const u8,
+        start: @FieldType(Request, "_body_state"),
+        bytes: []const u8 = "abc",
+        max: usize = 1024,
+        events: []const Event,
+        outcomes: []const Outcome,
+        end: Tag,
+        end_bytes: ?[]const u8 = null,
+        /// Bytes the reader from the last `.reader` event yields, when checked.
+        reads: ?usize = null,
+    };
+    const rows = [_]Row{
+        .{ .name = "unread/reader", .start = .unread, .events = &.{.reader}, .outcomes = &.{.ok}, .end = .reader_taken },
+        .{ .name = "reader_taken/reader", .start = .reader_taken, .events = &.{.reader}, .outcomes = &.{.taken}, .end = .reader_taken },
+        .{ .name = "reader_taken/body", .start = .reader_taken, .events = &.{.body}, .outcomes = &.{.taken}, .end = .reader_taken },
+        .{ .name = "unread/reader twice", .start = .unread, .events = &.{ .reader, .reader }, .outcomes = &.{ .ok, .taken }, .end = .reader_taken },
+        .{ .name = "cached/reader, repeatable", .start = .{ .cached = "xy" }, .events = &.{ .reader, .reader }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "xy" },
+        .{ .name = "cached null/reader", .start = .{ .cached = null }, .events = &.{.reader}, .outcomes = &.{.ok}, .end = .cached, .reads = 0 },
+        .{ .name = "cached/body twice", .start = .{ .cached = "xy" }, .events = &.{ .body, .body }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "xy" },
+        .{ .name = "unread/body", .start = .unread, .events = &.{ .body, .body }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "abc" },
+        .{ .name = "unread/body, empty body is cached null", .start = .unread, .bytes = "", .events = &.{.body}, .outcomes = &.{.ok}, .end = .cached },
+        .{ .name = "unread/body past the limit stays claimed", .start = .unread, .max = 2, .events = &.{ .body, .body }, .outcomes = &.{ .too_big, .taken }, .end = .reader_taken },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var source: BindBody = .{};
+        var req = source.request(arena.allocator(), row.bytes);
+        req._config.max_body_size = row.max;
+        req._body_state = row.start;
+        for (row.events, row.outcomes) |event, outcome| {
+            const got: Outcome = switch (event) {
+                .reader => if (req.reader(&.{})) |rd| ok: {
+                    var r = rd;
+                    if (row.reads) |want| {
+                        var buf: [8]u8 = undefined;
+                        try std.testing.expectEqual(want, try r.interface.readSliceShort(&buf));
+                    }
+                    break :ok .ok;
+                } else |err| switch (err) {
+                    error.BodyReaderTaken => .taken,
+                    else => return err,
+                },
+                .body => if (req.body()) |_| .ok else |err| switch (err) {
+                    error.BodyReaderTaken => .taken,
+                    error.BodyTooBig => .too_big,
+                    else => return err,
+                },
+            };
+            try std.testing.expectEqual(outcome, got);
+        }
+        try std.testing.expectEqual(row.end, std.meta.activeTag(req._body_state));
+        if (row.end == .cached) {
+            const cached = req._body_state.cached;
+            try std.testing.expectEqual(row.end_bytes == null, cached == null);
+            if (row.end_bytes) |want| try std.testing.expectEqualStrings(want, cached.?);
+        }
+        req._reset();
+        try std.testing.expect(req._body_state == .unread);
+    }
+}
+
+test "Request.formData and multiFormData: parsed once, a failed parse leaves nothing" {
+    const part = "--b\r\nContent-Disposition: form-data; name=\"";
+    const Kind = enum { form, multipart };
+    const Row = struct {
+        name: []const u8,
+        kind: Kind,
+        content_type: []const u8,
+        body: []const u8,
+        max_count: usize = 32,
+        want: ?anyerror = null,
+        count: usize = 0,
+    };
+    const rows = [_]Row{
+        .{ .name = "form", .kind = .form, .content_type = "application/x-www-form-urlencoded", .body = "a=1&b=2", .count = 2 },
+        .{ .name = "form, empty body", .kind = .form, .content_type = "application/x-www-form-urlencoded", .body = "" },
+        .{ .name = "form, too many", .kind = .form, .content_type = "application/x-www-form-urlencoded", .body = "a=1&b=2", .max_count = 1, .want = error.TooManyFormFields },
+        .{ .name = "form, not a form", .kind = .form, .content_type = "application/json", .body = "a=1", .want = error.NotForm },
+        .{ .name = "multipart", .kind = .multipart, .content_type = "multipart/form-data; boundary=b", .body = part ++ "x\"\r\n\r\n1\r\n--b--\r\n", .count = 1 },
+        .{ .name = "multipart, empty body", .kind = .multipart, .content_type = "multipart/form-data; boundary=b", .body = "" },
+        .{ .name = "multipart, too many", .kind = .multipart, .content_type = "multipart/form-data; boundary=b", .body = part ++ "x\"\r\n\r\n1\r\n" ++ part ++ "y\"\r\n\r\n2\r\n--b--\r\n", .max_count = 1, .want = error.TooManyMultiFormFields },
+        .{ .name = "multipart, junk before the first boundary", .kind = .multipart, .content_type = "multipart/form-data; boundary=b", .body = "junk--b\r\n", .want = error.InvalidMultiPartEncoding },
+        .{ .name = "multipart, a later piece is bad", .kind = .multipart, .content_type = "multipart/form-data; boundary=b", .body = part ++ "x\"\r\n\r\n1\r\n--bjunk", .want = error.InvalidMultiPartEncoding },
+        .{ .name = "multipart, no boundary", .kind = .multipart, .content_type = "multipart/form-data", .body = "x", .want = error.InvalidMultiPartFormDataHeader },
+        .{ .name = "multipart, not multipart", .kind = .multipart, .content_type = "application/json", .body = "x", .want = error.NotMultipartForm },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var source: BindBody = .{};
+        var req = source.request(arena.allocator(), row.body);
+        req.headers = try http.Headers.init(arena.allocator(), 4);
+        try req.headers.put("content-type", row.content_type);
+        req._applyEntityHeaders();
+        req._config.max_form_count = row.max_count;
+        req._config.max_multiform_count = row.max_count;
+        // Twice: a failure repeats from scratch, a success is the same map.
+        var first: ?*anyopaque = null;
+        for (0..2) |_| {
+            const got = switch (row.kind) {
+                .form => if (req.formData()) |m| @as(anyerror!struct { *anyopaque, usize }, .{ m, m.count() }) else |err| err,
+                .multipart => if (req.multiFormData()) |m| @as(anyerror!struct { *anyopaque, usize }, .{ m, m.count() }) else |err| err,
+            };
+            if (row.want) |err| {
+                try std.testing.expectError(err, got);
+            } else {
+                const ptr, const count = try got;
+                try std.testing.expectEqual(row.count, count);
+                if (first) |p| try std.testing.expectEqual(p, ptr);
+                first = ptr;
+            }
+        }
+        const parsed = switch (row.kind) {
+            .form => req._form == .parsed,
+            .multipart => req._multipart == .parsed,
+        };
+        try std.testing.expectEqual(row.want == null, parsed);
+        req._reset();
+        try std.testing.expect(req._form == .unparsed and req._multipart == .unparsed);
+    }
+}
+
+test "Request.formData: a body over the limit propagates and caches nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var source: BindBody = .{};
+    var req = source.request(arena.allocator(), "a=1&b=2");
+    req.content_type = .form;
+    req._config.max_body_size = 2;
+    try std.testing.expectError(error.BodyTooBig, req.formData());
+    try std.testing.expect(req._form == .unparsed);
+    try std.testing.expect(req._body_state == .reader_taken);
+}
+
+test "Request.formData: a shed body propagates, caches nothing and leaves the form unparsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rows = [_]admission.Row{.{}};
+    var state: admission.State = .{ .rows = &rows, .buffer_budget = 10 };
+    // Another holder has most of it, so this body is refused.
+    var other: admission.Held = .{};
+    try std.testing.expect(other.growTo(&state, std.testing.io, 8));
+    defer other.release();
+    var source: BindBody = .{};
+    var req = source.request(arena.allocator(), "a=1&b=2");
+    req.io = std.testing.io;
+    req.content_type = .form;
+    req.content_length = 7;
+    req._config._admission = &state;
+    try std.testing.expectError(error.ServiceUnavailable, req.formData());
+    try std.testing.expect(req._form == .unparsed);
+    try std.testing.expect(req._body_state == .reader_taken);
+    try std.testing.expect(req._shed);
 }

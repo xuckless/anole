@@ -2078,6 +2078,37 @@ fn pipelinedBeforeHold(fx: *Fixture, io: std.Io) !void {
     try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nlate"));
 }
 
+test "capi engine over HTTP/1.1: an answer with as many headers as the limit allows is a valid response" {
+    var fx: Fixture = undefined;
+    try fx.start(Fixture.plain_listener);
+    defer fx.stop();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(fullTableAnswer, .{ &fx, io });
+    try f.await(io);
+    try fx.finish();
+}
+
+fn fullTableAnswer(fx: *Fixture, io: std.Io) !void {
+    const max = (anole.http.ServerConfig{}).response.max_header_count;
+    var headers: [max]abi.Header = undefined;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    for (&headers, 0..) |*h, i| h.* = .{ .name = .of(try std.fmt.allocPrint(arena.allocator(), "x-full-{d}", .{i})), .value = .of("v") };
+    fx.a.held.store(0, .release);
+    var get: RawGet = undefined;
+    try get.open(io, fx.e.port(0), "/hold");
+    defer get.close(io);
+    const held = try waitHeld(io, &fx.a.held);
+    try engine.respond(fx.e, held, 200, &headers, "ok", false);
+    var out: [4096]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    try readRest(&get.reader, &fw);
+    try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nok"));
+}
+
 test "capi: every ServerError and TlsLoadError name is an ABI error token" {
     // The server design's named error sets (`anole.ServerError`,
     // `anole.TlsLoadError`): their member names are the tokens verbatim.
