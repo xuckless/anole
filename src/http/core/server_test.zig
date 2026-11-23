@@ -1169,6 +1169,7 @@ const CorkCtx = struct {
         server.router.addRouteWith(.post, "/ignore", ignore, .{ .no_wait = true });
         server.router.addRouteWith(.get, "/ws-mode", wsMode, .{ .no_wait = true });
         server.router.addRouteWith(.get, "/adopt-stream", adoptStream, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/adopt-abort", adoptAbort, .{ .no_wait = true });
     }
 
     fn wsMode(ctx: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
@@ -1200,6 +1201,17 @@ const CorkCtx = struct {
         try body.interface.flush();
         try res.adopt(&ctx.adopter);
         res.keepalive = false;
+    }
+
+    /// A streamed 200 handed over, then aborted: the request fails before
+    /// the adopter's first run.
+    fn adoptAbort(ctx: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        var buf: [64]u8 = undefined;
+        var body = try res.stream(&buf);
+        try body.interface.writeAll("hello");
+        try body.interface.flush();
+        try res.adopt(&ctx.adopter);
+        return res.abort();
     }
 
     /// Answers without reading its body.
@@ -1544,6 +1556,23 @@ test "Server: a streamed 200 adopted without an upgrade is still ended, then ser
         }
     }.released);
     try std.testing.expectEqual(1, @atomicLoad(u32, &client.ctx.adopter_served, .acquire));
+}
+
+test "Server: an adopter whose request fails before its first run is released once and never served" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /adopt-abort HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const raw = try client.reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try wait.waitUntil(std.testing.io, "the adopter released", &client.ctx, struct {
+        fn released(ctx: *const CorkCtx) bool {
+            return @atomicLoad(u32, &ctx.adopter_released, .acquire) == 1;
+        }
+    }.released);
+    try std.testing.expectEqual(0, @atomicLoad(u32, &client.ctx.adopter_served, .acquire));
 }
 
 test "Connection.Mode: every state x event cell" {
@@ -2169,9 +2198,14 @@ test "Server: a bad percent escape in the query is a 400, not a dropped connecti
 /// with a FIN: a close with the body unread would be a reset, and the peer
 /// could lose the answer to it.
 fn statusLineWithUnreadBody(head: []const u8, body_len: usize, chunked: bool, timeouts: bool, out: []u8) ![]const u8 {
+    return statusLineWithUnreadBodyUnder(.{ .max_body_size = 100 }, head, body_len, chunked, timeouts, out);
+}
+
+/// `statusLineWithUnreadBody` on a server with the request limits `request`.
+fn statusLineWithUnreadBodyUnder(request: dusty.ServerConfig.Request, head: []const u8, body_len: usize, chunked: bool, timeouts: bool, out: []u8) ![]const u8 {
     const io = std.testing.io;
 
-    var config: dusty.ServerConfig = .{ .listeners = loopback, .request = .{ .max_body_size = 100 } };
+    var config: dusty.ServerConfig = .{ .listeners = loopback, .request = request };
     if (!timeouts) config.timeout = .{ .request = null, .keepalive = null };
     var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
     defer server.deinit();
@@ -2252,6 +2286,22 @@ test "Server: a 400 before an unread body is not answered with a reset" {
         const status = try statusLineWithUnreadBody("POST /?q=100% HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", 32768, false, timeouts, &buf);
         try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
     }
+}
+
+test "Server: every refusal before an unread body is answered and ended with a FIN" {
+    const Row = struct { name: []const u8, head: []const u8, status: []const u8, request: dusty.ServerConfig.Request = .{ .max_body_size = 100 } };
+    const rows = [_]Row{
+        .{ .name = "U1 a declared length over max_content_length", .head = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", .status = "HTTP/1.1 413 ", .request = .{ .max_body_size = 100, .max_content_length = 1000 } },
+        .{ .name = "U2 two Host headers", .head = "POST / HTTP/1.1\r\nHost: localhost\r\nHost: other\r\nContent-Length: 32768\r\n\r\n", .status = "HTTP/1.1 400 " },
+        .{ .name = "U3 an unknown Expect", .head = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\nExpect: unknown-value\r\n\r\n", .status = "HTTP/1.1 417 " },
+        .{ .name = "U4 a URL the router refuses", .head = "POST /?q=100% HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", .status = "HTTP/1.1 400 " },
+    };
+    var buf: [256]u8 = undefined;
+    for (rows) |row| for ([_]bool{ true, false }) |timeouts| {
+        errdefer std.debug.print("row: {s}, timeouts {}\n", .{ row.name, timeouts });
+        const status = try statusLineWithUnreadBodyUnder(row.request, row.head, 32768, false, timeouts, &buf);
+        try std.testing.expectStringStartsWith(status, row.status);
+    };
 }
 
 test "Server: too many query parameters is a 400, not a dropped connection" {

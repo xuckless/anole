@@ -4293,6 +4293,94 @@ test "Server: a connection gives back its in-flight count once, however it ends"
     }
 }
 
+test "Server: a refused request or head is answered with these exact bytes, once" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
+    const io = std.testing.io;
+    const get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: 2\r\n\r\nok";
+    const r400 = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const r431 = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    // What `Response.write` renders for a request refused after its head.
+    const res400 = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const res413 = "HTTP/1.1 413 Content Too Large\r\nContent-Type: text/plain; charset=UTF-8\r\nConnection: close\r\nContent-Length: 22\r\n\r\n413 Content Too Large\n";
+    const res417 = "HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const query33 = comptime blk: {
+        var q: []const u8 = "";
+        for (0..33) |i| q = q ++ std.fmt.comptimePrint("k{d}=v&", .{i});
+        break :blk q;
+    };
+    const Row = struct {
+        name: []const u8,
+        input: []const u8,
+        want: []const u8,
+        /// On a listener that also takes HTTP/2 with prior knowledge.
+        h2c: bool = false,
+        /// A refusal after the head: the same bytes with a request
+        /// pipelined behind it, which is never answered.
+        pipelined: bool = false,
+        request: ServerConfig.Request = .{},
+    };
+    const rows = [_]Row{
+        // Heads llhttp refuses (`refuseHead`).
+        .{ .name = "P1 invalid header token", .input = "GET / HTTP/1.1\r\nBad Header\r\n\r\n", .want = r400 },
+        .{ .name = "P2 invalid version", .input = "GET / HTTP/9.9\r\nHost: x\r\n\r\n", .want = r400 },
+        .{ .name = "P2 invalid version, h2c listener", .input = "GET / HTTP/9.9\r\nHost: x\r\n\r\n", .want = r400, .h2c = true },
+        .{ .name = "P3 invalid method", .input = "FOO / HTTP/1.1\r\n\r\n", .want = r400 },
+        .{ .name = "P4 invalid method first on an h2c listener: no reply", .input = "FOO / HTTP/1.1\r\n\r\n", .want = "", .h2c = true },
+        .{ .name = "P5 invalid method second on an h2c listener", .input = get ++ "FOO / HTTP/1.1\r\n\r\n", .want = ok ++ r400, .h2c = true },
+        .{ .name = "P6 HTTP/2 preface on an HTTP/1 listener: no reply", .input = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", .want = "" },
+        .{ .name = "P7 a broken preface", .input = "INVALID CONNECTION PREFACE\r\n\r\n", .want = r400 },
+        .{ .name = "P7 a broken preface, h2c listener: no reply", .input = "INVALID CONNECTION PREFACE\r\n\r\n", .want = "", .h2c = true },
+        .{ .name = "P8 too many headers", .input = "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n", .want = r431, .request = .{ .max_header_count = 2 } },
+        .{ .name = "P9 a head over the buffer", .input = "GET / HTTP/1.1\r\nHost: x\r\nA: " ++ &@as([600]u8, @splat('a')) ++ "\r\n\r\n", .want = r431, .request = .{ .buffer_size = 512 } },
+        .{ .name = "P10 invalid URL", .input = "GET /\x01 HTTP/1.1\r\nHost: x\r\n\r\n", .want = r400 },
+        .{ .name = "P10 invalid header value", .input = "GET / HTTP/1.1\r\nHost: x\r\nX: a\x01b\r\n\r\n", .want = r400 },
+        .{ .name = "P10 Content-Length and Transfer-Encoding", .input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", .want = r400 },
+        // Errors with no reply: the connection just ends.
+        .{ .name = "P11 the end inside a head", .input = "GET / HTTP/1.1\r\nHost: x\r\n", .want = "" },
+        .{ .name = "P12 the end before any byte", .input = "", .want = "" },
+        // Requests refused after their head (`refuse`).
+        .{ .name = "T1 Content-Length over max_content_length, body unread", .input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n" ++ &@as([50]u8, @splat('b')), .want = res413, .pipelined = true, .request = .{ .max_content_length = 10 } },
+        .{ .name = "T2 Content-Length over max_content_length, no body sent", .input = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n", .want = res413, .request = .{ .max_content_length = 10 } },
+        .{ .name = "T3 two Host headers", .input = "GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n", .want = res400, .pipelined = true },
+        .{ .name = "T4 HTTP/1.1 without Host", .input = "GET / HTTP/1.1\r\n\r\n", .want = res400, .pipelined = true },
+        .{ .name = "T5 unknown Expect", .input = "GET / HTTP/1.1\r\nHost: x\r\nExpect: unknown\r\n\r\n", .want = res417, .pipelined = true },
+        .{ .name = "T6 Expect: 100-continue in HTTP/1.0 is ignored, not refused", .input = "GET / HTTP/1.0\r\nExpect: 100-continue\r\n\r\n", .want = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok" },
+        .{ .name = "T7 bad percent escape", .input = "GET /?q=100% HTTP/1.1\r\nHost: x\r\n\r\n", .want = res400, .pipelined = true },
+        .{ .name = "T8 too many query parameters", .input = "GET /?" ++ query33 ++ " HTTP/1.1\r\nHost: x\r\n\r\n", .want = res400, .pipelined = true },
+    };
+    var failed: usize = 0;
+    for (rows) |row| {
+        if (row.h2c and !build_options.use_http2) continue;
+        const variants = [_]bool{ false, true };
+        for (variants[0 .. @as(usize, @intFromBool(row.pipelined)) + 1]) |pipelined| {
+            errdefer std.debug.print("row: {s}{s}\n", .{ row.name, if (pipelined) ", pipelined" else "" });
+            const listener: @import("config.zig").Listener = .{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = row.h2c };
+            var server = Server(void).init(std.testing.allocator, io, .{ .listeners = &.{listener}, .request = row.request, .response = .{ .date = false } }, {});
+            defer server.deinit();
+            const ok_handler = struct {
+                fn answer(_: *Request, res: *Response) !void {
+                    res.body = "ok";
+                }
+            }.answer;
+            server.router.get("/", ok_handler);
+            server.router.post("/", ok_handler);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(std.testing.allocator);
+            var input: std.ArrayList(u8) = .empty;
+            defer input.deinit(std.testing.allocator);
+            try input.appendSlice(std.testing.allocator, row.input);
+            if (pipelined) try input.appendSlice(std.testing.allocator, get);
+            try feedConnection(io, &server, &listener, input.items, &out);
+            if (!std.mem.eql(u8, row.want, out.items)) {
+                std.debug.print("row: {s}{s}\ngot:<<{s}>>\n", .{ row.name, if (pipelined) ", pipelined" else "", out.items });
+                failed += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(0, failed);
+}
+
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
     const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
