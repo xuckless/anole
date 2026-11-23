@@ -199,6 +199,18 @@ const connection_up: std.EnumArray(State, bool) = .init(.{
     .closed = false,
 });
 
+/// The status once a drain's first phase is over: publishes stop too. A
+/// close that came meanwhile stays, and the last barrier reports it.
+const publishes_stop: std.EnumArray(State, State) = .init(.{
+    .disconnected = .disconnected,
+    .connecting = .connecting,
+    .connected = .connected,
+    .reconnecting = .reconnecting,
+    .draining_subscriptions = .draining_publishes,
+    .draining_publishes = .draining_publishes,
+    .closed = .closed,
+});
+
 pub const InitError = Options.Error || Allocator.Error;
 
 pub const ConnectError = error{
@@ -664,8 +676,7 @@ fn drainSteps(client: *Client, deadline: ?Io.Clock.Timestamp) error{ Timeout, Co
     {
         client.mutex.lockUncancelable(io);
         defer client.mutex.unlock(io);
-        // Not over a `.closed` set meanwhile: the barrier below reports it.
-        if (client.status == .draining_subscriptions) client.status = .draining_publishes;
+        client.status = publishes_stop.get(client.status);
     }
     // What the handlers published goes out; a publish that waited for room
     // until after this PING fails with ConnectionDraining.
@@ -1007,7 +1018,11 @@ fn ping(client: *Client, timeout: Io.Timeout) FlushError!Io.Duration {
     const io = client.io;
     const deadline = time.deadline(io, timeout);
     const current = client.state();
-    if (!connection_up.get(current)) return if (current == .closed) error.ConnectionClosed else error.Disconnected;
+    if (!connection_up.get(current)) return switch (current) {
+        .closed => error.ConnectionClosed,
+        .disconnected, .connecting, .reconnecting => error.Disconnected,
+        .connected, .draining_subscriptions, .draining_publishes => unreachable,
+    };
     const sent_at = Io.Clock.awake.now(io);
     const ping_sent = client.outbound.putPing(io, .flush) catch |err| switch (err) {
         error.Closed => return error.ConnectionClosed,
@@ -1361,6 +1376,11 @@ test "what a call may queue in each state: facts, or why not" {
         };
     }
     client.status = .disconnected;
+}
+
+test "a drain's second phase starts only from its first, never over a close" {
+    try testing.expectEqual(State.draining_publishes, publishes_stop.get(.draining_subscriptions));
+    try testing.expectEqual(State.closed, publishes_stop.get(.closed));
 }
 
 test "a message fits when it is within max_payload, or nine digits when that is unknown" {
