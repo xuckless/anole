@@ -389,6 +389,50 @@ test "s3: deinit before finish aborts the multipart upload" {
     try testing.expect(env.fake.getObject("b", "abandoned.bin") == null);
 }
 
+test "s3: upload lifecycle: calls after finish, a failure or abort; deinit in each phase" {
+    const Step = struct { op: enum { write, write_parts, finish, abort }, err: ?anyerror = null, code: []const u8 = "" };
+    const over_w: Step = .{ .op = .write, .err = error.BadRequest, .code = "upload_over" };
+    const over_f: Step = .{ .op = .finish, .err = error.BadRequest, .code = "upload_over" };
+    const replay_w: Step = .{ .op = .write, .err = error.ServiceUnavailable, .code = "InternalError" };
+    const replay_f: Step = .{ .op = .finish, .err = error.ServiceUnavailable, .code = "InternalError" };
+    // Every row ends in deinit; none may leave a multipart upload or send a DELETE.
+    const rows = [_]struct { name: []const u8, fail: bool = false, steps: []const Step }{
+        .{ .name = "deinit while open", .steps = &.{.{ .op = .write }} },
+        .{ .name = "write after finish, finish twice", .steps = &.{ .{ .op = .write }, .{ .op = .finish }, over_w, .{ .op = .finish } } },
+        .{ .name = "a failure replays to write and finish", .fail = true, .steps = &.{ .{ .op = .write }, replay_f, replay_w, replay_f } },
+        .{ .name = "failure, abort: the failure still replays", .fail = true, .steps = &.{ .{ .op = .write }, replay_f, .{ .op = .abort }, replay_w, replay_f } },
+        .{ .name = "abort, write, finish, abort twice", .steps = &.{ .{ .op = .write }, .{ .op = .abort }, over_w, over_f, .{ .op = .abort } } },
+        .{ .name = "abort after a multipart success is a no-op", .steps = &.{ .{ .op = .write_parts }, .{ .op = .finish }, .{ .op = .abort }, over_w } },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        const env = try Env.init(.{ .part_size = 5 * mib });
+        defer env.deinit();
+        if (row.fail) try env.fake.addFault(.{ .method = "PUT", .remaining = 1000, .status = 500, .code = "InternalError" });
+        const q = Quiet.on();
+        defer q.done();
+        const data = try pattern(env.ctx.arena, 6 * mib, 7);
+        const up = try env.client.upload(env.c(), "life.bin", .{});
+        for (row.steps) |s| {
+            const r: anyerror!void = switch (s.op) {
+                .write => if (up.write(env.c(), data[0..1])) |_| {} else |e| e,
+                .write_parts => if (up.write(env.c(), data)) |_| {} else |e| e,
+                .finish => if (up.finish(env.c())) |_| {} else |e| e,
+                .abort => up.abort(),
+            };
+            const e = s.err orelse {
+                try r;
+                continue;
+            };
+            try testing.expectError(e, r);
+            try testing.expectEqualStrings(s.code, env.lastCode());
+        }
+        up.deinit();
+        try testing.expectEqual(@as(usize, 0), env.fake.count("DELETE", "uploadId="));
+        try testing.expectEqual(@as(usize, 0), env.fake.openUploads());
+    }
+}
+
 test "s3: upload_memory is shared: a second upload cannot take a buffer while the first holds it" {
     const env = try Env.init(.{ .part_size = 5 * mib, .upload_memory = 5 * mib });
     defer env.deinit();

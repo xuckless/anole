@@ -73,6 +73,30 @@ const Fail = struct {
     message: []const u8,
 };
 
+/// Where a push upload is. `failure` and `result` are data beside it: the
+/// first error wins in any phase; `result` is the success value.
+///
+/// | phase     | write          | beginFinish   | a failure  | abort()       | driver exits |
+/// |-----------|----------------|---------------|------------|---------------|--------------|
+/// | open      | taken          | -> finishing  | -> stopping| -> aborted    | -> done      |
+/// | finishing | upload_over    | no-op         | -> stopping| -> aborted    | -> done      |
+/// | stopping  | replay failure | replay        | kept first | -> aborted    | -> done      |
+/// | aborted   | replay or over | replay or over| aborted    | no-op         | aborted      |
+/// | done      | replay or over | replay or ok  | recorded   | -> aborted, a no-op after success | - |
+///
+/// `aborted`: abort() ran its cancel/abortRemote sequence, which happens at
+/// most once per Upload; it is not overwritten when the cancelled driver
+/// exits, so a second abort() or deinit() finds it.
+const Phase = enum { open, finishing, stopping, aborted, done };
+
+/// Every phase change except beginFinish's and abort()'s is a row here.
+const after_failure: std.EnumArray(Phase, Phase) = .init(.{ .open = .stopping, .finishing = .stopping, .stopping = .stopping, .aborted = .aborted, .done = .done });
+const after_driver: std.EnumArray(Phase, Phase) = .init(.{ .open = .done, .finishing = .done, .stopping = .done, .aborted = .aborted, .done = .done });
+/// The driver starts nothing more and exits.
+const stops: std.EnumArray(Phase, bool) = .init(.{ .open = false, .finishing = false, .stopping = true, .aborted = true, .done = true });
+/// awaitDone returns and poll answers.
+const ended: std.EnumArray(Phase, bool) = .init(.{ .open = false, .finishing = false, .stopping = false, .aborted = true, .done = true });
+
 /// owner: whoever opened it (`open`: a `put`, a handler's `Client.upload`,
 /// the C ABI's transfer slot), which calls `deinit` once. Lifetime: a child
 /// of that owner; its driver and part tasks are its children: `deinit`
@@ -102,10 +126,8 @@ pub const Upload = struct {
     multipart: bool = false,
     etags: std.ArrayList(root.Part) = .empty,
     upload_id: ?[]const u8 = null,
+    phase: Phase = .open,
     failure: ?Fail = null,
-    finishing: bool = false,
-    done: bool = false,
-    aborted: bool = false,
     result: ?Stored = null,
     total: u64 = 0,
     buffered: std.atomic.Value(u64) = .init(0),
@@ -154,7 +176,7 @@ pub const Upload = struct {
         self.lock();
         defer self.unlock();
         if (self.failure) |f| return self.replay(c, f);
-        if (self.finishing or self.aborted or self.done) return self.client.failOur(c, .invalid, "upload_over", "the upload is finished or aborted");
+        if (self.phase != .open) return self.client.failOur(c, .invalid, "upload_over", "the upload is finished or aborted");
         const busy_at: u64 = @as(u64, self.client.concurrency) * self.part_size;
         const full_at: u64 = busy_at + self.part_size;
         const have = self.buffered.load(.acquire);
@@ -237,8 +259,11 @@ pub const Upload = struct {
         self.lock();
         defer self.unlock();
         if (self.failure) |f| return self.replay(c, f);
-        if (self.aborted) return self.client.failOur(c, .invalid, "upload_over", "the upload was aborted");
-        if (self.finishing) return;
+        switch (self.phase) {
+            .open => {},
+            .finishing, .done => return,
+            .stopping, .aborted => return self.client.failOur(c, .invalid, "upload_over", "the upload was aborted"),
+        }
         if (self.multipart and self.cur.items.len > 0) {
             if (self.next_part > max_parts) return self.client.failOur(c, .invalid, "too_many_parts", "the upload would need more than 10000 parts; raise part_size");
             try self.ready.append(self.gpa, .{ .data = self.cur.allocatedSlice(), .len = self.cur.items.len, .number = self.next_part });
@@ -246,7 +271,7 @@ pub const Upload = struct {
             self.cur_charged = false;
             self.next_part += 1;
         }
-        self.finishing = true;
+        self.phase = .finishing;
     }
 
     /// Waits for the driver to end, then returns its result, its strings
@@ -256,7 +281,7 @@ pub const Upload = struct {
         while (true) {
             const seen = self.progress.seen();
             self.lock();
-            const done = self.done;
+            const done = ended.get(self.phase);
             const f = self.failure;
             const res = self.result;
             self.unlock();
@@ -282,7 +307,7 @@ pub const Upload = struct {
         self.lock();
         defer self.unlock();
         if (self.failure) |f| return f.err;
-        if (self.done) return self.result orelse error.Database;
+        if (ended.get(self.phase)) return self.result orelse error.Database;
         return null;
     }
 
@@ -300,12 +325,13 @@ pub const Upload = struct {
     }
 
     /// Aborts (AbortMultipartUpload when one was started). Cleanup: never fails.
+    /// A no-op once aborted or after a success.
     pub fn abort(self: *Upload) void {
         self.lock();
-        const already = self.aborted;
-        self.aborted = true;
+        const skip = self.phase == .aborted or self.succeeded();
+        if (!skip) self.phase = .aborted;
         self.unlock();
-        if (already) return;
+        if (skip) return;
         self.wake.ring(self.io);
         self.group.cancel(self.io);
         self.parts.cancel(self.io);
@@ -316,13 +342,13 @@ pub const Upload = struct {
     /// Aborts unless finished; frees.
     pub fn deinit(self: *Upload) void {
         self.lock();
-        const finished = self.done and self.failure == null and !self.aborted;
+        const finished = self.succeeded();
         self.unlock();
         if (!finished) self.abort() else {
             self.group.cancel(self.io);
-            // A part task can still be in its tail (freeing its buffer,
-            // ringing the bells) after the driver saw `inflight == 0` and
-            // finished: wait for it before the Upload goes away.
+            // A part task can still be in its tail (ringing the bells)
+            // after the driver saw `inflight == 0` and finished: wait for
+            // it before the Upload goes away.
             self.parts.cancel(self.io);
         }
         self.freeBuffers();
@@ -334,6 +360,11 @@ pub const Upload = struct {
         self.arena.deinit();
         _ = client.uploads_live.fetchSub(1, .acq_rel);
         gpa.destroy(self);
+    }
+
+    /// Under the lock.
+    fn succeeded(self: *const Upload) bool {
+        return self.phase == .done and self.failure == null and self.result != null;
     }
 
     fn freeBuffers(self: *Upload) void {
@@ -361,6 +392,7 @@ pub const Upload = struct {
         self.lock();
         defer self.unlock();
         if (self.failure != null) return;
+        self.phase = after_failure.get(self.phase);
         const a = self.arena.allocator();
         self.failure = .{
             .err = err,
@@ -381,8 +413,7 @@ pub const Upload = struct {
             // Parts to start.
             while (true) {
                 self.lock();
-                const stop = self.failure != null or self.aborted;
-                const can = !stop and self.ready.items.len > 0 and self.inflight < self.client.concurrency;
+                const can = !stops.get(self.phase) and self.ready.items.len > 0 and self.inflight < self.client.concurrency;
                 var part: ?PartBuf = null;
                 if (can) {
                     part = self.ready.orderedRemove(0);
@@ -394,58 +425,56 @@ pub const Upload = struct {
                     self.createRemote(&ctx) catch |err| {
                         if (err == error.Canceled) return error.Canceled;
                         self.setFailure(&ctx, err);
-                        self.gpa.free(p.data);
-                        self.client.giveMemory(self.part_size);
-                        self.lock();
-                        self.inflight -= 1;
-                        self.unlock();
+                        self.dropPart(p);
                         break;
                     };
                 }
                 placement.concurrent(&self.parts, self.io, .local, partTask, .{ self, p }) catch {
                     self.setFailure(&ctx, error.ServiceUnavailable);
-                    self.gpa.free(p.data);
-                    self.client.giveMemory(self.part_size);
-                    self.lock();
-                    self.inflight -= 1;
-                    self.unlock();
+                    self.dropPart(p);
                     break;
                 };
             }
             self.lock();
             const failed = self.failure != null;
-            const stop = failed or self.aborted;
-            const finish_now = self.finishing and self.ready.items.len == 0 and self.inflight == 0;
+            const stop = stops.get(self.phase);
+            const finish_now = self.phase == .finishing and self.ready.items.len == 0 and self.inflight == 0;
             self.unlock();
             if (stop) {
                 self.parts.cancel(self.io);
                 if (failed) self.abortRemote();
-                self.lock();
-                self.done = true;
-                self.unlock();
-                self.notify();
-                return;
+                return self.exit(null);
             }
             if (finish_now) {
                 const r = if (self.multipart or self.upload_id != null) self.completeRemote(&ctx) else self.putRemote(&ctx);
-                if (r) |stored| {
-                    self.lock();
-                    self.result = stored;
-                    self.done = true;
-                    self.unlock();
-                } else |err| {
+                const stored = r catch |err| {
                     if (err == error.Canceled) return error.Canceled;
                     self.setFailure(&ctx, err);
                     self.abortRemote();
-                    self.lock();
-                    self.done = true;
-                    self.unlock();
-                }
-                self.notify();
-                return;
+                    return self.exit(null);
+                };
+                return self.exit(stored);
             }
             try self.wake.wait(self.io, seen);
         }
+    }
+
+    /// The driver's one way out: the phase after it, the result, then the wake.
+    fn exit(self: *Upload, result: ?Stored) void {
+        self.lock();
+        self.phase = after_driver.get(self.phase);
+        if (result) |r| self.result = r;
+        self.unlock();
+        self.notify();
+    }
+
+    /// A part buffer that will not be (or was) sent: its memory back, out of `inflight`.
+    fn dropPart(self: *Upload, p: PartBuf) void {
+        self.gpa.free(p.data);
+        self.client.giveMemory(self.part_size);
+        self.lock();
+        self.inflight -= 1;
+        self.unlock();
     }
 
     fn createRemote(self: *Upload, ctx: *db.Ctx) Error!void {
@@ -472,27 +501,17 @@ pub const Upload = struct {
             .max_bytes = 64 * 1024,
             .bound_bytes = p.len,
         }, self.call);
-        const freed = struct {
-            fn f(s: *Upload, part: PartBuf) void {
-                s.gpa.free(part.data);
-                s.client.giveMemory(s.part_size);
-            }
-        }.f;
         if (reply) |r| {
             self.lock();
             const a = self.arena.allocator();
             if (a.dupe(u8, r.meta.etag)) |etag| {
                 self.etags.append(self.gpa, .{ .number = p.number, .etag = etag }) catch {};
             } else |_| {}
-            self.inflight -= 1;
             _ = self.buffered.fetchSub(p.len, .acq_rel);
             self.unlock();
-            freed(self, p);
+            self.dropPart(p);
         } else |err| {
-            freed(self, p);
-            self.lock();
-            self.inflight -= 1;
-            self.unlock();
+            self.dropPart(p);
             if (err == error.Canceled) {
                 self.wake.ring(self.io);
                 return error.Canceled;
