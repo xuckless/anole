@@ -43,11 +43,11 @@ const MemSink = struct {
     cond: std.Io.Condition = .init,
     store: std.heap.ArenaAllocator,
     status: dusty.Status = .ok,
-    head_seen: bool = false,
+    /// open -> head_sent (head written) -> ended (response complete or handler done).
+    phase: enum { open, head_sent, ended } = .open,
     headers: std.ArrayList(Header) = .empty,
     pieces: std.ArrayList([]const u8) = .empty,
     trailers: std.ArrayList(Header) = .empty,
-    ended: bool = false,
     /// The client left (`Stream.close`): writes fail.
     gone: bool = false,
     err: ?dusty.Response.SendError = null,
@@ -112,7 +112,7 @@ const MemSink = struct {
                 .{ .name = "Transfer-Encoding", .value = "chunked" };
             self.headers.append(a, extra) catch return self.fail(error.SystemResources);
         }
-        self.head_seen = true;
+        if (self.phase == .open) self.phase = .head_sent;
     }
 
     fn head(ptr: *anyopaque, status: dusty.Status, headers: *const dusty.Headers, content_length: ?usize) std.Io.Writer.Error!void {
@@ -175,7 +175,7 @@ const MemSink = struct {
         self.lock();
         defer self.unlock();
         try self.trailersLocked(trailers);
-        self.ended = true;
+        self.phase = .ended;
         self.cond.broadcast(self.io);
     }
 
@@ -205,7 +205,7 @@ const MemSink = struct {
         try self.headLocked(status, headers, content_length);
         try self.pushLocked(parts);
         try self.trailersLocked(trailers);
-        self.ended = true;
+        self.phase = .ended;
         self.cond.broadcast(self.io);
     }
 
@@ -224,8 +224,7 @@ const MemSink = struct {
     fn finish(self: *MemSink) void {
         self.lock();
         defer self.unlock();
-        self.ended = true;
-        self.head_seen = true;
+        self.phase = .ended;
         self.cond.broadcast(self.io);
     }
 };
@@ -443,7 +442,7 @@ pub fn Client(comptime S: type) type {
             };
             // The head is out.
             run.sink.lock();
-            while (!run.sink.head_seen and !run.sink.ended) run.sink.cond.wait(io, &run.sink.mutex) catch {
+            while (run.sink.phase == .open) run.sink.cond.wait(io, &run.sink.mutex) catch {
                 run.sink.unlock();
                 return error.Canceled;
             };
@@ -655,7 +654,7 @@ pub const Stream = struct {
                 defer self.next_piece += 1;
                 return sink.pieces.items[self.next_piece];
             }
-            if (sink.ended) return null;
+            if (sink.phase == .ended) return null;
             sink.cond.wait(self.io, &sink.mutex) catch return error.Canceled;
         }
     }
