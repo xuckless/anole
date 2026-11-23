@@ -1244,9 +1244,31 @@ test "kafka client: start, consume and drain by phase; each consumer is started 
     // `spawned`: the members of the last consumer added; null: none, or refused.
     const Row = struct { act: enum { add, start, drain }, phase: @FieldType(kafka.Client, "phase"), spawned: ?usize = 0 };
     for ([_]struct { suppress: bool, rows: []const Row }{
-        .{ .suppress = false, .rows = &.{ .{ .act = .add, .phase = .idle }, .{ .act = .start, .phase = .serving, .spawned = 1 }, .{ .act = .start, .phase = .serving, .spawned = 1 }, .{ .act = .add, .phase = .serving, .spawned = 1 }, .{ .act = .drain, .phase = .drained, .spawned = 1 }, .{ .act = .drain, .phase = .drained, .spawned = 1 }, .{ .act = .add, .phase = .drained, .spawned = null } } },
-        .{ .suppress = false, .rows = &.{ .{ .act = .drain, .phase = .drained, .spawned = null }, .{ .act = .start, .phase = .drained, .spawned = null }, .{ .act = .add, .phase = .drained, .spawned = null } } },
-        .{ .suppress = true, .rows = &.{ .{ .act = .add, .phase = .idle }, .{ .act = .start, .phase = .serving }, .{ .act = .add, .phase = .serving } } },
+        .{
+            .suppress = false,
+            .rows = &.{
+                .{ .act = .add, .phase = .idle },
+                .{ .act = .start, .phase = .serving, .spawned = 1 },
+                .{ .act = .start, .phase = .serving, .spawned = 1 }, // start twice starts once
+                .{ .act = .add, .phase = .serving, .spawned = 1 }, // started by consume, not again by start
+                .{ .act = .drain, .phase = .drained, .spawned = 1 },
+                .{ .act = .drain, .phase = .drained, .spawned = 1 }, // drain twice drains once
+                .{ .act = .add, .phase = .drained, .spawned = null },
+            },
+        },
+        .{
+            .suppress = false,
+            .rows = &.{ // drain before start: the consumer added first is never started
+                .{ .act = .add, .phase = .idle },
+                .{ .act = .drain, .phase = .drained },
+                .{ .act = .start, .phase = .drained },
+            },
+        },
+        .{ .suppress = true, .rows = &.{
+            .{ .act = .add, .phase = .idle },
+            .{ .act = .start, .phase = .serving },
+            .{ .act = .add, .phase = .serving },
+        } },
     }, 0..) |s, si| {
         const client = try kafka.Client.init(gpa, io, .{ .brokers = &.{"127.0.0.1:1"}, .connect_timeout = .fromMilliseconds(300) });
         defer client.deinit();
