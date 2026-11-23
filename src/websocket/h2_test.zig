@@ -1333,7 +1333,8 @@ test "WebSocket over HTTP/2: drain cuts an unresponsive client after close_timeo
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
         .http2 = .{ .enable_connect_protocol = true },
-        .timeout = .{ .shutdown = .fromSeconds(20) },
+        // No drain deadline: only close_timeout can end the socket.
+        .timeout = .{ .shutdown = null },
     }, {});
     defer server.deinit();
     server.router.get("/chat", h2ShortClose);
@@ -1354,7 +1355,6 @@ test "WebSocket over HTTP/2: drain cuts an unresponsive client after close_timeo
     try client.sendFrame(.text, "hi");
     try std.testing.expectEqualStrings("hi", try client.nextFrame(&op, &buf));
 
-    const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var drain = try io.concurrent(struct {
         fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
             try std.testing.expectError(error.Canceled, f.cancel(io_));
@@ -1371,7 +1371,6 @@ test "WebSocket over HTTP/2: drain cuts an unresponsive client after close_timeo
         }
     }.f);
     try drain.await(io);
-    if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expectEqual(@as(usize, 1), h2_close_done.load(.acquire));
 }
 

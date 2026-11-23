@@ -507,11 +507,18 @@ pub const Socket = struct {
     /// `receive`; if it does not arrive within `UpgradeOptions.close_timeout`,
     /// the underlying connection or stream is closed.
     pub noinline fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
+        try self.sendClose(code, reason);
+        if (self._close_watch) |w| w.arm();
+    }
+
+    /// `close` without the close-handshake timer, for the closes the
+    /// server sends as a handler ends: the socket is released right after,
+    /// which ends the connection or stream anyway.
+    fn sendClose(self: *Socket, code: CloseCode, reason: []const u8) !void {
         self._closed.store(true, .release);
-        try switch (self._conn) {
+        return switch (self._conn) {
             inline else => |ws| ws.close(code, reason),
         };
-        if (self._close_watch) |w| w.arm();
     }
 
     /// Releases the socket: its rooms (every `Rooms` it joined), the drain
@@ -608,48 +615,57 @@ const CloseWatch = struct {
 
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const self: *CloseWatch = @alignCast(@fieldParentPtr("hook", hook));
+        // Without a task to spare, the socket lives on until the handler
+        // ends it or the drain's deadline does.
+        self.start(drainSend);
+    }
+
+    /// Arms the close-handshake timer once `Socket.close` sent a close.
+    fn arm(self: *CloseWatch) void {
+        if (self.close_timeout != null) self.start(sleepAndAbort);
+    }
+
+    /// `open` -> `closing` with `task` started, under the lock. From any
+    /// other state a no-op, so a second close never resets the timer; a
+    /// task that cannot start leaves the watch `open`.
+    fn start(self: *CloseWatch, comptime task: fn (*CloseWatch) std.Io.Cancelable!void) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.state != .open) return;
+        // On the socket's executor. `.local` when already there (a close
+        // from the socket's own task); the drain's hooks and a close from
+        // another task (a `Rooms` sender) run elsewhere, and the close and
+        // its timer belong with the socket, so a peer that does not read
+        // holds up only its own executor.
+        const where: placement.Where = if (self.executor) |i|
+            (if (placement.currentExecutor(self.io) == i) .local else .{ .executor = i })
+        else
+            .local;
+        placement.concurrent(&self.group, self.io, where, task, .{self}) catch return;
         self.state = .closing;
-        const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
-        // Without a task to spare, the socket lives on until the handler
-        // ends it or the drain's deadline does.
-        placement.concurrent(&self.group, self.io, where, drainSend, .{self}) catch {
-            self.state = .open;
-        };
     }
 
     fn drainSend(self: *CloseWatch) std.Io.Cancelable!void {
         switch (self.conn) {
             inline else => |ws| ws.close(.going_away, self.reason) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
+                // Nothing went out (the connection is gone or failing):
+                // no answer to wait for.
+                return;
             },
         }
         if (self.close_timeout != null) try self.sleepAndAbort();
     }
 
-    /// Arms the close-handshake timer once a server-initiated close frame has
-    /// gone out (`Socket.close`). Re-entering while already closing or stopped
-    /// is a no-op so a second close never resets the timer.
-    fn arm(self: *CloseWatch) void {
-        if (self.close_timeout == null) return;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.state != .open) return;
-        self.state = .closing;
-        const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
-        placement.concurrent(&self.group, self.io, where, sleepAndAbort, .{self}) catch {
-            self.state = .open;
-        };
-    }
-
     fn sleepAndAbort(self: *CloseWatch) std.Io.Cancelable!void {
         try self.io.sleep(self.close_timeout.?, .awake);
+        // Held across the abort, so a `stop` (the peer's close arriving,
+        // the socket released) either comes first and nothing is aborted,
+        // or waits until the abort is done, while the socket's task is
+        // still inside `stop`: no cancel lands on a task that moved on.
         self.mutex.lockUncancelable(self.io);
-        const active = self.state == .closing;
-        self.mutex.unlock(self.io);
-        if (active) abortConn(self.io, self.conn, self.task);
+        defer self.mutex.unlock(self.io);
+        if (self.state == .closing) abortConn(self.io, self.conn, self.task);
     }
 
     /// Out of the drain hooks, and any close or timer task finished or canceled.
@@ -787,8 +803,15 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     }
     req.setDeadline(options.timeout);
     const drain_hooks = if (options.close_on_drain) req._drain_hooks else null;
+    // A timer only where `abortConn` can end the socket: an HTTP/1.1
+    // socket on TCP, or a stream with a task to cancel (not an in-memory
+    // exchange).
+    const abortable = switch (socket._conn) {
+        .h1 => |ws| ws.transport.tcp_reader != null,
+        .stream => socket._task != null,
+    };
     const close_timeout: ?std.Io.Duration = if (options.close_timeout) |d|
-        (if (d.toNanoseconds() > 0) d else null)
+        (if (abortable and d.toNanoseconds() > 0) d else null)
     else
         null;
     if (drain_hooks != null or close_timeout != null) {
@@ -863,7 +886,7 @@ noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: 
     // The peer went away mid-send: not the handler's fault.
     if (res.peerGone()) return;
     std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, err });
-    if (!ws._closed.load(.acquire)) ws.close(.internal_error, "") catch {};
+    if (!ws._closed.load(.acquire)) ws.sendClose(.internal_error, "") catch {};
 }
 
 fn checkRouteHandler(comptime Ctx: type, comptime handler: anytype) void {
@@ -893,7 +916,7 @@ fn serveRoute(
         else => unreachable,
     };
     result catch |err| return failed(&ws, req, res, err);
-    if (!ws._closed.load(.acquire)) ws.close(.normal, "") catch {};
+    if (!ws._closed.load(.acquire)) ws.sendClose(.normal, "") catch {};
 }
 
 fn optionsFromData(req: *const dusty.Request) UpgradeOptions {
@@ -1120,7 +1143,7 @@ const H1Callbacks = struct {
         self.ending = true;
         if (err == error.Canceled) return;
         std.log.scoped(.anole).warn("WebSocket open for {s} failed: {t}", .{ req.url, err });
-        if (!self.socket._closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
+        if (!self.socket._closed.load(.acquire)) self.socket.sendClose(.internal_error, "") catch {};
     }
 
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
@@ -1158,7 +1181,7 @@ const H1Callbacks = struct {
                 .text, .binary => self.table.message(self.state, &self.socket, msg) catch |err| {
                     if (err != error.Canceled and !self.socket._closed.load(.acquire)) {
                         std.log.scoped(.anole).warn("WebSocket message handler failed: {t}", .{err});
-                        self.socket.close(.internal_error, "") catch {};
+                        self.socket.sendClose(.internal_error, "") catch {};
                     }
                     return self.finish(err);
                 },

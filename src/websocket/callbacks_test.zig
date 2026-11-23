@@ -816,7 +816,8 @@ test "WebSocket callbacks: peers that hang up or reset are closed, parked or on 
 test "WebSocket callbacks: drain cuts a parked unresponsive client after close_timeout, not timeout.shutdown" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
-    try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(30), .shutdown = .fromSeconds(20) } });
+    // No drain deadline: only close_timeout can end the socket.
+    try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(30), .shutdown = null } });
     defer f.deinit(gpa);
 
     var c: Client = undefined;
@@ -825,7 +826,6 @@ test "WebSocket callbacks: drain cuts a parked unresponsive client after close_t
     try c.expectText("hello");
     try f.waitParked(1);
 
-    const start: std.Io.Clock.Timestamp = .now(f.io, .awake);
     var stopper = try f.io.concurrent(struct {
         fn run(fx: *Fixture) void {
             fx.stopServer();
@@ -836,7 +836,6 @@ test "WebSocket callbacks: drain cuts a parked unresponsive client after close_t
     // Client never answers the close: close_timeout cuts the parked socket.
     try std.testing.expect(c.hungUp());
     stopper.await(f.io);
-    if (wait.timing()) try std.testing.expect(start.durationTo(.now(f.io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expectEqual(1, closed.load(.acquire));
     try std.testing.expectEqual(0, f.server.active_connections.load(.acquire));
 }
@@ -856,7 +855,9 @@ test "WebSocket callbacks: handler ws.close cuts an unresponsive client after cl
     // Client never answers: close_timeout cuts the connection and runs close().
     try std.testing.expect(c.hungUp());
     try f.waitClosed(1);
-    try std.testing.expectEqual(0, f.server.active_connections.load(.acquire));
+    // `close` runs as the core releases the socket, before it counts the
+    // connection out.
+    try f.waitConnections(0);
 }
 
 test "WebSocket loop: peers that hang up or reset are closed" {

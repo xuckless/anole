@@ -294,7 +294,9 @@ To close from the server side, call `close(code, reason)`, then keep calling
 `receive` until the client's answer arrives as a `.close` message (or
 `receive` fails). If the client does not answer within
 `UpgradeOptions.close_timeout` (5 s by default), the server closes the
-connection or stream itself (RFC 6455 §7.1.1) and `receive` fails:
+connection or stream itself (RFC 6455 §7.1.1) and `receive` fails. The
+close an `app.ws` route sends when its handler returns waits for nothing: the
+socket is released right after it.
 
 ```zig
 try ws.close(.going_away, "server restarting");

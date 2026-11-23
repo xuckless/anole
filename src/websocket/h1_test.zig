@@ -618,7 +618,8 @@ test "WebSocket over HTTP/1.1: drain cuts an unresponsive client after close_tim
     close_saw_peer.store(false, .release);
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
-        .timeout = .{ .shutdown = .fromSeconds(20) },
+        // No drain deadline: only close_timeout can end the socket.
+        .timeout = .{ .shutdown = null },
     }, {});
     defer server.deinit();
     server.router.get("/ws", closeTimeoutHandler(.{ .close_timeout = .fromMilliseconds(150) }));
@@ -637,7 +638,6 @@ test "WebSocket over HTTP/1.1: drain cuts an unresponsive client after close_tim
     var buf: [125]u8 = undefined;
     try std.testing.expectEqualStrings("hi", (try c.next(&buf)).payload);
 
-    const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var drain = try io.concurrent(struct {
         fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
             try std.testing.expectError(error.Canceled, f.cancel(io_));
@@ -648,7 +648,6 @@ test "WebSocket over HTTP/1.1: drain cuts an unresponsive client after close_tim
     // Never answer the close: the server cuts the connection after close_timeout.
     try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
     try drain.await(io);
-    if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expectEqual(@as(usize, 1), close_done.load(.acquire));
     try std.testing.expect(!close_saw_peer.load(.acquire));
 }
