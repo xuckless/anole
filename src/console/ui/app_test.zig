@@ -552,3 +552,34 @@ test "app: JSON log records show their message and fields" {
     const last = f.app.logLines()[f.app.logLines().len - 1];
     try std.testing.expectEqualStrings("charged amount=12 currency=EUR", last.text);
 }
+
+test "app: peer transitions (bye, restarting, connection loss)" {
+    const Ev = union(enum) { bye: []const u8, restarting, lost };
+    const Gone = app_mod.Peer.Gone;
+    const peer_rows = [_]struct { name: []const u8, evs: []const Ev, exited: bool, restarting: bool, gone: ?Gone }{
+        .{ .name = "none", .evs = &.{}, .exited = false, .restarting = false, .gone = null },
+        .{ .name = "bye drain", .evs = &.{.{ .bye = "drain" }}, .exited = true, .restarting = false, .gone = .stopped },
+        .{ .name = "bye stop", .evs = &.{.{ .bye = "stop" }}, .exited = true, .restarting = false, .gone = .stopped },
+        .{ .name = "restarting", .evs = &.{.restarting}, .exited = false, .restarting = true, .gone = null },
+        .{ .name = "connection loss", .evs = &.{.lost}, .exited = true, .restarting = false, .gone = .stopped },
+        .{ .name = "restarting then loss", .evs = &.{ .restarting, .lost }, .exited = true, .restarting = true, .gone = .restarted },
+        .{ .name = "restarting then bye", .evs = &.{ .restarting, .{ .bye = "stop" } }, .exited = true, .restarting = true, .gone = .restarted },
+        .{ .name = "bye then restarting", .evs = &.{ .{ .bye = "drain" }, .restarting }, .exited = true, .restarting = true, .gone = .restarted },
+    };
+    for (peer_rows) |row| {
+        const f = try fixture(.attach, true);
+        defer {
+            f.deinit();
+            gpa.destroy(f);
+        }
+        for (row.evs) |ev| switch (ev) {
+            .bye => |r| f.app.frame(.{ .bye = .{ .reason = r } }),
+            .restarting => f.app.frame(.{ .restarting = .{ .mode = "handoff", .successor_pid = 77 } }),
+            .lost => f.app.connectionClosed(),
+        };
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        try std.testing.expectEqual(row.exited, f.app.link() == .exited);
+        try std.testing.expectEqual(row.restarting, f.app.isRestarting());
+        if (row.gone) |g| try std.testing.expectEqual(g, f.app.peer.gone);
+    }
+}

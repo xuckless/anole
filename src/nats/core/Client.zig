@@ -122,8 +122,6 @@ attempt: ?*manager.AttemptState = null,
 connect_error: ?ConnectError = null,
 /// Why the client closed; the first reason stays.
 close_reason: ?CloseReason = null,
-/// What a drain lets through, while `status` is `.draining`.
-drain_phase: DrainPhase = .subscriptions,
 /// A connection was up once: the next ones are reconnections.
 ever_connected: bool = false,
 /// When the current connection came up.
@@ -161,8 +159,11 @@ pub const State = enum {
     connected,
     /// The connection was lost and a new one is being opened.
     reconnecting,
-    /// Finishing its work before it closes.
-    draining,
+    /// Draining, first phase: subscriptions stop while publishes still go
+    /// out, so handlers can answer.
+    draining_subscriptions,
+    /// Draining, second phase: publishes stop too.
+    draining_publishes,
     /// Closed for good.
     closed,
 };
@@ -187,9 +188,28 @@ pub const CloseReason = enum {
     reconnect_failed,
 };
 
-/// The two phases of a drain: first the subscriptions stop while publishes
-/// still go out, so handlers can answer; then publishes stop too.
-const DrainPhase = enum { subscriptions, publishes };
+/// A connection is up: connected, or draining in either phase.
+const connection_up: std.EnumArray(State, bool) = .init(.{
+    .disconnected = false,
+    .connecting = false,
+    .connected = true,
+    .reconnecting = false,
+    .draining_subscriptions = true,
+    .draining_publishes = true,
+    .closed = false,
+});
+
+/// The status once a drain's first phase is over: publishes stop too. A
+/// close that came meanwhile stays, and the last barrier reports it.
+const publishes_stop: std.EnumArray(State, State) = .init(.{
+    .disconnected = .disconnected,
+    .connecting = .connecting,
+    .connected = .connected,
+    .reconnecting = .reconnecting,
+    .draining_subscriptions = .draining_publishes,
+    .draining_publishes = .draining_publishes,
+    .closed = .closed,
+});
 
 pub const InitError = Options.Error || Allocator.Error;
 
@@ -535,7 +555,8 @@ fn currentServer(client: *Client, use: Use) error{ Disconnected, ConnectionClose
     return switch (client.status) {
         .connected => facts,
         .reconnecting => if (use != .subscribe and client.options.options.reconnect.buffer_bytes == 0) error.Disconnected else facts,
-        .draining => if (use == .publish and client.drain_phase == .subscriptions) facts else error.ConnectionDraining,
+        .draining_subscriptions => if (use == .publish) facts else error.ConnectionDraining,
+        .draining_publishes => error.ConnectionDraining,
         .closed => error.ConnectionClosed,
         .disconnected, .connecting => error.Disconnected,
     };
@@ -604,8 +625,7 @@ pub fn drain(client: *Client, options: DrainOptions) DrainError!void {
             if (client.exit) |exit| if (exit == .lame_duck and !client.exit_taken) {
                 client.exit = null;
             };
-            client.status = .draining;
-            client.drain_phase = .subscriptions;
+            client.status = .draining_subscriptions;
             client.changed.wake(io);
         }
         break :begin status;
@@ -614,7 +634,7 @@ pub fn drain(client: *Client, options: DrainOptions) DrainError!void {
     if (status == .connected) log.debug("draining the client", .{});
     switch (status) {
         .connected => {},
-        .draining => return error.ConnectionDraining,
+        .draining_subscriptions, .draining_publishes => return error.ConnectionDraining,
         .closed => return error.ConnectionClosed,
         // Nothing can be drained without a connection.
         .disconnected, .connecting => {
@@ -656,7 +676,7 @@ fn drainSteps(client: *Client, deadline: ?Io.Clock.Timestamp) error{ Timeout, Co
     {
         client.mutex.lockUncancelable(io);
         defer client.mutex.unlock(io);
-        client.drain_phase = .publishes;
+        client.status = publishes_stop.get(client.status);
     }
     // What the handlers published goes out; a publish that waited for room
     // until after this PING fails with ConnectionDraining.
@@ -956,7 +976,7 @@ pub fn connect(client: *Client) ConnectError!void {
             },
             .connecting => {},
             .closed => return error.ConnectionClosed,
-            .connected, .reconnecting, .draining => return,
+            .connected, .reconnecting, .draining_subscriptions, .draining_publishes => return,
         }
     }
 
@@ -975,7 +995,7 @@ pub fn connect(client: *Client) ConnectError!void {
         // The first connection was made; it may be lost again already,
         // and with reconnect off the client may have closed before this
         // call looked: `wait` says why.
-        .connected, .reconnecting, .draining => {},
+        .connected, .reconnecting, .draining_subscriptions, .draining_publishes => {},
         .closed => if (client.ever_connected) {} else client.connect_error orelse error.ConnectionClosed,
         .disconnected, .connecting => client.connect_error orelse error.ConnectionClosed,
     };
@@ -997,11 +1017,12 @@ pub fn rtt(client: *Client, options: FlushOptions) FlushError!Io.Duration {
 fn ping(client: *Client, timeout: Io.Timeout) FlushError!Io.Duration {
     const io = client.io;
     const deadline = time.deadline(io, timeout);
-    switch (client.state()) {
-        .connected, .draining => {},
-        .closed => return error.ConnectionClosed,
-        .disconnected, .connecting, .reconnecting => return error.Disconnected,
-    }
+    const current = client.state();
+    if (!connection_up.get(current)) return switch (current) {
+        .closed => error.ConnectionClosed,
+        .disconnected, .connecting, .reconnecting => error.Disconnected,
+        .connected, .draining_subscriptions, .draining_publishes => unreachable,
+    };
     const sent_at = Io.Clock.awake.now(io);
     const ping_sent = client.outbound.putPing(io, .flush) catch |err| switch (err) {
         error.Closed => return error.ConnectionClosed,
@@ -1188,10 +1209,7 @@ pub fn shutdown(client: *Client, io: Io, deadline: Io.Clock.Timestamp) ShutdownE
     client.checkHome();
     defer client.close();
     const due = time.deadline(client.io, .{ .deadline = deadline.subDuration(.{ .raw = shutdown_reserve, .clock = deadline.clock }) }).?;
-    switch (client.state()) {
-        .connected, .draining => {},
-        .disconnected, .connecting, .reconnecting, .closed => return,
-    }
+    if (!connection_up.get(client.state())) return;
     client.drain(.{ .timeout = .{ .deadline = due } }) catch |err| switch (err) {
         error.Timeout => return error.Timeout,
         // The connection went before or during the drain: the client is
@@ -1223,14 +1241,11 @@ pub fn state(client: *Client) State {
     return client.status;
 }
 
-/// A connection is up: the state is `.connected` or `.draining`. False
+/// A connection is up: the state is `.connected` or a draining one. False
 /// before `connect()`, while it connects or reconnects, and once closed.
 pub fn isConnected(client: *Client) bool {
     client.checkHome();
-    return switch (client.state()) {
-        .connected, .draining => true,
-        .disconnected, .connecting, .reconnecting, .closed => false,
-    };
+    return connection_up.get(client.state());
 }
 
 /// The server of the current connection, a draining one included; null
@@ -1245,7 +1260,7 @@ pub fn connectedServer(client: *Client) ?ServerAddress {
 
 /// Under `mutex`: a connection is up.
 fn hasConnection(client: *const Client) bool {
-    return client.status == .connected or client.status == .draining;
+    return connection_up.get(client.status);
 }
 
 pub const NextEventError = EventQueue.NextError;
@@ -1334,6 +1349,38 @@ test "subscribe before connect is Disconnected, after close ConnectionClosed" {
     try testing.expectError(error.InvalidOptions, client.subscribe("foo", .{ .queue = "two words" }));
     client.close();
     try testing.expectError(error.ConnectionClosed, client.subscribe("foo", .{}));
+}
+
+test "what a call may queue in each state: facts, or why not" {
+    var client: Client = try .init(testing.allocator, testing.io, .{ .servers = one_server });
+    defer client.deinit();
+    const E = error{ Disconnected, ConnectionClosed, ConnectionDraining };
+    const rows = [_]struct { State, Use, E!void }{
+        .{ .connected, .request, {} },
+        .{ .reconnecting, .publish, {} },
+        .{ .draining_subscriptions, .publish, {} },
+        .{ .draining_subscriptions, .request, error.ConnectionDraining },
+        .{ .draining_subscriptions, .subscribe, error.ConnectionDraining },
+        .{ .draining_publishes, .publish, error.ConnectionDraining },
+        .{ .draining_publishes, .request, error.ConnectionDraining },
+        .{ .draining_publishes, .subscribe, error.ConnectionDraining },
+        .{ .connecting, .publish, error.Disconnected },
+        .{ .closed, .publish, error.ConnectionClosed },
+    };
+    for (rows) |row| {
+        client.status = row[0];
+        const got: E!void = if (client.currentServer(row[1])) |_| {} else |err| err;
+        testing.expectEqual(row[2], got) catch |err| {
+            std.debug.print("{t} {t}\n", .{ row[0], row[1] });
+            return err;
+        };
+    }
+    client.status = .disconnected;
+}
+
+test "a drain's second phase starts only from its first, never over a close" {
+    try testing.expectEqual(State.draining_publishes, publishes_stop.get(.draining_subscriptions));
+    try testing.expectEqual(State.closed, publishes_stop.get(.closed));
 }
 
 test "a message fits when it is within max_payload, or nine digits when that is unknown" {

@@ -24,7 +24,6 @@ const copy = @import("copy.zig");
 const decode = @import("decode.zig");
 const naming = @import("naming.zig");
 const Tree = @import("tree.zig").Tree;
-const dotenv = @import("parsers/dotenv.zig");
 const env_mod = @import("../env.zig");
 const modes = @import("../modes.zig");
 const env = @import("parsers/env.zig");
@@ -91,19 +90,21 @@ pub fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Erro
     for (options.sources) |source| switch (source) {
         .json_file => |path| {
             has_file_source = true;
-            const text = try readFile(arena, options, path, .required, diag) orelse continue;
+            const text = try readFile(arena, options, path, diag) orelse continue;
             if (try json.parse(arena, text, path, diag)) |object| try tree.merge(object);
         },
         .ini_file => |path| {
             has_file_source = true;
-            const text = try readFile(arena, options, path, .required, diag) orelse continue;
+            const text = try readFile(arena, options, path, diag) orelse continue;
             try tree.merge(try ini.parse(arena, text, path, diag));
         },
         .dotenv => |path| {
             has_env_source = true;
-            const text = try readFile(arena, options, path, .optional, diag) orelse continue;
-            const vars = try dotenv.parse(arena, text, path, diag);
-            try env.placeDotEnv(&tree, leaves, &env_names, &vars, path);
+            const files = env_mod.Files.load(arena, options.io, options.dir, &.{path}, diag) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidEnvFile => continue, // the problems are in `diag`
+            };
+            try env.placeOverlay(&tree, leaves, &env_names, &files);
         },
         .dotenv_files => {
             has_env_source = true;
@@ -129,7 +130,7 @@ pub fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Erro
     config.* = try copy.dupe(T, gpa, value);
 }
 
-/// Like `load`, but on failure logs every problem and exits with status 1.
+/// Like `loadSources`, but on failure logs every problem and exits with status 1.
 pub fn loadSourcesOrExit(gpa: Allocator, config: anytype, options: SourceOptions) void {
     var own_diagnostics: Diagnostics = .init(gpa);
     defer own_diagnostics.deinit();
@@ -268,16 +269,14 @@ fn ConfigType(comptime CfgPtr: type) type {
     return info.pointer.child;
 }
 
-const Presence = enum { required, optional };
-
-/// The file's contents, or null when it can't be read (reported unless an optional file is missing).
-fn readFile(arena: Allocator, options: SourceOptions, path: []const u8, presence: Presence, diag: *Diagnostics) Allocator.Error!?[]const u8 {
+/// The file's contents, or null when it can't be read (reported).
+fn readFile(arena: Allocator, options: SourceOptions, path: []const u8, diag: *Diagnostics) Allocator.Error!?[]const u8 {
     const dir = options.dir orelse std.Io.Dir.cwd();
     // readFileAlloc fails as soon as it has read `limit` bytes, so allow one more.
     return dir.readFileAlloc(options.io, path, arena, .limited(max_file_bytes + 1)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FileNotFound => {
-            if (presence == .required) try diag.add(.{ .kind = .unreadable, .origin = .{ .file = path }, .detail = "file not found" });
+            try diag.add(.{ .kind = .unreadable, .origin = .{ .file = path }, .detail = "file not found" });
             return null;
         },
         error.StreamTooLong => {
@@ -305,6 +304,12 @@ test {
 }
 
 const testing = std.testing;
+
+/// The `.env` files `paths` in `dir` as the overlay `load` builds.
+fn testFiles(arena: Allocator, dir: std.Io.Dir, paths: []const []const u8) !env_mod.Files {
+    var diag: Diagnostics = .init(arena);
+    return env_mod.Files.load(arena, testing.io, dir, paths, &diag);
+}
 
 const TestConfig = struct {
     name: []const u8,
@@ -344,19 +349,18 @@ test "sources apply in order" {
     try environ.put("APP_LOG_LEVEL", "debug");
     try environ.put("APP_HOSTS", "x, y, z");
 
+    var files_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer files_arena.deinit();
+    const files = try testFiles(files_arena.allocator(), tmp.dir, &.{ ".env", ".env.local" }); // the second is missing: skipped
+
     var config: TestConfig = undefined;
     try loadSources(testing.allocator, &config, .{
         .io = testing.io,
         .environ = &environ,
         .env_prefix = "APP_",
         .dir = tmp.dir,
-        .sources = &.{
-            .json("config.json"),
-            .ini("config.ini"),
-            .env(".env"),
-            .env(".env.local"), // missing: skipped
-            .osEnv(),
-        },
+        .overlay = &files,
+        .sources = &.{ .json("config.json"), .ini("config.ini"), .dotenvFiles(), .osEnv() },
     });
     defer free(testing.allocator, config);
 
@@ -399,8 +403,11 @@ test "every problem is reported and config is left untouched" {
     });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = ".env", .data =
         \\APP_DEBUG=maybe
-        \\APP_DEBUG=yes
     });
+
+    var files_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer files_arena.deinit();
+    const files = try testFiles(files_arena.allocator(), tmp.dir, &.{".env"});
 
     var diag: Diagnostics = .init(testing.allocator);
     defer diag.deinit();
@@ -411,16 +418,16 @@ test "every problem is reported and config is left untouched" {
         .env_prefix = "APP_",
         .dir = tmp.dir,
         .diagnostics = &diag,
-        .sources = &.{ .json("config.json"), .json("missing.json"), .env(".env") },
+        .overlay = &files,
+        .sources = &.{ .json("config.json"), .json("missing.json"), .dotenvFiles() },
     }));
     try testing.expectEqualStrings("untouched", config.name);
 
     const text = try std.fmt.allocPrint(testing.allocator, "{f}", .{&diag});
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\8 configuration problems:
+        \\7 configuration problems:
         \\  missing.json: cannot read file (file not found)
-        \\  .env:2: APP_DEBUG: duplicate key (first set on line 1)
         \\  name: missing (set APP_NAME, or "name" in a config file)
         \\  db.host: missing (set APP_DB_HOST, or "db.host" in a config file)
         \\  config.json:3: db.port: invalid (expected an integer 0..65535)
@@ -503,8 +510,12 @@ test "secrets load from any source and never print" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = ".env", .data = "API_TOKEN=tok-123\n" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{ \"db_password\": \"pa55\" }" });
 
+    var files_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer files_arena.deinit();
+    const files = try testFiles(files_arena.allocator(), tmp.dir, &.{".env"});
+
     var config: Config = undefined;
-    try loadSources(testing.allocator, &config, .{ .io = testing.io, .dir = tmp.dir, .sources = &.{ .json("config.json"), .env(".env") } });
+    try loadSources(testing.allocator, &config, .{ .io = testing.io, .dir = tmp.dir, .overlay = &files, .sources = &.{ .json("config.json"), .dotenvFiles() } });
     defer free(testing.allocator, config);
 
     try testing.expectEqualStrings("tok-123", config.api_token.expose());
@@ -543,13 +554,18 @@ test "a secret must be a string" {
 }
 
 fn loadEverything(gpa: Allocator, dir: std.Io.Dir, environ: *const std.process.Environ.Map) !void {
+    var files_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer files_arena.deinit();
+    const files = try testFiles(files_arena.allocator(), dir, &.{".env"});
+
     var config: TestConfig = undefined;
     try loadSources(gpa, &config, .{
         .io = testing.io,
         .environ = environ,
         .env_prefix = "APP_",
         .dir = dir,
-        .sources = &.{ .json("config.json"), .env(".env"), .osEnv() },
+        .overlay = &files,
+        .sources = &.{ .json("config.json"), .dotenvFiles(), .osEnv() },
     });
     free(gpa, config);
 }
@@ -597,6 +613,21 @@ test "loadSourcesOrExit fills config when it is valid" {
     try testing.expectEqualStrings("anole", config.name);
 }
 
+test "variables from a .env(path) file keep their file and line; a missing one is skipped" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "app.env", .data = "# settings\nPORT=eighty\n" });
+
+    try expectProblems(struct { port: u16 }, .{
+        .io = testing.io,
+        .dir = tmp.dir,
+        .sources = &.{ .env("missing.env"), .env("app.env") },
+    },
+        \\1 configuration problem:
+        \\  app.env:2: PORT: invalid (expected an integer 0..65535)
+    );
+}
+
 test "a later source overrides an earlier one of any kind" {
     const Config = struct { a: u8, b: u8, c: u8 };
 
@@ -610,12 +641,17 @@ test "a later source overrides an earlier one of any kind" {
     try environ.put("A", "1");
     try environ.put("C", "1");
 
+    var files_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer files_arena.deinit();
+    const files = try testFiles(files_arena.allocator(), tmp.dir, &.{".env"});
+
     var config: Config = undefined;
     try loadSources(testing.allocator, &config, .{
         .io = testing.io,
         .environ = &environ,
         .dir = tmp.dir,
-        .sources = &.{ .osEnv(), .env(".env"), .json("config.json") },
+        .overlay = &files,
+        .sources = &.{ .osEnv(), .dotenvFiles(), .json("config.json") },
     });
 
     try testing.expectEqual(2, config.a);

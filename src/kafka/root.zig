@@ -170,6 +170,8 @@ pub const Client = struct {
     /// The console's `/db` "system" for this connector.
     pub const console_system = "kafka";
 
+    const Phase = enum { idle, serving, drained };
+
     gpa: std.mem.Allocator,
     io: std.Io,
     arena_state: std.heap.ArenaAllocator,
@@ -187,10 +189,11 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    /// Over `consumers`, `started`, `drained` and `starting`. A leaf.
+    /// Over `consumers`, `phase` and `starting`. A leaf.
     consumers_mutex: std.Io.Mutex = .init,
-    started: bool = false,
-    drained: bool = false,
+    /// idle until a start succeeds, serving until the drain; a drain
+    /// from either is final (a start after it is a no-op).
+    phase: Phase = .idle,
     /// Consumer starts under way outside the lock (`start`, `consume`):
     /// `drain` waits for them (`starts_done`) before it stops and joins the
     /// consumers, so a start never races its consumer's stop.
@@ -329,7 +332,11 @@ pub const Client = struct {
     /// this for you): metrics, spans for calls in traced requests, the
     /// `/readyz` check. Also starts the consumers registered so far.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        if (self.isStarted()) return;
+        {
+            self.consumers_mutex.lockUncancelable(self.io);
+            defer self.consumers_mutex.unlock(self.io);
+            if (self.phase != .idle) return;
+        }
         self.observer = try db.Observer.init(.kafka, self.name, registry, tracer);
         if (registry) |r| {
             self.telemetry = try Telemetry.init(r, self.name);
@@ -345,17 +352,21 @@ pub const Client = struct {
                 return error.KafkaUnavailable;
             };
         }
-        // The consumers added before `started` is set are started here, the
+        // The consumers added before `serving` are started here, the
         // ones after it by `consume`: each by exactly one of the two. A start
         // spawns (and may suspend), and the log line may wait: both after
         // the lock.
         const n = blk: {
             self.consumers_mutex.lockUncancelable(self.io);
             defer self.consumers_mutex.unlock(self.io);
-            // Set only once the observer, telemetry, health check and the
-            // start's refresh succeeded: a failed start can be retried, and
-            // consume does not start groups added before a successful start.
-            self.started = true;
+            // Serving only once the observer, telemetry, health check and
+            // the start's refresh succeeded: a failed start can be retried,
+            // and consume does not start groups added before a successful
+            // start. A drain that raced the setup wins: start nothing.
+            switch (self.phase) {
+                .idle => self.phase = .serving,
+                .serving, .drained => return,
+            }
             break :blk self.consumers.items.len;
         };
         if (self.suppress_consumers) {
@@ -370,7 +381,7 @@ pub const Client = struct {
                 defer self.consumers_mutex.unlock(self.io);
                 // A drain that began meanwhile stops what is started: start
                 // no more.
-                if (self.drained) return;
+                if (self.phase == .drained) return;
                 self.starting += 1;
                 break :blk self.consumers.items[i];
             };
@@ -387,12 +398,6 @@ pub const Client = struct {
         if (self.starting == 0) self.starts_done.broadcast(self.io);
     }
 
-    fn isStarted(self: *Client) bool {
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
-        return self.started;
-    }
-
     /// Adds a consumer; true when it is to be started now (serving has
     /// started), which the caller does after the lock and ends with
     /// `endStart`. `error.Closing` once a drain began: the list `drain`
@@ -400,9 +405,9 @@ pub const Client = struct {
     fn addConsumer(self: *Client, c: *consumer_mod.Consumer) error{ OutOfMemory, Closing }!bool {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
-        if (self.drained) return error.Closing;
+        if (self.phase == .drained) return error.Closing;
         try self.consumers.append(self.gpa, c);
-        const now = self.started and !self.drained and !self.suppress_consumers;
+        const now = self.phase == .serving and !self.suppress_consumers;
         if (now) self.starting += 1;
         return now;
     }
@@ -425,11 +430,11 @@ pub const Client = struct {
     /// committed, groups are left) and flushes the producer, by `deadline`.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
         self.consumers_mutex.lockUncancelable(self.io);
-        if (self.drained) {
+        if (self.phase == .drained) {
             self.consumers_mutex.unlock(self.io);
             return;
         }
-        self.drained = true;
+        self.phase = .drained;
         // No start begins from here on; the ones under way finish first.
         if (self.starting > 0) {
             self.consumers_mutex.unlock(self.io);

@@ -79,12 +79,12 @@ fn writeValue(node: Node, w: *Writer, depth: usize, names: NameTable) Writer.Err
         .object => |members| {
             if (members.len == 0) return w.writeAll("{}");
             try w.writeByte('{');
-            for (members, 0..) |m, i| {
+            for (members, 0..) |mem, i| {
                 if (i > 0) try w.writeByte(',');
                 try newline(w, depth + 1);
-                try std.json.Stringify.encodeJsonString(m.key, .{}, w);
+                try std.json.Stringify.encodeJsonString(mem.key, .{}, w);
                 try w.writeAll(": ");
-                try writeValue(m.value, w, depth + 1, names);
+                try writeValue(mem.value, w, depth + 1, names);
             }
             try newline(w, depth);
             try w.writeByte('}');
@@ -173,11 +173,31 @@ fn writeRaw(text: []const u8, w: *Writer, start: usize) Writer.Error!void {
 pub fn object(comptime members: []const Member) Node {
     return .{ .object = members };
 }
+/// The short builders the schema files use at compile time (one per kind of node).
+pub const obj = object;
+pub fn m(comptime key: []const u8, comptime value: Node) Member {
+    return .{ .key = key, .value = value };
+}
+pub fn arr(comptime items: []const Node) Node {
+    return .{ .array = items };
+}
+pub fn str(comptime s: []const u8) Node {
+    return .{ .string = s };
+}
+pub fn raw(comptime s: []const u8) Node {
+    return .{ .raw = s };
+}
+pub fn typeOnly(comptime t: []const u8) Node {
+    return obj(&.{m("type", str(t))});
+}
+pub fn typeFormat(comptime t: []const u8, comptime f: []const u8) Node {
+    return obj(&.{ m("type", str(t)), m("format", str(f)) });
+}
 
 /// The value of `key` in the members of an object, or null.
 pub fn get(comptime members: []const Member, comptime key: []const u8) ?Node {
-    for (members) |m| {
-        if (std.mem.eql(u8, m.key, key)) return m.value;
+    for (members) |mem| {
+        if (std.mem.eql(u8, mem.key, key)) return mem.value;
     }
     return null;
 }

@@ -833,7 +833,7 @@ test "drain: subscriptions stop and are read to their end, publishes still go ou
 
     var drainer = try io.concurrent(drainClient, .{ &client, Io.Duration.fromSeconds(5) });
     defer drainer.cancel(io) catch {};
-    try awaitState(&client, .draining);
+    try awaitState(&client, .draining_subscriptions);
     // Phase one: no new work, but handlers may still answer.
     try testing.expectError(error.ConnectionDraining, client.subscribe("more", .{}));
     try testing.expectError(error.ConnectionDraining, client.request("service.x", "?", .{}));
@@ -1306,7 +1306,7 @@ test "drain, second phase: publishes and responds fail with ConnectionDraining u
     defer request.deinit();
     var drainer = try io.concurrent(drainClientLong, .{&client});
     defer drainer.cancel(io) catch {};
-    try awaitState(&client, .draining);
+    try awaitState(&client, .draining_subscriptions);
     // First phase: the handler answers what it took.
     try client.respond(&request, "early");
     try testing.expect(try work.next(within_five_seconds) == null);
@@ -1403,7 +1403,7 @@ test "drain: a publish that waits for room as publishes stop fails, and every pu
     try awaitRoomWaitersOf(&client, 1);
     var drainer = try io.concurrent(drainClient, .{ &client, Io.Duration.fromSeconds(10) });
     defer drainer.cancel(io) catch {};
-    try awaitState(&client, .draining);
+    try awaitState(&client, .draining_subscriptions);
     slow.go.store(true, .release);
     try drainer.await(io);
     publisher.await(io);

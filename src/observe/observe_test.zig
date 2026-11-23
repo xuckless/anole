@@ -4,6 +4,7 @@ const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const observe = @import("root.zig");
+const anole_log = @import("anole_log");
 
 var collected: [16 * 1024]u8 = undefined;
 var collected_len: usize = 0;
@@ -159,13 +160,13 @@ test "access log: text and JSON lines" {
     req.id = "rid";
     req.trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
     req.span_id = "00f067aa0ba902b7";
-    const json = try observe.access_log.format(arena_state.allocator(), .json, &req, 200, 42, 1700000000000, null);
+    const json = try observe.access_log.formatLine(arena_state.allocator(), .{ .format = .json }, &req, 200, 42, 1700000000000, null);
     // The shared record: time, level, scope, message, the ids, then the request.
     try std.testing.expect(std.mem.startsWith(u8, json, "{\"time\":\"2023-11-14T22:13:20.000Z\",\"level\":\"info\",\"scope\":\"access\",\"message\":\"GET /a\\\"b 200\","));
     try std.testing.expect(std.mem.indexOf(u8, json, "\"request_id\":\"rid\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"span_id\":\"00f067aa0ba902b7\",\"method\":\"GET\",\"path\":\"/a\\\"b\",\"status\":200,\"duration_us\":42,") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"ts\"") == null);
     try std.testing.expect(std.mem.endsWith(u8, json, "}\n"));
-    const text = try observe.access_log.format(arena_state.allocator(), .text, &req, 404, 7, 0, null);
+    const text = try observe.access_log.formatLine(arena_state.allocator(), .{ .format = .text }, &req, 404, 7, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
 
@@ -177,7 +178,7 @@ test "access log: a request ID cannot add JSON fields" {
     req.method = .get;
     req.url = "/x";
     req.id = "x\",\"status\":200,\"y\":\"\\";
-    const json = try observe.access_log.format(arena, .json, &req, 403, 1, 0, null);
+    const json = try observe.access_log.formatLine(arena, .{ .format = .json }, &req, 403, 1, 0, null);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     try std.testing.expectEqual(@as(i64, 403), parsed.object.get("status").?.integer);
     try std.testing.expectEqualStrings(req.id, parsed.object.get("request_id").?.string);
@@ -430,14 +431,28 @@ test "access log: the query is left out unless log_query" {
     var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/callback?code=secret-code&state=s";
-    const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);
+    const json = try observe.access_log.formatLine(arena, .{ .format = .json }, &req, 200, 1, 0, null);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     try std.testing.expectEqualStrings("/callback", parsed.object.get("path").?.string);
     try std.testing.expect(std.mem.indexOf(u8, json, "secret-code") == null);
-    const text = try observe.access_log.format(arena, .text, &req, 200, 1, 0, null);
+    const text = try observe.access_log.formatLine(arena, .{ .format = .text }, &req, 200, 1, 0, null);
     try std.testing.expect(std.mem.indexOf(u8, text, "secret-code") == null);
     const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
+    // `.auto` follows anole.log; `.text`/`.json` force it.
+    const prev = anole_log.currentFormat();
+    defer anole_log.setFormat(prev);
+    const Row = struct { process: anole_log.Format, line: anole_log.Format, json: bool };
+    for ([_]Row{
+        .{ .process = .json, .line = .auto, .json = true },
+        .{ .process = .text, .line = .auto, .json = false },
+        .{ .process = .text, .line = .json, .json = true },
+        .{ .process = .json, .line = .text, .json = false },
+    }) |row| {
+        anole_log.setFormat(row.process);
+        const out = try observe.access_log.formatLine(arena, .{ .format = row.line }, &req, 200, 1, 0, null);
+        try std.testing.expectEqual(row.json, out[0] == '{');
+    }
 }
 
 test "tracing: OTEL_SERVICE_NAME from the process environment without .process" {
@@ -554,7 +569,7 @@ test "access log json: an error is named in error, and a request without an id h
     var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/users/42";
-    const json = try observe.access_log.format(arena, .json, &req, 500, 9, 0, error.Boom);
+    const json = try observe.access_log.formatLine(arena, .{ .format = .json }, &req, 500, 9, 0, error.Boom);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     try std.testing.expectEqualStrings("access", parsed.object.get("scope").?.string);
     try std.testing.expectEqualStrings("GET /users/42 500", parsed.object.get("message").?.string);
@@ -817,12 +832,31 @@ test "trace: spans close finds unsent are counted finished and dropped" {
     defer client.deinit();
     // Never started: nothing sends what is queued.
     var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "unsent" });
+    // deinit after close: close is a no-op there.
     defer exporter.deinit();
     for ("ghi") |id| exporter.submit(testSpan(id));
-    exporter.close();
-    try std.testing.expectEqual(@as(u64, 3), exporter.queued.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 3), exporter.finished.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 3), exporter.dropped.load(.acquire));
+    // Before start: returns at once (an hour's timeout would hang the test).
+    exporter.flush(.fromSeconds(3600));
+    // Each step, then the counters it leaves: queued, finished, dropped.
+    const Step = enum { close, close_again, submit_closed, flush_closed };
+    const rows = [_]struct { Step, [3]u64 }{
+        .{ .close, .{ 3, 3, 3 } },
+        .{ .close_again, .{ 3, 3, 3 } },
+        .{ .submit_closed, .{ 3, 3, 4 } },
+        .{ .flush_closed, .{ 3, 3, 4 } },
+    };
+    for (rows) |row| {
+        switch (row[0]) {
+            .close, .close_again => exporter.close(),
+            .submit_closed => exporter.submit(testSpan('j')),
+            .flush_closed => exporter.flush(.fromSeconds(3600)),
+        }
+        const got = [3]u64{ exporter.queued.load(.acquire), exporter.finished.load(.acquire), exporter.dropped.load(.acquire) };
+        std.testing.expectEqualSlices(u64, &row[1], &got) catch |err| {
+            std.debug.print("step {t}\n", .{row[0]});
+            return err;
+        };
+    }
     try std.testing.expectEqual(@as(u64, 0), exporter.exported.load(.acquire));
 }
 

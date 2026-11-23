@@ -233,6 +233,9 @@ pub const Msg = struct {
     }
 };
 
+/// A `Client`'s lifecycle (its `phase`).
+pub const Phase = enum(u8) { idle, serving, closing };
+
 /// The client: `app.nats(options)` makes one.
 pub const Client = struct {
     /// The console's `/db` "system" for this connector.
@@ -261,12 +264,14 @@ pub const Client = struct {
     hooks: std.ArrayList(Hook) = .empty,
     /// Delivery and message tasks.
     group: std.Io.Group = .init,
-    started: bool = false,
+    /// `start` moves idle -> serving (CAS), `drain` anything -> closing
+    /// (swap); nothing else writes it. Handlers and hooks begin only while
+    /// serving.
+    phase: std.atomic.Value(Phase) = .init(.idle),
     /// Set by `app.nats` under `deployment = lambda`: handlers and
     /// JetStream consumers do not start (the process is frozen between
     /// invocations); publishing, requests and `subscribe` by hand work.
     suppress_consumers: bool = false,
-    closing: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
 
     /// The console's `/db` entry. The core clients keep their own
@@ -363,7 +368,7 @@ pub const Client = struct {
     /// Connects (every connection), ensures JetStream streams and
     /// consumers, starts handlers. `app` calls it when serving starts.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        if (self.started) return;
+        if (self.phase.load(.acquire) != .idle) return;
         self.observer = try .init(.nats, self.label, registry, tracer);
         try self.guard.observe(self.gpa, registry);
         if (health) |h| if (self.readiness_on) try h.addCheck(self.label, readyCheck, self);
@@ -378,7 +383,8 @@ pub const Client = struct {
                 log.warn("nats \"{s}\": not connected yet ({t}); trying in the background", .{ self.label, err });
             };
         }
-        self.started = true;
+        // A drain during the connects wins: nothing begins on a cancelled group.
+        if (self.phase.cmpxchgStrong(.idle, .serving, .acq_rel, .acquire) != null) return;
         if (need_js) {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
@@ -407,18 +413,23 @@ pub const Client = struct {
 
     pub fn addHook(self: *Client, hook: Hook) !void {
         try self.hooks.append(self.gpa, hook);
-        if (self.started and !self.suppress_consumers) try hook.begin(hook.context);
+        if (self.beginsNow()) try hook.begin(hook.context);
     }
 
     /// Stops handlers (subscriptions drain: messages taken are finished),
     /// flushes and closes; by `deadline`. `deinit` calls it.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
-        if (self.closing.swap(true, .acq_rel)) return;
+        if (self.phase.swap(.closing, .acq_rel) == .closing) return;
         for (self.cores) |*c| {
             if (!c.isConnected()) continue;
             c.drain(.{ .timeout = .{ .deadline = deadline } }) catch {};
         }
         self.group.cancel(self.io);
+    }
+
+    /// Whether a handler or hook added now begins at once.
+    fn beginsNow(self: *const Client) bool {
+        return self.phase.load(.acquire) == .serving and !self.suppress_consumers;
     }
 
     pub fn deinit(self: *Client) void {
@@ -440,7 +451,7 @@ pub const Client = struct {
 
     fn readyCheck(ctx: ?*anyopaque) bool {
         const self: *Client = @ptrCast(@alignCast(ctx.?));
-        if (self.closing.load(.acquire)) return false;
+        if (self.phase.load(.acquire) == .closing) return false;
         for (self.cores) |*c| if (!c.isConnected()) return false;
         return true;
     }
@@ -551,7 +562,7 @@ pub const Client = struct {
         };
         if (opts.queue) |q| h.opts.queue = try a.dupe(u8, q);
         try self.handlers.append(self.gpa, h);
-        if (self.started and !self.suppress_consumers) try h.begin();
+        if (self.beginsNow()) try h.begin();
     }
 
     // -- errors ------------------------------------------------------------

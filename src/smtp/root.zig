@@ -505,7 +505,7 @@ pub const Client = struct {
     /// What a send's attempts share.
     const Attempt = struct {
         /// The final "." may have reached the server.
-        after_dot: bool = false,
+        dot_sent: bool = false,
     };
 
     fn deliver(self: *Client, ctx: *const Ctx, composed: *const mime.Composed, opts: CallOptions) Error!Sent {
@@ -520,10 +520,10 @@ pub const Client = struct {
         var attempt: Attempt = .{};
         var n: u32 = 1;
         while (true) : (n += 1) {
-            attempt.after_dot = false;
+            attempt.dot_sent = false;
             const r = internal.guarded(ctx, &self.guard, self.errors, false, deadline, attemptOnce, .{ self, ctx, composed, timeout, &attempt });
             const out = r catch |err| {
-                if (!opts.retry or attempt.after_dot or n >= self.guard.retry.attempts or !self.retryable(ctx, err)) return err;
+                if (!opts.retry or attempt.dot_sent or n >= self.guard.retry.attempts or !self.retryable(ctx, err)) return err;
                 if (!self.guard.throttle.allowRetry()) return err;
                 self.guard.throttle.onFailure();
                 var rb: [8]u8 = undefined;
@@ -590,12 +590,12 @@ pub const Client = struct {
         var stale: u8 = 0;
         while (true) {
             const r = s.transact(ctx, self.errors, ctx.io, c, self.max_message_bytes) catch |err| {
-                attempt.after_dot = attempt.after_dot or s.after_dot;
+                attempt.dot_sent = attempt.dot_sent or s.txn == .dot_sent;
                 // A connection taken idle that the server had closed meanwhile
                 // fails before it accepted anything: once more on another, not
                 // a failure of the send.
-                if (s.reused and !s.mail_accepted and !s.after_dot and stale < 3 and isStale(err, s)) {
-                    s.broken = true;
+                if (s.reused and s.txn == .idle and stale < 3 and isStale(err, s)) {
+                    s.markBroken();
                     self.give(s);
                     stale += 1;
                     s = try self.take(ctx);
@@ -631,7 +631,7 @@ pub const Client = struct {
             self.give(s);
             return @errorCast(err);
         }
-        s.broken = true;
+        s.markBroken();
         const cause = switch (err) {
             error.ReadFailed => s.stream.readError() orelse err,
             error.WriteFailed => s.stream.writeError() orelse err,

@@ -98,6 +98,21 @@ fn socketDir(buf: []u8, env: Env) ![]const u8 {
     return ui.discover.defaultDir(buf, vars) catch ui.discover.fallbackDir(buf, vars.uid);
 }
 
+/// One owned socket choice; `name` stays null for a path target until the
+/// hello names the app.
+const Target = struct {
+    path: []u8,
+    name: ?[]u8,
+
+    fn deinit(t: Target, gpa: std.mem.Allocator) void {
+        gpa.free(t.path);
+        if (t.name) |n| gpa.free(n);
+    }
+};
+
+/// Either the app to attach to or the exit code of a pick that found none.
+const Choice = union(enum) { target: Target, exit: u8 };
+
 pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: Env) !u8 {
     if (!sys.supported) {
         warn("anole console: not available on Windows yet; use WSL2 or Docker\n", .{});
@@ -113,64 +128,72 @@ pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: 
     };
     var dir_buf: [256]u8 = undefined;
     const dir = socketDir(&dir_buf, env) catch "/tmp";
-    const target = ui.discover.parseTarget(a.target);
-
-    // The socket to use.
-    var path_owned: ?[]u8 = null;
-    defer if (path_owned) |p| gpa.free(p);
-    var name_owned: ?[]u8 = null;
-    defer if (name_owned) |p| gpa.free(p);
     const entries = try ui.discover.list(gpa, io, dir, .{ .alive = alive });
     defer ui.discover.freeEntries(gpa, entries);
 
-    if (a.list) {
-        if (entries.len == 0) {
-            say("no Anole app with a console is running for this user (looked in {s})\n", .{dir});
-            return exit_no_app;
-        }
-        say("{s:<24} {s:>8} {s:>10}  {s}\n", .{ "NAME", "PID", "UP", "SOCKET" });
-        const now_ms = sys.wallMs();
-        for (entries) |e| {
-            const up_s: i64 = @max(0, @divTrunc(now_ms - @as(i64, @intCast(@divTrunc(e.mtime_ns, std.time.ns_per_ms))), 1000));
-            say("{s:<24} {d:>8} {d:>9}s  {s}\n", .{ e.name, @as(u64, @intCast(@max(0, e.pid))), @as(u64, @intCast(up_s)), e.path });
-        }
-        return 0;
+    if (a.list) return listApps(entries, dir);
+    const target = switch (try chooseTarget(gpa, entries, ui.discover.parseTarget(a.target), dir)) {
+        .target => |t| t,
+        .exit => |code| return code,
+    };
+    if (a.snapshot) |view_name| {
+        defer target.deinit(gpa);
+        return snapshot(gpa, io, target.path, view_name);
     }
+    return attachLoop(gpa, io, target, dir, a.wedge_s);
+}
 
-    var chosen: ?ui.discover.Entry = null;
+fn listApps(entries: []const ui.discover.Entry, dir: []const u8) u8 {
+    if (entries.len == 0) {
+        say("no Anole app with a console is running for this user (looked in {s})\n", .{dir});
+        return exit_no_app;
+    }
+    say("{s:<24} {s:>8} {s:>10}  {s}\n", .{ "NAME", "PID", "UP", "SOCKET" });
+    const now_ms = sys.wallMs();
+    for (entries) |e| {
+        const up_s: i64 = @max(0, @divTrunc(now_ms - @as(i64, @intCast(@divTrunc(e.mtime_ns, std.time.ns_per_ms))), 1000));
+        say("{s:<24} {d:>8} {d:>9}s  {s}\n", .{ e.name, @as(u64, @intCast(@max(0, e.pid))), @as(u64, @intCast(up_s)), e.path });
+    }
+    return 0;
+}
+
+/// Resolves the target to one socket: a path as given, or the one app
+/// matching a name or pid, or the numbered pick when several match.
+fn chooseTarget(gpa: std.mem.Allocator, entries: []const ui.discover.Entry, target: ui.discover.Target, dir: []const u8) !Choice {
     switch (target) {
-        .path => |p| path_owned = try gpa.dupe(u8, p),
-        else => {
-            const picked = try ui.discover.select(gpa, entries, target);
-            defer gpa.free(picked);
-            if (picked.len == 0) {
-                warn("anole console: no Anole app with a console is running for this user (looked in {s})\n", .{dir});
-                return exit_no_app;
-            }
-            if (picked.len == 1) {
-                chosen = picked[0];
-            } else {
-                warn("several apps have a console:\n", .{});
-                for (picked, 1..) |e, n| warn("  {d}) {s} (pid {d})\n", .{ n, e.name, e.pid });
-                if (!sys.isatty(0) or !sys.isatty(2)) {
-                    warn("name one (anole console <name>|<pid>)\n", .{});
-                    return exit_no_app;
-                }
-                warn("number: ", .{});
-                var line: [32]u8 = undefined;
-                const n = sys.read(0, &line) catch 0;
-                const choice = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..n], " \r\n"), 10) catch 0;
-                if (choice == 0 or choice > picked.len) return exit_no_app;
-                chosen = picked[choice - 1];
-            }
-            path_owned = try gpa.dupe(u8, chosen.?.path);
-            name_owned = try gpa.dupe(u8, chosen.?.name);
-        },
+        .path => |p| return .{ .target = .{ .path = try gpa.dupe(u8, p), .name = null } },
+        else => {},
     }
+    const picked = try ui.discover.select(gpa, entries, target);
+    defer gpa.free(picked);
+    if (picked.len == 0) {
+        warn("anole console: no Anole app with a console is running for this user (looked in {s})\n", .{dir});
+        return .{ .exit = exit_no_app };
+    }
+    var chosen = picked[0];
+    if (picked.len > 1) {
+        warn("several apps have a console:\n", .{});
+        for (picked, 1..) |e, n| warn("  {d}) {s} (pid {d})\n", .{ n, e.name, e.pid });
+        if (!sys.isatty(0) or !sys.isatty(2)) {
+            warn("name one (anole console <name>|<pid>)\n", .{});
+            return .{ .exit = exit_no_app };
+        }
+        warn("number: ", .{});
+        var line: [32]u8 = undefined;
+        const n = sys.read(0, &line) catch 0;
+        const choice = std.fmt.parseInt(usize, std.mem.trim(u8, line[0..n], " \r\n"), 10) catch 0;
+        if (choice == 0 or choice > picked.len) return .{ .exit = exit_no_app };
+        chosen = picked[choice - 1];
+    }
+    const path = try gpa.dupe(u8, chosen.path);
+    errdefer gpa.free(path);
+    return .{ .target = .{ .path = path, .name = try gpa.dupe(u8, chosen.name) } };
+}
 
-    if (a.snapshot) |view_name| return snapshot(gpa, io, path_owned.?, view_name);
-
-    // Interactive.
+/// Owns `target` (its path is replaced after each restart).
+fn attachLoop(gpa: std.mem.Allocator, io: Io, target_in: Target, dir: []const u8, wedge_s: u32) !u8 {
+    var target = target_in;
+    defer target.deinit(gpa);
     var term = ui.term.Terminal.open() catch |err| switch (err) {
         error.NotATerminal, error.DumbTerminal => {
             warn("anole console: needs a terminal (TERM is dumb or there is none); use --snapshot <view> for scripts\n", .{});
@@ -184,48 +207,38 @@ pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: 
     defer term.close();
     installSignalHandlers();
 
-    var path: []u8 = try gpa.dupe(u8, path_owned.?);
-    defer gpa.free(path);
-    var name: ?[]u8 = if (name_owned) |n| try gpa.dupe(u8, n) else null;
-    defer if (name) |n| gpa.free(n);
-
     while (true) {
-        var conn = connect(gpa, io, path) catch |err| {
-            warn("anole console: cannot attach to {s}: {t}\n", .{ path, err });
+        var conn = connect(gpa, io, target.path) catch |err| {
+            warn("anole console: cannot attach to {s}: {t}\n", .{ target.path, err });
             return if (err == error.Refused or err == error.Version) exit_refused else exit_no_app;
         };
         defer conn.deinit();
         const hello = conn.hello.?;
-        if (name == null) name = try gpa.dupe(u8, hello.app.?.name);
+        if (target.name == null) target.name = try gpa.dupe(u8, hello.app.?.name);
         const pid = hello.app.?.pid;
 
-        var have_launch = false;
         var launch: ?ui.relaunch.LaunchInfo = null;
         var launch_arena = std.heap.ArenaAllocator.init(gpa);
         defer launch_arena.deinit();
         if (hello.allow != null and hello.allow.?.full_restart) {
-            if (fetchLaunchInfo(&conn, launch_arena.allocator())) |li| {
-                launch = li;
-                have_launch = true;
-            }
+            launch = fetchLaunchInfo(&conn, launch_arena.allocator());
         }
 
-        var kill: ui.run.KillRequest = undefined;
-        var kill_set: ?ui.run.KillRequest = null;
-        _ = &kill;
+        // run() writes this only for a kill restart; a hand-off or exec
+        // restart leaves it as "no kill requested".
+        var kill: ui.run.KillRequest = .{ .send_kill = false, .then = .wait_for_supervisor };
         const exit = ui.run.run(gpa, .{
             .mode = .attach,
             .term = &term,
             .conn = &conn,
-            .wedge_timeout_ms = a.wedge_s * 1000,
-            .have_launch_info = have_launch,
+            .wedge_timeout_ms = wedge_s * 1000,
+            .have_launch_info = launch != null,
             .kill = &kill,
         }) catch |err| {
             term.leave();
             warn("anole console: {t}\n", .{err});
             return 1;
         };
-        _ = &kill_set;
         switch (exit) {
             .quit, .back_to_logs, .interrupt, .server_gone => {
                 conn.close();
@@ -239,19 +252,18 @@ pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: 
                 conn.close();
                 if (launch != null and kill.send_kill) {
                     ui.relaunch.killAndWait(pid, 10_000, .{}) catch {};
-                    if (!std.mem.eql(u8, sup_kind, "none") or kill.then == .wait_for_supervisor) {
-                        // supervised: wait for it to bring the app back
-                    } else {
+                    // Supervised: it brings the app back; otherwise relaunch.
+                    if (std.mem.eql(u8, sup_kind, "none") and kill.then != .wait_for_supervisor) {
                         var out_path_buf: [300]u8 = undefined;
-                        const out_path = std.fmt.bufPrint(&out_path_buf, "{s}/{s}.out", .{ dir, name.? }) catch "/dev/null";
+                        const out_path = std.fmt.bufPrint(&out_path_buf, "{s}/{s}.out", .{ dir, target.name.? }) catch "/dev/null";
                         _ = ui.relaunch.relaunch(gpa, launch.?, out_path) catch {};
                     }
                 }
                 const wait_ms: u32 = if (kill.send_kill) 60_000 else 20_000;
-                const found = ui.relaunch.waitForSocket(gpa, io, dir, name.?, if (kill.send_kill) pid else pid, wait_ms, .{}) catch null;
+                const found = ui.relaunch.waitForSocket(gpa, io, dir, target.name.?, pid, wait_ms, .{}) catch null;
                 if (found) |p| {
-                    gpa.free(path);
-                    path = p;
+                    gpa.free(target.path);
+                    target.path = p;
                     continue;
                 }
                 // An exec restart keeps the pid: the same path comes back.

@@ -145,7 +145,7 @@ pub fn Chain(comptime Ctx: type) type {
                         // with framing that doesn't account for an error body.
                         // We can't safely rewrite it as a 500; abort the
                         // connection instead of corrupting the response.
-                        log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                        if (!expect_log.swallow()) log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
                     self.handleError(err);

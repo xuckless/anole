@@ -643,9 +643,7 @@ pub const Client = struct {
     bytes_up: ?*observe.metrics.Counter = null,
     bytes_down: ?*observe.metrics.Counter = null,
     memory_gauge: ?*observe.metrics.Gauge = null,
-    ready_mutex: std.Io.Mutex = .init,
-    ready_at: ?std.Io.Clock.Timestamp = null,
-    ready_ok: bool = false,
+    ready: db.Readiness,
     /// Uploads in flight (so `drain` can wait for them).
     uploads_live: std.atomic.Value(u32) = .init(0),
     /// Wakes whoever waits for upload memory or room.
@@ -707,9 +705,7 @@ pub const Client = struct {
         self.bytes_up = null;
         self.bytes_down = null;
         self.memory_gauge = null;
-        self.ready_mutex = .init;
-        self.ready_at = null;
-        self.ready_ok = false;
+        self.ready = .{ .io = io, .context = self, .ping = ping, .ttl = .fromSeconds(5) };
         self.uploads_live = .init(0);
         self.bell = .{};
         self.guard = try .init(.s3, self.label, opts.breaker, opts.retry orelse .{ .attempts = 1 });
@@ -794,7 +790,7 @@ pub const Client = struct {
             }
             self.creds.start();
         }
-        if (health) |h| if (self.readiness_on) try h.addCheck(self.label, readyCheck, self);
+        if (health) |h| if (self.readiness_on) try self.ready.register(h, self.label);
         self.started = true;
     }
 
@@ -827,18 +823,17 @@ pub const Client = struct {
         gpa.destroy(self);
     }
 
-    fn readyCheck(ctx: ?*anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx.?));
-        self.ready_mutex.lock(self.io) catch return false;
-        defer self.ready_mutex.unlock(self.io);
-        const now: std.Io.Clock.Timestamp = .now(self.io, .awake);
-        if (self.ready_at) |at| if (at.durationTo(now).raw.nanoseconds < 5 * std.time.ns_per_s) return self.ready_ok;
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self: *Client = @ptrCast(@alignCast(context));
+        if (self.default_bucket == null) return true;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        var ctx_: db.Ctx = .{ .io = self.io, .arena = arena.allocator() };
-        self.ready_ok = if (self.default_bucket == null) true else if (self.with(.{ .timeout = .fromSeconds(2), .retry = false }).headBucket(&ctx_)) true else |_| false;
-        self.ready_at = .now(self.io, .awake);
-        return self.ready_ok;
+        var ctx_: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        self.with(.{ .timeout = .fromSeconds(2), .retry = false }).headBucket(&ctx_) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
+        return true;
     }
 
     /// The console's `/db` entry.

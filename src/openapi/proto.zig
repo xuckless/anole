@@ -86,27 +86,13 @@ pub const status_error_ref: json.Node = .{ .ref = &statusErrorFn };
 
 // ------------------------------------------------------------------ node builders
 
-fn m(comptime key: []const u8, comptime value: json.Node) json.Member {
-    return .{ .key = key, .value = value };
-}
-fn obj(comptime members: []const json.Member) json.Node {
-    return .{ .object = members };
-}
-fn arr(comptime items: []const json.Node) json.Node {
-    return .{ .array = items };
-}
-fn str(comptime s: []const u8) json.Node {
-    return .{ .string = s };
-}
-fn raw(comptime s: []const u8) json.Node {
-    return .{ .raw = s };
-}
-fn typeOnly(comptime t: []const u8) json.Node {
-    return obj(&.{m("type", str(t))});
-}
-fn typeFormat(comptime t: []const u8, comptime f: []const u8) json.Node {
-    return obj(&.{ m("type", str(t)), m("format", str(f)) });
-}
+const m = json.m;
+const obj = json.obj;
+const arr = json.arr;
+const str = json.str;
+const raw = json.raw;
+const typeOnly = json.typeOnly;
+const typeFormat = json.typeFormat;
 /// `node` or null.
 fn orNull(comptime node: json.Node) json.Node {
     return obj(&.{m("oneOf", arr(&.{ node, typeOnly("null") }))});

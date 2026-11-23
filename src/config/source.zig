@@ -3,7 +3,7 @@
 //! Where configuration comes from.
 
 /// One configuration source. Create it with `.json(path)`, `.ini(path)`,
-/// `.env(path)` or `.osEnv()`.
+/// `.env(path)`, `.dotenvFiles()` or `.osEnv()`.
 pub const ConfigSource = union(enum) {
     json_file: []const u8,
     ini_file: []const u8,

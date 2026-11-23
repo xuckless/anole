@@ -14,6 +14,30 @@ const sys = ui.sys;
 
 pub const CloseReason = enum(u32) { quit = 0, interrupt = 1, restarting = 2 };
 
+const close_reason = std.EnumArray(ui.run.Exit, CloseReason).init(.{
+    .quit = .quit,
+    .back_to_logs = .quit,
+    .interrupt = .interrupt,
+    .restarted = .restarting,
+    .server_gone = .quit,
+});
+
+test "inprocess: every Exit maps to its CloseReason, a failed handshake (no Exit) to quit" {
+    const rows = [_]struct { exit: ?ui.run.Exit, want: CloseReason }{
+        .{ .exit = .quit, .want = .quit },
+        .{ .exit = .back_to_logs, .want = .quit },
+        .{ .exit = .interrupt, .want = .interrupt },
+        .{ .exit = .restarted, .want = .restarting },
+        .{ .exit = .server_gone, .want = .quit },
+        .{ .exit = null, .want = .quit },
+    };
+    for (rows) |r| try std.testing.expectEqual(r.want, reasonOf(r.exit));
+}
+
+fn reasonOf(exit: ?ui.run.Exit) CloseReason {
+    return if (exit) |e| close_reason.get(e) else .quit;
+}
+
 pub const OpenError = error{ AlreadyOpen, NotRunning, Busy, SystemResources, OutOfMemory } || ui.term.OpenError;
 
 pub const Closed = *const fn (ctx: ?*anyopaque, reason: CloseReason) void;
@@ -41,9 +65,8 @@ pub const InProcess = struct {
     client_fd: sys.fd_t = -1,
     capture: Capture = .{},
     finished: std.atomic.Value(bool) = .init(false),
-    interrupted: bool = false,
-    reason: CloseReason = .quit,
-    server_gone: bool = false,
+    /// How the TUI ended; null when the handshake failed. Written and read on the TUI thread.
+    exit: ?ui.run.Exit = null,
 };
 
 pub fn isOpen() bool {
@@ -66,8 +89,7 @@ pub fn open(gpa: std.mem.Allocator, svc: *service_mod.Service, logs: ?*logring.L
     errdefer self.term.close();
     const pair = os.socketpair() catch return error.SystemResources;
     errdefer sys.close(pair[1]);
-    self.service.adopt(pair[0], true) catch |e| {
-        sys.close(pair[1]);
+    self.service.adopt(pair[0]) catch |e| {
         return switch (e) {
             error.Busy => error.Busy,
             else => error.SystemResources,
@@ -120,30 +142,14 @@ fn run(self: *InProcess) void {
     var conn = ui.client.Conn.init(gpa, self.client_fd, self.client_fd);
     defer conn.deinit();
     conn.handshake("anole in-process", 5000, sys.monotonicMs) catch return;
-    const exit = ui.run.run(gpa, .{
+    self.exit = ui.run.run(gpa, .{
         .mode = .in_process,
         .term = &self.term,
         .conn = &conn,
         .wake_fd = self.wake[0],
-        .on_interrupt = onInterrupt,
-        .ctx = self,
     }) catch .server_gone;
-    switch (exit) {
-        .quit, .back_to_logs => self.reason = .quit,
-        .interrupt => {
-            self.interrupted = true;
-            self.reason = .interrupt;
-        },
-        .restarted => self.reason = .restarting,
-        .server_gone => self.server_gone = true,
-    }
     conn.close();
     self.client_fd = -1;
-}
-
-fn onInterrupt(ctx: ?*anyopaque) void {
-    const self: *InProcess = @ptrCast(@alignCast(ctx.?));
-    self.interrupted = true;
 }
 
 fn cleanup(self: *InProcess) void {
@@ -155,8 +161,8 @@ fn cleanup(self: *InProcess) void {
     sys.close(self.wake[1]);
     const cb = self.on_closed;
     const ctx = self.ctx;
-    const reason = self.reason;
-    const interrupted = self.interrupted;
+    const reason = reasonOf(self.exit);
+    const interrupted = self.exit == .interrupt;
     active.store(null, .release);
     if (cb) |f| f(ctx, reason);
     if (interrupted) _ = sys.kill(sys.getpid(), sys.Sig.int);
