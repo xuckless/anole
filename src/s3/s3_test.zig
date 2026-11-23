@@ -390,25 +390,30 @@ test "s3: deinit before finish aborts the multipart upload" {
 }
 
 test "s3: upload lifecycle: calls after finish, a failure or abort; deinit in each phase" {
-    const Step = struct { op: enum { write, write_parts, finish, abort }, err: ?anyerror = null, code: []const u8 = "" };
+    const Step = struct { op: enum { write, write_parts, wait_held, finish, abort, poll, await_done }, err: ?anyerror = null, code: []const u8 = "" };
     const over_w: Step = .{ .op = .write, .err = error.BadRequest, .code = "upload_over" };
     const over_f: Step = .{ .op = .finish, .err = error.BadRequest, .code = "upload_over" };
     const replay_w: Step = .{ .op = .write, .err = error.ServiceUnavailable, .code = "InternalError" };
     const replay_f: Step = .{ .op = .finish, .err = error.ServiceUnavailable, .code = "InternalError" };
-    // Every row ends in deinit; none may leave a multipart upload or send a DELETE.
-    const rows = [_]struct { name: []const u8, fail: bool = false, steps: []const Step }{
+    const parts_held = [_]Step{ .{ .op = .write_parts }, .{ .op = .wait_held } };
+    // Every row ends in deinit, then no multipart upload is left and `deletes` DELETEs were sent.
+    const rows = [_]struct { name: []const u8, fail: bool = false, hold: enum { none, parts, create } = .none, deletes: usize = 0, steps: []const Step }{
         .{ .name = "deinit while open", .steps = &.{.{ .op = .write }} },
         .{ .name = "write after finish, finish twice", .steps = &.{ .{ .op = .write }, .{ .op = .finish }, over_w, .{ .op = .finish } } },
         .{ .name = "a failure replays to write and finish", .fail = true, .steps = &.{ .{ .op = .write }, replay_f, replay_w, replay_f } },
         .{ .name = "failure, abort: the failure still replays", .fail = true, .steps = &.{ .{ .op = .write }, replay_f, .{ .op = .abort }, replay_w, replay_f } },
-        .{ .name = "abort, write, finish, abort twice", .steps = &.{ .{ .op = .write }, .{ .op = .abort }, over_w, over_f, .{ .op = .abort } } },
+        .{ .name = "abort, poll, await, write, finish, abort twice", .steps = &.{ .{ .op = .write }, .{ .op = .abort }, .{ .op = .poll, .err = error.Database }, .{ .op = .await_done, .err = error.Database, .code = "upload_over" }, over_w, over_f, .{ .op = .abort } } },
         .{ .name = "abort after a multipart success is a no-op", .steps = &.{ .{ .op = .write_parts }, .{ .op = .finish }, .{ .op = .abort }, over_w } },
+        .{ .name = "abort with a part in flight, then deinit: one DELETE", .hold = .parts, .deletes = 1, .steps = &(parts_held ++ [_]Step{.{ .op = .abort }}) },
+        .{ .name = "deinit during CreateMultipartUpload frees the taken part", .hold = .create, .steps = &parts_held },
     };
     for (rows) |row| {
         errdefer std.debug.print("row: {s}\n", .{row.name});
         const env = try Env.init(.{ .part_size = 5 * mib });
         defer env.deinit();
         if (row.fail) try env.fake.addFault(.{ .method = "PUT", .remaining = 1000, .status = 500, .code = "InternalError" });
+        env.fake.hold_parts = row.hold == .parts;
+        env.fake.hold_create = row.hold == .create;
         const q = Quiet.on();
         defer q.done();
         const data = try pattern(env.ctx.arena, 6 * mib, 7);
@@ -417,18 +422,25 @@ test "s3: upload lifecycle: calls after finish, a failure or abort; deinit in ea
             const r: anyerror!void = switch (s.op) {
                 .write => if (up.write(env.c(), data[0..1])) |_| {} else |e| e,
                 .write_parts => if (up.write(env.c(), data)) |_| {} else |e| e,
+                .wait_held => wait.waitUntil(tio(), "a request is held", env.fake, struct {
+                    fn held(fake: *FakeServer) bool {
+                        return fake.held_parts.load(.acquire) != 0;
+                    }
+                }.held),
                 .finish => if (up.finish(env.c())) |_| {} else |e| e,
                 .abort => up.abort(),
+                .poll => if (up.poll()) |res| (if (res) |_| {} else |e| e) else error.TestPollPending,
+                .await_done => if (up.awaitDone(env.c())) |_| {} else |e| e,
             };
             const e = s.err orelse {
                 try r;
                 continue;
             };
             try testing.expectError(e, r);
-            try testing.expectEqualStrings(s.code, env.lastCode());
+            if (s.code.len != 0) try testing.expectEqualStrings(s.code, env.lastCode());
         }
         up.deinit();
-        try testing.expectEqual(@as(usize, 0), env.fake.count("DELETE", "uploadId="));
+        try testing.expectEqual(row.deletes, env.fake.count("DELETE", "uploadId="));
         try testing.expectEqual(@as(usize, 0), env.fake.openUploads());
     }
 }

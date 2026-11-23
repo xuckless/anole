@@ -85,13 +85,15 @@ pub const FakeServer = struct {
     next_upload: u32 = 1,
     /// The key and secret requests must be signed with.
     expect_token: ?[]const u8 = null,
-    /// Part uploads wait here until `releaseParts` (back-pressure tests).
+    /// Part uploads (and with `hold_create` CreateMultipartUpload) wait
+    /// here until `releaseParts` (back-pressure and cancel tests).
     hold_parts: bool = false,
+    hold_create: bool = false,
     parts_gate: std.Io.Event = .unset,
     /// A GET of a key in `stall_keys` sends half its body and then waits.
     stall_gets: bool = false,
     stall_gate: std.Io.Event = .unset,
-    /// Requests currently inside a handler holding a part.
+    /// Requests currently waiting at `parts_gate`.
     held_parts: std.atomic.Value(u32) = .init(0),
     now_override: ?i64 = null,
     /// Seconds the fake's own clock is ahead of the test process's. As S3
@@ -771,6 +773,7 @@ pub const FakeServer = struct {
     // ---- Multipart ----------------------------------------------------------------------
 
     fn initiate(self: *FakeServer, req: *dusty.Request, res: *dusty.Response, bucket: []const u8, key: []const u8) !void {
+        if (self.hold_create) self.waitGate();
         try self.lock();
         defer self.unlock();
         const id = try std.fmt.allocPrint(self.arena.allocator(), "upload-{d}", .{self.next_upload});
@@ -786,13 +789,15 @@ pub const FakeServer = struct {
         res.body = try std.fmt.allocPrint(res.arena, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult><Bucket>{s}</Bucket><Key>{s}</Key><UploadId>{s}</UploadId></InitiateMultipartUploadResult>", .{ bucket, try escapeXml(res.arena, key), id });
     }
 
+    fn waitGate(self: *FakeServer) void {
+        _ = self.held_parts.fetchAdd(1, .acq_rel);
+        defer _ = self.held_parts.fetchSub(1, .acq_rel);
+        self.parts_gate.wait(self.io) catch {};
+    }
+
     fn uploadPart(self: *FakeServer, req: *dusty.Request, res: *dusty.Response, id: []const u8, number_text: []const u8) !void {
         const body = (try req.body()) orelse "";
-        if (self.hold_parts) {
-            _ = self.held_parts.fetchAdd(1, .acq_rel);
-            defer _ = self.held_parts.fetchSub(1, .acq_rel);
-            self.parts_gate.wait(self.io) catch {};
-        }
+        if (self.hold_parts) self.waitGate();
         const number = std.fmt.parseInt(u16, number_text, 10) catch return errorXml(res, .bad_request, "InvalidArgument", "bad part number");
         try self.lock();
         defer self.unlock();

@@ -423,9 +423,9 @@ pub const Upload = struct {
                 const p = part orelse break;
                 if (self.upload_id == null) {
                     self.createRemote(&ctx) catch |err| {
-                        if (err == error.Canceled) return error.Canceled;
-                        self.setFailure(&ctx, err);
+                        if (err != error.Canceled) self.setFailure(&ctx, err);
                         self.dropPart(p);
+                        if (err == error.Canceled) return error.Canceled;
                         break;
                     };
                 }
@@ -511,12 +511,15 @@ pub const Upload = struct {
             self.unlock();
             self.dropPart(p);
         } else |err| {
+            // The failure before the part leaves `inflight`: a driver that
+            // sees `inflight == 0` must also see it, or it completes
+            // without this part.
+            if (err != error.Canceled) self.setFailure(&ctx, err);
             self.dropPart(p);
             if (err == error.Canceled) {
                 self.wake.ring(self.io);
                 return error.Canceled;
             }
-            self.setFailure(&ctx, err);
         }
         self.notify();
         self.wake.ring(self.io);
