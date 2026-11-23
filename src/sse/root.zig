@@ -476,7 +476,7 @@ pub const Topics = struct {
                 body.retain();
                 if (sub.claimSender()) {
                     started.append(self.gpa, sub) catch {
-                        sub.running = false;
+                        _ = sub.transition(.sender_idle);
                     };
                 }
             }
@@ -687,17 +687,14 @@ pub const Topics = struct {
     fn register(self: *Topics, io: std.Io, sub: *Subscriber, opts: ServeOptions, last_header: ?[]const u8) error{ OutOfMemory, TooManyTopics, InvalidTopic }!void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        errdefer self.unlinkLocked(sub);
-        if (self.draining.load(.acquire)) {
-            sub.draining_at_start = true;
-        } else {
-            for (opts.topics) |name| try self.joinLocked(sub, name);
-        }
+        // Linked first, so `unlinkLocked` undoes exactly this on failure.
         self.execs[sub.execIndex(self)].subscribers.append(&sub.exec_node);
-        sub.linked = true;
         _ = self.subscribers.fetchAdd(1, .monotonic);
+        errdefer self.unlinkLocked(sub);
+        const draining = self.draining.load(.acquire);
+        if (!draining) for (opts.topics) |name| try self.joinLocked(sub, name);
         try self.queueOpenLine(sub);
-        if (sub.draining_at_start) {
+        if (draining) {
             try self.queueDrainEnd(sub);
         } else {
             try self.queueReplayLocked(sub, last_header, opts.last);
@@ -722,7 +719,7 @@ pub const Topics = struct {
         {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            sub.armed = true;
+            _ = sub.transition(.armed);
             launch = sub.queue.len() > 0 and sub.claimSender();
         }
         if (launch) self.startSender(io, sub);
@@ -768,7 +765,8 @@ pub const Topics = struct {
         unreachable;
     }
 
-    /// Takes `sub` out of every topic and its executor's list.
+    /// Takes `sub` out of every topic and its executor's list (once per
+    /// `register`).
     fn unlinkLocked(self: *Topics, sub: *Subscriber) void {
         const now = self.nowMs();
         for (sub.memberships.items) |m| {
@@ -776,11 +774,8 @@ pub const Topics = struct {
             if (m.topic.members.items.len == 0) m.topic.empty_since_ms = now;
         }
         sub.memberships.clearRetainingCapacity();
-        if (sub.linked) {
-            sub.linked = false;
-            self.execs[sub.execIndex(self)].subscribers.remove(&sub.exec_node);
-            _ = self.subscribers.fetchSub(1, .monotonic);
-        }
+        self.execs[sub.execIndex(self)].subscribers.remove(&sub.exec_node);
+        _ = self.subscribers.fetchSub(1, .monotonic);
     }
 
     fn queueOpenLine(self: *Topics, sub: *Subscriber) error{OutOfMemory}!void {
@@ -809,7 +804,7 @@ pub const Topics = struct {
         self.end_payload.retain();
         errdefer self.end_payload.release(self.gpa);
         try self.enqueueLocked(sub, self.end_payload);
-        sub.phase = .{ .ending = .graceful };
+        _ = sub.transition(.end_queued);
         sub.close_reason = .drain;
     }
 
@@ -907,31 +902,30 @@ pub const Topics = struct {
     /// A subscriber that takes no more events: after what is queued, its
     /// stream ends. Under the mutex.
     fn beginClose(self: *Topics, sub: *Subscriber, reason: CloseReason, count_slow: bool) void {
-        if (!sub.accepts()) return;
-        sub.phase = .{ .ending = .graceful };
+        if (!sub.transition(.end_queued)) return;
         sub.close_reason = reason;
         if (count_slow) _ = self.n_closed_slow.fetchAdd(1, .monotonic);
         self.end_payload.retain();
         sub.queue.push(self.gpa, self.end_payload) catch {
             self.end_payload.release(self.gpa);
             // No room even for that: it is stuck, and aborted below.
-            sub.phase = .{ .ending = .abort };
+            _ = sub.transition(.abort_end);
         };
     }
 
     /// A sender stuck on an ending subscriber past `close_after` is
     /// canceled, which aborts the stream. Under the mutex.
     fn checkStuck(self: *Topics, sub: *Subscriber, now: i64) void {
-        if (sub.phase != .ending or !sub.running) return;
+        if (sub.life != .ending or sub.life.ending.sender != .running) return;
         const since = sub.sending_since_ms orelse return;
         if (now - since < self.options.close_after.toMilliseconds()) return;
-        sub.phase = .{ .ending = .abort };
+        _ = sub.transition(.abort_end);
         if (sub.task) |t| placement.cancelTask(t);
     }
 
     // -- senders ---------------------------------------------------------
 
-    /// Starts `sub`'s sender, `sub.running` already set. Without a task to
+    /// Starts `sub`'s sender, already claimed. Without a task to
     /// spare, what is queued waits for the next event to try again.
     fn startSender(self: *Topics, io: std.Io, sub: *Subscriber) void {
         if (sub.fallback) {
@@ -942,8 +936,8 @@ pub const Topics = struct {
         placement.concurrent(&sub.sender, io, where, senderTask, .{ self, sub }) catch {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            sub.running = false;
-            if (sub.phase == .left) self.idle.broadcast(io);
+            _ = sub.transition(.sender_idle);
+            if (sub.life == .left) self.idle.broadcast(io);
         };
     }
 
@@ -974,7 +968,7 @@ pub const Topics = struct {
         self.mutex.lockUncancelable(io);
         sub.task = placement.currentTask(io);
         // Each pass: send until the queue is empty, end the burst. Events
-        // queued while the burst ended (unlocked) found `running` set and
+        // queued while the burst ended (unlocked) found the sender running and
         // started no sender: a further pass takes them.
         pass: while (true) {
             while (sub.writable()) {
@@ -1028,8 +1022,7 @@ pub const Topics = struct {
                 if (!ok) {
                     failed = true;
                     if (canceled and sub.abortRequested()) aborted = true;
-                    // Once left, it stays left.
-                    if (sub.phase != .left) sub.phase = .broken;
+                    _ = sub.transition(.write_failed);
                     sub.queue.drop(self.gpa);
                     break;
                 }
@@ -1056,12 +1049,15 @@ pub const Topics = struct {
             }
             break :pass;
         }
-        if ((ended or aborted) and sub.phase != .left) sub.phase = .over;
-        sub.running = false;
+        if (ended or aborted) {
+            _ = sub.transition(.sender_over);
+        } else {
+            _ = sub.transition(.sender_idle);
+        }
         sub.task = null;
         const spawn_end = (ended or aborted or failed) and !sub.fallback;
         if (failed and !ended and !aborted) sub.close_reason = .client_gone;
-        if (sub.phase == .left) self.idle.broadcast(io);
+        if (sub.life == .left) self.idle.broadcast(io);
         self.mutex.unlock(io);
         if (spawn_end) self.spawnEnd(sub);
         if (canceled and !aborted) return error.Canceled;
@@ -1094,10 +1090,7 @@ pub const Topics = struct {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         const reason = reason_arg orelse sub.close_reason;
-        sub.phase = .{ .left = switch (sub.phase) {
-            .ending => |e| e,
-            else => null,
-        } };
+        _ = sub.transition(.finish);
         self.unlinkLocked(sub);
         sub.queue.drop(self.gpa);
         const canceled = self.awaitSender(io, sub);
@@ -1118,13 +1111,13 @@ pub const Topics = struct {
     fn awaitSender(self: *Topics, io: std.Io, sub: *Subscriber) bool {
         var canceled = false;
         const deadline = placement.graceDeadline(io, self.options.leave_grace);
-        while (sub.running) {
+        while (sub.life.left.sender == .running) {
             self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
                 if (err == error.Canceled) canceled = true;
                 break;
             };
         }
-        if (sub.running) {
+        if (sub.life.left.sender == .running) {
             if (sub.task) |t| {
                 placement.cancelTask(t);
             } else if (!sub.fallback) {
@@ -1136,7 +1129,7 @@ pub const Topics = struct {
                 self.mutex.lockUncancelable(io);
             }
         }
-        while (sub.running) self.idle.waitUncancelable(io, &self.mutex);
+        while (sub.life.left.sender == .running) self.idle.waitUncancelable(io, &self.mutex);
         return canceled;
     }
 
@@ -1222,7 +1215,7 @@ pub const Topics = struct {
                 }
                 self.checkStuck(sub, now_ms);
                 if (hb_ms) |hb| {
-                    if (sub.accepts() and sub.armed and now_ms - sub.last_write_ms >= hb) {
+                    if (sub.life == .open and now_ms - sub.last_write_ms >= hb) {
                         self.heartbeat_payload.retain();
                         if (sub.queue.push(self.gpa, self.heartbeat_payload)) |_| {
                             sub.last_write_ms = now_ms;
@@ -1313,7 +1306,7 @@ pub const Topics = struct {
                 self.queueDrainEnd(sub) catch continue;
                 if (sub.claimSender()) {
                     started.append(self.gpa, sub) catch {
-                        sub.running = false;
+                        _ = sub.transition(.sender_idle);
                     };
                 }
             }
@@ -1355,19 +1348,9 @@ pub const Subscriber = struct {
     out: Out = undefined,
     has_out: bool = false,
     queue: fanout.Queue(Payload) = .{},
-    /// A sender is started or running; it alone takes from the queue. Not
-    /// part of `phase`: a sender may exist in every phase but `over`.
-    /// Set only through `claimSender`. Under the hub's mutex.
-    running: bool = false,
-    /// The head is out and the first sender may start. Not part of
-    /// `phase` either: a subscriber can be ending before it is armed (a
-    /// subscribe during the drain, `close` from `on_open`, a publish past
-    /// the cap between `register` and `arm`). Under the hub's mutex.
-    armed: bool = false,
-    phase: Phase = .open,
-    linked: bool = false,
+    /// Its lifecycle, sender included; changed only by `transition`.
+    life: Life = .{ .opening = null },
     fallback: bool = false,
-    draining_at_start: bool = false,
     /// The peer is gone (set from the engine's callback).
     gone: std.atomic.Value(bool) = .init(false),
     /// Its end task (`spawnEnd`), started once.
@@ -1433,40 +1416,166 @@ pub const Subscriber = struct {
 
     pub const Membership = struct { topic: *Topics.Topic, index: u32 };
 
-    /// Where the subscriber is in its life, under the hub's mutex:
+    /// Whether a sender is started or running; it alone takes from the queue.
+    pub const Sender = enum { idle, running };
+
+    /// Where the subscriber is in its life. Every cell runs under the hub's
+    /// mutex (`gone` and `end` are the lock-free facts, outside it). `-`:
+    /// refused, `transition` returns false and nothing changes; `!`: no
+    /// path raises it there (`unreachable`); e = its End, s = its Sender.
     ///
-    ///   open --close/slow/drain--> ending --end written--> over
-    ///   open, ending --write failed--> broken (ending + abort --canceled--> over)
-    ///   any --finishSubscriber--> left (final; a later write failure or
-    ///   end of the sender leaves it `left`)
+    ///   state      | armed      | end_queued   | abort_end    | claim        | write_failed | sender_idle  | sender_over | finish
+    ///   opening(-) | open(idle) | opening(gr.) | -            | -            | !            | !            | !           | !
+    ///   opening(e) | ending(e,i)| -            | opening(ab.) | -            | !            | !            | !           | !
+    ///   open(s)    | !          | ending(gr,s) | -            | idle: run    | broken(s)    | open(idle)   | !           | left(-,s)
+    ///   ending(e,s)| !          | -            | ending(ab,s) | idle: run    | broken(s)    | ending(e,i)  | over        | left(e,s)
+    ///   over       | !          | -            | -            | -            | !            | !            | !           | left(-,idle)
+    ///   broken(s)  | !          | -            | -            | -            | !            | broken(idle) | over        | left(-,s)
+    ///   left(e,s)  | !          | -            | -            | -            | = (stays)    | left(e,idle) | left(e,idle)| !
     ///
-    /// `ending` carries whether its sender is to be aborted (no room for
-    /// the end, or stuck past `close_after`), and `left` keeps that when it
-    /// left while ending: a sender still writing then aborts the stream as
-    /// before. Once `broken` or `over`, it no longer matters whether the
-    /// end was queued: `close_reason` holds the reason, and a failed write
-    /// turns it into `client_gone` anyway.
-    pub const Phase = union(enum) {
+    /// `broken` and `over` forget the End: `close_reason` holds the reason,
+    /// and a failed write turns it into `client_gone` anyway. `left` keeps
+    /// it: a sender still writing then aborts the stream as before. Every
+    /// move is a cell of `step`; add behaviour as a cell, not as a branch in
+    /// a caller.
+    pub const Life = union(enum) {
+        /// Made, the head not out yet (`register` .. `arm`): no sender may
+        /// start. The End already queued, if any (a subscribe during the
+        /// drain, `close` from `on_open`, a publish past the cap).
+        opening: ?End,
         /// Takes events.
-        open,
-        /// The end is queued (slow, drain, `close`): it takes no more events.
-        ending: End,
+        open: Sender,
+        /// The end is queued (slow, drain, `close`): it takes no more
+        /// events. `abort`: no room for the end, or stuck past `close_after`.
+        ending: struct { end: End, sender: Sender },
         /// The end was written, or the stream aborted.
         over,
         /// A write failed.
-        broken,
-        /// Out of the hub (finishSubscriber); the end it had queued, if
-        /// it was ending.
-        left: ?End,
+        broken: Sender,
+        /// Out of the hub (`finishSubscriber`); the End it had queued.
+        left: struct { end: ?End, sender: Sender },
 
         pub const End = enum { graceful, abort };
+        pub const Tag = std.meta.Tag(Life);
+
+        /// The next life after `ev`, null when `ev` is refused here.
+        pub inline fn step(life: Life, ev: LifeEvent) ?Life {
+            return switch (life) {
+                .opening => |e| switch (ev) {
+                    .armed => if (e) |end| .{ .ending = .{ .end = end, .sender = .idle } } else .{ .open = .idle },
+                    .end_queued => if (e == null) .{ .opening = .graceful } else null,
+                    .abort_end => if (e != null) .{ .opening = .abort } else null,
+                    .claim => null,
+                    // No sender before the head is out; the end task waits for `arm`.
+                    .write_failed, .sender_idle, .sender_over, .finish => unreachable,
+                },
+                .open => |s| switch (ev) {
+                    .end_queued => .{ .ending = .{ .end = .graceful, .sender = s } },
+                    .abort_end => null,
+                    .claim => if (s == .idle) .{ .open = .running } else null,
+                    .write_failed => .{ .broken = s },
+                    .sender_idle => .{ .open = .idle },
+                    .finish => .{ .left = .{ .end = null, .sender = s } },
+                    // Armed once; no end is queued while open.
+                    .armed, .sender_over => unreachable,
+                },
+                .ending => |x| switch (ev) {
+                    .end_queued => null,
+                    .abort_end => .{ .ending = .{ .end = .abort, .sender = x.sender } },
+                    .claim => if (x.sender == .idle) .{ .ending = .{ .end = x.end, .sender = .running } } else null,
+                    .write_failed => .{ .broken = x.sender },
+                    .sender_idle => .{ .ending = .{ .end = x.end, .sender = .idle } },
+                    .sender_over => .over,
+                    .finish => .{ .left = .{ .end = x.end, .sender = x.sender } },
+                    .armed => unreachable,
+                },
+                .over => switch (ev) {
+                    .end_queued, .abort_end, .claim => null,
+                    .finish => .{ .left = .{ .end = null, .sender = .idle } },
+                    // Its sender ended with `sender_over`, and none starts again.
+                    .armed, .write_failed, .sender_idle, .sender_over => unreachable,
+                },
+                .broken => |s| switch (ev) {
+                    .end_queued, .abort_end, .claim => null,
+                    .sender_idle => .{ .broken = .idle },
+                    // A canceled write of an aborting stream.
+                    .sender_over => .over,
+                    .finish => .{ .left = .{ .end = null, .sender = s } },
+                    // It writes no more after the failed write.
+                    .armed, .write_failed => unreachable,
+                },
+                .left => |x| switch (ev) {
+                    .end_queued, .abort_end, .claim => null,
+                    .write_failed => life,
+                    .sender_idle, .sender_over => .{ .left = .{ .end = x.end, .sender = .idle } },
+                    // It leaves once, after the head is out.
+                    .armed, .finish => unreachable,
+                },
+            };
+        }
+
+        /// Its sender, `idle` where none can be.
+        pub fn sender(life: Life) Sender {
+            return switch (life) {
+                .opening, .over => .idle,
+                .open, .broken => |s| s,
+                .ending => |x| x.sender,
+                .left => |x| x.sender,
+            };
+        }
     };
+
+    /// What moves `life` (the table on `Life`).
+    pub const LifeEvent = enum {
+        /// The head is out (`arm`).
+        armed,
+        /// The end is queued: `close`, slow, the drain.
+        end_queued,
+        /// Its end is to be aborted: no room for it, or stuck.
+        abort_end,
+        /// A sender is to start (`claimSender`).
+        claim,
+        /// A write failed (after `abortRequested` was read).
+        write_failed,
+        /// The sender stopped with the stream still going, or failed to start.
+        sender_idle,
+        /// The sender wrote the end, or aborted the stream.
+        sender_over,
+        /// `finishSubscriber`.
+        finish,
+    };
+
+    /// The only writer of `life`. False: refused, nothing changed.
+    inline fn transition(sub: *Subscriber, ev: LifeEvent) bool {
+        sub.life = Life.step(sub.life, ev) orelse return false;
+        return true;
+    }
+
+    /// Neither failed nor left: its sender may write.
+    const writable_table = std.EnumArray(Life.Tag, bool).init(.{
+        .opening = true,
+        .open = true,
+        .ending = true,
+        .over = true,
+        .broken = false,
+        .left = false,
+    });
+
+    /// The hub's sender is done with it: its end task is wanted.
+    const ends_when_over = std.EnumArray(Life.Tag, bool).init(.{
+        .opening = false,
+        .open = false,
+        .ending = false,
+        .over = true,
+        .broken = true,
+        .left = false,
+    });
 
     /// Its queued end is to be aborted. Under the hub's mutex.
     fn abortRequested(sub: *const Subscriber) bool {
-        return switch (sub.phase) {
-            .ending => |e| e == .abort,
-            .left => |e| e == .abort,
+        return switch (sub.life) {
+            .ending => |x| x.end == .abort,
+            .left => |x| x.end == .abort,
             else => false,
         };
     }
@@ -1477,28 +1586,27 @@ pub const Subscriber = struct {
     fn wantsEnd(sub: *const Subscriber) bool {
         if (sub.gone.load(.acquire)) return true;
         if (sub.fallback) return false;
-        return switch (sub.phase) {
-            .broken, .over => true,
-            .open, .ending, .left => false,
-        };
+        return ends_when_over.get(sub.life);
     }
 
     /// Whether it still takes events (and a `close`). Under the hub's mutex.
     fn accepts(sub: *const Subscriber) bool {
-        return sub.phase == .open;
+        return switch (sub.life) {
+            .open => true,
+            .opening => |e| e == null,
+            else => false,
+        };
     }
 
-    /// Neither failed nor left: its sender may write. Under the hub's mutex.
+    /// Under the hub's mutex.
     fn writable(sub: *const Subscriber) bool {
-        return sub.phase != .broken and sub.phase != .left;
+        return writable_table.get(sub.life);
     }
 
     /// Marks a sender as started when none runs and the head is out; the
     /// caller then starts it (`startSender`). Under the hub's mutex.
     fn claimSender(sub: *Subscriber) bool {
-        if (sub.running or !sub.armed) return false;
-        sub.running = true;
-        return true;
+        return sub.transition(.claim);
     }
 
     fn execIndex(sub: *const Subscriber, hub: *const Topics) usize {
