@@ -144,13 +144,15 @@ pub const Client = struct {
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
     /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
+    /// Tests only: runs in a `drain` that found another under way, right before it waits for `drained`.
+    test_on_drain_wait: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
     /// The client's lifecycle. `stopWork` runs on the owner's thread only;
     /// `drain` may race it (the server's drainWatcher). Every cell:
     ///
     /// | phase    | start           | drain(deadline)                  | stopWork                               |
     /// |----------|-----------------|----------------------------------|----------------------------------------|
-    /// | new      | -> serving      | -> draining, runs it, -> drained | -> closing, no drain, cancel, -> stopped |
+    /// | new      | -> serving      | -> draining, runs it, -> drained | -> closing, no drain, cancel, waits for a drain that raced in, -> stopped |
     /// | serving  | no-op           | -> draining, runs it, -> drained | -> closing, drain(now + 10 s), cancel, -> stopped |
     /// | closing  | no-op           | -> draining, runs it, -> drained | no-op (stopWork under way)             |
     /// | draining | no-op           | waits for `drained`              | waits for the drain, cancel, -> stopped |
@@ -158,6 +160,8 @@ pub const Client = struct {
     /// | stopped  | no-op           | returns                          | no-op                                  |
     ///
     /// A failure inside `start` leaves it serving: `stopWork` cleans up.
+    /// Every phase past `new` counts as started: `addQueue`, `cron*`,
+    /// `handle*` and `step` (which starts a `new` client) see it so.
     /// `drained` is set after the phase reaches `drained` (notify last).
     pub const Phase = enum(u8) { new, serving, closing, draining, drained, stopped };
 
@@ -474,7 +478,10 @@ pub const Client = struct {
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
         if (self.advance(&.{ .new, .serving, .closing }, .draining) == null) {
             // Stopped without a drain: nothing sets `drained`.
-            if (self.phase.load(.acquire) != .stopped) self.drained.waitUncancelable(self.io);
+            if (self.phase.load(.acquire) != .stopped) {
+                if (builtin.is_test) if (self.test_on_drain_wait) |f| f(self);
+                self.drained.waitUncancelable(self.io);
+            }
             return;
         }
         defer {
