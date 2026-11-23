@@ -146,6 +146,23 @@ pub fn pack(gen: u32, state: SlotState) u64 {
 pub fn genOf(word: u64) u32 {
     return @intCast(word >> 32);
 }
+/// The first of `items` named `name`: a connector's `config.name`, or the
+/// item's own `name`.
+pub fn findByName(comptime T: type, items: []T, name: []const u8) ?*T {
+    for (items) |*x| {
+        const n = if (@hasField(T, "config")) x.config.name else x.name;
+        if (std.mem.eql(u8, n, name)) return x;
+    }
+    return null;
+}
+
+/// `p` as a `*T` of the current engine, or null (null, or a pointer of a
+/// destroyed or other engine); `T` has an `engine` field.
+pub fn ownedBy(comptime T: type, p: ?*const anyopaque) ?*T {
+    const x: *T = @ptrCast(@alignCast(@constCast(p orelse return null)));
+    return if (global == x.engine) x else null;
+}
+
 pub fn stateOf(word: u64) SlotState {
     return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
 }
@@ -701,6 +718,29 @@ pub fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const ev: *abi.Event = @ptrCast(rec.ptr);
     ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
     return rec;
+}
+
+/// Fills a record's variable part: each `put` copies `bytes` at the cursor
+/// and returns where they went (an empty `put` is the empty span).
+pub const Writer = struct {
+    rec: []u8,
+    at: usize,
+
+    pub fn put(w: *Writer, bytes: []const u8) abi.Span {
+        if (bytes.len == 0) return .{};
+        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
+        defer w.at += bytes.len;
+        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
+    }
+};
+
+/// What an area call refuses with; lib.zig answers it through `failure`.
+pub const failure = @import("failure.zig");
+pub const CallError = failure.CallError;
+
+/// A copy of `s` in `a`; empty gives the empty slice (`free` ignores it).
+pub fn dupeStr(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error![]const u8 {
+    return a.dupe(u8, s.slice());
 }
 
 /// An `ANOLE_EV_SENT` record for a body about to be borrowed, built by the
@@ -4443,7 +4483,35 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
     }
 }
 
+test "findByName: hit, miss, empty, first of duplicates, both name shapes" {
+    const A = struct { config: struct { name: []const u8 }, id: u8 };
+    const B = struct { name: []const u8, id: u8 };
+    var a = [_]A{ .{ .config = .{ .name = "x" }, .id = 1 }, .{ .config = .{ .name = "y" }, .id = 2 }, .{ .config = .{ .name = "y" }, .id = 3 } };
+    var b = [_]B{ .{ .name = "x", .id = 1 }, .{ .name = "y", .id = 2 } };
+    try std.testing.expectEqual(@as(u8, 2), findByName(A, &a, "y").?.id);
+    try std.testing.expectEqual(@as(u8, 2), findByName(B, &b, "y").?.id);
+    try std.testing.expect(findByName(A, &a, "z") == null);
+    try std.testing.expect(findByName(A, &a, "") == null);
+    try std.testing.expect(findByName(A, a[0..0], "x") == null);
+}
+
+test "ownedBy: null, foreign engine, own engine" {
+    const T = struct { engine: *Engine };
+    const saved = global;
+    defer global = saved;
+    var own: Engine = undefined;
+    var other: Engine = undefined;
+    global = &own;
+    var mine: T = .{ .engine = &own };
+    var foreign: T = .{ .engine = &other };
+    try std.testing.expect(ownedBy(T, null) == null);
+    try std.testing.expect(ownedBy(T, &foreign) == null);
+    try std.testing.expectEqual(&mine, ownedBy(T, &mine).?);
+}
+
 test {
+    _ = @import("slot_table.zig");
+    _ = @import("lane.zig");
     _ = config_mod;
     _ = @import("engine_test.zig");
     _ = @import("nats_test.zig");

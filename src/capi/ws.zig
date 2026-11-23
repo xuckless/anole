@@ -16,6 +16,7 @@ const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const SlotTable = @import("slot_table.zig").SlotTable;
+const Lane = @import("lane.zig").Lane;
 const placement = dusty.placement;
 const websocket = anole.websocket;
 const origin = @import("../origin.zig");
@@ -83,22 +84,13 @@ pub const WsSlot = struct {
     fn release(s: *WsSlot) void {
         s.lock.unlock();
     }
-    fn gen(s: *const WsSlot) u32 {
-        return @intCast(s.word.load(.acquire) >> 32);
-    }
-    fn live(s: *const WsSlot, g: u32) bool {
-        return s.word.load(.acquire) == pack(g, .open);
-    }
-    fn handle(s: *const WsSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .websocket, .slot = @intCast(s.index), .exec = s.exec.index });
-    }
 };
 
 fn freeWord(gen: u32) u64 {
     return pack(gen, .free);
 }
 
-const Slots = SlotTable(WsSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyWebSockets }, freeWord);
+const Slots = SlotTable(WsSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManyWebSockets, .kind = .websocket, .open = @backingInt(State.open) }, freeWord);
 
 pub const ExecState = struct {
     slots: Slots = .{},
@@ -106,16 +98,14 @@ pub const ExecState = struct {
     work: std.Io.Group = .init,
     /// The publish lane: publishes to topics that hash to this executor,
     /// in the order they were taken, and the one task that fans them out.
-    lane_head: ?*PublishCmd = null,
-    lane_tail: ?*PublishCmd = null,
-    lane_running: bool = false,
+    lane: Lane(PublishCmd) = .{},
 
     /// A slot for a socket whose handshake the consumer is deciding
     /// (executor-local): not open yet, its handle not handed out. The
     /// outbox is clean and the socket unset.
     fn reserve(st: *ExecState, x: *Exec, route: *const Route) !*WsSlot {
         const s = try st.slots.alloc(x);
-        const g = s.gen();
+        const g = Slots.gen(s);
         s.acquire();
         s.bytes = 0;
         s.want_event = false;
@@ -137,7 +127,7 @@ pub const ExecState = struct {
     /// out or failed before any handle was handed out): back on the free
     /// list under a new generation.
     fn unreserve(st: *ExecState, s: *WsSlot) void {
-        const g = s.gen();
+        const g = Slots.gen(s);
         s.word.store(pack(engine.nextGen(g), .free), .release);
         st.slots.free(s);
     }
@@ -148,7 +138,7 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.dropLane();
+        _ = st.lane.dropAll();
         st.slots.deinit(freeSlotBuffers);
     }
 
@@ -161,15 +151,6 @@ pub const ExecState = struct {
         gpa.free(s.close_reason);
         for (s.topics.items) |t| gpa.free(t);
         s.topics.deinit(gpa);
-    }
-
-    /// Frees the publishes left in the lane.
-    fn dropLane(st: *ExecState) void {
-        while (st.lane_head) |p| {
-            st.lane_head = p.next;
-            p.free();
-        }
-        st.lane_tail = null;
     }
 
     /// Cancels the executor's WebSocket work (at the server's end).
@@ -190,10 +171,10 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *WsSlot, u32 } {
 /// of the handshake the consumer accepted; its handle. Any thread.
 pub fn openReserved(x: *Exec, i: u32) u64 {
     const s = x.ws.slots.slot(i).?;
-    const g = s.gen();
+    const g = Slots.gen(s);
     s.word.store(pack(g, .open), .release);
     _ = x.engine.websockets.fetchAdd(1, .monotonic);
-    return s.handle(g);
+    return Slots.handle(s, g);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +240,7 @@ fn serveAccepted(route: *const Route, req: *dusty.Request, res: *dusty.Response,
         res.fail(.service_unavailable, "too many WebSockets");
         return;
     };
-    const g = slot.gen();
+    const g = Slots.gen(slot);
     var up: engine.Upgrade = .{ .ws_slot = slot.index, .accept = .{ .ws = null } };
     engine.serveUpgrade(route, req, res, &up) catch |err| {
         x.ws.unreserve(slot);
@@ -311,7 +292,7 @@ fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void 
     const e = route.engine;
     const x = &e.execs[placement.currentExecutor(req.io).?];
     const s = try x.ws.slots.alloc(x);
-    const g = s.gen();
+    const g = Slots.gen(s);
     s.socket = sock;
     s.route = route;
     s.bytes = 0;
@@ -332,7 +313,7 @@ fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void 
     };
     const size = head.size();
     const rec = try engine.allocRecord(size);
-    _ = head.encode(.ws_open, s.handle(g), rec);
+    _ = head.encode(.ws_open, Slots.handle(s, g), rec);
     x.postRecord(rec, true);
 }
 
@@ -345,7 +326,7 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
     const rec = try engine.allocRecord(n);
     const ev: *abi.WsMessageEvent = @ptrCast(rec.ptr);
     ev.* = .{
-        .ev = .{ .type = @backingInt(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
+        .ev = .{ .type = @backingInt(abi.EventType.ws_message), .len = @intCast(n), .handle = Slots.handle(s, Slots.gen(s)) },
         .route_id = s.route.id,
         .type = if (msg.type == .text) abi.WS_TEXT else abi.WS_BINARY,
         .data = .{ .off = @sizeOf(abi.WsMessageEvent), .len = @intCast(msg.data.len) },
@@ -359,7 +340,7 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
 fn onClose(_: ?*anyopaque, sock: *Socket) void {
     const s: *WsSlot = @ptrCast(@alignCast(sock.context orelse return));
     const code: u16 = if (sock.close_code) |c| @backingInt(c) else if (sock.end_error != null) 1006 else 1005;
-    retire(s.exec, s, s.gen(), sock, code);
+    retire(s.exec, s, Slots.gen(s), sock, code);
 }
 
 /// The socket is over: its handle goes stale, what was queued for it is
@@ -383,7 +364,7 @@ fn retire(x: *Exec, s: *WsSlot, g: u32, sock: ?*Socket, code: u16) void {
     gpa.free(s.close_reason);
     s.close_reason = &.{};
     s.release();
-    for (rest.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(s.handle(g), r);
+    for (rest.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(Slots.handle(s, g), r);
     rest.deinit(gpa);
     rest_buf.deinit(gpa);
     if (sock) |sk| {
@@ -399,7 +380,7 @@ fn retire(x: *Exec, s: *WsSlot, g: u32, sock: ?*Socket, code: u16) void {
     }
     s.socket = null;
 
-    if (newRecord(@sizeOf(abi.WsCloseEvent), .ws_close, s.handle(g))) |rec| {
+    if (newRecord(@sizeOf(abi.WsCloseEvent), .ws_close, Slots.handle(s, g))) |rec| {
         const ev: *abi.WsCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;
         ev.code = code;
@@ -438,11 +419,11 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
     const x = s.exec;
     const e = x.engine;
     const sock = s.socket orelse return;
-    const g = s.gen();
+    const g = Slots.gen(s);
     const high = e.config.limits.ws_high_water;
     while (true) {
         s.acquire();
-        if (!s.live(g)) {
+        if (!Slots.live(s, g)) {
             s.release();
             return;
         }
@@ -480,7 +461,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         sock._flushOut() catch {
             failed = true;
         };
-        for (list.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(s.handle(g), r);
+        for (list.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(Slots.handle(s, g), r);
         // The byte buffer goes back to the slot when it is small and the
         // slot has none, so a steady stream allocates nothing.
         buf.clearRetainingCapacity();
@@ -495,7 +476,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         const drained = s.want_event and s.bytes <= high / 2;
         if (drained) s.want_event = false;
         s.release();
-        if (drained) x.postEvent(.writable, s.handle(g));
+        if (drained) x.postEvent(.writable, Slots.handle(s, g));
         if (failed) return;
     }
 }
@@ -513,7 +494,7 @@ pub fn send(e: *Engine, hv: u64, typ: u32, data: []const u8, borrow: bool) engin
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
     s.acquire();
-    if (!s.live(g)) {
+    if (!Slots.live(s, g)) {
         s.release();
         return e.gone();
     }
@@ -545,7 +526,7 @@ pub fn close(e: *Engine, hv: u64, code: u16, reason: []const u8) engine.AnswerEr
     const s, const g = try slotOf(e, hv);
     const copy = try gpa.dupe(u8, reason);
     s.acquire();
-    if (!s.live(g) or s.close_code != null) {
+    if (!Slots.live(s, g) or s.close_code != null) {
         s.release();
         gpa.free(copy);
         return error.Over;
@@ -579,7 +560,7 @@ fn checkTopic(topic: []const u8) engine.AnswerError!void {
 pub fn subscribe(e: *Engine, hv: u64, topic: []const u8, join: bool) engine.AnswerError!void {
     try checkTopic(topic);
     const s, const g = if (join) slotOf(e, hv) catch |err| return e.badHandle(err) else try slotOf(e, hv);
-    if (!s.live(g)) return if (join) e.gone() else error.Over;
+    if (!Slots.live(s, g)) return if (join) e.gone() else error.Over;
     const c = try gpa.create(TopicCmd);
     c.* = .{ .cmd = .{ .run = runTopic }, .handle = hv, .topic = gpa.dupe(u8, topic) catch {
         gpa.destroy(c);
@@ -598,22 +579,11 @@ fn topicChangeDone(e: *Engine) void {
     e.wakeFutex(&e.topic_changes_done);
 }
 
-/// Waits until every `subscribe` taken before `want` was counted is
-/// applied: joins and leaves run on each socket's executor, a publish on
-/// any, and one must not overtake the other.
-fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
-    while (true) {
-        const done = e.topic_changes_done.load(.acquire);
-        if (@as(i32, @bitCast(done -% want)) >= 0) return;
-        try e.io.futexWait(u32, &e.topic_changes_done.raw, done);
-    }
-}
-
 fn runTopic(cmd: *Command, x: *Exec) void {
     const c: *TopicCmd = @fieldParentPtr("cmd", cmd);
     const e = x.engine;
     const found = slotOf(e, c.handle) catch null;
-    if (found == null or !found.?[0].live(found.?[1]) or found.?[0].socket == null or e.phase.load(.acquire) == .stopped) {
+    if (found == null or !Slots.live(found.?[0], found.?[1]) or found.?[0].socket == null or e.phase.load(.acquire) == .stopped) {
         gpa.free(c.topic);
         gpa.destroy(c);
         topicChangeDone(e);
@@ -679,7 +649,7 @@ const PublishCmd = struct {
     /// The next publish in the executor's lane.
     next: ?*PublishCmd = null,
 
-    fn free(p: *PublishCmd) void {
+    pub fn free(p: *PublishCmd) void {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
         _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.payload.len, .monotonic);
         gpa.free(p.topic);
@@ -740,48 +710,28 @@ fn runPublish(cmd: *Command, x: *Exec) void {
     const p: *PublishCmd = @fieldParentPtr("cmd", cmd);
     if (x.engine.phase.load(.acquire) == .stopped) return p.free();
     const st = &x.ws;
-    p.next = null;
-    if (st.lane_tail) |t| t.next = p else st.lane_head = p;
-    st.lane_tail = p;
-    if (st.lane_running) return;
-    st.lane_running = true;
+    if (!st.lane.push(p)) return;
     placement.concurrent(&st.work, x.engine.io, .local, publishLane, .{ x.engine, x }) catch {
         // No task to spare: what is queued is dropped, and counted.
-        st.lane_running = false;
-        while (st.lane_head) |q| {
-            st.lane_head = q.next;
-            _ = x.engine.publish_dropped.fetchAdd(1, .monotonic);
-            q.free();
-        }
-        st.lane_tail = null;
+        _ = x.engine.publish_dropped.fetchAdd(st.lane.dropAll(), .monotonic);
     };
 }
 
 /// Takes the executor's publishes one after the other, in order: each waits
-/// for the topic changes taken before it, then fans out to the topic's
-/// members (every member's queue gets it before the next publish starts).
+/// for the topic changes taken before it (joins and leaves run on each
+/// socket's executor, a publish on any, and one must not overtake the
+/// other), then fans out to the topic's members (every member's queue gets
+/// it before the next publish starts).
 fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
-    const st = &x.ws;
-    while (true) {
-        const p = st.lane_head orelse {
-            st.lane_running = false;
-            return;
-        };
-        st.lane_head = p.next;
-        if (st.lane_head == null) st.lane_tail = null;
-        defer p.free();
-        awaitTopicChanges(e, p.after) catch |err| {
-            // The stop: what is left is dropped.
-            st.lane_running = false;
-            st.dropLane();
-            return err;
-        };
-        // Only compared, never followed: a stale handle names no member.
-        var except: ?*Socket = null;
-        if (p.except != 0) if (slotOf(e, p.except)) |found| {
-            if (found[0].live(found[1])) except = found[0].socket;
-        } else |_| {};
-        const reached = e.rooms.broadcastPayload(p.topic, p.payload, except);
-        _ = e.ws_out.fetchAdd(reached, .monotonic);
-    }
+    return x.ws.lane.run(e.io, &e.topic_changes_done, e, fanOut);
+}
+
+fn fanOut(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
+    // Only compared, never followed: a stale handle names no member.
+    var except: ?*Socket = null;
+    if (p.except != 0) if (slotOf(e, p.except)) |found| {
+        if (Slots.live(found[0], found[1])) except = found[0].socket;
+    } else |_| {};
+    const reached = e.rooms.broadcastPayload(p.topic, p.payload, except);
+    _ = e.ws_out.fetchAdd(reached, .monotonic);
 }

@@ -21,6 +21,7 @@ const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const SlotTable = @import("slot_table.zig").SlotTable;
+const Lane = @import("lane.zig").Lane;
 const placement = dusty.placement;
 const Engine = engine.Engine;
 const Exec = engine.Exec;
@@ -72,23 +73,13 @@ pub const SseSlot = struct {
     /// subscriber's, and `onClose` retires it.
     opened: bool = false,
     next_free: u32 = engine.no_slot,
-
-    fn gen(s: *const SseSlot) u32 {
-        return @intCast(s.word.load(.acquire) >> 32);
-    }
-    fn live(s: *const SseSlot, g: u32) bool {
-        return s.word.load(.acquire) == pack(g, .open);
-    }
-    fn handle(s: *const SseSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .sse, .slot = @intCast(s.index), .exec = s.exec.index });
-    }
 };
 
 fn freeWord(gen: u32) u64 {
     return pack(gen, .free);
 }
 
-const Slots = SlotTable(SseSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManySubscribers }, freeWord);
+const Slots = SlotTable(SseSlot, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.TooManySubscribers, .kind = .sse, .open = @backingInt(SlotState.open) }, freeWord);
 
 /// Engine-wide state (`Engine.sse_state`).
 pub const State = struct {
@@ -119,15 +110,13 @@ pub const ExecState = struct {
     slots: Slots = .{},
     /// The publish lane's task.
     work: std.Io.Group = .init,
-    lane_head: ?*PublishCmd = null,
-    lane_tail: ?*PublishCmd = null,
-    lane_running: bool = false,
+    lane: Lane(PublishCmd) = .{},
 
     /// A slot for a subscription the consumer is deciding: not open, its
     /// handle not handed out.
     fn reserve(st: *ExecState, x: *Exec, route: *const Route) !*SseSlot {
         const s = try st.slots.alloc(x);
-        const g = s.gen();
+        const g = Slots.gen(s);
         s.pending_bytes.store(0, .monotonic);
         s.want_event.store(false, .monotonic);
         s.sub = null;
@@ -140,7 +129,7 @@ pub const ExecState = struct {
     /// A reserved slot that was not used: back on the free list under a
     /// new generation.
     fn unreserve(st: *ExecState, s: *SseSlot) void {
-        const g = s.gen();
+        const g = Slots.gen(s);
         s.word.store(pack(engine.nextGen(g), .free), .release);
         st.slots.free(s);
     }
@@ -150,21 +139,13 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.dropLane();
+        _ = st.lane.dropAll();
         st.slots.deinit(freeSlotPending);
     }
 
     fn freeSlotPending(s: *SseSlot) void {
         for (s.pending.items) |cmd| freeCmd(cmd);
         s.pending.deinit(gpa);
-    }
-
-    fn dropLane(st: *ExecState) void {
-        while (st.lane_head) |p| {
-            st.lane_head = p.next;
-            p.free();
-        }
-        st.lane_tail = null;
     }
 
     /// Cancels the executor's SSE work (at the server's end).
@@ -186,9 +167,9 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *SseSlot, u32 } {
 /// thread.
 pub fn openReserved(x: *Exec, i: u32) u64 {
     const s = x.sse.slots.slot(i).?;
-    const g = s.gen();
+    const g = Slots.gen(s);
     s.word.store(pack(g, .open), .release);
-    return s.handle(g);
+    return Slots.handle(s, g);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +250,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     };
     // Accepted: the consumer holds the handle. If the stream cannot be
     // set up, it hears it end.
-    const g = slot.gen();
+    const g = Slots.gen(slot);
     defer if (!slot.opened) retire(x, slot, g, abi.SSE_CLOSED_SERVER);
     for (chosen.topics) |t| try names.append(req.arena, t);
     const hdrs = try req.arena.alloc([2][]const u8, chosen.headers.len);
@@ -301,7 +282,7 @@ fn onOpen(sub: *sse.Subscriber) void {
 fn onClose(sub: *sse.Subscriber, reason: sse.CloseReason) void {
     const slot: *SseSlot = @ptrCast(@alignCast(sub.context.?));
     slot.sub = null;
-    retire(slot.exec, slot, slot.gen(), @backingInt(reason));
+    retire(slot.exec, slot, Slots.gen(slot), @backingInt(reason));
 }
 
 fn retire(x: *Exec, s: *SseSlot, g: u32, reason: u32) void {
@@ -309,7 +290,7 @@ fn retire(x: *Exec, s: *SseSlot, g: u32, reason: u32) void {
     s.sub = null;
     for (s.pending.items) |cmd| dropCmd(x.engine, cmd);
     s.pending.clearRetainingCapacity();
-    if (engine.newRecord(@sizeOf(abi.SseCloseEvent), .sse_close, s.handle(g))) |rec| {
+    if (engine.newRecord(@sizeOf(abi.SseCloseEvent), .sse_close, Slots.handle(s, g))) |rec| {
         const ev: *abi.SseCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;
         ev.reason = reason;
@@ -326,7 +307,7 @@ fn onWritten(sub: *sse.Subscriber, bytes: usize) void {
     const left = before -| bytes;
     const cap = sub.hub.options.max_queued_bytes;
     if (left <= cap / 4 and slot.want_event.cmpxchgStrong(true, false, .seq_cst, .seq_cst) == null) {
-        slot.exec.postEvent(.writable, slot.handle(slot.gen()));
+        slot.exec.postEvent(.writable, Slots.handle(slot, Slots.gen(slot)));
     }
 }
 
@@ -349,7 +330,7 @@ fn run(cmd: *Command, x: *Exec) void {
     const c: *SseCmd = @alignCast(@fieldParentPtr("cmd", cmd));
     const e = x.engine;
     const found = slotOf(e, c.handle) catch null;
-    if (found == null or !found.?[0].live(found.?[1]) or e.phase.load(.acquire) == .stopped) {
+    if (found == null or !Slots.live(found.?[0], found.?[1]) or e.phase.load(.acquire) == .stopped) {
         dropCmd(e, c);
         return;
     }
@@ -402,7 +383,7 @@ fn checkTopic(topic: []const u8) AnswerError!void {
 pub fn subscribe(e: *Engine, hv: u64, topic: []const u8, last: u32) AnswerError!void {
     try checkTopic(topic);
     const s, const g = slotOf(e, hv) catch |err| return e.badHandle(err);
-    if (!s.live(g)) return e.gone();
+    if (!Slots.live(s, g)) return e.gone();
     const c = try gpa.create(SseCmd);
     errdefer gpa.destroy(c);
     c.* = .{ .handle = hv, .kind = .subscribe, .topic = try gpa.dupe(u8, topic), .last = last, .counted = true };
@@ -414,7 +395,7 @@ pub fn subscribe(e: *Engine, hv: u64, topic: []const u8, last: u32) AnswerError!
 pub fn unsubscribe(e: *Engine, hv: u64, topic: []const u8) AnswerError!void {
     try checkTopic(topic);
     const s, const g = try slotOf(e, hv);
-    if (!s.live(g)) return error.Over;
+    if (!Slots.live(s, g)) return error.Over;
     const c = try gpa.create(SseCmd);
     errdefer gpa.destroy(c);
     c.* = .{ .handle = hv, .kind = .unsubscribe, .topic = try gpa.dupe(u8, topic), .counted = true };
@@ -425,7 +406,7 @@ pub fn unsubscribe(e: *Engine, hv: u64, topic: []const u8) AnswerError!void {
 /// `anole_sse_close`: a cleanup call.
 pub fn closeSub(e: *Engine, hv: u64) AnswerError!void {
     const s, const g = try slotOf(e, hv);
-    if (!s.live(g)) return error.Over;
+    if (!Slots.live(s, g)) return error.Over;
     const c = try gpa.create(SseCmd);
     c.* = .{ .handle = hv, .kind = .close };
     s.exec.post(&c.cmd);
@@ -438,7 +419,7 @@ pub fn send(e: *Engine, hv: u64, event: []const u8, data: []const u8) AnswerErro
     if (std.mem.indexOfAny(u8, event, "\r\n") != null) return error.Invalid;
     if (data.len > e.config.limits.sse_max_event) return error.Invalid;
     const s, const g = slotOf(e, hv) catch |err| return e.badHandle(err);
-    if (!s.live(g)) return e.gone();
+    if (!Slots.live(s, g)) return e.gone();
     const topics = e.sse_state.topics orelse return error.State;
     const p = topics._encode(.{ .data = data, .event = if (event.len > 0) event else null }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -487,7 +468,7 @@ const PublishCmd = struct {
     after: u32,
     next: ?*PublishCmd = null,
 
-    fn free(p: *PublishCmd) void {
+    pub fn free(p: *PublishCmd) void {
         const st = &p.engine.sse_state;
         _ = st.publishing.fetchSub(1, .monotonic);
         _ = st.publish_bytes.fetchSub(p.size, .monotonic);
@@ -550,29 +531,10 @@ fn runPublish(cmd: *Command, x: *Exec) void {
     const p: *PublishCmd = @alignCast(@fieldParentPtr("cmd", cmd));
     if (x.engine.phase.load(.acquire) == .stopped) return p.free();
     const st = &x.sse;
-    p.next = null;
-    if (st.lane_tail) |t| t.next = p else st.lane_head = p;
-    st.lane_tail = p;
-    if (st.lane_running) return;
-    st.lane_running = true;
+    if (!st.lane.push(p)) return;
     placement.concurrent(&st.work, x.engine.io, .local, publishLane, .{ x.engine, x }) catch {
-        st.lane_running = false;
-        while (st.lane_head) |q| {
-            st.lane_head = q.next;
-            _ = x.engine.sse_state.publish_dropped.fetchAdd(1, .monotonic);
-            q.free();
-        }
-        st.lane_tail = null;
+        _ = x.engine.sse_state.publish_dropped.fetchAdd(st.lane.dropAll(), .monotonic);
     };
-}
-
-fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
-    const st = &e.sse_state;
-    while (true) {
-        const done = st.topic_changes_done.load(.acquire);
-        if (@as(i32, @bitCast(done -% want)) >= 0) return;
-        try e.io.futexWait(u32, &st.topic_changes_done.raw, done);
-    }
 }
 
 /// A test hook (test builds only): while `test_lane_hold` is set, every
@@ -594,29 +556,16 @@ pub const LaneHold = struct {
 };
 pub var test_lane_hold: if (builtin.is_test) ?*LaneHold else void = if (builtin.is_test) null else {};
 
+/// Takes the executor's publishes in order: each waits for the topic
+/// changes taken before it, then fans out.
 fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
-    const st = &x.sse;
+    return x.sse.lane.run(e.io, &e.sse_state.topic_changes_done, e, fanOut);
+}
+
+fn fanOut(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
+    if (comptime builtin.is_test) if (test_lane_hold) |h| try h.wait(e);
     const hub = e.sse_state.topics orelse return;
-    while (true) {
-        const p = st.lane_head orelse {
-            st.lane_running = false;
-            return;
-        };
-        st.lane_head = p.next;
-        if (st.lane_head == null) st.lane_tail = null;
-        defer p.free();
-        if (comptime builtin.is_test) if (test_lane_hold) |h| h.wait(e) catch |err| {
-            st.lane_running = false;
-            st.dropLane();
-            return err;
-        };
-        awaitTopicChanges(e, p.after) catch |err| {
-            st.lane_running = false;
-            st.dropLane();
-            return err;
-        };
-        _ = hub._publishPayload(p.topic, p.payload, p.record);
-    }
+    _ = hub._publishPayload(p.topic, p.payload, p.record);
 }
 
 /// `anole_sse_gap`.

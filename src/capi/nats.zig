@@ -349,18 +349,6 @@ fn natsOptions(e: *Engine, b: *Broker) !anole.nats.Options {
 // ---------------------------------------------------------------------------
 // Records
 
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
-
 const Header = [2][]const u8;
 
 /// What goes into an `anole_nats_msg_event`.
@@ -389,7 +377,7 @@ fn msgRecord(typ: abi.EventType, handle: u64, m: MsgData) ![]align(8) u8 {
     const bytes_off = spans_off + m.headers.len * 2 * @sizeOf(abi.Span);
     const rec = try engine.newRecord(bytes_off + bytes, typ, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = bytes_off };
+    var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
     ev.user_data = m.user_data;
     ev.sub = m.sub;
     ev.subject = w.put(m.subject);
@@ -438,7 +426,7 @@ fn replyRecord(r: ReplyData) ![]align(8) u8 {
     const bytes_off = spans_off + r.headers.len * 2 * @sizeOf(abi.Span);
     const rec = try engine.newRecord(bytes_off + bytes, .nats_reply, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = bytes_off };
+    var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
     ev.user_data = r.user_data;
     ev.status = r.status;
     ev.http_status = r.http_status;
@@ -466,7 +454,7 @@ fn endRecord(handle: u64, user_data: u64, reason: u32, dropped: u64, message: []
     const Ev = abi.BrokerEndEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + message.len, .nats_sub_end, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = user_data;
     ev.reason = reason;
     ev.dropped = dropped;
@@ -477,7 +465,7 @@ fn endRecord(handle: u64, user_data: u64, reason: u32, dropped: u64, message: []
 // ---------------------------------------------------------------------------
 // Publishing
 
-pub const CallError = error{ Invalid, State, Again, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 fn checkOpen(b: *Broker) CallError!void {
     if (comptime !features.nats) return error.Unsupported;
