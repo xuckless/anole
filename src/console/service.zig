@@ -6,7 +6,6 @@
 //! rings that each client reads at its own pace, and a client that stops
 //! reading blocks only its own thread.
 const std = @import("std");
-const builtin = @import("builtin");
 const dusty = @import("dusty");
 const ui = @import("anole_console_ui");
 const logging = @import("anole_log");
@@ -15,7 +14,6 @@ const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const procinfo = @import("procinfo.zig");
 const reexec = @import("reexec.zig");
-const SpinLock = @import("anole_mem").SpinLock;
 
 const protocol = ui.protocol;
 const sys = ui.sys;
@@ -84,7 +82,7 @@ pub const Info = struct {
 pub const Metric = struct { name: []const u8, value: f64, unit: []const u8 };
 
 /// A language metric as the service keeps it: copied into fixed room, so
-/// that `setMetrics` and `/runtime` copy it under the service's spin lock
+/// that `setMetrics` and `/runtime` copy it under the service's lock
 /// without allocating.
 const Stored = struct {
     name: [max_metric_name]u8 = @splat(0),
@@ -99,10 +97,20 @@ pub const max_metric_name = 48;
 pub const max_metric_unit = 16;
 pub const max_metrics = 32;
 
-/// Clients the service tracks at once: the ones attached and the ones whose
-/// thread ended and is not joined yet (`reap`). A fixed list, so that adding
-/// one under the spin lock never allocates.
-const max_tracked = 2 * protocol.max_clients + 8;
+/// A lock whose waiters block (a futex), taken from the console's own
+/// threads and from the C ABI's: `std.Io.Mutex` on the threaded `Io`,
+/// since none of them runs in an `Io` of its own.
+const Lock = struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *Lock) void {
+        self.inner.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock(std.Io.Threaded.global_single_threaded.io());
+    }
+};
 
 pub const Options = struct {
     read_only: bool = false,
@@ -111,19 +119,27 @@ pub const Options = struct {
     restart_wait_ms: u32 = 15_000,
 };
 
+/// Why the console says bye; set before `setStopping`.
+pub const ByeReason = enum(u8) { stop, drain };
+const bye_text = std.EnumArray(ByeReason, []const u8).init(.{ .stop = "stop", .drain = "drain" });
+
+/// Restart handshake with `run`: idle -> requested (handleRestart's swap; a
+/// second handleRestart while requested answers busy); requested ->
+/// succeeded | failed (restartFinished); any -> idle (handleRestart after it
+/// answered).
+const RestartState = enum(u8) { idle, requested, succeeded, failed };
+
 const Client = struct {
     service: *Service,
     fd: sys.fd_t,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
-    in_process: bool = false,
     /// Broadcast sequence this client has flushed.
     seen_broadcast: std.atomic.Value(u32) = .init(0),
 
     reader: protocol.LineReader = .init(protocol.max_client_line),
     out: std.ArrayList(u8) = .empty,
     out_off: usize = 0,
-    hello_done: bool = false,
 
     // subscriptions
     next_sub: u32 = 1,
@@ -158,15 +174,14 @@ pub const Service = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     /// `stop` ran (the owner's thread only).
     stopped: bool = false,
-    bye_reason: std.atomic.Value(u8) = .init(0),
+    bye_reason: std.atomic.Value(ByeReason) = .init(.stop),
 
-    /// Over `clients`, the broadcast line and the language metrics; held
-    /// for bounded copies only, never across an allocation.
-    lock: SpinLock = .init,
-    /// In `clients_buf` (set by `init`).
+    /// Over `clients`, the broadcast line and the language metrics; never
+    /// held across I/O, a wait or a host callback.
+    lock: Lock = .{},
+    /// Attached clients and the ones whose thread ended and that `reap` has
+    /// not joined yet.
     clients: std.ArrayList(*Client) = .empty,
-    // SAFETY: only `clients.items` is read; `init` points `clients` here.
-    clients_buf: [max_tracked]*Client = undefined,
     attached: std.atomic.Value(u32) = .init(0),
     euid: u32,
 
@@ -176,7 +191,7 @@ pub const Service = struct {
     broadcast_len: usize = 0,
 
     // restart handshake with `run`
-    restart_state: std.atomic.Value(u8) = .init(0), // 0 idle, 1 requested, 2 ok, 3 failed
+    restart_state: std.atomic.Value(RestartState) = .init(.idle),
     restart_pid: std.atomic.Value(i32) = .init(0),
 
     metrics: [max_metrics]Stored = @splat(.{}),
@@ -196,7 +211,6 @@ pub const Service = struct {
             .euid = sys.geteuid(),
             .runtime_name = info.runtime,
         };
-        self.clients = .initBuffer(&self.clients_buf);
         self.stop_pipe = try sys.pipe();
         return self;
     }
@@ -253,111 +267,74 @@ pub const Service = struct {
 
     /// Frees the service, once nothing can reach it any more (after `stop`).
     pub fn destroy(self: *Service) void {
+        self.clients.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
     /// Joins and frees every client whose thread ended.
+    /// One at a time, so that the join runs outside the lock.
     fn reap(self: *Service) void {
         while (true) {
-            var finished: [8]*Client = undefined;
-            var n: usize = 0;
-            self.lock.lock();
-            var i: usize = 0;
-            while (i < self.clients.items.len and n < finished.len) {
-                const c = self.clients.items[i];
-                if (c.done.load(.acquire)) {
-                    finished[n] = c;
-                    n += 1;
-                    _ = self.clients.swapRemove(i);
-                } else i += 1;
-            }
-            self.lock.unlock();
-            for (finished[0..n]) |c| {
-                if (c.thread) |t| t.join();
-                c.reader.deinit(self.gpa);
-                c.out.deinit(self.gpa);
-                self.gpa.destroy(c);
-            }
-            if (n < finished.len) return;
+            const c = c: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                for (self.clients.items, 0..) |x, i| {
+                    if (x.done.load(.acquire)) break :c self.clients.swapRemove(i);
+                }
+                return;
+            };
+            if (c.thread) |t| t.join();
+            c.reader.deinit(self.gpa);
+            c.out.deinit(self.gpa);
+            self.gpa.destroy(c);
         }
     }
 
-    /// Tells the peer on `fd` that the console is busy, and closes it.
-    fn refuseBusy(fd: sys.fd_t) error{Busy} {
+    /// Tells the peer on `fd` that the console is busy; the caller closes it.
+    fn tellBusy(fd: sys.fd_t) void {
         var buf: [256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         protocol.encode(.{ .err = .{ .code = protocol.code_busy, .message = "4 consoles are attached already" } }, &w) catch {};
         sys.writeAll(fd, w.buffered()) catch {};
-        sys.close(fd);
-        return error.Busy;
-    }
-
-    fn liveCount(self: *Service) usize {
-        self.lock.lock();
-        defer self.lock.unlock();
-        var n: usize = 0;
-        for (self.clients.items) |c| {
-            if (!c.done.load(.acquire)) n += 1;
-        }
-        return n;
     }
 
     /// Adds an already connected stream (the in-process console's socketpair
-    /// end, or an accepted socket). The service owns `fd` from here.
-    pub fn adopt(self: *Service, fd: sys.fd_t, in_process: bool) !void {
+    /// end, or an accepted socket). The service owns `fd` from here. The live
+    /// cap is counted and the client appended in one lock section, so two
+    /// concurrent adopts cannot both pass it.
+    pub fn adopt(self: *Service, fd: sys.fd_t) !void {
         self.reap();
-        if (self.liveCount() >= protocol.max_clients) return refuseBusy(fd);
+        errdefer sys.close(fd);
         const c = try self.gpa.create(Client);
-        c.* = .{ .service = self, .fd = fd, .in_process = in_process };
+        c.* = .{ .service = self, .fd = fd };
         errdefer self.gpa.destroy(c);
+        const admitted = admitted: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            var live: usize = 0;
+            for (self.clients.items) |x| {
+                if (!x.done.load(.acquire)) live += 1;
+            }
+            if (live >= protocol.max_clients) break :admitted false;
+            try self.clients.append(self.gpa, c);
+            break :admitted true;
+        };
+        if (!admitted) {
+            tellBusy(fd);
+            return error.Busy;
+        }
         sys.setNonblock(fd);
-        if (comptime builtin.is_test) if (test_before_append) |hook| {
-            test_before_append = null;
-            hook(self);
-        };
-        self.lock.lock();
-        self.clients.appendBounded(c) catch {
-            // Unreachable in practice (reap empties, live < max_clients < max_tracked); the fd is closed.
-            // Clients whose thread ended faster than `reap` could join
-            // them fill the list: this one is told busy.
-            self.lock.unlock();
-            return refuseBusy(fd);
-        };
-        self.lock.unlock();
         _ = self.attached.fetchAdd(1, .monotonic);
         c.thread = std.Thread.spawn(.{}, clientMain, .{c}) catch {
             _ = self.attached.fetchSub(1, .monotonic);
             self.lock.lock();
+            defer self.lock.unlock();
             for (self.clients.items, 0..) |x, i| if (x == c) {
                 _ = self.clients.swapRemove(i);
                 break;
             };
-            self.lock.unlock();
-            sys.close(fd);
             return error.SystemResources;
         };
-    }
-
-    /// Tests: runs once in `adopt`, after its count of live clients and
-    /// before the new one is added, where clients whose thread ended can
-    /// fill the list before `reap` joins them. Test builds only.
-    pub var test_before_append: if (builtin.is_test) ?*const fn (*Service) void else void = if (builtin.is_test) null else {};
-
-    /// Tests: fills the list with clients whose thread has ended and that
-    /// `reap` has not joined yet (no thread, no socket). Test builds only.
-    pub fn testFillFinished(self: *Service) void {
-        comptime std.debug.assert(builtin.is_test);
-        while (true) {
-            const c = self.gpa.create(Client) catch @panic("OOM");
-            c.* = .{ .service = self, .fd = -1, .done = .init(true) };
-            self.lock.lock();
-            const added = if (self.clients.appendBounded(c)) |_| true else |_| false;
-            self.lock.unlock();
-            if (!added) {
-                self.gpa.destroy(c);
-                return;
-            }
-        }
     }
 
     // ---------------------------------------------------------- acceptor
@@ -383,7 +360,7 @@ pub const Service = struct {
                 sys.close(fd);
                 continue;
             }
-            self.adopt(fd, false) catch {};
+            self.adopt(fd) catch {};
         }
     }
 
@@ -427,7 +404,7 @@ pub const Service = struct {
             };
             _ = sys.poll(&fds, tick_ms);
             if (self.stopping.load(.acquire)) {
-                const reason: []const u8 = if (self.bye_reason.load(.acquire) == 1) "drain" else "stop";
+                const reason = bye_text.get(self.bye_reason.load(.acquire));
                 try send(c, .{ .bye = .{ .reason = reason } });
                 try flush(c);
                 return;
@@ -532,7 +509,6 @@ pub const Service = struct {
                     try flush(c);
                     return error.Version;
                 }
-                c.hello_done = true;
             },
             .req => |r| try handleRequest(c, a, r),
             else => {},
@@ -587,7 +563,7 @@ pub const Service = struct {
                 if (self.opts.read_only) return fail(c, r.id, protocol.code_refused, "the console is read-only (console.read_only)");
                 if (!confirmed(r, protocol.confirm_drain)) return fail(c, r.id, protocol.code_confirm_required, "send confirm \"drain\"");
                 std.log.scoped(.anole).info("console: drain requested", .{});
-                self.bye_reason.store(1, .release);
+                self.bye_reason.store(.drain, .release);
                 try reply(c, r.id, emptyObject());
                 try flush(c);
                 self.host.stop(self.host.ctx);
@@ -629,18 +605,16 @@ pub const Service = struct {
         }
         if (!confirmed(r, protocol.confirm_restart)) return fail(c, r.id, protocol.code_confirm_required, "send confirm \"restart\"");
         const restart = self.host.restart orelse return fail(c, r.id, protocol.code_unavailable, "no listener hand-off");
-        if (self.restart_state.swap(1, .acq_rel) == 1) return fail(c, r.id, protocol.code_busy, "a restart is already in progress");
+        if (self.restart_state.swap(.requested, .acq_rel) == .requested) return fail(c, r.id, protocol.code_busy, "a restart is already in progress");
         std.log.scoped(.anole).info("console: restart requested", .{});
         restart(self.host.ctx);
         const deadline = sys.monotonicMs() + self.opts.restart_wait_ms;
         while (sys.monotonicMs() < deadline) {
-            const st = self.restart_state.load(.acquire);
-            if (st >= 2) break;
+            if (self.restart_state.load(.acquire) != .requested) break;
             var p = [1]sys.PollFd{.{ .fd = -1, .events = 0, .revents = 0 }};
             _ = sys.poll(&p, 50);
         }
-        const st = self.restart_state.swap(0, .acq_rel);
-        if (st == 2) {
+        if (self.restart_state.swap(.idle, .acq_rel) == .succeeded) {
             const pid = self.restart_pid.load(.acquire);
             var buf: [128]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
@@ -657,7 +631,7 @@ pub const Service = struct {
     /// Called by `run` after the hand-off attempt.
     pub fn restartFinished(self: *Service, ok: bool, successor_pid: i32) void {
         self.restart_pid.store(successor_pid, .release);
-        self.restart_state.store(if (ok) 2 else 3, .release);
+        self.restart_state.store(if (ok) .succeeded else .failed, .release);
     }
 
     fn handleFullRestart(c: *Client, a: std.mem.Allocator, r: protocol.Request) !void {

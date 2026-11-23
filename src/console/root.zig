@@ -333,7 +333,7 @@ pub const Console = struct {
     pub fn stop(self: *Console, reason_drain: bool) void {
         if (self.keys) |k| k.stop();
         self.keys = null;
-        if (reason_drain) self.service.bye_reason.store(1, .release);
+        if (reason_drain) self.service.bye_reason.store(.drain, .release);
         inprocess.close();
         stats.uninstall();
         if (self.logs) |lr| lr.uninstall();

@@ -18,7 +18,7 @@ pub const Exit = enum {
     quit,
     /// Esc with nothing to close, in-process.
     back_to_logs,
-    /// Ctrl-C in-process: the terminal is restored and `on_interrupt` has run.
+    /// Ctrl-C in-process: the terminal is restored; the caller re-raises SIGINT.
     interrupt,
     /// The app announced a restart (hand-off or exec), or a kill restart was
     /// asked for (see `RunOptions.kill`). The CLI reattaches.
@@ -35,9 +35,6 @@ pub const RunOptions = struct {
     mode: Mode,
     term: *term_mod.Terminal,
     conn: *client.Conn,
-    /// In-process: called on Ctrl-C after the terminal is restored.
-    on_interrupt: ?*const fn (ctx: ?*anyopaque) void = null,
-    ctx: ?*anyopaque = null,
     /// Written (from another thread) to stop the loop; -1 for none.
     wake_fd: sys.fd_t = -1,
     wedge_timeout_ms: u32 = 5000,
@@ -185,7 +182,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
                 while (conn.nextFrame(frame_arena.allocator()) catch null) |f| app.frame(f);
                 if (!alive) {
                     app.connectionClosed();
-                    if (opts.mode == .in_process and exit == null) exit = if (app.restarting != null) .restarted else .server_gone;
+                    if (opts.mode == .in_process and exit == null) exit = if (app.isRestarting()) .restarted else .server_gone;
                 }
                 dirty = true;
             }
@@ -228,7 +225,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
         }
         conn.flush() catch {};
 
-        if (app.restarting != null and exit == null) exit = .restarted;
+        if (app.isRestarting() and exit == null) exit = .restarted;
 
         // Resize: polled, no SIGWINCH handler (D17).
         if (now - last_size_check >= 250) {
@@ -242,7 +239,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
             }
         }
         // Keep the link alive and notice a silent server.
-        if (now - last_ping >= 1000 and !app.server_gone) {
+        if (now - last_ping >= 1000 and app.peer != .gone) {
             last_ping = now;
             _ = conn.ping() catch {};
         }
@@ -252,11 +249,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
 
     // Restore the terminal before anything else runs.
     t.leave();
-    const result = exit.?;
-    if (result == .interrupt) {
-        if (opts.on_interrupt) |f| f(opts.ctx);
-    }
-    return result;
+    return exit.?;
 }
 
 fn sendOutbox(app: *app_mod.App, conn: *client.Conn) !?KillRequest {

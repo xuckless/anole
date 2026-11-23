@@ -73,6 +73,9 @@ test "resolution: enabled off in tests, lambda and with ANOLE_CONSOLE=0; allow_r
 const Fake = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     reloads: std.atomic.Value(u32) = .init(0),
+    /// What the stub hand-off reports back to the service.
+    svc: ?*service.Service = null,
+    restart_ok: bool = false,
 
     fn reload(ctx: *anyopaque, _: []u8) service.ReloadResult {
         const self: *Fake = @ptrCast(@alignCast(ctx));
@@ -82,6 +85,10 @@ const Fake = struct {
     fn stop(ctx: *anyopaque) void {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         self.stopped.store(true, .release);
+    }
+    fn restart(ctx: *anyopaque) void {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        self.svc.?.restartFinished(self.restart_ok, 4242);
     }
     fn routeMeta(_: *anyopaque, index: u32) ?service.RouteMeta {
         if (index == 1) return .{ .method = "GET", .pattern = "/users/:id" };
@@ -146,7 +153,7 @@ const Harness = struct {
     /// A connected, hello'd client.
     fn attach(self: *Harness) !ui.client.Conn {
         const pair = try os.socketpair();
-        try self.svc.adopt(pair[0], false);
+        try self.svc.adopt(pair[0]);
         var c = ui.client.Conn.init(self.gpa, pair[1], pair[1]);
         errdefer c.deinit();
         try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
@@ -306,7 +313,7 @@ test "service: the fifth client is told busy" {
         c.deinit();
     };
     const pair = try os.socketpair();
-    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0], false));
+    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0]));
     var c5 = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
     defer {
         c5.close();
@@ -314,25 +321,14 @@ test "service: the fifth client is told busy" {
     }
     try std.testing.expectError(error.Refused, c5.handshake("test", 5000, sys.monotonicMs));
     try std.testing.expect(std.mem.startsWith(u8, c5.refusal.?, "busy:"));
-}
-
-test "service: a client past the tracked limit is told busy" {
-    if (!os.supported) return error.SkipZigTest;
-    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
-    defer h.deinit();
-    // Past the count of live clients, the list fills with clients whose
-    // thread ended and that are not joined yet.
-    service.Service.test_before_append = service.Service.testFillFinished;
-    defer service.Service.test_before_append = null;
-    const pair = try os.socketpair();
-    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0], false));
-    var c = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
-    defer {
-        c.close();
-        c.deinit();
+    // The four attached ones keep working.
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    for (&clients) |*c| {
+        _ = try c.ping();
+        try c.flush();
+        try std.testing.expect((try waitFor(c, arena_s.allocator(), .res)).res.ok);
     }
-    try std.testing.expectError(error.Refused, c.handshake("test", 5000, sys.monotonicMs));
-    try std.testing.expect(std.mem.startsWith(u8, c.refusal.?, "busy:"));
 }
 
 test "service: a newer protocol gets a version error" {
@@ -340,7 +336,7 @@ test "service: a newer protocol gets a version error" {
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
     defer h.deinit();
     const pair = try os.socketpair();
-    try h.svc.adopt(pair[0], false);
+    try h.svc.adopt(pair[0]);
     defer sys.close(pair[1]);
     // Read the server's hello by hand, then answer with proto 2.
     var buf: [4096]u8 = undefined;
@@ -405,6 +401,30 @@ test "service: drain without its token is refused, with it the server stops; rel
     try wait.waitFlag(std.testing.io, "the drain stopped the server", &h.fake.stopped);
 }
 
+test "service: restart answers with the successor pid on success and an error on failure" {
+    if (!os.supported) return error.SkipZigTest;
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const a = arena_s.allocator();
+    var h = try Harness.init(std.testing.allocator, .{ .allow_restart = true }, .{ .restart = true });
+    defer h.deinit();
+    h.fake.svc = h.svc;
+    h.svc.host.restart = Fake.restart;
+    var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
+    }
+    for ([_]bool{ true, false, true }) |ok| {
+        h.fake.restart_ok = ok;
+        _ = try c.op("restart", "restart");
+        try c.flush();
+        const rs = (try waitFor(&c, a, .res)).res;
+        try std.testing.expectEqual(ok, rs.ok);
+        if (ok) try std.testing.expectEqual(@as(i64, 4242), rs.data.?.object.get("successor_pid").?.integer);
+    }
+}
+
 test "service: read_only refuses reload, drain, restart and full_restart" {
     if (!os.supported) return error.SkipZigTest;
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -457,7 +477,7 @@ test "service: stopping sends bye to every client" {
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_s.deinit();
     const a = arena_s.allocator();
-    h.svc.bye_reason.store(1, .release);
+    h.svc.bye_reason.store(.drain, .release);
     h.svc.setStopping();
     const bye = (try waitFor(&c, a, .bye)).bye;
     try std.testing.expectEqualStrings("drain", bye.reason);
