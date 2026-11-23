@@ -360,17 +360,19 @@ pub const Watch = struct {
     reconnect: resilience.Backoff,
     data_mode: Data,
     targets: []TargetRt = &.{},
-    /// Over the sinks, the position, the failure and the inbox.
+    /// Over the sinks, the position and the inbox.
     mutex: std.Io.Mutex = .init,
     sinks: std.DoublyLinkedList = .{},
     handler: ?HandlerSlot = null,
+    /// The lifecycle; changed only by `advance`.
+    phase: std.atomic.Value(Phase) = .init(.idle),
+    /// What the reader last said of its link (starting, connected,
+    /// reconnecting); `status()` shows it until the phase ends the watch.
     status_value: std.atomic.Value(u8) = .init(@backingInt(Status.starting)),
-    stopping: std.atomic.Value(bool) = .init(false),
-    started: bool = false,
-    /// Set by `start` before it adds the watch to its shared connection's
-    /// hub (PostgreSQL LISTEN, Redis Pub/Sub); the first `stop` takes it
-    /// out again, whatever set `stopping` before (`fail`, a drain that
-    /// could not start its task), so a freed watch is never listed (#157).
+    /// A resource, apart from the phase: set by `start` before it adds the
+    /// watch to its shared connection's hub (PostgreSQL LISTEN, Redis
+    /// Pub/Sub); every `stop` takes it out whatever the phase (a failed or
+    /// already stopped watch too), so a freed watch is never listed (#157).
     hub_listed: std.atomic.Value(bool) = .init(false),
     /// Not started under this deployment (lambda).
     disabled: bool = false,
@@ -403,10 +405,38 @@ pub const Watch = struct {
     n_listener_dropped: std.atomic.Value(u64) = .init(0),
     n_template_skipped: std.atomic.Value(u64) = .init(0),
     metrics: ?Metrics = null,
-    /// Tests: no real source; `_inject` feeds it.
-    fake: bool = false,
 
     const inbox_max = 4096;
+
+    /// The lifecycle, one value. Events (rows: from -> to):
+    ///   start:  idle -> running; else nothing (a disabled watch stays idle).
+    ///   stop:   idle, running, stop_asked -> stopping (the caller that won
+    ///           tears down; the reader is canceled only from running) ->
+    ///           stopped; stopping, stopped, failed: only the hub's listing
+    ///           goes (#157); a failed watch stays failed.
+    ///   askStop (a drain whose stop task did not start; never waits):
+    ///           idle, running -> stop_asked; `stop` still owes the teardown.
+    ///   fail:   idle, running, stop_asked -> failed (listeners end failed);
+    ///           later phases: ignored, the first end wins.
+    const Phase = enum(u8) { idle, running, stop_asked, stopping, stopped, failed };
+
+    /// Readers, listeners and handler slots stop at these.
+    const phase_stopped = std.EnumArray(Phase, bool).init(.{ .idle = false, .running = false, .stop_asked = true, .stopping = true, .stopped = true, .failed = true });
+    /// What `status()` shows; null: the reader's link status.
+    const phase_status = std.EnumArray(Phase, ?Status).init(.{ .idle = null, .running = null, .stop_asked = null, .stopping = .stopped, .stopped = .stopped, .failed = .failed });
+    /// The statuses a reader reports through `setStatus`; the other two are
+    /// phases.
+    const link_status = std.EnumArray(Status, bool).init(.{ .starting = true, .connected = true, .reconnecting = true, .stopped = false, .failed = false });
+
+    /// The one mutator of `phase`: moves it to `to` when it is in `from`;
+    /// returns the phase it left, null when it was not in `from`.
+    fn advance(self: *Watch, comptime from: []const Phase, to: Phase) ?Phase {
+        var cur = self.phase.load(.acquire);
+        while (std.mem.indexOfScalar(Phase, from, cur) != null) {
+            cur = self.phase.cmpxchgWeak(cur, to, .acq_rel, .acquire) orelse return cur;
+        }
+        return null;
+    }
 
     const Metrics = struct {
         events: *observe_metrics.Counter,
@@ -568,7 +598,14 @@ pub const Watch = struct {
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const self: *Watch = @alignCast(@fieldParentPtr("drain_hook", hook));
         // A task: stopping takes the hub's lock.
-        placement.concurrent(&self.group, self.io, .local, stopTask, .{self}) catch self.stopping.store(true, .release);
+        placement.concurrent(&self.group, self.io, .local, stopTask, .{self}) catch self.askStop();
+    }
+
+    /// Stops reading without waiting or locking (for callbacks that must
+    /// not wait, as a drain hook): readers and `listen` see the watch
+    /// stopped; `stop` or `deinit` does the rest.
+    pub fn askStop(self: *Watch) void {
+        _ = self.advance(&.{ .idle, .running }, .stop_asked);
     }
 
     fn stopTask(self: *Watch) std.Io.Cancelable!void {
@@ -585,8 +622,8 @@ pub const Watch = struct {
         _ = tracer;
         _ = health;
         if (registry) |r| try self.observe(r);
-        if (self.started or self.disabled or self.fake) return;
-        self.started = true;
+        if (self.disabled) return;
+        _ = self.advance(&.{.idle}, .running) orelse return;
         switch (self.source) {
             // Listed before registering: a registration that fails half way
             // is undone by `stop` too.
@@ -636,26 +673,31 @@ pub const Watch = struct {
 
     /// Stops reading and ends handlers' work and listeners (W8). Does not wait.
     pub fn stop(self: *Watch) void {
-        const first = !self.stopping.swap(true, .acq_rel);
-        // Out of the hub even when `stopping` was set already: `deinit`
-        // frees the watch right after this.
+        // Out of the hub in every phase: `deinit` frees the watch right
+        // after this.
         if (self.hub_listed.swap(false, .acq_rel)) switch (self.source) {
             .postgres => if (comptime features.postgres) @import("pg.zig").unregister(self),
             .redis => if (comptime features.redis) @import("redis.zig").unregister(self),
             .redis_stream, .mongodb => {},
         };
-        if (!first) return;
-        self.setStatus(.stopped);
-        if (self.reader_task) |t| placement.cancelTask(t);
+        const from = self.advance(&.{ .idle, .running, .stop_asked }, .stopping) orelse return;
+        // Only a running reader is surely alive: after `askStop` it may
+        // have seen the stop and gone (`deinit`'s group cancel covers it).
+        if (from == .running) if (self.reader_task) |t| placement.cancelTask(t);
         self.inbox_signal.set(self.io);
+        _ = self.advance(&.{.stopping}, .stopped);
+        if (self.metrics != null) self.syncMetrics();
         self.endSinks(false, "");
     }
 
     pub fn status(self: *const Watch) Status {
-        return @fromBackingInt(@intCast(self.status_value.load(.acquire)));
+        return phase_status.get(self.phase.load(.acquire)) orelse @fromBackingInt(@intCast(self.status_value.load(.acquire)));
     }
 
+    /// The reader's link status (starting, connected, reconnecting);
+    /// ignored once the watch is stopped (`stop` and `fail` own the rest).
     pub fn setStatus(self: *Watch, s: Status) void {
+        if (!link_status.get(s) or self.isStopped()) return;
         const old: Status = @fromBackingInt(@intCast(self.status_value.swap(@backingInt(s), .acq_rel)));
         if (old == s) return;
         if (self.metrics != null) self.syncMetrics();
@@ -670,21 +712,27 @@ pub const Watch = struct {
     }
 
     pub fn isStopped(self: *const Watch) bool {
-        return self.stopping.load(.acquire);
+        return phase_stopped.get(self.phase.load(.acquire));
     }
 
     /// The source cannot go on: stopped with `status() == .failed`, one
-    /// error line saying what to change.
+    /// error line saying what to change. Called by the reader as it goes
+    /// (so `stop` owes it no cancel).
     pub fn fail(self: *Watch, comptime fmt: []const u8, args: anytype) void {
-        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        log.err("watch \"{s}\": {s}", .{ self.name, text });
-        self.mutex.lockUncancelable(self.io);
-        if (self.failure) |old| self.gpa.free(old);
+        // The text is best effort: out of memory, the watch still fails.
+        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch null;
+        const shown = text orelse "(no detail: out of memory)";
+        if (self.advance(&.{ .idle, .running, .stop_asked }, .failed) == null) {
+            log.warn("watch \"{s}\": {s} (ignored: the watch had stopped)", .{ self.name, shown });
+            if (text) |t| self.gpa.free(t);
+            return;
+        }
+        log.err("watch \"{s}\": {s}", .{ self.name, shown });
+        // Only the first end gets here; `deinit` frees it.
         self.failure = text;
-        self.mutex.unlock(self.io);
-        self.stopping.store(true, .release);
-        self.setStatus(.failed);
-        self.endSinks(true, text);
+        self.inbox_signal.set(self.io);
+        if (self.metrics != null) self.syncMetrics();
+        self.endSinks(true, shown);
     }
 
     // -- outputs ----------------------------------------------------------
@@ -1032,8 +1080,7 @@ pub const Watch = struct {
 
     /// Tests: a watch with no real source, fed by `_inject`.
     pub fn _fake(self: *Watch) void {
-        self.fake = true;
-        self.started = true;
+        _ = self.advance(&.{.idle}, .running);
         self.setStatus(.connected);
     }
 
