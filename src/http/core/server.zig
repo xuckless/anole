@@ -224,53 +224,33 @@ fn lastForwardedValue(headers: *const Headers, name: []const u8) ?[]const u8 {
     return if (value.len == 0) null else value;
 }
 
-/// What the server takes from forwarding headers: `ServerConfig`'s
-/// `trusted_proxy_hops`, `trust_forwarded_proto` and `trust_forwarded_host`.
-const Forwarding = struct {
-    hops: usize = 0,
-    proto: bool = true,
-    host: bool = false,
-    trusted: ?[]const proxy_protocol.Network = null,
-    warn: bool = false,
-
-    fn of(config: *const ServerConfig) Forwarding {
-        return .{
-            .hops = config.trusted_proxy_hops,
-            .proto = config.trust_forwarded_proto,
-            .host = config.trust_forwarded_host,
-            .trusted = config.trusted_proxies,
-            .warn = config.warn_untrusted_peer,
-        };
-    }
-};
-
 /// Applies what trusted proxies say about a request: its client address
 /// (`X-Forwarded-For`), whether the client's connection is TLS
 /// (`X-Forwarded-Proto`, unless turned off) and the host it asked for
 /// (`X-Forwarded-Host`, only when turned on). With no trusted hops, only
 /// the peer address applies.
-fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: Forwarding) void {
+fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, config: *const ServerConfig) void {
     request.forwarded_host = null;
-    if (forwarding.trusted) |nets| {
+    if (config.trusted_proxies) |nets| {
         if (!proxy_protocol.containsAny(nets, peer)) {
             request.remote_address = unmapIpv4(peer);
-            if (forwarding.warn) _ = warnUntrustedPeer(peer);
+            if (config.warn_untrusted_peer) _ = warnUntrustedPeer(peer);
             return;
         }
-        const client = if (forwarding.hops > 0)
-            forwardedRemoteAddress(&request.headers, forwarding.hops)
+        const client = if (config.trusted_proxy_hops > 0)
+            forwardedRemoteAddress(&request.headers, config.trusted_proxy_hops)
         else
             rightmostUntrusted(&request.headers, nets);
         request.remote_address = unmapIpv4(client orelse peer);
     } else {
-        request.remote_address = remoteAddress(peer, &request.headers, forwarding.hops);
-        if (forwarding.hops == 0) return;
+        request.remote_address = remoteAddress(peer, &request.headers, config.trusted_proxy_hops);
+        if (config.trusted_proxy_hops == 0) return;
     }
-    if (forwarding.proto) if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
+    if (config.trust_forwarded_proto) if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
         if (std.ascii.eqlIgnoreCase(proto, "https")) request.secure = true;
         if (std.ascii.eqlIgnoreCase(proto, "http")) request.secure = false;
     };
-    if (forwarding.host) if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
+    if (config.trust_forwarded_host) if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
         // A host name or address with an optional port: nothing that could
         // break a URL or a log line built from it.
         const ok = host.len <= 255 and for (host) |ch| {
@@ -994,6 +974,13 @@ pub const Connection = struct {
     /// is gone. Asked instead of judging an error by its name: a handler's
     /// own `EndOfStream`, from a file or from a std helper at the end of
     /// the body, is spelled like a disconnect and is not one.
+    /// Records what a PROXY protocol header named about the connection.
+    pub fn setProxied(self: *Connection, header: proxy_protocol.Header) void {
+        self.proxied_peer = header.source;
+        self.proxied_secure = header.ssl;
+        self.proxied_local = header.destination;
+    }
+
     /// The client's address: the socket peer, or what a PROXY protocol
     /// header named; IPv4 when a dual-stack socket saw it IPv4-mapped.
     pub fn peerAddress(self: *const Connection) std.Io.net.IpAddress {
@@ -2992,9 +2979,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     if (!try self.handshakeTls(conn, m, timer)) return .close;
 
-                    connection.proxied_peer = proxied.source;
-                    connection.proxied_secure = proxied.ssl;
-                    connection.proxied_local = proxied.destination;
+                    connection.setProxied(proxied);
                     if (l.config.raw) |raw| return self.startRaw(conn, raw, timer);
                     connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
@@ -3015,9 +3000,7 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             try connection.initPlain(self.allocator, self.io, stream);
-            connection.proxied_peer = proxied.source;
-            connection.proxied_secure = proxied.ssl;
-            connection.proxied_local = proxied.destination;
+            connection.setProxied(proxied);
             if (l.config.raw) |raw| return self.startRaw(conn, raw, timer);
             connection.write_pool = &self.request_buffers;
             return self.serveRequests(conn, timer);
@@ -3303,7 +3286,7 @@ pub fn Server(comptime Ctx: type) type {
         /// from `connection`, through the trusted proxies, for an engine
         /// other than the HTTP/1.x loop.
         pub fn applyForwarded(self: *const Self, request: *Request, connection: *const Connection) void {
-            applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
+            applyForwardedFn(request, connection.peerAddress(), &self.config);
         }
 
         /// `Request.id` from `config.request_id_header`, when the request
@@ -3318,7 +3301,7 @@ pub fn Server(comptime Ctx: type) type {
         /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
         /// UDP): the peer address is given directly.
         pub fn applyForwardedFrom(self: *const Self, request: *Request, peer: std.Io.net.IpAddress) void {
-            applyForwardedFn(request, peer, .of(&self.config));
+            applyForwardedFn(request, peer, &self.config);
         }
 
         /// Routes `req` and runs its handler, with the middleware, writing to
@@ -3422,11 +3405,12 @@ pub fn Server(comptime Ctx: type) type {
         noinline fn handleRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
             const l = conn.listener;
             const connection = &conn.connection;
+            const listener_tls = build_options.use_tls and l.config.tls != null;
             var lp: Loop = .{
                 .conn = conn,
                 .timer = timer,
-                .h2c = build_options.use_http2 and l.config.http2_prior_knowledge and
-                    !(build_options.use_tls and l.config.tls != null),
+                .tls = listener_tls,
+                .h2c = build_options.use_http2 and l.config.http2_prior_knowledge and !listener_tls,
                 // A connection woken after a long park parks again once it
                 // has served a request (`park.Shelf.long_park`).
                 .repark_after = if (conn.parked.woke_from_long) conn.request_count + 1 else null,
@@ -3444,7 +3428,7 @@ pub fn Server(comptime Ctx: type) type {
                     ._config = self.config.request,
                     .remote_address = connection.peerAddress(),
                     .listener = l.config,
-                    .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
+                    .secure = listener_tls or connection.proxied_secure,
                     .drain = &self.draining,
                     ._drain_hooks = &self.drain_hooks,
                     .peer_certificate = connection.peerCertificate(),
@@ -3573,6 +3557,8 @@ pub fn Server(comptime Ctx: type) type {
         const Loop = struct {
             conn: *Conn,
             timer: *Timer,
+            /// This listener terminates TLS itself.
+            tls: bool,
             /// Cleartext HTTP/2 with prior knowledge on this listener.
             h2c: bool,
             repark_after: ?usize,
@@ -3751,8 +3737,8 @@ pub fn Server(comptime Ctx: type) type {
                 // request. Starting from the socket peer also makes an absent
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
-                request.secure = (build_options.use_tls and lp.conn.listener.config.tls != null) or connection.proxied_secure;
-                applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
+                request.secure = lp.tls or connection.proxied_secure;
+                applyForwardedFn(request, connection.peerAddress(), &self.config);
                 self.applyRequestIdHeader(request);
 
                 var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
