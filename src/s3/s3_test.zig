@@ -948,3 +948,22 @@ test "s3: anonymous credentials send unsigned requests (the fake refuses them)" 
     try testing.expectError(error.Database, client.get(&c, "k", .{}));
     try testing.expectEqualStrings("SignatureDoesNotMatch", db.lastError(&c).?.code);
 }
+
+test "s3: readiness: HEAD ok is ready and cached; a failing HEAD is not ready; no default bucket is ready without a request" {
+    const Row = struct { name: []const u8, no_bucket: bool = false, fault: bool = false, ready: bool, heads: usize };
+    const rows = [_]Row{
+        .{ .name = "reachable", .ready = true, .heads = 1 },
+        .{ .name = "head fails", .fault = true, .ready = false, .heads = 1 },
+        .{ .name = "no default bucket", .no_bucket = true, .ready = true, .heads = 0 },
+    };
+    const q = Quiet.on();
+    defer q.done();
+    for (rows) |row| {
+        const env = try Env.init(.{});
+        defer env.deinit();
+        if (row.no_bucket) env.client.default_bucket = null;
+        if (row.fault) try env.fake.addFault(.{ .method = "HEAD", .remaining = 1 });
+        for (0..2) |_| try testing.expectEqual(row.ready, db.Readiness.check(&env.client.ready));
+        try testing.expectEqual(row.heads, env.fake.count("HEAD", "/b"));
+    }
+}
