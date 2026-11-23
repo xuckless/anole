@@ -421,7 +421,6 @@ test "H2Socket: a message past the 64 KiB kept is refused 1013 before its memory
     try std.testing.expectEqualStrings("\x88\x02\x03\xf5", sock.out.interface.buffered());
 }
 
-/// A writer that keeps what a flush drains, to tell a held frame from a sent one.
 /// The Wire a drain writes to: the H2 socket holds a copy of the writer, so it cannot find its parent.
 var current: *Wire = undefined;
 const Wire = struct {
@@ -480,10 +479,10 @@ test "Socket: send flushes, _sendDeferred holds until _flushOut, RSV1 only on a 
         try std.testing.expectEqual(rsv1, wire.got[0] == 0xc1);
         try std.testing.expect(rsv1 or wire.got[0] == 0x81);
         if (!rsv1) try std.testing.expectEqualStrings(data[0..c.len], wire.got[2..][0..c.len]);
-        if (comptime features.compression) if (is_stream) {
+        if (is_stream) {
             // Only `send` takes a ping on a stream: the deferred leaf is text/binary.
             const ping = if (flush) socket.send(.ping, "") else socket._sendDeferred(.ping, "");
             try if (flush) ping else std.testing.expectError(error.InvalidOpcode, ping);
-        };
+        }
     };
 }
