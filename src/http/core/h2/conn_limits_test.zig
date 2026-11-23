@@ -70,7 +70,7 @@ fn provoke(t: *T, id: u31) !void {
 
 test "h2 limits: rapid reset closes the connection" {
     {
-        const t = try ready(.{ .stream_reset_burst = 5, .stream_reset_rate = 1 });
+        const t = try ready(.{ .http2 = .{ .stream_reset_burst = 5, .stream_reset_rate = 1 } });
         defer t.destroy();
         var id: u31 = 1;
         while (id < 11) : (id += 2) {
@@ -94,7 +94,7 @@ test "h2 limits: rapid reset closes the connection" {
     {
         // D15 point 1: streams we answered (END_STREAM queued), then reset
         // by the peer, are ordinary traffic and never charged.
-        const t = try ready(.{ .stream_reset_burst = 1, .stream_reset_rate = 1 });
+        const t = try ready(.{ .http2 = .{ .stream_reset_burst = 1, .stream_reset_rate = 1 } });
         defer t.destroy();
         t.rec.answer = true;
         var id: u31 = 1;
@@ -115,7 +115,7 @@ test "h2 limits: rapid reset closes the connection" {
 
 test "h2 limits: provoked resets count toward the reset budget" {
     {
-        const t = try ready(.{ .stream_reset_burst = 4, .stream_reset_rate = 1 });
+        const t = try ready(.{ .http2 = .{ .stream_reset_burst = 4, .stream_reset_rate = 1 } });
         defer t.destroy();
         // The peer's RST (1), our STREAM_CLOSED answer (2).
         try provoke(t, 1);
@@ -138,7 +138,7 @@ test "h2 limits: provoked resets count toward the reset budget" {
     {
         // Resets the handler asks for, or causes by failing, aren't the
         // peer's doing.
-        const t = try ready(.{ .stream_reset_burst = 1, .stream_reset_rate = 1 });
+        const t = try ready(.{ .http2 = .{ .stream_reset_burst = 1, .stream_reset_rate = 1 } });
         defer t.destroy();
         var id: u31 = 1;
         while (id < 7) : (id += 2) {
@@ -182,7 +182,7 @@ test "h2 limits: CONTINUATION flood" {
     // decoding: the assembly buffer never grows past it, and is freed
     // (testing.allocator's leak check).
     {
-        const t = try ready(.{ .max_header_list_size = 1024 });
+        const t = try ready(.{ .http2 = .{ .max_header_list_size = 1024 } });
         defer t.destroy();
         const junk: [600]u8 = @splat('~');
         try t.feed(try t.headersFrame(1, .{ .end_stream = true, .end_headers = false, .fragment = &junk }));
@@ -197,7 +197,7 @@ test "h2 limits: CONTINUATION flood" {
 }
 
 test "h2 limits: HPACK bomb through a connection" {
-    const t = try ready(.{ .max_header_list_size = 16384 });
+    const t = try ready(.{ .http2 = .{ .max_header_list_size = 16384 } });
     defer t.destroy();
     const z: [3999]u8 = @splat('z');
     // One 4032-byte entry, then references to it: the list passes 16384 at
@@ -442,7 +442,7 @@ test "h2 limits: every unknown frame type at once after the preface is ignored, 
 }
 
 test "h2 limits: refused-stream burst" {
-    const t = try ready(.{ .max_concurrent_streams = 2, .refused_stream_burst = 3, .refused_stream_rate = 1 });
+    const t = try ready(.{ .http2 = .{ .max_concurrent_streams = 2, .refused_stream_burst = 3, .refused_stream_rate = 1 } });
     defer t.destroy();
     try t.feed(try headFrame(t, 1, try head(t, ""), false));
     try t.feed(try headFrame(t, 3, try head(t, ""), false));
@@ -535,7 +535,7 @@ test "h2 limits: one large DATA frame in flight refuses nothing" {
     // A peer that reads at full speed with a 16 MiB frame size and big
     // windows: one pending() frames a 2 MiB DATA frame, and a request
     // arriving while it is written is admitted, uncharged.
-    const t = try ready(.{ .refused_stream_burst = 1, .refused_stream_rate = 1 });
+    const t = try ready(.{ .http2 = .{ .refused_stream_burst = 1, .refused_stream_rate = 1 } });
     defer t.destroy();
     try t.feed(try t.settings(&.{
         .{ .id = .max_frame_size, .value = frame.max_max_frame_size },
@@ -578,7 +578,7 @@ test "h2 limits: window update zero and overflow" {
     // A stream overflow is a stream FLOW_CONTROL_ERROR, charged as a
     // provoked reset.
     {
-        const t = try ready(.{ .stream_reset_burst = 1, .stream_reset_rate = 1 });
+        const t = try ready(.{ .http2 = .{ .stream_reset_burst = 1, .stream_reset_rate = 1 } });
         defer t.destroy();
         inline for (.{ 1, 3 }) |id| {
             try t.feed(try t.headers(id, &post, false));
@@ -688,7 +688,7 @@ test "h2: body over the limit" {
     // Past the stream's window: a connection FLOW_CONTROL_ERROR, as nghttp2
     // (nghttp2_session_update_recv_stream_window_size :5202).
     {
-        const t = try ready(.{ .initial_window = 1024 });
+        const t = try ready(.{ .http2 = .{ .stream_window = 1024 } });
         defer t.destroy();
         t.rec.consume = false;
         try t.feed(try t.headers(1, &post, false));
@@ -698,7 +698,7 @@ test "h2: body over the limit" {
     }
     // Past the connection's.
     {
-        const t = try ready(.{ .connection_window = 65535, .initial_window = 65536 });
+        const t = try ready(.{ .http2 = .{ .connection_window = 65535, .stream_window = 65536 } });
         defer t.destroy();
         t.rec.consume = false;
         try t.feed(try t.headers(1, &post, false));

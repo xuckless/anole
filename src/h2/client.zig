@@ -406,9 +406,7 @@ pub const ClientConnection = struct {
         // so a stream's queue never overflows. Into the heap connection:
         // no copy of the core's HPACK tables through this frame (#223).
         try self.proto.initAt(gpa, &self.handler, .{
-            .initial_window = stream_window,
-            .connection_window = max_data,
-            .max_header_list_size = max_header_list_size,
+            .http2 = .{ .stream_window = stream_window, .connection_window = max_data, .max_header_list_size = max_header_list_size },
             .seed = seed,
         });
         errdefer self.proto.deinit();

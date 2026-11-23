@@ -689,7 +689,6 @@ pub fn Engine(comptime Ctx: type) type {
             secure: bool,
             io: std.Io,
             allocator: std.mem.Allocator,
-            config: ServerConfig.Http2,
             /// The streams' tasks and the flusher (`group_`).
             group: *std.Io.Group,
             group_: std.Io.Group = .init,
@@ -820,7 +819,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// The HPACK scratch for `recv`. Under the lock (it never
             /// yields).
             fn scratch(conn: *Conn) error{OutOfMemory}![]u8 {
-                const need = @max(conn.proto.opts.max_header_list_size, hpack.table_capacity);
+                const need = @max(conn.proto.opts.http2.max_header_list_size, hpack.table_capacity);
                 if (conn.own_scratch.len >= need) return conn.own_scratch;
                 if (scratch_block.len >= need) return scratch_block;
                 if (block_cache.classFor(need)) |class| {
@@ -1308,7 +1307,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn mayRaise(conn: *Conn, es: *const EStream) bool {
                 if (es.protocol.len > 0) return false;
                 const current = es.windowSize(conn);
-                if (current >= conn.config.stream_window_reading) return false;
+                if (current >= conn.proto.opts.http2.stream_window_reading) return false;
                 if (es.content_length) |n| if (n <= current) return false;
                 return true;
             }
@@ -1323,12 +1322,12 @@ pub fn Engine(comptime Ctx: type) type {
                 const s = es.cs orelse return;
                 if (es.recv != .receiving or es.reset or !conn.mayRaise(es)) return;
                 const current = es.windowSize(conn);
-                var next: u31 = @intCast(@min(@as(usize, conn.config.stream_window_reading), @as(usize, current) * 4));
+                var next: u31 = @intCast(@min(@as(usize, conn.proto.opts.http2.stream_window_reading), @as(usize, current) * 4));
                 if (es.content_length) |n| next = @intCast(@min(next, n));
                 if (next <= current) return;
                 const size: usize = @max(next, conn.proto.local.initial_window);
                 const cost = BodyBuf.footprint(size);
-                if (cost -| es.raised_bytes > conn.config.reading_window_budget -| conn.raised_bytes) return;
+                if (cost -| es.raised_bytes > conn.proto.opts.http2.reading_window_budget -| conn.raised_bytes) return;
                 var buf = BodyBuf.alloc(es, size) orelse return;
                 conn.proto.raiseWindow(s, next - current) catch {
                     buf.free(conn.allocator);
@@ -1841,9 +1840,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// `tunnel_window` below `stream_window` is left at the latter
             /// (INTENTIONAL.md). Under the lock.
             fn setTunnelWindow(conn: *Conn, es: *EStream, s: *PStream) void {
-                const want = conn.config.tunnel_window;
-                if (want <= conn.config.stream_window) return;
-                conn.proto.raiseWindow(s, want - conn.config.stream_window) catch return;
+                const want = conn.proto.opts.http2.tunnel_window;
+                if (want <= conn.proto.opts.http2.stream_window) return;
+                conn.proto.raiseWindow(s, want - conn.proto.opts.http2.stream_window) catch return;
                 es.window = want;
             }
 
@@ -2350,7 +2349,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn windowSize(es: *const EStream, conn: *const Conn) u31 {
-                return if (es.window != 0) es.window else conn.config.stream_window;
+                return if (es.window != 0) es.window else conn.proto.opts.http2.stream_window;
             }
 
             /// A spare (its arena trimmed when it was freed), or a new one.
@@ -2465,7 +2464,6 @@ pub fn Engine(comptime Ctx: type) type {
                 .secure = secure or connection.proxied_secure,
                 .io = io,
                 .allocator = server.allocator,
-                .config = h,
                 // SAFETY: set to `group_` right below.
                 .group = undefined,
                 .max_spares = @max(1, @min(max_spare_streams, h.max_concurrent_streams)),
@@ -2479,19 +2477,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock_.owner = e;
             };
             probe.setLockFree(conn.lock_.free);
-            var opts: conn_mod.Options = .{
-                .max_concurrent_streams = h.max_concurrent_streams,
-                .initial_window = h.stream_window,
-                .connection_window = h.connection_window,
-                .max_header_list_size = h.max_header_list_size,
-                .max_header_count = server.config.request.max_header_count,
-                .max_continuations = std.math.cast(u32, h.max_continuations) orelse std.math.maxInt(u32),
-                .enable_connect_protocol = h.enable_connect_protocol,
-                .stream_reset_burst = h.stream_reset_burst,
-                .stream_reset_rate = h.stream_reset_rate,
-                .refused_stream_burst = h.refused_stream_burst,
-                .refused_stream_rate = h.refused_stream_rate,
-            };
+            var opts: conn_mod.Options = .{ .http2 = h, .max_header_count = server.config.request.max_header_count };
             // The stream table's hash seed (hash flooding).
             io.random(std.mem.asBytes(&opts.seed));
             probe.outHigh(&opts.limits);

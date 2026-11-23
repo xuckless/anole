@@ -150,7 +150,7 @@ const CT = struct {
         t.srv = try ct.T.create(gpa, .{});
         errdefer t.srv.destroy();
         t.rec = .{ .gpa = gpa, .arena = t.srv.arena() };
-        t.scratch = try gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
+        t.scratch = try gpa.alloc(u8, @max(opts.http2.max_header_list_size, hpack.table_capacity));
         errdefer gpa.free(t.scratch);
         try t.c.initAt(conn_gpa, &t.rec, opts);
         t.rec.c = &t.c;
@@ -297,7 +297,7 @@ fn ready(opts: conn.Options) !*CT {
 // The preface and the requests
 
 test "h2 client conn: the preface is the magic, then SETTINGS with ENABLE_PUSH=0 and no MAX_CONCURRENT_STREAMS" {
-    const t = try CT.create(testing.allocator, .{ .initial_window = 1 << 20, .connection_window = 1 << 24, .max_header_list_size = 8192 });
+    const t = try CT.create(testing.allocator, .{ .http2 = .{ .stream_window = 1 << 20, .connection_window = 1 << 24, .max_header_list_size = 8192 } });
     defer t.destroy();
     const out = try t.drain();
     try expectFrames(out, &.{ .{ .type = .settings, .flags = 0 }, .{ .type = .window_update, .id = 0 } });
@@ -318,13 +318,13 @@ test "h2 client conn: the preface is the magic, then SETTINGS with ENABLE_PUSH=0
 }
 
 test "h2 client conn: raised options add MAX_FRAME_SIZE and CONNECT in wire order" {
-    const t = try CT.create(testing.allocator, .{ .max_frame_size = 1 << 16, .enable_connect_protocol = true });
+    const t = try CT.create(testing.allocator, .{ .http2 = .{ .enable_connect_protocol = true }, .max_frame_size = 1 << 16 });
     defer t.destroy();
     const out = try t.drain();
     const want = [_]frame.Setting{
         .{ .id = .enable_push, .value = 0 },
-        .{ .id = .initial_window_size, .value = (conn.Options{}).initial_window },
-        .{ .id = .max_header_list_size, .value = (conn.Options{}).max_header_list_size },
+        .{ .id = .initial_window_size, .value = (conn.Options{}).http2.stream_window },
+        .{ .id = .max_header_list_size, .value = (conn.Options{}).http2.max_header_list_size },
         .{ .id = .max_frame_size, .value = 1 << 16 },
         .{ .id = .enable_connect_protocol, .value = 1 },
         .{ .id = .no_rfc7540_priorities, .value = 1 },
@@ -512,7 +512,7 @@ test "h2 client conn: test_nghttp2_http_on_header's response cases: each malform
         &.{ .{ .name = "x", .value = "y" }, .{ .name = ":status", .value = "200" } },
     };
     // Past the server's reset budget (burst 1000): a client charges none.
-    const t = try ready(.{ .stream_reset_burst = 4, .stream_reset_rate = 0 });
+    const t = try ready(.{ .http2 = .{ .stream_reset_burst = 4, .stream_reset_rate = 0 } });
     defer t.destroy();
     for (0..4) |_| for (cases) |fs| {
         const s = try t.request(&get, true);
@@ -540,7 +540,7 @@ test "h2 client conn: a 204's content-length 0 is dropped, and lenient fields ar
 }
 
 test "h2 client conn: a head past max_header_list_size is refused and reset" {
-    const t = try ready(.{ .max_header_list_size = 4096 });
+    const t = try ready(.{ .http2 = .{ .max_header_list_size = 4096 } });
     defer t.destroy();
     _ = try t.request(&get, true);
     _ = try t.drain();
@@ -614,7 +614,7 @@ test "h2 client conn: what the server sends on a stream we reset is ignored" {
 }
 
 test "h2 client conn: a server's RST_STREAMs are charged to no budget" {
-    const t = try ready(.{ .stream_reset_burst = 2, .stream_reset_rate = 0 });
+    const t = try ready(.{ .http2 = .{ .stream_reset_burst = 2, .stream_reset_rate = 0 } });
     defer t.destroy();
     for (0..10) |_| {
         const s = try t.request(&get, false);
@@ -780,7 +780,7 @@ test "h2 client conn: a GOAWAY of ours, then no new streams" {
 fn fuzzOne(input: []const u8) anyerror!void {
     var peak: ct.Peak = .{ .child = testing.allocator };
     {
-        const t = try CT.createSplit(testing.allocator, peak.allocator(), .{ .max_header_list_size = 4096, .initial_window = 1024, .connection_window = 65535 });
+        const t = try CT.createSplit(testing.allocator, peak.allocator(), .{ .http2 = .{ .max_header_list_size = 4096, .stream_window = 1024, .connection_window = 65535 } });
         defer t.destroy();
         t.rec.record = false;
         // Three requests, one with a body, before the server's bytes.
