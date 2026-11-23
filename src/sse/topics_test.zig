@@ -3,13 +3,12 @@
 
 const std = @import("std");
 const root = @import("root.zig");
-const out_mod = @import("out.zig");
 const wait = @import("anole_test_wait");
 const replay = @import("replay.zig");
 
 const Topics = root.Topics;
 const Subscriber = root.Subscriber;
-const Fake = out_mod.Fake;
+const Fake = @import("out_fake.zig").Fake;
 
 const gpa = std.testing.allocator;
 const io = std.testing.io;

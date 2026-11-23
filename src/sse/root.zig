@@ -601,7 +601,7 @@ pub const Topics = struct {
             self.freeSubscriber(sub);
             return error.OutOfMemory;
         };
-        var fb: out_mod.Fallback = .{ .res = res, .body = res.stream(buf) catch |err| {
+        var fb: out_mod.Fallback = .{ .body = res.stream(buf) catch |err| {
             self.abandon(io, sub);
             self.freeSubscriber(sub);
             return err;
@@ -621,7 +621,7 @@ pub const Topics = struct {
         }
         const reason: CloseReason = if (outcome == .over) sub.close_reason else .client_gone;
         self.finishSubscriber(sub, reason);
-        if (fb.aborted) return error.ResponseAborted;
+        if (fb.state == .aborted) return error.ResponseAborted;
     }
 
     /// A subscriber made but not in the hub yet.
