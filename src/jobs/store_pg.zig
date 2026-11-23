@@ -217,7 +217,7 @@ pub const Postgres = struct {
         return store_sql.rowFrom(Postgres, a, r);
     }
 
-    const copyRow = store_sql.copyRow;
+    const copyRow = store.copyRow;
 
     // ---- insert
 
