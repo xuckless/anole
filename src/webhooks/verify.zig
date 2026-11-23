@@ -233,24 +233,17 @@ pub const Verify = struct {
                 const id = req.headers.get("webhook-id") orelse return "missing header webhook-id";
                 const ts = req.headers.get("webhook-timestamp") orelse return "missing header webhook-timestamp";
                 const sig = req.headers.get("webhook-signature") orelse return "missing header webhook-signature";
-                sign.verify(o.secrets, id, ts, sig, body, now_s, tol) catch |e| return explain(buf, e, ts, now_s);
+                sign.verify(o.secrets, id, ts, sig, body, now_s, tol) catch |e| return explain(buf, e, ts, now_s, tol);
                 meta.setId(id);
                 meta.timestamp = std.fmt.parseInt(i64, ts, 10) catch null;
             },
             .stripe => {
                 const h = req.headers.get("Stripe-Signature") orelse return "missing header Stripe-Signature";
                 const parsed = parseStripe(h) orelse return "malformed Stripe-Signature";
-                const diff = @abs(@as(i128, now_s) - parsed.t);
-                if (diff > @as(u128, @intCast(@max(tol, 0)))) return std.fmt.bufPrint(buf, "timestamp {d} s off", .{diff}) catch "stale timestamp";
+                if (staleReason(buf, now_s, parsed.t, tol)) |why| return why;
                 var ts_buf: [24]u8 = undefined;
                 const ts_text = std.fmt.bufPrint(&ts_buf, "{d}", .{parsed.t}) catch unreachable;
-                var ok = false;
-                for (o.secrets) |secret| {
-                    for (parsed.v1[0..parsed.v1_count]) |hex| {
-                        if (macMatches(std.crypto.auth.hmac.sha2.HmacSha256, secret, &.{ ts_text, ".", body }, hex, .hex)) ok = true;
-                    }
-                }
-                if (!ok) return "no matching signature";
+                if (!anySecretMatches(std.crypto.auth.hmac.sha2.HmacSha256, o.secrets, &.{ ts_text, ".", body }, parsed.v1[0..parsed.v1_count], .hex)) return "no matching signature";
                 meta.timestamp = parsed.t;
                 var tmp: [255]u8 = undefined;
                 if (jsonTopString(body, "id", &tmp)) |v| meta.setId(v);
@@ -258,11 +251,7 @@ pub const Verify = struct {
             .github => {
                 const h = req.headers.get("X-Hub-Signature-256") orelse return "missing header X-Hub-Signature-256";
                 if (!std.mem.startsWith(u8, h, "sha256=")) return "malformed X-Hub-Signature-256";
-                var ok = false;
-                for (o.secrets) |secret| {
-                    if (macMatches(std.crypto.auth.hmac.sha2.HmacSha256, secret, &.{body}, h["sha256=".len..], .hex)) ok = true;
-                }
-                if (!ok) return "no matching signature";
+                if (!anySecretMatches(std.crypto.auth.hmac.sha2.HmacSha256, o.secrets, &.{body}, &.{h["sha256=".len..]}, .hex)) return "no matching signature";
                 if (req.headers.get("X-GitHub-Delivery")) |d| meta.setId(d);
             },
             .slack => {
@@ -270,13 +259,8 @@ pub const Verify = struct {
                 const ts = req.headers.get("X-Slack-Request-Timestamp") orelse return "missing header X-Slack-Request-Timestamp";
                 if (!std.mem.startsWith(u8, h, "v0=")) return "malformed X-Slack-Signature";
                 const t = std.fmt.parseInt(i64, ts, 10) catch return "bad timestamp";
-                const diff = @abs(@as(i128, now_s) - t);
-                if (diff > @as(u128, @intCast(@max(tol, 0)))) return std.fmt.bufPrint(buf, "timestamp {d} s off", .{diff}) catch "stale timestamp";
-                var ok = false;
-                for (o.secrets) |secret| {
-                    if (macMatches(std.crypto.auth.hmac.sha2.HmacSha256, secret, &.{ "v0:", ts, ":", body }, h[3..], .hex)) ok = true;
-                }
-                if (!ok) return "no matching signature";
+                if (staleReason(buf, now_s, t, tol)) |why| return why;
+                if (!anySecretMatches(std.crypto.auth.hmac.sha2.HmacSha256, o.secrets, &.{ "v0:", ts, ":", body }, &.{h[3..]}, .hex)) return "no matching signature";
                 meta.timestamp = t;
                 var tmp: [255]u8 = undefined;
                 if (jsonTopString(body, "event_id", &tmp)) |v| meta.setId(v);
@@ -286,15 +270,11 @@ pub const Verify = struct {
                 var h = req.headers.get(hm.header) orelse return "missing signature header";
                 if (!std.mem.startsWith(u8, h, hm.prefix)) return "malformed signature header";
                 h = h[hm.prefix.len..];
-                var ok = false;
-                for (o.secrets) |secret| {
-                    const m = switch (hm.algorithm) {
-                        .sha1 => macMatches(std.crypto.auth.hmac.HmacSha1, secret, &.{body}, h, hm.encoding),
-                        .sha256 => macMatches(std.crypto.auth.hmac.sha2.HmacSha256, secret, &.{body}, h, hm.encoding),
-                        .sha512 => macMatches(std.crypto.auth.hmac.sha2.HmacSha512, secret, &.{body}, h, hm.encoding),
-                    };
-                    if (m) ok = true;
-                }
+                const ok = switch (hm.algorithm) {
+                    .sha1 => anySecretMatches(std.crypto.auth.hmac.HmacSha1, o.secrets, &.{body}, &.{h}, hm.encoding),
+                    .sha256 => anySecretMatches(std.crypto.auth.hmac.sha2.HmacSha256, o.secrets, &.{body}, &.{h}, hm.encoding),
+                    .sha512 => anySecretMatches(std.crypto.auth.hmac.sha2.HmacSha512, o.secrets, &.{body}, &.{h}, hm.encoding),
+                };
                 if (!ok) return "no matching signature";
                 if (hm.id_header) |ih| if (req.headers.get(ih)) |d| meta.setId(d);
             },
@@ -303,14 +283,11 @@ pub const Verify = struct {
     }
 };
 
-fn explain(buf: []u8, e: sign.VerifyError, ts: []const u8, now_s: i64) []const u8 {
+fn explain(buf: []u8, e: sign.VerifyError, ts: []const u8, now_s: i64, tol: i64) []const u8 {
     return switch (e) {
         error.MissingHeader => "missing header",
         error.BadTimestamp => "bad timestamp",
-        error.Stale => blk: {
-            const t = std.fmt.parseInt(i64, ts, 10) catch 0;
-            break :blk std.fmt.bufPrint(buf, "timestamp {d} s off", .{@abs(@as(i128, now_s) - t)}) catch "stale timestamp";
-        },
+        error.Stale => staleReason(buf, now_s, std.fmt.parseInt(i64, ts, 10) catch 0, tol) orelse "stale timestamp",
         error.NoMatch => "no matching signature",
         error.InvalidSecret => "invalid secret",
     };
@@ -343,6 +320,27 @@ fn macMatches(comptime H: type, key: []const u8, parts: []const []const u8, enco
     var want: [H.mac_length]u8 = undefined;
     h.final(&want);
     return std.crypto.timing_safe.eql([H.mac_length]u8, got, want);
+}
+
+/// Whether any of `candidates` is `H`'s MAC of `parts` under any of `secrets`.
+/// Every pair is compared, even after a match, so the time does not tell
+/// which secret or candidate matched.
+fn anySecretMatches(comptime H: type, secrets: []const []const u8, parts: []const []const u8, candidates: []const []const u8, enc: Encoding) bool {
+    var ok = false;
+    for (secrets) |secret| {
+        for (candidates) |c| {
+            if (macMatches(H, secret, parts, c, enc)) ok = true;
+        }
+    }
+    return ok;
+}
+
+/// Null when `t` is within `tol_s` of `now_s` (both directions; a negative
+/// tolerance counts as 0), else the reason for the log.
+fn staleReason(buf: []u8, now_s: i64, t: i64, tol_s: i64) ?[]const u8 {
+    const diff = @abs(@as(i128, now_s) - t);
+    if (diff <= @as(u128, @intCast(@max(tol_s, 0)))) return null;
+    return std.fmt.bufPrint(buf, "timestamp {d} s off", .{diff}) catch "stale timestamp";
 }
 
 const StripeParts = struct {
