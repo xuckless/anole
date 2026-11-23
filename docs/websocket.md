@@ -62,8 +62,9 @@ memory, which the handler should pass on.
 
 The handler takes `(ws, req)`, `(ws)` alone, or on a `Server(App)`
 `(app, ws, req)`. `app.wsWith(path, handler, options)` takes the
-[upgrade options](#upgrade-options) (at compile time); groups have `ws` and
-`wsWith` too.
+[upgrade options](#upgrade-options) at run time (copied into the server's
+arena, so values from `anole.config.load` work directly); groups have `ws`
+and `wsWith` too.
 
 ## Callbacks
 
@@ -239,8 +240,11 @@ var ws = (try anole.websocket.upgrade(req, res, .{
 })) orelse return res.fail(.bad_request, "");
 ```
 
-`app.wsWith(path, handler, .{ .allowed_origins = ... })` takes the same
-options. `.any` lets every page in; use it only for an endpoint that does
+`app.wsWith(path, handler, .{ .allowed_origins = ... })` and
+`app.wsCallbacksWith(path, Callbacks, .{ .allowed_origins = ... })` take the
+same options at run time (copied into the server's arena, so an origin loaded
+through `anole.config.load` can be passed directly; empty entries in `.list`
+are ignored). `.any` lets every page in; use it only for an endpoint that does
 not trust cookies or other credentials the browser adds itself, such as one
 that authenticates with a token in its first message. The C ABI's WebSocket
 routes take `"origins": ["https://app.example.com"]` (or `["*"]`).

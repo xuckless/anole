@@ -150,7 +150,39 @@ pub const UpgradeOptions = struct {
     /// `Transfer-Encoding`) is `error.InvalidHeaderName`. The values must
     /// stay valid until `upgrade` returns.
     headers: []const std.http.Header = &.{},
+
+    /// Deep-copies all slices into `arena` so options built from temporary or
+    /// stack storage outlive route registration. Allocations are arena-owned
+    /// (freed together with `arena`, not individually).
+    pub fn clone(self: UpgradeOptions, arena: std.mem.Allocator) std.mem.Allocator.Error!UpgradeOptions {
+        var out = self;
+        out.allowed_origins = switch (self.allowed_origins) {
+            .list => |list| .{ .list = try dupeStrings(arena, list) },
+            .same_origin => .same_origin,
+            .any => .any,
+        };
+        out.drain_reason = try arena.dupe(u8, self.drain_reason);
+        out.subprotocols = try dupeStrings(arena, self.subprotocols);
+        if (self.headers.len > 0) {
+            const headers = try arena.alloc(std.http.Header, self.headers.len);
+            for (self.headers, headers) |h, *dst| {
+                dst.* = .{
+                    .name = try arena.dupe(u8, h.name),
+                    .value = try arena.dupe(u8, h.value),
+                };
+            }
+            out.headers = headers;
+        }
+        return out;
+    }
 };
+
+fn dupeStrings(allocator: std.mem.Allocator, items: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
+    if (items.len == 0) return &.{};
+    const copy = try allocator.alloc([]const u8, items.len);
+    for (items, copy) |s, *dst| dst.* = try allocator.dupe(u8, s);
+    return copy;
+}
 
 /// Whether `req` is a WebSocket handshake `upgrade` would accept, origins
 /// aside: an HTTP/1.1 GET with `Upgrade: websocket`, `Connection: upgrade`,
@@ -768,7 +800,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
             .task = socket._task,
             // Copied for a socket in the request's arena, where `options`
             // may be a caller's temporary; a socket that outlives the
-            // request has comptime options.
+            // request has comptime or server-arena options.
             .reason = if (drain_hooks == null) "" else if (owner != null and !h2) options.drain_reason else try req.arena.dupe(u8, options.drain_reason),
             .close_timeout = close_timeout,
             .executor = placement.currentExecutor(req.io),
@@ -834,6 +866,41 @@ noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: 
     if (!ws._closed.load(.acquire)) ws.close(.internal_error, "") catch {};
 }
 
+fn checkRouteHandler(comptime Ctx: type, comptime handler: anytype) void {
+    const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
+    switch (params.len) {
+        1, 2 => {},
+        3 => if (Ctx == void) @compileError("a WebSocket handler with three parameters takes the server's state first, but this server has none"),
+        else => @compileError("a WebSocket handler takes (*anole.websocket.Socket) or (*anole.websocket.Socket, *anole.Request), got " ++ @typeName(@TypeOf(handler))),
+    }
+}
+
+fn serveRoute(
+    comptime Ctx: type,
+    comptime handler: anytype,
+    ctx: if (Ctx == void) void else *Ctx,
+    req: *dusty.Request,
+    res: *dusty.Response,
+    options: UpgradeOptions,
+) anyerror!void {
+    const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
+    var ws = (try upgrade(req, res, options)) orelse return refuse(res);
+    defer ws.deinit();
+    const result = switch (params.len) {
+        1 => handler(&ws),
+        2 => handler(&ws, req),
+        3 => handler(ctx, &ws, req),
+        else => unreachable,
+    };
+    result catch |err| return failed(&ws, req, res, err);
+    if (!ws._closed.load(.acquire)) ws.close(.normal, "") catch {};
+}
+
+fn optionsFromData(req: *const dusty.Request) UpgradeOptions {
+    const data = (req.route orelse return .{}).data orelse return .{};
+    return @as(*const UpgradeOptions, @ptrCast(@alignCast(data))).*;
+}
+
 /// A route handler for `Server.ws`: upgrades, runs `handler` with the open
 /// socket, and closes it when `handler` returns (1000, or 1011 when it
 /// failed; nothing when the socket is already closed). A request that is
@@ -841,24 +908,26 @@ noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: 
 /// `fn (*Socket) !void`, `fn (*Socket, *Request) !void`, or with the
 /// server's state first, `fn (*Ctx, *Socket, *Request) !void`.
 pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: UpgradeOptions) dusty.Router(Ctx).Handler {
-    const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
-    switch (params.len) {
-        1, 2 => {},
-        3 => if (Ctx == void) @compileError("a WebSocket handler with three parameters takes the server's state first, but this server has none"),
-        else => @compileError("a WebSocket handler takes (*anole.websocket.Socket) or (*anole.websocket.Socket, *anole.Request), got " ++ @typeName(@TypeOf(handler))),
-    }
+    comptime checkRouteHandler(Ctx, handler);
     const S = struct {
         fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-            var ws = (try upgrade(req, res, options)) orelse return refuse(res);
-            defer ws.deinit();
-            const result = switch (params.len) {
-                1 => handler(&ws),
-                2 => handler(&ws, req),
-                3 => handler(ctx, &ws, req),
-                else => unreachable,
-            };
-            result catch |err| return failed(&ws, req, res, err);
-            if (!ws._closed.load(.acquire)) ws.close(.normal, "") catch {};
+            return serveRoute(Ctx, handler, ctx, req, res, options);
+        }
+    };
+    return if (Ctx == void) struct {
+        fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            return S.serve({}, req, res);
+        }
+    }.h else S.serve;
+}
+
+/// `route` reading its `*const UpgradeOptions` from the matched route's
+/// `.data` pointer (`Server.wsWith`).
+pub fn routeFromData(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Handler {
+    comptime checkRouteHandler(Ctx, handler);
+    const S = struct {
+        fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            return serveRoute(Ctx, handler, ctx, req, res, optionsFromData(req));
         }
     };
     return if (Ctx == void) struct {
@@ -902,6 +971,23 @@ pub fn callbacks(comptime Ctx: type, comptime Handler: type, comptime options: U
         fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
             const state: ?*anyopaque = if (Ctx == void) null else ctx;
             return serveTable(req, res, options, &H.table, state);
+        }
+    };
+    return if (Ctx == void) struct {
+        fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            return S.serve({}, req, res);
+        }
+    }.h else S.serve;
+}
+
+/// `callbacks` reading its `*const UpgradeOptions` from the matched route's
+/// `.data` pointer (`Server.wsCallbacksWith`).
+pub fn callbacksFromData(comptime Ctx: type, comptime Handler: type) dusty.Router(Ctx).Handler {
+    const H = Hooks(Ctx, Handler);
+    const S = struct {
+        fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            const state: ?*anyopaque = if (Ctx == void) null else ctx;
+            return serveTable(req, res, optionsFromData(req), &H.table, state);
         }
     };
     return if (Ctx == void) struct {

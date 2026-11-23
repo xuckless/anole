@@ -2397,12 +2397,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.wsWith(path, handler, .{});
         }
 
-        /// `ws` with upgrade options (message size limit, compression,
-        /// timeout, the drain close).
-        pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+        fn storeWsOptions(self: *Self, upgrade: websocket.UpgradeOptions) *const websocket.UpgradeOptions {
+            const a = self.arena.allocator();
+            const copy = a.create(websocket.UpgradeOptions) catch @panic("OOM");
+            copy.* = upgrade.clone(a) catch @panic("OOM");
+            return copy;
+        }
+
+        /// `ws` with upgrade options (allowed origins, message size limit,
+        /// compression, timeout, the drain close). Copied into the server's
+        /// arena, so options built at run time (e.g. from `anole.config.load`)
+        /// need not outlive registration.
+        pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
+            self.router.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
         }
 
         /// A WebSocket endpoint at `path` served through callbacks:
@@ -2421,11 +2430,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.wsCallbacksWith(path, Handlers, .{});
         }
 
-        /// `wsCallbacks` with upgrade options.
-        pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+        /// `wsCallbacks` with upgrade options (copied into the server's arena,
+        /// as with `wsWith`).
+        pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
+            self.router.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -2602,20 +2612,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 g.wsWith(path, handler, .{});
             }
             /// `Server.wsWith` under this group.
-            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
+                g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
             }
             /// `Server.wsCallbacks` under this group.
             pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
                 g.wsCallbacksWith(path, Handlers, .{});
             }
             /// `Server.wsCallbacksWith` under this group.
-            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
+                g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
             }
             /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
