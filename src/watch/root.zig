@@ -360,7 +360,7 @@ pub const Watch = struct {
     reconnect: resilience.Backoff,
     data_mode: Data,
     targets: []TargetRt = &.{},
-    /// Over the sinks, the position, the failure and the inbox.
+    /// Over the sinks, the position and the inbox.
     mutex: std.Io.Mutex = .init,
     sinks: std.DoublyLinkedList = .{},
     handler: ?HandlerSlot = null,
@@ -719,20 +719,20 @@ pub const Watch = struct {
     /// error line saying what to change. Called by the reader as it goes
     /// (so `stop` owes it no cancel).
     pub fn fail(self: *Watch, comptime fmt: []const u8, args: anytype) void {
-        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        // The text is best effort: out of memory, the watch still fails.
+        const text = std.fmt.allocPrint(self.gpa, fmt, args) catch null;
+        const shown = text orelse "(no detail: out of memory)";
         if (self.advance(&.{ .idle, .running, .stop_asked }, .failed) == null) {
-            log.warn("watch \"{s}\": {s} (ignored: the watch had stopped)", .{ self.name, text });
-            self.gpa.free(text);
+            log.warn("watch \"{s}\": {s} (ignored: the watch had stopped)", .{ self.name, shown });
+            if (text) |t| self.gpa.free(t);
             return;
         }
-        log.err("watch \"{s}\": {s}", .{ self.name, text });
-        self.mutex.lockUncancelable(self.io);
-        if (self.failure) |old| self.gpa.free(old);
+        log.err("watch \"{s}\": {s}", .{ self.name, shown });
+        // Only the first end gets here; `deinit` frees it.
         self.failure = text;
-        self.mutex.unlock(self.io);
         self.inbox_signal.set(self.io);
         if (self.metrics != null) self.syncMetrics();
-        self.endSinks(true, text);
+        self.endSinks(true, shown);
     }
 
     // -- outputs ----------------------------------------------------------

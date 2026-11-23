@@ -408,7 +408,7 @@ const Ends = struct {
 test "watch: phase table" {
     const g = @import("../errors.zig").expectLog();
     defer g.deinit();
-    const Op = enum { start, stop, fail, ask_stop, connected };
+    const Op = enum { start, stop, fail, fail_oom, ask_stop, connected };
     const Row = struct { name: []const u8, idle: bool = false, ops: []const Op, status: root.Status, stopped: bool = true, ended_ok: u32 = 0, ended_failed: u32 = 0 };
     const rows = [_]Row{
         .{ .name = "running", .ops = &.{}, .status = .connected, .stopped = false },
@@ -428,6 +428,7 @@ test "watch: phase table" {
         .{ .name = "idle stop", .idle = true, .ops = &.{.stop}, .status = .stopped, .ended_ok = 1 },
         .{ .name = "idle fail", .idle = true, .ops = &.{.fail}, .status = .failed, .ended_failed = 1 },
         .{ .name = "idle askStop then stop", .idle = true, .ops = &.{ .ask_stop, .stop }, .status = .stopped, .ended_ok = 1 },
+        .{ .name = "fail out of memory: still failed", .idle = true, .ops = &.{ .fail_oom, .stop }, .status = .failed, .ended_failed = 1 },
     };
     var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
     defer topics.deinit();
@@ -437,8 +438,11 @@ test "watch: phase table" {
     for (rows) |row| {
         errdefer std.debug.print("row: {s}\n", .{row.name});
         var ends: Ends = .{};
+        // Idle rows' watches allocate through `fa`; `fail_oom` makes its next
+        // allocation fail.
+        var fa: std.testing.FailingAllocator = .init(gpa, .{});
         const w = if (row.idle)
-            try Watch.init(gpa, io, .{ .postgres = .{ .client = stubClient(), .channels = &.{"orders"} } }, .{})
+            try Watch.init(fa.allocator(), io, .{ .postgres = .{ .client = stubClient(), .channels = &.{"orders"} } }, .{})
         else
             try newWatch(&topics, "t", &.{});
         defer w.deinit();
@@ -448,6 +452,10 @@ test "watch: phase table" {
             .start => try w.start(null, null, null),
             .stop => w.stop(),
             .fail => w.fail("test failure", .{}),
+            .fail_oom => {
+                fa.fail_index = fa.alloc_index;
+                w.fail("test failure", .{});
+            },
             .ask_stop => w.askStop(),
             .connected => w.setStatus(.connected),
         };
