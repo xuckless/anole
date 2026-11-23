@@ -113,10 +113,10 @@ pub const Client = struct {
     next_seq: u64 = 0,
     group: std.Io.Group = .init,
     maint_signal: placement.Signal = .{},
-    draining: std.atomic.Value(bool) = .init(false),
-    /// Set when the drain has ended; a later `drain` waits for it.
+    /// The lifecycle; changed only by `advance`.
+    phase: std.atomic.Value(Phase) = .init(.new),
+    /// Set after `phase` reaches `drained`; a second `drain` waits for it.
     drained: std.Io.Event = .unset,
-    started: bool = false,
     is_leader: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
     last_prune: i64 = 0,
@@ -134,20 +134,51 @@ pub const Client = struct {
     /// with nothing allocated (`Exporter.close`).
     tracer: ?*observe.trace.Exporter = null,
     last_gauges: i64 = 0,
-    /// Set before the tasks are canceled (drain, deinit).
-    closing: std.atomic.Value(bool) = .init(false),
     /// When the drain stops waiting for the runs it canceled (awake clock,
-    /// ns); maxInt while not draining. Bounds the outcome writes.
+    /// ns); valid from `draining`, maxInt before. Bounds the outcome writes.
     drain_gives_up_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
     /// Wake-ups from the store's listener, the one it sends once it listens
     /// included: a test waits for the first before it counts on a wake.
     wake_kicks: std.atomic.Value(u32) = .init(0),
     /// Tests only: runs on a run's task right after `hold` has published it.
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
-    /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
-    work_stopped: bool = false,
     /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
+
+    /// The client's lifecycle. `stopWork` runs on the owner's thread only;
+    /// `drain` may race it (the server's drainWatcher). Every cell:
+    ///
+    /// | phase    | start           | drain(deadline)                  | stopWork                               |
+    /// |----------|-----------------|----------------------------------|----------------------------------------|
+    /// | new      | -> serving      | -> draining, runs it, -> drained | -> closing, no drain, cancel, -> stopped |
+    /// | serving  | no-op           | -> draining, runs it, -> drained | -> closing, drain(now + 10 s), cancel, -> stopped |
+    /// | closing  | no-op           | -> draining, runs it, -> drained | no-op (stopWork under way)             |
+    /// | draining | no-op           | waits for `drained`              | waits for the drain, cancel, -> stopped |
+    /// | drained  | no-op           | returns                          | cancel, -> stopped                     |
+    /// | stopped  | no-op           | returns                          | no-op                                  |
+    ///
+    /// A failure inside `start` leaves it serving: `stopWork` cleans up.
+    /// `drained` is set after the phase reaches `drained` (notify last).
+    pub const Phase = enum(u8) { new, serving, closing, draining, drained, stopped };
+
+    /// `wakeTask` ends: `stopWork` or a drain began.
+    const closing_or_later: std.EnumArray(Phase, bool) = .init(.{ .new = false, .serving = false, .closing = true, .draining = true, .drained = true, .stopped = true });
+    /// The fetchers, heartbeat and maintenance end: a drain began.
+    const winding_down: std.EnumArray(Phase, bool) = .init(.{ .new = false, .serving = false, .closing = false, .draining = true, .drained = true, .stopped = true });
+
+    /// The one writer of `phase`: moves it to `to` if it is in `from`, and
+    /// returns the phase it left (null: it was in none of them).
+    fn advance(self: *Client, comptime from: []const Phase, to: Phase) ?Phase {
+        var cur = self.phase.load(.acquire);
+        while (std.mem.indexOfScalar(Phase, from, cur) != null) {
+            cur = self.phase.cmpxchgWeak(cur, to, .acq_rel, .acquire) orelse return cur;
+        }
+        return null;
+    }
+
+    fn windingDown(self: *Client) bool {
+        return winding_down.get(self.phase.load(.acquire));
+    }
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -202,18 +233,22 @@ pub const Client = struct {
     /// run may use any of them; `deinit` calls it first.
     /// Outside an app, call it before freeing what the handlers use.
     pub fn stopWork(self: *Client) void {
-        if (self.work_stopped) return;
-        self.work_stopped = true;
+        const left = self.advance(&.{ .new, .serving }, .closing) orelse self.phase.load(.acquire);
+        switch (left) {
+            .closing, .stopped => return,
+            .new, .serving, .draining, .drained => {},
+        }
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
-        self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
         // Pre-existing: if drainWatcher has not started the server's drain
         // yet, this one wins and uses 10 s, not drain_timeout. On the owner's
         // thread (no executor), so nothing here yields.
-        if (self.started) {
+        if (left != .new) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
         self.group.cancel(self.io);
+        // Never started, a drain may still race in from `closing`: wait for it.
+        while (self.advance(&.{ .closing, .drained }, .stopped) == null) self.drained.waitUncancelable(self.io);
     }
 
     pub fn deinit(self: *Client) void {
@@ -326,8 +361,7 @@ pub const Client = struct {
     /// Migrates, loads cron state, starts fetchers, heartbeat, wakes, leader (per `run`).
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         _ = health;
-        if (self.started) return;
-        self.started = true;
+        if (self.advance(&.{.new}, .serving) == null) return;
         self.tracer = tracer;
         if (registry) |r| {
             const mm = try self.gpa.create(metrics_mod.Series);
@@ -368,7 +402,7 @@ pub const Client = struct {
     /// its delivery queue this way). A queue that exists is left as it is.
     pub fn addQueue(self: *Client, q: root.QueueOptions) !void {
         if (self.queueIndex(q.name) != null) return;
-        if (self.started) {
+        if (self.phase.load(.acquire) != .new) {
             log.err("jobs: queue \"{s}\" must be in Options.queues (it is needed after the queue started)", .{q.name});
             return error.InvalidOptions;
         }
@@ -405,11 +439,11 @@ pub const Client = struct {
     fn wakeTask(self: *Client) std.Io.Cancelable!void {
         const backoff: resilience.Backoff = .{ .base = .fromSeconds(1), .max = .fromSeconds(30), .jitter = .equal };
         var failures: u32 = 0;
-        while (!self.closing.load(.acquire)) {
+        while (!closing_or_later.get(self.phase.load(.acquire))) {
             if (self.backend.vt.runWake.?(self.backend.ptr, self.io, .{ .context = self, .kick = kickFromStore })) |_| {
                 return;
             } else |err| {
-                if (self.closing.load(.acquire)) {
+                if (closing_or_later.get(self.phase.load(.acquire))) {
                     // The cancel may have been taken by the listener's read.
                     self.io.recancel();
                     return error.Canceled;
@@ -438,12 +472,15 @@ pub const Client = struct {
     /// Stops claiming; running jobs finish by `deadline`, then are put back
     /// (J14). A call while a drain runs waits for that one to end.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
-        self.closing.store(true, .release);
-        if (self.draining.swap(true, .acq_rel)) {
-            self.drained.waitUncancelable(self.io);
+        if (self.advance(&.{ .new, .serving, .closing }, .draining) == null) {
+            // Stopped without a drain: nothing sets `drained`.
+            if (self.phase.load(.acquire) != .stopped) self.drained.waitUncancelable(self.io);
             return;
         }
-        defer self.drained.set(self.io);
+        defer {
+            _ = self.advance(&.{.draining}, .drained);
+            self.drained.set(self.io);
+        }
         // On the awake clock, whatever clock the deadline is on.
         const to_deadline = std.Io.Clock.Timestamp.now(self.io, deadline.clock).durationTo(deadline);
         const gives_up = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = to_deadline.raw, .clock = .awake }).addDuration(.{ .raw = cancel_grace, .clock = .awake });
@@ -763,7 +800,7 @@ pub const Client = struct {
         };
         try self.handlers.append(self.gpa, .{ .kind = kind, .state = state, .run = run });
         // Added after `start` (behind a gate): the fetcher's filter learns it.
-        if (self.started) try self.queues[self.queueIndex(kind.queue).?].kinds.append(self.gpa, self.handlers.items[self.handlers.items.len - 1].kind.name);
+        if (self.phase.load(.acquire) != .new) try self.queues[self.queueIndex(kind.queue).?].kinds.append(self.gpa, self.handlers.items[self.handlers.items.len - 1].kind.name);
     }
 
     fn handlerFor(self: *Client, kind: []const u8) ?*const Handler {
@@ -788,7 +825,7 @@ pub const Client = struct {
 
     /// Handlers may still be added: not started, or started behind a gate that has not opened.
     fn registrable(self: *Client) bool {
-        if (!self.started) return true;
+        if (self.phase.load(.acquire) == .new) return true;
         const g = self.options.gate orelse return false;
         return !g.is_open(g.context);
     }
@@ -1069,7 +1106,7 @@ pub const Client = struct {
     }
 
     fn fetcherTask(self: *Client, q: *Queue) std.Io.Cancelable!void {
-        while (!self.draining.load(.acquire)) {
+        while (!self.windingDown()) {
             if (self.gated() or (q.kinds.items.len == 0 and q.catch_all == null)) {
                 try self.waitSignal(&q.signal, self.options.poll_interval);
                 continue;
@@ -1171,7 +1208,7 @@ pub const Client = struct {
         while (true) {
             self.io.sleep(every, .awake) catch return error.Canceled;
             try self.heartbeatOnce();
-            if (self.draining.load(.acquire) and self.runningTotal() == 0) return;
+            if (self.windingDown() and self.runningTotal() == 0) return;
         }
     }
 
@@ -1246,7 +1283,7 @@ pub const Client = struct {
     }
 
     fn maintenanceTask(self: *Client) std.Io.Cancelable!void {
-        while (!self.draining.load(.acquire)) {
+        while (!self.windingDown()) {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             var report: StepReport = .{};
@@ -1334,7 +1371,7 @@ pub const Client = struct {
     }
 
     pub fn cronRaw(self: *Client, name: []const u8, spec: []const u8, kind: []const u8, args_json: []const u8, opts: root.CronOptions) !void {
-        if (self.started) {
+        if (self.phase.load(.acquire) != .new) {
             log.err("cron \"{s}\": schedules are registered before serving starts", .{name});
             return error.InvalidOptions;
         }
@@ -1512,7 +1549,7 @@ pub const Client = struct {
     /// every due job of every handled kind, until none is due at the clock's now.
     pub fn step(self: *Client, c: anytype) Error!StepReport {
         var report: StepReport = .{};
-        if (!self.started) self.start(null, null, null) catch return error.ServiceUnavailable;
+        if (self.phase.load(.acquire) == .new) self.start(null, null, null) catch return error.ServiceUnavailable;
         try self.maintain(c.arena, &report);
         // maintain's stage ran before the cron jobs; stage again so a tick that is due now runs now.
         _ = self.backend.vt.stage(self.backend.ptr, self.now()) catch 0;
