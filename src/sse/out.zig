@@ -73,8 +73,14 @@ pub const Out = union(enum) {
 /// writer. `end` ends the body; `abort` makes the handler return
 /// `error.ResponseAborted` (`state == .aborted`).
 ///
-/// One state: `open` (writing), `ended` (body ended: begin false, write Gone,
-/// end a no-op), `aborted` (as ended; abort always lands here).
+/// | state   | begin | write                     | end                  | abort   | endBurst | release |
+/// |---------|-------|---------------------------|----------------------|---------|----------|---------|
+/// | open    | true  | parts + flush (failure: Gone, stays open) | body.end(), -> ended | -> aborted | no-op | no-op |
+/// | ended   | false | Gone                      | no-op                | -> aborted | no-op | no-op |
+/// | aborted | false | Gone                      | no-op                | -> aborted | no-op | no-op |
+///
+/// End after abort is a no-op (it once ended the body); unreachable, since
+/// `sendQueued` ends or aborts once and `Parked` makes both the last call.
 pub const Fallback = struct {
     body: dusty.StreamingBodyWriter,
     state: State = .open,
