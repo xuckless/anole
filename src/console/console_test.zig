@@ -73,6 +73,9 @@ test "resolution: enabled off in tests, lambda and with ANOLE_CONSOLE=0; allow_r
 const Fake = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     reloads: std.atomic.Value(u32) = .init(0),
+    /// What the stub hand-off reports back to the service.
+    svc: ?*service.Service = null,
+    restart_ok: bool = false,
 
     fn reload(ctx: *anyopaque, _: []u8) service.ReloadResult {
         const self: *Fake = @ptrCast(@alignCast(ctx));
@@ -82,6 +85,10 @@ const Fake = struct {
     fn stop(ctx: *anyopaque) void {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         self.stopped.store(true, .release);
+    }
+    fn restart(ctx: *anyopaque) void {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        self.svc.?.restartFinished(self.restart_ok, 4242);
     }
     fn routeMeta(_: *anyopaque, index: u32) ?service.RouteMeta {
         if (index == 1) return .{ .method = "GET", .pattern = "/users/:id" };
@@ -403,6 +410,30 @@ test "service: drain without its token is refused, with it the server stops; rel
     const ok = (try waitFor(&c, a, .res)).res;
     try std.testing.expect(ok.ok);
     try wait.waitFlag(std.testing.io, "the drain stopped the server", &h.fake.stopped);
+}
+
+test "service: restart answers with the successor pid on success and an error on failure" {
+    if (!os.supported) return error.SkipZigTest;
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const a = arena_s.allocator();
+    var h = try Harness.init(std.testing.allocator, .{ .allow_restart = true }, .{ .restart = true });
+    defer h.deinit();
+    h.fake.svc = h.svc;
+    h.svc.host.restart = Fake.restart;
+    var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
+    }
+    for ([_]bool{ true, false, true }) |ok| {
+        h.fake.restart_ok = ok;
+        _ = try c.op("restart", "restart");
+        try c.flush();
+        const rs = (try waitFor(&c, a, .res)).res;
+        try std.testing.expectEqual(ok, rs.ok);
+        if (ok) try std.testing.expectEqual(@as(i64, 4242), rs.data.?.object.get("successor_pid").?.integer);
+    }
 }
 
 test "service: read_only refuses reload, drain, restart and full_restart" {
