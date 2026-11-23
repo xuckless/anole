@@ -1,0 +1,6 @@
+# Merged by compose into the runner's docker-compose.yml (run.sh copies this
+# and sim-run.sh into the runner dir): the simulator waits for its captures.
+services:
+  sim:
+    volumes:
+      - ./sim-run.sh:/ns3/run.sh:ro

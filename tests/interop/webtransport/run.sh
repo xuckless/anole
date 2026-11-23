@@ -58,6 +58,9 @@ impls["anole"] = {"image": "anole-wt-interop:latest", "url": "https://github.com
 json.dump(impls, open(p, "w"), indent=2)
 PY
 "$here/../empty-env.sh" "$work/runner" "$runner_commit"
+# The simulator waits for its captures (see tests/interop/run.sh).
+cp "$here/../sim-run.sh" "$here/../docker-compose.override.yml" "$work/runner/"
+chmod +x "$work/runner/sim-run.sh"
 python3 -m venv "$work/venv"
 # The runner's own requirements.txt, pinned with hashes here.
 "$work/venv/bin/pip" install -q --require-hashes -r "$here/../requirements.txt"

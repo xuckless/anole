@@ -11,6 +11,20 @@
 # the server (a Linux binary of `zig build h3-interop-server`);
 # ANOLE_INTEROP_IMAGE names its image (default anole-interop:latest), so
 # two checkouts can keep their own. Exits non-zero when any test fails.
+#
+# CI-only patches to the pinned runner and simulator, redone on every run
+# (the runner checkout is reset first, so a second run on the same work dir
+# works; a runner_commit bump that breaks a patch fails the run):
+#  - sim-run.sh + docker-compose.override.yml: the simulator waits for its
+#    dumpcap processes on SIGTERM, so 1-second cases (handshake, retry) keep
+#    both captures (without it: "Expected exactly one version. Got []").
+#  - rebind-check.patch: the rebind-port/-addr check passes when every new
+#    path has any answered PATH_CHALLENGE, not only its first (a lost first
+#    probe is re-sent with new data, RFC 9000 8.2.1).
+#  - empty-env.sh: see there.
+# Known flakes left: quic-go with handshakeloss/handshakecorruption (L1/C1),
+# "Expected 50 handshakes" with "handshake did not complete in time" in the
+# client's log (the client gives up at 10 s; no Anole fix, no retries).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -52,6 +66,10 @@ impls["anole"] = {"image": sys.argv[2], "url": "https://github.com/xuckless/anol
 json.dump(impls, open(p, "w"), indent=2)
 PY
 "$here/empty-env.sh" "$work/runner" "$runner_commit"
+cp "$here/sim-run.sh" "$here/docker-compose.override.yml" "$work/runner/"
+chmod +x "$work/runner/sim-run.sh"
+git -C "$work/runner" checkout -q -- testcases_quic.py
+git -C "$work/runner" apply "$here/rebind-check.patch"
 python3 -m venv "$work/venv"
 # The runner's own requirements.txt, pinned with hashes here.
 "$work/venv/bin/pip" install -q --require-hashes -r "$here/requirements.txt"
