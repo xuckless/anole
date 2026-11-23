@@ -20,6 +20,7 @@
 const std = @import("std");
 const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
+const clock = @import("clock.zig");
 
 /// The core's own tests build against a stub of zio.
 pub const is_stub = @hasDecl(zio, "is_stub");
@@ -71,6 +72,13 @@ pub const Where = union(enum) {
     executor: usize,
 };
 
+/// The zio runtime behind `io` (unwrapping `Clock.io` when installed), or null
+/// off zio.
+pub fn runtime(io: std.Io) ?*zio.Runtime {
+    if (comptime !have_zio) return null;
+    return zio.Runtime.fromIo(clock.unwrapIo(io));
+}
+
 /// `group.concurrent(io, func, args)`, placed as `where` says when the `Io`
 /// is zio's and placement applies.
 pub fn concurrent(
@@ -81,7 +89,7 @@ pub fn concurrent(
     args: std.meta.ArgsTuple(@TypeOf(func)),
 ) std.Io.ConcurrentError!void {
     if (comptime have_zio) {
-        if (zio.Runtime.fromIo(io)) |rt| {
+        if (runtime(io)) |rt| {
             const placement: zio.Placement = switch (where) {
                 .local => .local,
                 .executor => |i| .{ .executor = @intCast(i % rt.executors.items.len) },
@@ -117,7 +125,7 @@ pub fn concurrent(
 /// its blocking pool, say).
 pub fn currentExecutor(io: std.Io) ?usize {
     if (comptime !have_zio) return null;
-    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const rt = runtime(io) orelse return null;
     return rt.currentExecutor() orelse null;
 }
 
@@ -126,7 +134,7 @@ pub fn currentExecutor(io: std.Io) ?usize {
 /// doesn't measure it (io_uring; see `admission`).
 pub fn loopIdleNs(io: std.Io) ?u64 {
     if (comptime !have_zio) return null;
-    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const rt = runtime(io) orelse return null;
     return rt.currentLoopIdleNs();
 }
 
@@ -135,10 +143,13 @@ pub fn loopIdleNs(io: std.Io) ?u64 {
 /// of its event loop, so this is a load rather than a clock read, and at
 /// most one pass behind (a task that runs long without yielding holds it
 /// back as long). For deadlines that may come that much early, never late:
-/// a timestamp of something that happened is never after it. Null off zio
-/// or off an executor; callers read the clock instead.
+/// a timestamp of something that happened is never after it. Null off zio,
+/// off an executor, or when a test `Clock` overrides `io`; callers read the
+/// clock instead.
 pub fn tickNow(io: std.Io) ?std.Io.Timestamp {
     if (comptime !have_zio) return null;
+    // Call `zio.Runtime.fromIo` directly (not `runtime`) so a `Clock.io`-wrapped
+    // `Io` returns null here and callers fall back to `std.Io.Clock.awake.now`.
     if (zio.Runtime.fromIo(io) == null) return null;
     const task = zio.currentTask() orelse return null;
     return .fromNanoseconds(task.getExecutor().loop.now().toNanoseconds());
@@ -148,7 +159,7 @@ pub fn tickNow(io: std.Io) ?std.Io.Timestamp {
 /// placement does not apply (not zio).
 pub fn executorCount(io: std.Io) ?usize {
     if (comptime !have_zio) return null;
-    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const rt = runtime(io) orelse return null;
     return rt.executors.items.len;
 }
 
@@ -166,7 +177,7 @@ pub const Task = if (have_task_cancel) @typeInfo(@FieldType(zio.AutoCancel, "tas
 /// returned yet (in practice, under a lock the task takes before it ends).
 pub fn currentTask(io: std.Io) ?Task {
     if (comptime !have_task_cancel) return null;
-    if (zio.Runtime.fromIo(io) == null) return null;
+    if (runtime(io) == null) return null;
     return zio.currentTask();
 }
 
@@ -186,7 +197,7 @@ const have_current_task = !is_stub;
 /// which is the task there.
 pub fn taskId(io: std.Io) usize {
     if (comptime have_current_task) {
-        if (zio.Runtime.fromIo(io)) |rt| {
+        if (runtime(io)) |rt| {
             if (rt.currentExecutor()) |id| {
                 if (rt.executors.items[id].current_task) |task| return @intFromPtr(task);
             }
@@ -221,18 +232,18 @@ pub const Signal = struct {
     zio_event: if (have_zio_event) zio.Event else void = if (have_zio_event) .init else {},
 
     pub fn set(self: *Signal, io: std.Io) void {
-        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.set();
+        if (comptime have_zio_event) if (runtime(io) != null) return self.zio_event.set();
         self.std_event.set(io);
     }
 
     /// Only by the waiting task, after its wait returned.
     pub fn reset(self: *Signal, io: std.Io) void {
-        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.reset();
+        if (comptime have_zio_event) if (runtime(io) != null) return self.zio_event.reset();
         self.std_event.reset();
     }
 
     pub fn wait(self: *Signal, io: std.Io) std.Io.Cancelable!void {
-        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.wait() catch |err| switch (err) {
+        if (comptime have_zio_event) if (runtime(io) != null) return self.zio_event.wait() catch |err| switch (err) {
             error.Canceled => error.Canceled,
         };
         return self.std_event.wait(io);

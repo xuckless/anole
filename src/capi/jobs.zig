@@ -80,16 +80,6 @@ pub const ExecState = struct {
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
     }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
-    }
 };
 
 /// The state `txOp` and the handlers reach without an engine argument (one
@@ -228,8 +218,8 @@ fn sqlHandler(ctx: ?*anyopaque, job: *J.Job) anyerror!void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): workers take no more
-/// jobs; each ends when its last job is over.
+/// The drain started (however it started; once; never waits): workers take
+/// no more jobs; each ends when its last job is over.
 pub fn draining(e: *Engine) void {
     const t = &e.jobs_state.workers;
     t.acquire();
@@ -244,11 +234,6 @@ pub fn draining(e: *Engine) void {
         w.stopped.store(true, .release);
         maybeEnd(w);
     }
-}
-
-/// The server stops: nothing new starts from here.
-pub fn close(e: *Engine) void {
-    _ = e;
 }
 
 /// `anole_server_destroy`: frees what a stopped server still holds.
@@ -267,25 +252,13 @@ pub fn destroy(e: *Engine) void {
 // ---------------------------------------------------------------------------
 // Records
 
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
-
 fn enqueuedRecord(user_data: u64, status: i32, http: u16, class: u8, entries: []const abi.JobEnqueuedEntry, message: []const u8) ![]align(8) u8 {
     const Ev = abi.JobEnqueuedEvent;
     const entries_off = @sizeOf(Ev);
     const bytes_off = entries_off + entries.len * @sizeOf(abi.JobEnqueuedEntry);
     const rec = try engine.newRecord(bytes_off + message.len, .job_enqueued, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = bytes_off };
+    var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
     ev.user_data = user_data;
     ev.status = status;
     ev.http_status = http;
@@ -301,7 +274,7 @@ fn resultRecord(user_data: u64, status: i32, http: u16, json: []const u8, messag
     const Ev = abi.JobsResultEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + json.len + message.len, .jobs_result, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = user_data;
     ev.status = status;
     ev.http_status = http;
@@ -324,7 +297,7 @@ fn workerEndRecord(w: *Worker, reason: u32, message: []const u8) ![]align(8) u8 
     const Ev = abi.JobWorkerEndEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + message.len, .job_worker_end, w.handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var wr: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var wr: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = w.user_data;
     ev.reason = reason;
     ev.@"error" = wr.put(message);
@@ -340,7 +313,7 @@ fn jobRecord(w: *Worker, handle: u64, job: *J.Job) ![]align(8) u8 {
     const total = job.kind.len + job.queue.len + job.args_json.len + job.meta_json.len + errors_json.len + cron.len + tp.len;
     const rec = try engine.newRecord(@sizeOf(Ev) + total, .job, handle);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var wr: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var wr: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = w.user_data;
     ev.worker = w.handle;
     ev.id = job.id;
@@ -397,7 +370,7 @@ pub const JobSlot = struct {
     job: *J.Job,
 };
 
-pub const CallError = error{ Invalid, State, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 /// `anole_jobs_work`: after `anole_server_open`, before the server starts.
 pub fn work(e: *Engine, c: *Consumer, o: abi.JobsWorkOptions, user_data: u64) CallError!u64 {
@@ -542,12 +515,12 @@ fn abiRun(ctx: ?*anyopaque, job: *J.Job) anyerror!void {
         slot.finished = true;
         t.release();
         if (!already) {
-            const reason: u32 = if (job.interrupted_flag != null and job.interrupted_flag.?.load(.acquire))
-                abi.JOB_CANCEL_DRAIN
-            else if (job.lost_flag != null and job.lost_flag.?.load(.acquire))
-                (if (job.admin_cancelled.load(.acquire)) abi.JOB_CANCEL_ADMIN else abi.JOB_CANCEL_LEASE_LOST)
-            else
-                abi.JOB_CANCEL_TIMEOUT;
+            const reason = std.EnumArray(anole.jobs.Stop, u32).init(.{
+                .none = abi.JOB_CANCEL_TIMEOUT,
+                .interrupted = abi.JOB_CANCEL_DRAIN,
+                .lost = abi.JOB_CANCEL_LEASE_LOST,
+                .admin_cancelled = abi.JOB_CANCEL_ADMIN,
+            }).get(job.stopReason());
             if (cancelRecord(slot.handle, w.user_data, job.id, reason)) |r| w.x.postRecord(r, false) else |_| {}
             return error.Canceled;
         }
@@ -770,13 +743,7 @@ pub fn enqueue(e: *Engine, c: ?*Consumer, outs: []const abi.JobOut, opts: abi.Jo
     if (opts.tx != 0) {
         if (Handle.decode(opts.tx).kind != .db_tx or opts.req != 0) return error.Invalid;
         const payload = std.json.Stringify.valueAlloc(a, .{ .jobs = items }, .{ .emit_null_optional_fields = false }) catch return error.OutOfMemory;
-        db.txSubmit(e, opts.tx, .job_enqueue, payload, &.{}, .{ .size = @sizeOf(abi.DbOptions), .timeout_ms = opts.timeout_ms }, user_data) catch |err| return switch (err) {
-            error.Invalid => error.Invalid,
-            error.State => error.State,
-            error.OutOfMemory => error.OutOfMemory,
-            error.Unsupported => error.Unsupported,
-            error.Gone => error.Gone,
-        };
+        db.txSubmit(e, opts.tx, .job_enqueue, payload, &.{}, .{ .size = @sizeOf(abi.DbOptions), .timeout_ms = opts.timeout_ms }, user_data) catch |err| return err;
         arena.deinit();
         return;
     }
@@ -819,13 +786,7 @@ pub fn completeIn(e: *Engine, hv: u64, tx: u64, user_data: u64) CallError!void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const payload = std.fmt.allocPrint(arena.allocator(), "{{\"id\":{d},\"attempt\":{d},\"job\":{d}}}", .{ id, attempt, hv }) catch return error.OutOfMemory;
-    db.txSubmit(e, tx, .job_complete, payload, &.{}, .{ .size = @sizeOf(abi.DbOptions) }, user_data) catch |err| return switch (err) {
-        error.Invalid => error.Invalid,
-        error.State => error.State,
-        error.OutOfMemory => error.OutOfMemory,
-        error.Unsupported => error.Unsupported,
-        error.Gone => error.Gone,
-    };
+    db.txSubmit(e, tx, .job_complete, payload, &.{}, .{ .size = @sizeOf(abi.DbOptions) }, user_data) catch |err| return err;
     arena.deinit();
 }
 

@@ -291,6 +291,14 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
+    /// A fake clock (`anole.testing.Clock`) for tests of expiry, rate
+    /// limits, sessions and caches without sleeping, in test builds only.
+    /// It is the clock of `app.io()` (so of the features built on it:
+    /// `rateLimit`, `responseCache`, `webhooks`, sessions and auth stores
+    /// made with `app.io()`) and of `req.io` in `anole.testing` exchanges.
+    /// The server's sockets, their timeouts and the HTTP client stay on
+    /// the runtime's real clock. Must outlive the server.
+    clock: ?*http.Clock = null,
     /// The I/O engine. `.auto`: io_uring on Linux, epoll when the kernel
     /// refuses a ring (the startup line says why). `.io_uring`: refuse to
     /// start on epoll (and off Linux) with the cause named.
@@ -833,6 +841,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         gpa: std.mem.Allocator,
         /// The zio runtime the server owns; `io()` is its `std.Io`.
         rt: *zio.Runtime,
+        /// Optional test-clock `std.Io` binding (`Options.clock`), freed in `deinit`.
+        clock_io: ?*http.Clock.IoBinding = null,
         /// Holds what the server points into for its whole life: the
         /// listeners, certificates and middleware copies. So `Self` can
         /// move after `init`.
@@ -1265,6 +1275,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false, rt) catch "" else "";
             const rt_io = rt.io();
+            var clock_io: ?*http.Clock.IoBinding = null;
+            if (comptime builtin.is_test) {
+                if (opts.clock) |c| {
+                    const binding = try a.create(http.Clock.IoBinding);
+                    binding.* = c.io(rt_io);
+                    clock_io = binding;
+                }
+            } else if (opts.clock != null) @panic("ServerOptions.clock is for test builds");
+            errdefer if (clock_io) |b| b.deinit();
             server_on_thread = true;
             errdefer server_on_thread = false;
 
@@ -1302,6 +1321,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .console_embedded = opts._resolved != null,
                 .gpa = gpa,
                 .rt = rt,
+                .clock_io = clock_io,
                 .arena = arena,
                 .server = server,
                 .router = &server.router,
@@ -1975,6 +1995,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
             // Nothing can reach it any more: every task has stopped.
+            if (self.clock_io) |b| b.deinit();
             if (extras.exporter) |e| e.deinit();
             if (comptime features.console) if (self.console_stopped) |stopped| stopped.release();
             server_on_thread = false;
@@ -1983,9 +2004,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.* = undefined;
         }
 
-        /// The runtime's `std.Io`, for work beside the server.
+        /// The runtime's `std.Io`, for work beside the server (carrying the
+        /// test clock when `Options.clock` is set).
         pub fn io(self: *const Self) std.Io {
-            return self.rt.io();
+            return if (self.clock_io) |b| b.io() else self.rt.io();
         }
 
         /// Serves on `address`, in Go's notation, until SIGINT, SIGTERM or
@@ -2199,7 +2221,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn rateLimit(self: *Self, opts: RateLimitOptions) void {
             const a = self.arena.allocator();
             const limiter = self.gpa.create(ratelimit.MemoryLimiter) catch @panic("OOM");
-            limiter.* = .init(self.gpa, self.rt.io(), .{ .max_entries = opts.max_entries });
+            limiter.* = .init(self.gpa, self.io(), .{ .max_entries = opts.max_entries });
             const key: ratelimit.Key = switch (opts.key) {
                 .ip => .ip,
                 .header => |h| .{ .header = a.dupe(u8, h) catch @panic("OOM") },
@@ -2320,7 +2342,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     app.with(.{pages}).get("/about", about);
         ///     pages.invalidate(.{ .path = "/about" });
         pub fn responseCache(self: *Self, settings: ResponseCache.Options) *ResponseCache {
-            const cache = ResponseCache.init(self.gpa, self.rt.io(), settings) catch @panic("OOM");
+            const cache = ResponseCache.init(self.gpa, self.io(), settings) catch @panic("OOM");
             self.extras.connectors.append(self.arena.allocator(), .of(ResponseCache, cache)) catch @panic("OOM");
             if (self.extras.connectors_started) cache.start(self.extras.metrics, self.extras.exporter, self.extras.health) catch {};
             return cache;
@@ -2397,12 +2419,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.wsWith(path, handler, .{});
         }
 
-        /// `ws` with upgrade options (message size limit, compression,
-        /// timeout, the drain close).
-        pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+        fn storeWsOptions(self: *Self, upgrade: websocket.UpgradeOptions) *const websocket.UpgradeOptions {
+            const a = self.arena.allocator();
+            const copy = a.create(websocket.UpgradeOptions) catch @panic("OOM");
+            copy.* = upgrade.clone(a) catch @panic("OOM");
+            return copy;
+        }
+
+        /// `ws` with upgrade options (allowed origins, message size limit,
+        /// compression, timeout, the drain close). Copied into the server's
+        /// arena, so options built at run time (e.g. from `anole.config.load`)
+        /// need not outlive registration.
+        pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
+            self.router.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
         }
 
         /// A WebSocket endpoint at `path` served through callbacks:
@@ -2421,11 +2452,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.wsCallbacksWith(path, Handlers, .{});
         }
 
-        /// `wsCallbacks` with upgrade options.
-        pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+        /// `wsCallbacks` with upgrade options (copied into the server's arena,
+        /// as with `wsWith`).
+        pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
+            self.router.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = self.storeWsOptions(upgrade) });
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -2602,20 +2634,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 g.wsWith(path, handler, .{});
             }
             /// `Server.wsWith` under this group.
-            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
+                g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
             }
             /// `Server.wsCallbacks` under this group.
             pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
                 g.wsCallbacksWith(path, Handlers, .{});
             }
             /// `Server.wsCallbacksWith` under this group.
-            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
+                g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
             }
             /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
@@ -3285,7 +3317,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
             if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
-            const w = try wh.Client.init(self.gpa, self.rt.io(), config);
+            const w = try wh.Client.init(self.gpa, self.io(), config);
             errdefer w.deinit();
             try w.register(self);
             try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
@@ -3304,7 +3336,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn webhookVerify(self: *Self, config: @import("webhooks/root.zig").Verify.Options) *@import("webhooks/root.zig").Verify {
             if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
-            const v = wh.Verify.init(self.gpa, self.rt.io(), config) catch |err| @panic(@errorName(err));
+            const v = wh.Verify.init(self.gpa, self.io(), config) catch |err| @panic(@errorName(err));
             self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
             return v;
         }

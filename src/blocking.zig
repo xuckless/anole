@@ -231,7 +231,7 @@ fn unregister(pool: *Pool) void {
 }
 
 fn find(io: std.Io) ?*Pool {
-    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const rt = @import("dusty").placement.runtime(io) orelse return null;
     for (&registry) |*slot| {
         const pool = slot.load(.acquire) orelse continue;
         if (pool.rt == rt) return pool;

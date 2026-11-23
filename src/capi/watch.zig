@@ -111,22 +111,7 @@ pub const State = struct {
 };
 
 /// Per executor (`Exec.watch`): the tasks it runs are canceled at the stop.
-pub const ExecState = struct {
-    pub fn cancel(st: *ExecState, io: std.Io) void {
-        _ = st;
-        _ = io;
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
-    }
-};
+pub const ExecState = struct {};
 
 // ---------------------------------------------------------------------------
 // Opening, starting, stopping
@@ -296,26 +281,23 @@ pub fn start(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): the watches stop reading;
-/// their listeners end after what is queued.
-pub fn draining(e: *Engine) void {
+/// `anole_server_drain` (not the drain hook: stopping waits on the hub and
+/// the sinks): the watches stop reading and their listeners end before the
+/// call returns, whether or not a watch's own drain hook could start its
+/// stop task. Drains started elsewhere stop them through those hooks.
+pub fn stop(e: *Engine) void {
     for (e.watch_state.entries) |en| en.w.stop();
 }
 
 /// The server stops: the watches are stopped and freed (their tasks are on
 /// the runtime, which is still up), their listeners end.
 pub fn close(e: *Engine) void {
-    for (e.watch_state.entries) |en| en.w.stop();
+    stop(e);
     for (e.watch_state.entries) |en| en.w.deinit();
     // The watches are gone: their entries stay (for stale lookups) but are
     // not used again.
     for (e.watch_state.entries) |*en| en.w = undefined;
     e.watch_state.entries = e.watch_state.entries[0..0];
-}
-
-/// `anole_server_destroy`: frees what a stopped server still holds.
-pub fn destroy(e: *Engine) void {
-    _ = e;
 }
 
 /// `anole_handle_release` for the kind `watch_sub` (a cleanup call: a handle
@@ -341,8 +323,7 @@ fn subOf(e: *Engine, hv: u64) engine.HandleError!*Sub {
 
 /// `anole_watch_find`.
 pub fn find(e: *Engine, name: []const u8) ?*Entry {
-    for (e.watch_state.entries) |*en| if (std.mem.eql(u8, en.name, name)) return en;
-    return null;
+    return engine.findByName(Entry, e.watch_state.entries, name);
 }
 
 /// `anole_watch_listen`: events of `entry` from now on, to `home`'s

@@ -76,6 +76,7 @@ const Echo = struct {
             var buf: [32]u8 = undefined;
             return ws.send(.text, try std.fmt.bufPrint(&buf, "{d}", .{ws.contextAs(PerSocket).messages}));
         }
+        if (std.mem.eql(u8, msg.data, "close")) return ws.close(.normal, "bye");
         try ws.send(msg.type, msg.data);
     }
 
@@ -301,6 +302,7 @@ const Fixture = struct {
         self.server.router.get("/watched", websocket.callbacks(void, Watched, .{}));
         self.server.router.get("/watched-loop", websocket.route(void, watchedLoop, .{}));
         self.server.router.get("/brief", websocket.callbacks(void, Echo, .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } } }));
+        self.server.router.get("/short-close", websocket.callbacks(void, Echo, .{ .close_timeout = .fromMilliseconds(150) }));
         self.future = try self.io.concurrent(struct {
             fn run(s: *Server) anyerror!void {
                 try s.run();
@@ -376,6 +378,8 @@ fn messagesAcrossParking(secure: bool) !void {
     try c.send(0x1, "one");
     try c.expectText("one");
     try f.waitParked(1);
+    // Parked, it stays in flight for the drain until it closes.
+    try std.testing.expectEqual(1, f.server.busy.load(.acquire).count);
 
     for (0..3) |_| {
         // Woken by the next message, parked again after it.
@@ -414,6 +418,12 @@ fn messagesAcrossParking(secure: bool) !void {
     try std.testing.expectEqual(1000, last_close_code.load(.acquire));
     try std.testing.expect(c.hungUp());
     try std.testing.expectEqual(0, f.server.parkedConnections());
+    // Its close gave the count back.
+    try wait.waitUntil(f.io, "the closed socket gave its count back", &f.server, struct {
+        fn idle(s: *const Server) bool {
+            return s.busy.load(.acquire).count == 0;
+        }
+    }.idle);
 }
 
 test "WebSocket callbacks: messages, ping and close across parking" {
@@ -470,6 +480,8 @@ test "WebSocket callbacks: with parking off, the socket waits on its task" {
         try c.send(0x1, "again");
         try c.expectText("again");
     }
+    // On its task after the 101, in flight for the drain.
+    try std.testing.expectEqual(1, f.server.busy.load(.acquire).count);
     try wait.expectStays(f.io, "no socket parks with parking off", &f.server, struct {
         fn parkedIsZero(s: *const Server) bool {
             return s.parkedConnections() == 0;
@@ -543,6 +555,8 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
     }
     defer for (&clients) |*c| c.close(f.io);
     try f.waitParked(clients.len);
+    // Parked, each is in flight for the drain.
+    try std.testing.expectEqual(clients.len, f.server.busy.load(.acquire).count);
 
     var stopper = try f.io.concurrent(struct {
         fn run(fx: *Fixture) void {
@@ -558,6 +572,7 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
     stopper.await(f.io);
     try std.testing.expectEqual(3, closed.load(.acquire));
     for (&clients) |*c| try std.testing.expect(c.hungUp());
+    try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
 }
 
 test "WebSocket callbacks: stopping the server closes parked sockets" {
@@ -796,6 +811,53 @@ test "WebSocket callbacks: peers that hang up or reset are closed, parked or on 
     try std.testing.expectEqual(opened.load(.acquire), closed.load(.acquire));
     try hangUps("/ws", .{ .idle_park = null }, false);
     try std.testing.expectEqual(opened.load(.acquire), closed.load(.acquire));
+}
+
+test "WebSocket callbacks: drain cuts a parked unresponsive client after close_timeout, not timeout.shutdown" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    // No drain deadline: only close_timeout can end the socket.
+    try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(30), .shutdown = null } });
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/short-close");
+    defer c.close(f.io);
+    try c.expectText("hello");
+    try f.waitParked(1);
+
+    var stopper = try f.io.concurrent(struct {
+        fn run(fx: *Fixture) void {
+            fx.stopServer();
+        }
+    }.run, .{&f});
+    defer stopper.cancel(f.io);
+    try c.expectClose(1001);
+    // Client never answers the close: close_timeout cuts the parked socket.
+    try std.testing.expect(c.hungUp());
+    stopper.await(f.io);
+    try std.testing.expectEqual(1, closed.load(.acquire));
+    try std.testing.expectEqual(0, f.server.active_connections.load(.acquire));
+}
+
+test "WebSocket callbacks: handler ws.close cuts an unresponsive client after close_timeout" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, quick);
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/short-close");
+    defer c.close(f.io);
+    try c.expectText("hello");
+    try c.send(0x1, "close");
+    try c.expectClose(1000);
+    // Client never answers: close_timeout cuts the connection and runs close().
+    try std.testing.expect(c.hungUp());
+    try f.waitClosed(1);
+    // `close` runs as the core releases the socket, before it counts the
+    // connection out.
+    try f.waitConnections(0);
 }
 
 test "WebSocket loop: peers that hang up or reset are closed" {

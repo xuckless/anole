@@ -154,7 +154,7 @@ pub fn unregister(entry: *const Entry) void {
 }
 
 fn find(io: std.Io) ?*http.Client {
-    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const rt = @import("dusty").placement.runtime(io) orelse return null;
     for (&registry) |*slot| {
         const entry = slot.load(.acquire) orelse continue;
         if (entry.rt == rt) return entry.client;

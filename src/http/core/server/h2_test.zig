@@ -59,6 +59,24 @@ pub fn Behaviour(comptime e: harness.Engine) type {
             try std.testing.expectEqual(@as(u16, 404), client.get(missing).status);
         }
 
+        test "HTTP/2: a response with as many headers as the limit allows is answered, not reset" {
+            const io = std.testing.io;
+            var fx: Fixture = undefined;
+            try fx.start(io);
+            defer fx.stop(io);
+
+            var client: TestClient = undefined;
+            try client.init(std.testing.allocator, io, fx.server.address.ip);
+            defer client.deinit();
+            const full = try client.request("GET", "/full", null);
+            const after = try client.request("GET", "/hello", null);
+            try client.run();
+
+            try std.testing.expectEqual(@as(u16, 200), client.get(full).status);
+            try std.testing.expectEqualStrings("ok", client.get(full).body.items);
+            try std.testing.expectEqual(@as(u16, 200), client.get(after).status);
+        }
+
         test "HTTP/2: a whole body ends on its DATA frame, an empty one on HEADERS" {
             const io = std.testing.io;
             var fx: Fixture = undefined;

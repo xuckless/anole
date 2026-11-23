@@ -55,9 +55,12 @@ fn freeWord(gen: u32) u64 {
 
 /// Slots of one kind on one executor; also taken from consumer threads, so
 /// the free list is under a lock.
-fn Table(comptime T: type) type {
-    return SlotTable(T, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.OutOfMemory, .locked = true }, freeWord);
+fn Table(comptime T: type, comptime kind: engine.Handle.Kind) type {
+    return SlotTable(T, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.OutOfMemory, .locked = true, .kind = kind, .open = @backingInt(State.open) }, freeWord);
 }
+
+const Sessions = Table(SessionSlot, .wt_session);
+const Streams = Table(StreamSlot, .wt_stream);
 
 // ---------------------------------------------------------------------------
 // Slots
@@ -90,16 +93,6 @@ pub const SessionSlot = struct {
     /// The streams it has handed out, open or waiting to open.
     streams: std.ArrayList(*StreamSlot) = .empty,
     drain_posted: bool = false,
-
-    fn gen(s: *const SessionSlot) u32 {
-        return @intCast(s.word.load(.acquire) >> 32);
-    }
-    fn live(s: *const SessionSlot, g: u32) bool {
-        return s.word.load(.acquire) == pack(g, .open);
-    }
-    fn handle(s: *const SessionSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .wt_session, .slot = @intCast(s.index), .exec = s.exec.index });
-    }
 
     /// Wakes the session's task.
     fn wake(s: *SessionSlot) void {
@@ -231,16 +224,6 @@ pub const StreamSlot = struct {
         over,
     };
 
-    fn gen(s: *const StreamSlot) u32 {
-        return @intCast(s.word.load(.acquire) >> 32);
-    }
-    fn live(s: *const StreamSlot, g: u32) bool {
-        return s.word.load(.acquire) == pack(g, .open);
-    }
-    fn handle(s: *const StreamSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .wt_stream, .slot = @intCast(s.index), .exec = s.exec.index });
-    }
-
     fn clear(s: *StreamSlot) void {
         s.out.deinit(gpa);
         s.sending.deinit(gpa);
@@ -292,8 +275,8 @@ pub const StreamSlot = struct {
 };
 
 pub const ExecState = struct {
-    sessions: Table(SessionSlot) = .{},
-    streams: Table(StreamSlot) = .{},
+    sessions: Sessions = .{},
+    streams: Streams = .{},
 
     /// The highest generation of any slot (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
@@ -343,7 +326,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const xi = placement.currentExecutor(req.io) orelse return error.InternalServerError;
     const x = &e.execs[xi];
     if (x.consumer == null) return res.fail(.service_unavailable, "no consumer");
-    const opts = route.wt.?;
+    const opts = route.kind.webtransport;
     const session = (try webtransport.accept(req, res, opts.accept)) orelse
         return res.fail(.bad_request, "this endpoint speaks WebTransport over HTTP/3");
     defer session.deinit();
@@ -357,7 +340,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         queue.deinit(gpa);
         return;
     };
-    const g = s.gen();
+    const g = Sessions.gen(s);
     s.route = route;
     s.session = session;
     s.drain_posted = false;
@@ -379,7 +362,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         .claims = engine.claimsOf(req),
     };
     if (engine.allocRecord(head.size())) |rec| {
-        _ = head.encode(.wt_open, s.handle(g), rec);
+        _ = head.encode(.wt_open, Sessions.handle(s, g), rec);
         x.postRecord(rec, true);
     } else |_| {}
 
@@ -434,7 +417,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session) std.Io.Cancelable!void {
             defer session.freeDatagram(d);
             progress = true;
             const size = @sizeOf(abi.WtDatagramEvent) + d.len;
-            const rec = newRecord(size, .wt_datagram, s.handle(g)) catch continue;
+            const rec = newRecord(size, .wt_datagram, Sessions.handle(s, g)) catch continue;
             const ev: *abi.WtDatagramEvent = @ptrCast(rec.ptr);
             ev.route_id = s.route.id;
             ev.data = .{ .off = @sizeOf(abi.WtDatagramEvent), .len = @intCast(d.len) };
@@ -456,7 +439,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session) std.Io.Cancelable!void {
         if (!s.drain_posted and session.draining()) {
             s.drain_posted = true;
             progress = true;
-            postSmall(x, .wt_drain, s.handle(g));
+            postSmall(x, .wt_drain, Sessions.handle(s, g));
         }
         if (!session.isOpen()) return;
         const max = session.maxDatagramSize();
@@ -478,21 +461,21 @@ fn adopt(s: *SessionSlot, g: u32, stream: *Stream, dir: @FieldType(StreamSlot, "
         st.free();
         return stream.release();
     };
-    const sg = st.gen();
+    const sg = Streams.gen(st);
     st.word.store(pack(sg, .open), .release);
-    const rec = newRecord(@sizeOf(abi.WtStreamEvent), .wt_stream, st.handle(sg)) catch return;
+    const rec = newRecord(@sizeOf(abi.WtStreamEvent), .wt_stream, Streams.handle(st, sg)) catch return;
     const ev: *abi.WtStreamEvent = @ptrCast(rec.ptr);
     ev.route_id = s.route.id;
     ev.flags = if (dir == .uni_in) abi.WT_F_UNI else 0;
-    ev.session = s.handle(g);
+    ev.session = Sessions.handle(s, g);
     x.postRecord(rec, true);
 }
 
 /// One round for a stream; false once its slot is free again (released).
 fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, high: usize, progress: *bool) bool {
     const x = s.exec;
-    const sg = st.gen();
-    const h = st.handle(sg);
+    const sg = Streams.gen(st);
+    const h = Streams.handle(st, sg);
     st.postBorrowed();
 
     // Not opened yet (the peer's limit): try again.
@@ -653,7 +636,7 @@ fn dropOutput(st: *StreamSlot, h: u64) void {
 /// A stream slot of a session that is gone, never opened.
 fn abandon(st: *StreamSlot) void {
     spin(&st.lock);
-    st.word.store(pack(engine.nextGen(st.gen()), .free), .release);
+    st.word.store(pack(engine.nextGen(Streams.gen(st)), .free), .release);
     st.lock.unlock();
     st.free();
 }
@@ -679,7 +662,7 @@ fn finish(s: *SessionSlot, g: u32, session: *Session) void {
     ol.deinit(gpa);
     for (s.streams.items) |st| {
         spin(&st.lock);
-        st.word.store(pack(engine.nextGen(st.gen()), .free), .release);
+        st.word.store(pack(engine.nextGen(Streams.gen(st)), .free), .release);
         st.out.clearRetainingCapacity();
         st.bytes = 0;
         st.lock.unlock();
@@ -693,7 +676,7 @@ fn finish(s: *SessionSlot, g: u32, session: *Session) void {
 
     const info = session.closeInfo() orelse webtransport.CloseInfo{ .code = 0, .reason = "", .by = .connection };
     const size = @sizeOf(abi.WtCloseEvent) + info.reason.len;
-    if (newRecord(size, .wt_close, s.handle(g))) |rec| {
+    if (newRecord(size, .wt_close, Sessions.handle(s, g))) |rec| {
         const ev: *abi.WtCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;
         ev.code = info.code;
@@ -732,7 +715,7 @@ pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
     const s, const g = sessionOf(e, hv) catch |err| return e.badHandle(err);
     const x = s.exec;
     spin(&s.lock);
-    if (!s.live(g) or s.close_code != null) {
+    if (!Sessions.live(s, g) or s.close_code != null) {
         s.lock.unlock();
         return e.gone();
     }
@@ -747,11 +730,11 @@ pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
         x.wt.streams.free(st);
         return error.OutOfMemory;
     };
-    const sg = st.gen();
+    const sg = Streams.gen(st);
     st.word.store(pack(sg, .open), .release);
     s.lock.unlock();
     s.wake();
-    return st.handle(sg);
+    return Streams.handle(st, sg);
 }
 
 /// Queues `data` (and, with `fin`, the end after it); true when the
@@ -765,7 +748,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) eng
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
     spin(&st.lock);
-    if (!st.live(g)) {
+    if (!Streams.live(st, g)) {
         st.lock.unlock();
         return e.gone();
     }
@@ -801,7 +784,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) eng
 pub fn setPriority(e: *Engine, hv: u64, urgency: u3) engine.AnswerError!void {
     const st, const g = streamOf(e, hv) catch |err| return e.badHandle(err);
     spin(&st.lock);
-    if (!st.live(g)) {
+    if (!Streams.live(st, g)) {
         st.lock.unlock();
         return e.gone();
     }
@@ -822,7 +805,7 @@ pub const Op = enum { reset, stop, release };
 pub fn streamOp(e: *Engine, hv: u64, op: Op, code: u32) engine.AnswerError!void {
     const st, const g = try streamOf(e, hv);
     spin(&st.lock);
-    if (!st.live(g)) {
+    if (!Streams.live(st, g)) {
         st.lock.unlock();
         return error.Over;
     }
@@ -863,7 +846,7 @@ pub fn sendDatagram(e: *Engine, hv: u64, data: []const u8, borrow: bool) engine.
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
     const copy = try gpa.dupe(u8, data);
     spin(&s.lock);
-    if (!s.live(g) or s.close_code != null) {
+    if (!Sessions.live(s, g) or s.close_code != null) {
         s.lock.unlock();
         gpa.free(copy);
         return e.gone();
@@ -889,7 +872,7 @@ pub fn maxDatagram(e: *Engine, hv: u64) engine.AnswerError!usize {
     const s, const g = sessionOf(e, hv) catch |err| return e.badHandle(err);
     spin(&s.lock);
     defer s.lock.unlock();
-    if (!s.live(g)) return e.gone();
+    if (!Sessions.live(s, g)) return e.gone();
     return s.max_datagram;
 }
 
@@ -900,7 +883,7 @@ pub fn close(e: *Engine, hv: u64, code: u32, reason: []const u8) engine.AnswerEr
     const s, const g = try sessionOf(e, hv);
     const copy = try gpa.dupe(u8, reason);
     spin(&s.lock);
-    if (!s.live(g) or s.close_code != null) {
+    if (!Sessions.live(s, g) or s.close_code != null) {
         s.lock.unlock();
         gpa.free(copy);
         return error.Over;

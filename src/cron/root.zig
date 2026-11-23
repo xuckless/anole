@@ -14,7 +14,20 @@ pub const Diagnostic = struct { field: []const u8 = "", position: usize = 0, mes
 const day_names = [_][]const u8{ "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
 const month_names = [_][]const u8{ "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
 
-pub const Schedule = struct {
+const Field = enum { second, minute, hour, day_of_month, month, day_of_week };
+
+/// Per field: diagnostic name, range, month/day names, the value the first
+/// name maps to, and whether `L` is legal. Add a field as a row.
+const specs = std.EnumArray(Field, struct { name: []const u8, lo: u32, hi: u32, names: ?[]const []const u8, first: u32, allows_last: bool }).init(.{
+    .second = .{ .name = "second", .lo = 0, .hi = 59, .names = null, .first = 0, .allows_last = false },
+    .minute = .{ .name = "minute", .lo = 0, .hi = 59, .names = null, .first = 0, .allows_last = false },
+    .hour = .{ .name = "hour", .lo = 0, .hi = 23, .names = null, .first = 0, .allows_last = false },
+    .day_of_month = .{ .name = "day-of-month", .lo = 1, .hi = 31, .names = null, .first = 1, .allows_last = true },
+    .month = .{ .name = "month", .lo = 1, .hi = 12, .names = &month_names, .first = 1, .allows_last = false },
+    .day_of_week = .{ .name = "day-of-week", .lo = 0, .hi = 6, .names = null, .first = 0, .allows_last = false },
+});
+
+const Fields = struct {
     sec: u64 = 1,
     min: u64 = 0,
     hour: u32 = 0,
@@ -26,85 +39,16 @@ pub const Schedule = struct {
     dow_nth: [7]u8 = @splat(0),
     /// Bit d set: the last such weekday of the month.
     dow_last: u8 = 0,
-    every_ms: ?i64 = null,
     dom_star: bool = true,
     dow_star: bool = true,
     /// The hour field is `*` or a step: both occurrences of a repeated hour fire.
     hour_wild: bool = true,
     has_seconds: bool = false,
 
-    /// Parsed per C3. `error.InvalidSchedule` with `why` (field and position).
-    pub fn parse(text: []const u8, why: ?*Diagnostic) error{InvalidSchedule}!Schedule {
-        var d: Diagnostic = .{};
-        const out = parseInner(text, &d) catch {
-            if (why) |w| w.* = d;
-            return error.InvalidSchedule;
-        };
-        return out;
-    }
-
-    fn parseInner(text_in: []const u8, d: *Diagnostic) error{Bad}!Schedule {
-        const text = std.mem.trim(u8, text_in, " \t");
-        var s: Schedule = .{};
-        if (text.len == 0) return fail(d, "schedule", 0, "empty schedule");
-        if (text[0] == '@') {
-            if (std.mem.startsWith(u8, text, "@every")) {
-                const rest = std.mem.trim(u8, text[6..], " \t");
-                const ms = parseDuration(rest) orelse return fail(d, "@every", 7, "expected a duration such as 90s, 5m or 2h");
-                if (ms < 1000) return fail(d, "@every", 7, "the interval must be at least 1s");
-                s.every_ms = ms;
-                return s;
-            }
-            const map = [_]struct { []const u8, []const u8 }{
-                .{ "@yearly", "0 0 1 1 *" }, .{ "@annually", "0 0 1 1 *" }, .{ "@monthly", "0 0 1 * *" },
-                .{ "@weekly", "0 0 * * 0" }, .{ "@daily", "0 0 * * *" },    .{ "@midnight", "0 0 * * *" },
-                .{ "@hourly", "0 * * * *" },
-            };
-            for (map) |m| if (std.mem.eql(u8, m[0], text)) return parseInner(m[1], d);
-            return fail(d, "schedule", 0, "unknown nickname");
-        }
-        var fields: [6][]const u8 = undefined;
-        var offs: [6]usize = undefined;
-        var n: usize = 0;
-        var it = std.mem.tokenizeAny(u8, text, " \t");
-        while (it.next()) |f| {
-            if (n == 6) return fail(d, "schedule", it.index, "too many fields (5, or 6 with seconds first)");
-            fields[n] = f;
-            offs[n] = it.index - f.len;
-            n += 1;
-        }
-        if (n != 5 and n != 6) return fail(d, "schedule", 0, "expected 5 fields (minute hour day-of-month month day-of-week), or 6 with seconds first");
-        var k: usize = 0;
-        if (n == 6) {
-            s.has_seconds = true;
-            s.sec = try bits(fields[0], 0, 59, null, "second", offs[0], d, &s);
-            k = 1;
-        }
-        s.min = try bits(fields[k], 0, 59, null, "minute", offs[k], d, &s);
-        const hf = fields[k + 1];
-        s.hour = @intCast(try bits(hf, 0, 23, null, "hour", offs[k + 1], d, &s));
-        s.hour_wild = hf[0] == '*' or std.mem.indexOfScalar(u8, hf, '/') != null;
-        const dm = fields[k + 2];
-        s.dom_star = dm[0] == '*' or dm[0] == '?';
-        var dom_s = s;
-        s.dom = @intCast(try bits(dm, 1, 31, null, "day-of-month", offs[k + 2], d, &dom_s));
-        s.last_dom = dom_s.last_dom;
-        const mf = fields[k + 3];
-        s.month = @intCast(try bits(mf, 1, 12, &month_names, "month", offs[k + 3], d, &s));
-        const wf = fields[k + 4];
-        s.dow_star = wf[0] == '*' or wf[0] == '?';
-        try parseDow(wf, offs[k + 4], d, &s);
-        return s;
-    }
-
     /// The first fire time strictly after `after`, in `z`, or null when none
     /// in the next 5 years.
-    pub fn next(self: *const Schedule, after: Time, z: *const Zone) ?Time {
+    fn next(self: *const Fields, after: Time, z: *const Zone) ?Time {
         const after_s = @divFloor(after.us, std.time.us_per_s);
-        if (self.every_ms) |ms| {
-            const after_ms = @divFloor(after.us, 1000);
-            return Time.fromMillis((@divFloor(after_ms, ms) + 1) * ms);
-        }
         const unit: i64 = if (self.has_seconds) 1 else 60;
         // Local wall time of `after`, floored to the resolution, plus one unit.
         var l = after_s + z.offsetAtSeconds(after_s);
@@ -121,7 +65,7 @@ pub const Schedule = struct {
         return if (best) |b| Time.fromSeconds(b) else null;
     }
 
-    fn search(self: *const Schedule, start: i64, after_s: i64, z: *const Zone) ?i64 {
+    fn search(self: *const Fields, start: i64, after_s: i64, z: *const Zone) ?i64 {
         const unit: i64 = if (self.has_seconds) 1 else 60;
         var l = start;
         var guard: u32 = 0;
@@ -133,21 +77,7 @@ pub const Schedule = struct {
         return null;
     }
 
-    /// Every fire time in (after, until], at most `out.len`.
-    pub fn between(self: *const Schedule, after: Time, until: Time, z: *const Zone, out: []Time) usize {
-        var n: usize = 0;
-        var cur = after;
-        while (n < out.len) {
-            const t = self.next(cur, z) orelse break;
-            if (t.us > until.us) break;
-            out[n] = t;
-            n += 1;
-            cur = t;
-        }
-        return n;
-    }
-
-    fn dayMatches(self: *const Schedule, days: i64) bool {
+    fn dayMatches(self: *const Fields, days: i64) bool {
         const c = zone.civilFromDays(days);
         if (self.month & (@as(u16, 1) << @intCast(c.month)) == 0) return false;
         const dim = zone.daysInMonth(c.year, c.month);
@@ -164,7 +94,7 @@ pub const Schedule = struct {
     }
 
     /// The first matching wall time >= `l` (seconds of local time since the epoch).
-    fn nextWall(self: *const Schedule, l: i64) ?i64 {
+    fn nextWall(self: *const Fields, l: i64) ?i64 {
         var day = @divFloor(l, 86400);
         const first_day = day;
         var tod = @mod(l, 86400);
@@ -178,7 +108,7 @@ pub const Schedule = struct {
         return null;
     }
 
-    fn timeOfDay(self: *const Schedule, from: i64) ?i64 {
+    fn timeOfDay(self: *const Fields, from: i64) ?i64 {
         var h: i64 = @divFloor(from, 3600);
         var m: i64 = @divFloor(@mod(from, 3600), 60);
         var s: i64 = @mod(from, 60);
@@ -200,7 +130,7 @@ pub const Schedule = struct {
     }
 
     /// The UTC instant of wall time `w`, or null to carry on with a later one (C5).
-    fn resolve(self: *const Schedule, w: i64, after: i64, z: *const Zone) ?i64 {
+    fn resolve(self: *const Fields, w: i64, after: i64, z: *const Zone) ?i64 {
         const o1 = z.offsetAtSeconds(w - 86400);
         const o2 = z.offsetAtSeconds(w + 86400);
         var cand: [2]i64 = undefined;
@@ -235,6 +165,98 @@ pub const Schedule = struct {
         }
         const t = b;
         return if (t > after) t else null;
+    }
+};
+
+/// `every` is the `@every` interval in ms; `cron` a parsed expression.
+pub const Schedule = union(enum) {
+    every: i64,
+    cron: Fields,
+
+    /// Parsed per C3. `error.InvalidSchedule` with `why` (field and position).
+    pub fn parse(text: []const u8, why: ?*Diagnostic) error{InvalidSchedule}!Schedule {
+        var d: Diagnostic = .{};
+        const out = parseInner(text, &d) catch {
+            if (why) |w| w.* = d;
+            return error.InvalidSchedule;
+        };
+        return out;
+    }
+
+    fn parseInner(text_in: []const u8, d: *Diagnostic) error{Bad}!Schedule {
+        const text = std.mem.trim(u8, text_in, " \t");
+        if (text.len == 0) return fail(d, "schedule", 0, "empty schedule");
+        if (text[0] == '@') {
+            if (std.mem.startsWith(u8, text, "@every")) {
+                const rest = std.mem.trim(u8, text[6..], " \t");
+                const ms = parseDuration(rest) orelse return fail(d, "@every", 7, "expected a duration such as 90s, 5m or 2h");
+                if (ms < 1000) return fail(d, "@every", 7, "the interval must be at least 1s");
+                return .{ .every = ms };
+            }
+            const map = [_]struct { []const u8, []const u8 }{
+                .{ "@yearly", "0 0 1 1 *" }, .{ "@annually", "0 0 1 1 *" }, .{ "@monthly", "0 0 1 * *" },
+                .{ "@weekly", "0 0 * * 0" }, .{ "@daily", "0 0 * * *" },    .{ "@midnight", "0 0 * * *" },
+                .{ "@hourly", "0 * * * *" },
+            };
+            for (map) |m| if (std.mem.eql(u8, m[0], text)) return parseInner(m[1], d);
+            return fail(d, "schedule", 0, "unknown nickname");
+        }
+        var fields: [6][]const u8 = undefined;
+        var offs: [6]usize = undefined;
+        var n: usize = 0;
+        var it = std.mem.tokenizeAny(u8, text, " \t");
+        while (it.next()) |f| {
+            if (n == 6) return fail(d, "schedule", it.index, "too many fields (5, or 6 with seconds first)");
+            fields[n] = f;
+            offs[n] = it.index - f.len;
+            n += 1;
+        }
+        if (n != 5 and n != 6) return fail(d, "schedule", 0, "expected 5 fields (minute hour day-of-month month day-of-week), or 6 with seconds first");
+        var s: Fields = .{};
+        var k: usize = 0;
+        if (n == 6) {
+            s.has_seconds = true;
+            s.sec = (try bits(fields[0], .second, offs[0], d)).bits;
+            k = 1;
+        }
+        s.min = (try bits(fields[k], .minute, offs[k], d)).bits;
+        const hf = fields[k + 1];
+        s.hour = @intCast((try bits(hf, .hour, offs[k + 1], d)).bits);
+        s.hour_wild = hf[0] == '*' or std.mem.indexOfScalar(u8, hf, '/') != null;
+        const dm = fields[k + 2];
+        s.dom_star = dm[0] == '*' or dm[0] == '?';
+        const dom = try bits(dm, .day_of_month, offs[k + 2], d);
+        s.dom = @intCast(dom.bits);
+        s.last_dom = dom.last;
+        const mf = fields[k + 3];
+        s.month = @intCast((try bits(mf, .month, offs[k + 3], d)).bits);
+        const wf = fields[k + 4];
+        s.dow_star = wf[0] == '*' or wf[0] == '?';
+        try parseDow(wf, offs[k + 4], d, &s);
+        return .{ .cron = s };
+    }
+
+    /// The first fire time strictly after `after`, in `z`, or null when none
+    /// in the next 5 years.
+    pub fn next(self: *const Schedule, after: Time, z: *const Zone) ?Time {
+        switch (self.*) {
+            .every => |ms| return Time.fromMillis((@divFloor(@divFloor(after.us, 1000), ms) + 1) * ms),
+            .cron => |*f| return f.next(after, z),
+        }
+    }
+
+    /// Every fire time in (after, until], at most `out.len`.
+    pub fn between(self: *const Schedule, after: Time, until: Time, z: *const Zone, out: []Time) usize {
+        var n: usize = 0;
+        var cur = after;
+        while (n < out.len) {
+            const t = self.next(cur, z) orelse break;
+            if (t.us > until.us) break;
+            out[n] = t;
+            n += 1;
+            cur = t;
+        }
+        return n;
     }
 };
 
@@ -275,15 +297,21 @@ fn nameValue(tok: []const u8, names: ?[]const []const u8, first: u32) ?u32 {
     return std.fmt.parseInt(u32, tok, 10) catch null;
 }
 
-/// One cron field into a bit set. `L` in the day-of-month field is noted on `flags`.
-fn bits(text: []const u8, lo: u32, hi: u32, names: ?[]const []const u8, field: []const u8, base: usize, d: *Diagnostic, flags: *Schedule) error{Bad}!u64 {
-    const first: u32 = if (names != null and std.mem.eql(u8, field, "month")) 1 else lo;
+/// One cron field into a bit set; `last` when `L` was given where the field allows it.
+fn bits(text: []const u8, f: Field, base: usize, d: *Diagnostic) error{Bad}!struct { bits: u64, last: bool } {
+    const sp = specs.get(f);
+    const field = sp.name;
+    const lo = sp.lo;
+    const hi = sp.hi;
+    const names = sp.names;
+    const first = sp.first;
     var out: u64 = 0;
+    var last = false;
     var items = std.mem.splitScalar(u8, text, ',');
     while (items.next()) |item| {
         if (item.len == 0) return fail(d, field, base, "empty item");
-        if (std.mem.eql(u8, field, "day-of-month") and std.ascii.eqlIgnoreCase(item, "L")) {
-            flags.last_dom = true;
+        if (sp.allows_last and std.ascii.eqlIgnoreCase(item, "L")) {
+            last = true;
             continue;
         }
         if (std.mem.indexOfScalar(u8, item, 'W') != null) return fail(d, field, base, "W (nearest weekday) is not supported");
@@ -307,29 +335,30 @@ fn bits(text: []const u8, lo: u32, hi: u32, names: ?[]const []const u8, field: [
         var v = a;
         while (v <= b) : (v += step) out |= @as(u64, 1) << @intCast(v);
     }
-    return out;
+    return .{ .bits = out, .last = last };
 }
 
-fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Schedule) error{Bad}!void {
+fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Fields) error{Bad}!void {
     var items = std.mem.splitScalar(u8, text, ',');
+    const field = specs.get(.day_of_week).name;
     while (items.next()) |item| {
-        if (item.len == 0) return fail(d, "day-of-week", base, "empty item");
+        if (item.len == 0) return fail(d, field, base, "empty item");
         if (std.mem.indexOfScalar(u8, item, '#')) |h| {
-            const wd = dowValue(item[0..h]) orelse return fail(d, "day-of-week", base, "bad weekday");
-            const k = std.fmt.parseInt(u8, item[h + 1 ..], 10) catch return fail(d, "day-of-week", base + h + 1, "bad ordinal");
-            if (k < 1 or k > 5) return fail(d, "day-of-week", base + h + 1, "the ordinal must be 1 to 5");
+            const wd = dowValue(item[0..h]) orelse return fail(d, field, base, "bad weekday");
+            const k = std.fmt.parseInt(u8, item[h + 1 ..], 10) catch return fail(d, field, base + h + 1, "bad ordinal");
+            if (k < 1 or k > 5) return fail(d, field, base + h + 1, "the ordinal must be 1 to 5");
             s.dow_nth[wd] |= @as(u8, 1) << @intCast(k);
             continue;
         }
         if (item.len >= 2 and (item[item.len - 1] == 'L' or item[item.len - 1] == 'l') and item[0] != '*') {
-            const wd = dowValue(item[0 .. item.len - 1]) orelse return fail(d, "day-of-week", base, "bad weekday");
+            const wd = dowValue(item[0 .. item.len - 1]) orelse return fail(d, field, base, "bad weekday");
             s.dow_last |= @as(u8, 1) << @intCast(wd);
             continue;
         }
         if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
             if (std.mem.indexOfScalar(u8, item, '/') == null) {
-                const a = dowValue(item[0..dash]) orelse return fail(d, "day-of-week", base, "bad weekday");
-                const b = dowValue(item[dash + 1 ..]) orelse return fail(d, "day-of-week", base, "bad weekday");
+                const a = dowValue(item[0..dash]) orelse return fail(d, field, base, "bad weekday");
+                const b = dowValue(item[dash + 1 ..]) orelse return fail(d, field, base, "bad weekday");
                 // A range may wrap past Saturday ("sat-sun", "5-7").
                 var v = a;
                 while (true) : (v = (v + 1) % 7) {
@@ -339,14 +368,13 @@ fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Schedule) error{B
                 continue;
             }
         }
-        var tmp: Schedule = .{};
         // Names and 7 = Sunday: map to 0..6 before the generic parser.
         var buf: [32]u8 = undefined;
         var w: usize = 0;
         var i: usize = 0;
         while (i < item.len and w < buf.len - 2) {
             if (i + 3 <= item.len and std.ascii.isAlphabetic(item[i])) {
-                const v = dowValue(item[i .. i + 3]) orelse return fail(d, "day-of-week", base, "bad weekday name");
+                const v = dowValue(item[i .. i + 3]) orelse return fail(d, field, base, "bad weekday name");
                 buf[w] = '0' + v;
                 w += 1;
                 i += 3;
@@ -356,8 +384,7 @@ fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Schedule) error{B
                 i += 1;
             }
         }
-        const m = try bits(buf[0..w], 0, 6, null, "day-of-week", base, d, &tmp);
-        s.dow |= @intCast(m);
+        s.dow |= @intCast((try bits(buf[0..w], .day_of_week, base, d)).bits);
     }
 }
 
@@ -388,6 +415,14 @@ test "cron parse: forms and refusals" {
     inline for (.{ "", "* * * *", "61 * * * *", "* * 1W * *", "* * * * * * *", "@every 500ms", "*/0 * * * *", "0 0 * * MON#6" }) |e| {
         try std.testing.expectError(error.InvalidSchedule, Schedule.parse(e, &d));
     }
+    // `L` is legal only in day-of-month; elsewhere the diagnostic names the field and offset.
+    inline for (.{ .{ "L * * * *", "minute", 0 }, .{ "* L * * *", "hour", 2 }, .{ "* * * L *", "month", 6 }, .{ "L 0 0 * * *", "second", 0 }, .{ "* * * * L", "day-of-week", 8 } }) |c| {
+        try std.testing.expectError(error.InvalidSchedule, Schedule.parse(c[0], &d));
+        try std.testing.expectEqualStrings(c[1], d.field);
+        try std.testing.expectEqual(@as(usize, c[2]), d.position);
+    }
+    try std.testing.expect((try Schedule.parse("0 0 L * *", null)).cron.last_dom);
+    try std.testing.expectEqual(@as(i64, 90_000), (try Schedule.parse("@every 90s", null)).every);
 }
 
 test "cron: next in UTC and Vixie day semantics" {

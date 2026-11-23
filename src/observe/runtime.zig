@@ -117,7 +117,7 @@ pub fn writeConfigLines(w: *std.Io.Writer, rt: *zio.Runtime) std.Io.Writer.Error
 /// Updates the runtime gauges in `registry` from the zio runtime behind its
 /// `io` and the HTTP engines' counters. Called by `Registry.render`.
 pub fn refresh(registry: *metrics.Registry) void {
-    const rt = zio.Runtime.fromIo(registry.io) orelse return;
+    const rt = dusty.placement.runtime(registry.io) orelse return;
     const n = @min(rt.executorCount(), dusty.gauges.max_executors);
     var buf: [8]u8 = undefined;
 

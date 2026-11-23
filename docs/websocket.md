@@ -62,8 +62,9 @@ memory, which the handler should pass on.
 
 The handler takes `(ws, req)`, `(ws)` alone, or on a `Server(App)`
 `(app, ws, req)`. `app.wsWith(path, handler, options)` takes the
-[upgrade options](#upgrade-options) (at compile time); groups have `ws` and
-`wsWith` too.
+[upgrade options](#upgrade-options) at run time (copied into the server's
+arena, so values from `anole.config.load` work directly); groups have `ws`
+and `wsWith` too.
 
 ## Callbacks
 
@@ -173,6 +174,7 @@ HTTP/3: Anole is no proxy.
 | `deflate` | see below | Compressor settings. |
 | `close_on_drain` | true | Send close 1001 when the server starts to drain (see [Shutdown](#shutdown)). |
 | `drain_reason` | `"server shutting down"` | The reason in that close frame. |
+| `close_timeout` | 5 s | How long to wait for the client's close answer after the server sends a close frame (drain or `ws.close`) before closing the connection or stream. Null or zero disables it. |
 | `subprotocols` | none | The subprotocols you speak, most preferred first (see [Subprotocols and handshake headers](#subprotocols-and-handshake-headers)). |
 | `headers` | none | Extra headers on the handshake's answer. |
 
@@ -238,8 +240,11 @@ var ws = (try anole.websocket.upgrade(req, res, .{
 })) orelse return res.fail(.bad_request, "");
 ```
 
-`app.wsWith(path, handler, .{ .allowed_origins = ... })` takes the same
-options. `.any` lets every page in; use it only for an endpoint that does
+`app.wsWith(path, handler, .{ .allowed_origins = ... })` and
+`app.wsCallbacksWith(path, Callbacks, .{ .allowed_origins = ... })` take the
+same options at run time (copied into the server's arena, so an origin loaded
+through `anole.config.load` can be passed directly; empty entries in `.list`
+are ignored). `.any` lets every page in; use it only for an endpoint that does
 not trust cookies or other credentials the browser adds itself, such as one
 that authenticates with a token in its first message. The C ABI's WebSocket
 routes take `"origins": ["https://app.example.com"]` (or `["*"]`).
@@ -287,7 +292,11 @@ handler after that.
 
 To close from the server side, call `close(code, reason)`, then keep calling
 `receive` until the client's answer arrives as a `.close` message (or
-`receive` fails):
+`receive` fails). If the client does not answer within
+`UpgradeOptions.close_timeout` (5 s by default), the server closes the
+connection or stream itself (RFC 6455 §7.1.1) and `receive` fails. The
+close an `app.ws` route sends when its handler returns waits for nothing: the
+socket is released right after it.
 
 ```zig
 try ws.close(.going_away, "server restarting");
@@ -354,10 +363,13 @@ behind it, which a task of your own can wait on. Then close the socket
 yourself with `ws.close(.going_away, ...)` and keep calling `receive` until
 the answer arrives.
 
-A client that never answers the close holds its socket open until
-`timeouts.shutdown` (10 s by default) runs out; the remaining sockets are then
-cut without a further frame. A server with long-lived sockets may want a
-shorter wait:
+A client that never answers the close has its connection or stream closed
+after `UpgradeOptions.close_timeout` (5 s by default, RFC 6455 §7.1.1), so an
+unresponsive peer does not hold the drain open until `timeouts.shutdown` (10 s
+by default) runs out. Set `.close_timeout = null` (or `.zero`) to wait until
+the client answers or `timeouts.shutdown` cuts the remaining sockets without a
+further frame. A server with long-lived sockets may still want a shorter
+shutdown budget:
 
 ```zig
 .timeouts = .{ .shutdown = .fromSeconds(5) },

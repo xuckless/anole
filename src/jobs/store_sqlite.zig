@@ -143,7 +143,7 @@ pub const Sqlite = struct {
         return store_sql.rowFrom(Sqlite, a, r);
     }
 
-    const copyRow = store_sql.copyRow;
+    const copyRow = store.copyRow;
 
     // ---- insert
 

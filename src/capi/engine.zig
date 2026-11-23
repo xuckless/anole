@@ -47,35 +47,21 @@ const Pipe = pipe_mod.Pipe;
 const Chunk = pipe_mod.Chunk;
 pub const Config = config_mod.Config;
 pub const ws = if (features.websocket) @import("ws.zig") else struct {
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-        pub fn maxGen(_: *const ExecState) u32 {
-            return 0;
-        }
-    };
+    pub const ExecState = struct {};
 };
 /// gRPC services implemented by consumers (`anole_grpc_*`).
 pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
     pub const SlotState = struct {};
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-    };
+    pub const ExecState = struct {};
     pub const EngineState = struct {};
 };
 pub const wt = if (features.http3) @import("wt.zig") else struct {
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-        pub fn maxGen(_: *const ExecState) u32 {
-            return 0;
-        }
-    };
+    pub const ExecState = struct {};
 };
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const nats = @import("nats.zig");
 pub const kafka = @import("kafka.zig");
-/// Pass 3's areas (ABI 0.10): each a module with fixed hooks, called from
-/// here in one order (`openAreas`, `closeAreas`, ...).
 pub const net = @import("net.zig");
 pub const jobs = @import("jobs.zig");
 pub const webhooks = @import("webhooks.zig");
@@ -84,6 +70,40 @@ pub const watch = @import("watch.zig");
 pub const s3 = @import("s3.zig");
 pub const smtp = @import("smtp.zig");
 pub const config = config_mod;
+
+/// Pass 3's areas (ABI 0.10) by name, in OPEN order: each is the module
+/// `engine.<name>`, the field `Engine.<name>_state` and the field
+/// `Exec.<name>`. Open runs forward (jobs before webhooks, which hooks into
+/// it; watch last, it needs the databases); close, destroy, cancel and the
+/// State deinit run in reverse; drain runs forward. Every hook is optional
+/// and looked up by `@hasDecl`: module `open close destroy draining`, State
+/// `init maxGen deinit`, ExecState `cancel maxGen deinit`. To add an area:
+/// one name here, plus its three fields.
+const areas = [_][]const u8{ "s3", "smtp", "jobs", "webhooks", "watch", "sse", "net" };
+const areas_rev = reversed(areas);
+/// The names whose `Engine.<name>_state` is built, `maxGen`-read and freed
+/// with the areas (nats and kafka keep hand-called open and close: they
+/// bracket `db`).
+const state_areas = [_][]const u8{ "nats", "kafka" } ++ areas;
+const state_areas_rev = reversed(state_areas);
+/// The names of `Exec`'s per-area fields (the ones with `maxGen`/`deinit`).
+const exec_areas = [_][]const u8{ "ws", "grpc", "wt", "db", "nats", "kafka" } ++ areas;
+const exec_areas_rev = reversed(exec_areas);
+
+fn reversed(comptime a: anytype) [a.len][]const u8 {
+    var out: [a.len][]const u8 = undefined;
+    for (a, 0..) |n, i| out[a.len - 1 - i] = n;
+    return out;
+}
+
+fn mod(comptime name: []const u8) type {
+    return @field(@This(), name);
+}
+
+/// Calls the module hook `hook(e)` of each area in `list` that declares it.
+fn eachArea(comptime list: anytype, comptime hook: []const u8, e: *Engine) void {
+    inline for (list) |n| if (comptime @hasDecl(mod(n), hook)) @field(mod(n), hook)(e);
+}
 
 const log = std.log.scoped(.anole_capi);
 
@@ -126,6 +146,23 @@ pub fn pack(gen: u32, state: SlotState) u64 {
 pub fn genOf(word: u64) u32 {
     return @intCast(word >> 32);
 }
+/// The first of `items` named `name`: a connector's `config.name`, or the
+/// item's own `name`.
+pub fn findByName(comptime T: type, items: []T, name: []const u8) ?*T {
+    for (items) |*x| {
+        const n = if (@hasField(T, "config")) x.config.name else x.name;
+        if (std.mem.eql(u8, n, name)) return x;
+    }
+    return null;
+}
+
+/// `p` as a `*T` of the current engine, or null (null, or a pointer of a
+/// destroyed or other engine); `T` has an `engine` field.
+pub fn ownedBy(comptime T: type, p: ?*const anyopaque) ?*T {
+    const x: *T = @ptrCast(@alignCast(@constCast(p orelse return null)));
+    return if (global == x.engine) x else null;
+}
+
 pub fn stateOf(word: u64) SlotState {
     return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
 }
@@ -235,11 +272,240 @@ pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, v
 
 const Reply = enum { respond, fail, abort, fd, ws_accept, sse_accept };
 
+/// What a request slot is: one value, set when the request is admitted
+/// (`serve` for an upgrade, `grpc.serve` for a call) and reset when the slot
+/// is released, so a free slot is `.request`. To add a flavour, add a cell
+/// to both tables below; the compiler lists the rest.
+pub const What = enum(u8) { request, ws_upgrade, sse_subscribe, grpc_call };
+
+/// The kind of a slot's handles: an upgrade the consumer decides is answered
+/// through a request handle.
+const handle_kind: std.EnumArray(What, Handle.Kind) = .init(.{ .request = .request, .ws_upgrade = .request, .sse_subscribe = .request, .grpc_call = .grpc_call });
+
+/// The record `poll` delivers a slot as.
+const record_type: std.EnumArray(What, abi.EventType) = .init(.{ .request = .request, .ws_upgrade = .ws_upgrade, .sse_subscribe = .sse_subscribe, .grpc_call = .grpc_call });
+
+test "capi engine: a slot's flavour gives its handles' kind and its record's type" {
+    const rows = [_]struct { What, Handle.Kind, u32 }{
+        .{ .request, .request, 1 },
+        .{ .ws_upgrade, .request, 40 },
+        .{ .sse_subscribe, .request, 112 },
+        .{ .grpc_call, .grpc_call, 12 },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {t}\n", .{r[0]});
+        try std.testing.expectEqual(r[1], handle_kind.get(r[0]));
+        try std.testing.expectEqual(r[2], @backingInt(record_type.get(r[0])));
+    }
+}
+
+/// What the capi task does with an in-flight slot (`finish`): the consumer's
+/// answer came off the done list, the slot's deadline passed (the sweepers),
+/// or `destroy` abandons the consumer (`abandonAll`).
+pub const Event = enum { answered, deadline, abandon };
+
+/// Who ends an in-flight request slot (`Slot.owner`; not `Detached.owner`,
+/// which is the detached response's abort callback). Executor-local: set and
+/// read on the request's executor only, so the moves are plain stores; the
+/// word (`SlotState`) stays the only cross-thread state of the slot.
+///
+/// Moves (all here, each asserting where it comes from):
+///   `of`        set-up: `task`, or `detached` when the response detached
+///   `take`      detached -> task (the capi task or the attached task now
+///               writes the answer, or the sweeper ends it)
+///   `orphaned`  detached -> orphan (`detachedAborted` met a consumer call)
+///   `timeout`   task -> timed_out (the sweeper, at the deadline)
+///   `abandon`   task | timed_out | abandoned -> abandoned (`destroy`)
+///   release     any -> task (`Exec.release`)
+///
+/// `finish` is the owner x event table; every cell is decided there, and a
+/// new owner or event is a new row or column here and an arm there.
+/// `answered` meets the word `done` or `streaming`; `deadline` and `abandon`
+/// meet `queued` or `out` (other words are looked at again later, whoever
+/// owns the slot). A cell that ends the request first moves the word to
+/// `expired`; when that CAS loses (the consumer is in a call), nothing
+/// changes and the sweeper or the next round tries again.
+///
+/// | owner     | answered               | deadline                    | abandon                       |
+/// |-----------|------------------------|-----------------------------|-------------------------------|
+/// | task      | wake the task          | unlink, timeout, wake       | unlink, abandon, stop (*)     |
+/// | timed_out | wake the task          | unreachable: unlinked       | as task: 503, no abort        |
+/// | abandoned | wake the task          | unreachable: unlinked       | nothing (already told)        |
+/// | detached  | finishDetached (kind)  | endDetached: 504, ABORT     | endDetached: 503, nothing     |
+/// |           |                        | DEADLINE when `out`         | posted                        |
+/// | orphan    | ABORT CLIENT when      | expired, ABORT CLIENT when  | expired, release, nothing     |
+/// |           | `streaming`, release   | `out`, release (**)         | posted                        |
+///
+/// (*) stop: wake the task (a request), or end the call UNAVAILABLE
+/// (`grpc.stop`). (**) gRPC calls are swept by `grpc.sweep`, which only
+/// unwatches an orphan at its deadline. A `streaming` slot under `destroy`
+/// is cut whoever owns it (`abandonAll`); a gRPC call by its owner
+/// (`grpc_stream_cut`).
+pub const Owner = union(enum) {
+    /// A task waits for the answer (HTTP/1.1), or writes it (a detached
+    /// answer after `take`).
+    task,
+    /// The sweeper told the waiting task: the deadline passed.
+    timed_out,
+    /// `destroy` told the waiting task: the server is stopping (answered
+    /// 503, the consumer hears nothing more).
+    abandoned,
+    /// HTTP/2, HTTP/3: no task waits; the capi task finishes it.
+    detached: *Detached,
+    /// The detached request went away while a consumer call held the slot:
+    /// its request memory is gone; the capi task (or the sweeper) frees the
+    /// slot once it can.
+    orphan,
+
+    pub fn of(d: ?*Detached) Owner {
+        return if (d) |p| .{ .detached = p } else .task;
+    }
+
+    pub fn take(o: *Owner) *Detached {
+        const d = o.detached;
+        o.* = .task;
+        return d;
+    }
+
+    pub fn orphaned(o: *Owner) void {
+        std.debug.assert(o.* == .detached);
+        o.* = .orphan;
+    }
+
+    pub fn timeout(o: *Owner) void {
+        std.debug.assert(o.* == .task);
+        o.* = .timed_out;
+    }
+
+    pub fn abandon(o: *Owner) void {
+        std.debug.assert(o.* == .task or o.* == .timed_out or o.* == .abandoned);
+        o.* = .abandoned;
+    }
+
+    /// The waiting task is told to stop (it answers 504, or 503 when
+    /// abandoned).
+    pub fn over(o: Owner) bool {
+        return o == .timed_out or o == .abandoned;
+    }
+};
+
+test "capi engine: areas are declared once, in open order, with their lifecycle constraints" {
+    try std.testing.expectEqualSlices([]const u8, &.{ "s3", "smtp", "jobs", "webhooks", "watch", "sse", "net" }, &areas);
+    try std.testing.expectEqualSlices([]const u8, &.{ "net", "sse", "watch", "webhooks", "jobs", "smtp", "s3" }, &areas_rev);
+    const index = struct {
+        fn of(comptime name: []const u8) usize {
+            return for (areas, 0..) |n, i| {
+                if (std.mem.eql(u8, n, name)) break i;
+            } else unreachable;
+        }
+    }.of;
+    // webhooks hooks into jobs (open) and clears it (destroy); watch needs the databases.
+    comptime std.debug.assert(index("jobs") < index("webhooks") and index("webhooks") < index("watch"));
+}
+
+test "capi engine: no-op hooks stay deleted" {
+    try std.testing.expect(!@hasDecl(sse, "close"));
+    try std.testing.expect(!@hasDecl(sse, "destroy"));
+    try std.testing.expect(!@hasDecl(webhooks.State, "init"));
+    try std.testing.expect(!@hasDecl(smtp.State, "maxGen"));
+    try std.testing.expect(!@hasDecl(watch, "draining"));
+}
+
+test "capi engine: every _state field and every area's Exec field is declared" {
+    const contains = struct {
+        fn in(comptime list: anytype, comptime name: []const u8) bool {
+            return for (list) |n| {
+                if (std.mem.eql(u8, n, name)) break true;
+            } else false;
+        }
+    }.in;
+    inline for (@typeInfo(Engine).@"struct".field_names) |name| {
+        if (comptime std.mem.endsWith(u8, name, "_state")) {
+            try std.testing.expect(contains(state_areas, name[0 .. name.len - "_state".len]));
+        }
+    }
+    inline for (state_areas) |n| try std.testing.expect(@hasField(Engine, n ++ "_state"));
+    inline for (exec_areas) |n| try std.testing.expect(@hasField(Exec, n));
+    // An Exec field whose type has a lifecycle hook is declared, or its hooks would never run.
+    inline for (@typeInfo(Exec).@"struct".field_names) |f| {
+        const T = @FieldType(Exec, f);
+        if (comptime @typeInfo(T) == .@"struct" and (@hasDecl(T, "deinit") or @hasDecl(T, "maxGen") or @hasDecl(T, "cancel")))
+            try std.testing.expect(contains(exec_areas, f));
+    }
+    // An area with an Engine state has its Exec field declared too.
+    inline for (areas) |n| try std.testing.expect(contains(exec_areas, n));
+}
+
+test "capi engine: Owner transitions" {
+    // SAFETY: only its address is used.
+    var d: Detached = undefined;
+    const Tag = std.meta.Tag(Owner);
+    const Move = enum { take, orphaned, timeout, abandon };
+    const rows = [_]struct { name: []const u8, from: Owner, move: Move, to: Tag }{
+        .{ .name = "detached, taken", .from = .of(&d), .move = .take, .to = .task },
+        .{ .name = "detached, orphaned", .from = .of(&d), .move = .orphaned, .to = .orphan },
+        .{ .name = "task, timed out", .from = .of(null), .move = .timeout, .to = .timed_out },
+        .{ .name = "task, abandoned", .from = .task, .move = .abandon, .to = .abandoned },
+        .{ .name = "timed out, abandoned", .from = .timed_out, .move = .abandon, .to = .abandoned },
+        .{ .name = "abandoned, abandoned again", .from = .abandoned, .move = .abandon, .to = .abandoned },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s}\n", .{r.name});
+        var o = r.from;
+        switch (r.move) {
+            .take => try std.testing.expectEqual(&d, o.take()),
+            .orphaned => o.orphaned(),
+            .timeout => o.timeout(),
+            .abandon => o.abandon(),
+        }
+        try std.testing.expectEqual(r.to, std.meta.activeTag(o));
+    }
+    try std.testing.expectEqual(Tag.task, std.meta.activeTag(Owner.of(null)));
+    try std.testing.expectEqual(Tag.detached, std.meta.activeTag(Owner.of(&d)));
+    // The waiting task's verdict: only the sweeper's and destroy's.
+    const over = [_]struct { Owner, bool }{ .{ .task, false }, .{ .timed_out, true }, .{ .abandoned, true }, .{ .of(&d), false }, .{ .orphan, false } };
+    for (over) |row| try std.testing.expectEqual(row[1], row[0].over());
+}
+
+pub inline fn isGrpc(s: *const Slot) bool {
+    return features.grpc and s.what.load(.monotonic) == .grpc_call;
+}
+
+/// A slot's state crosses threads only through four atomics; everything
+/// else is the executor's, or the consumer's while the word says so.
+///
+/// `word` (`SlotState`, generation + state): the executor fills a slot and
+/// stores `queued` (release). The consumer moves it by CAS: `queued` ->
+/// `polling` (`poll`, acquire, while it copies the head) -> `out`; `out` ->
+/// `polling` (`requestTrace`'s pin, `claimOut`, seq_cst) -> `out`; `out` ->
+/// `responding` (an answer call, `claimOut`) -> `done` | `streaming`
+/// (`handBack`, release) or back to `out` (a failed or partial answer).
+/// The executor ends `queued` | `out` by CAS to `expired` (acq_rel) and
+/// stores `free` (release) in `release`. `polling` and `responding` are
+/// short windows on a consumer thread: the executor spins them out
+/// (`detachedAborted`) or looks again shortly (`waitForAnswer`, sweeps).
+///
+/// `gone` (Dekker with `polling`): `detachedAborted` stores true (seq_cst)
+/// and then loads `word` (seq_cst), spinning while it is `polling`;
+/// `requestTrace` CASes `out` -> `polling` (seq_cst) and then loads `gone`
+/// (seq_cst). Either the executor sees the pin and waits it out, or the pin
+/// sees `gone` and reads nothing of `req`. Reset by `release` (monotonic,
+/// before the word's `free` release store).
+///
+/// `drained`: `handBack` stores false (monotonic, before the word's release
+/// store) as the slot goes onto the done list; the capi task stores true
+/// (release) once it took the slot off. `waitForAnswer` and `grpc.wait`,
+/// woken some other way just as the answer came, spin on it (acquire)
+/// before they release the slot. Set true at set-up.
+///
+/// `answered`: `handBack` stores true (release, before the word);
+/// `Exec.release` loads it (acquire) to tell `db.endTied` whether to cut the
+/// queries tied to the request, and resets it (monotonic).
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
-    /// What its handles are (`Handle.Kind`): a request, or a gRPC call.
-    /// Set by the executor while the slot is free.
-    kind: std.atomic.Value(u8) = .init(@backingInt(Handle.Kind.request)),
+    /// What it is (`What`; its handles' kind follows, `handleKind`). Set by
+    /// the executor before the `queued` store, reset by `release`.
+    what: std.atomic.Value(What) = .init(.request),
     /// What a waiting request's task waits on (an answer, the deadline,
     /// stream data), and what an attached stream task waits on.
     event: std.Io.Event = .unset,
@@ -301,22 +567,12 @@ pub const Slot = struct {
     /// thread's call on it and orphaned the slot): `requestTrace` must not
     /// read `req` any more, though the slot may be `out` again once that
     /// call hands it back. Set by the executor, read by a consumer under
-    /// its pin, both `.seq_cst` (a Dekker handshake with the word: either
-    /// the executor sees the pin and waits it out, or the pin sees this).
-    /// Reset with `orphan` when the slot is released.
+    /// its pin, both `.seq_cst` (the handshake block above `Slot`).
+    /// Reset when the slot is released.
     gone: std.atomic.Value(bool) = .init(false),
 
     // Executor-local from here.
-    /// The request's response is detached (HTTP/2, HTTP/3): no task waits.
-    detached: ?*Detached = null,
-    /// The detached request went away while the consumer was in a call on
-    /// it: the capi task (or the sweeper) frees the slot once it can.
-    orphan: bool = false,
-    /// The sweeper's verdict for a waiting task.
-    timed_out: bool = false,
-    /// `destroy` on a server not drained: this request is answered 503 and
-    /// the consumer hears nothing more.
-    abandoned: bool = false,
+    owner: Owner = .task,
     /// The request body failed (too large, cut short): the answer.
     body_error: ?http.Status = null,
     deadline: i96 = 0,
@@ -329,17 +585,12 @@ pub const Slot = struct {
     /// way must not free a slot still on it).
     drained: std.atomic.Value(bool) = .init(true),
     next_free: u32 = no_slot,
-    /// A gRPC call's own state (`kind` grpc_call).
+    /// A gRPC call's own state (`what` grpc_call).
     grpc: grpc.SlotState = .{},
-    /// A WebSocket handshake the consumer decides (ANOLE_EV_WS_UPGRADE),
-    /// with the WebSocket slot reserved for it (executor-local, set before
-    /// the `queued` store and read by `poll` after its CAS).
-    ws_upgrade: bool = false,
+    /// `what` ws_upgrade: the WebSocket slot reserved for the handshake;
+    /// sse_subscribe: the SSE slot (executor-local, set before the `queued`
+    /// store). `anole_sse_accept` stores the topics after the headers.
     ws_slot: u32 = no_slot,
-    /// A server-sent events route the consumer decides
-    /// (ANOLE_EV_SSE_SUBSCRIBE); `ws_slot` is then its SSE slot, and
-    /// `anole_sse_accept` stores the topics after the headers.
-    sse_subscribe: bool = false,
     sse_last: u32 = 0,
     /// `anole_ws_accept`: the extra headers are stored as a response's are,
     /// the accepted subprotocol's bytes follow them in `bytes`.
@@ -354,6 +605,12 @@ pub const Slot = struct {
 
     /// Above this, a slot's answer buffer is freed after use.
     const keep_capacity = 64 * 1024;
+
+    /// The kind its handles carry (`handleOf`) and stale ones are checked
+    /// against (`slotOfKind`, `db.slotLive`, `db.stillOwed`).
+    pub fn handleKind(s: *const Slot, comptime order: std.builtin.AtomicOrder) Handle.Kind {
+        return handle_kind.get(s.what.load(order));
+    }
 
     pub fn replyBody(s: *const Slot) []const u8 {
         if (s.borrowed) |b| return b;
@@ -461,6 +718,29 @@ pub fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const ev: *abi.Event = @ptrCast(rec.ptr);
     ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
     return rec;
+}
+
+/// Fills a record's variable part: each `put` copies `bytes` at the cursor
+/// and returns where they went (an empty `put` is the empty span).
+pub const Writer = struct {
+    rec: []u8,
+    at: usize,
+
+    pub fn put(w: *Writer, bytes: []const u8) abi.Span {
+        if (bytes.len == 0) return .{};
+        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
+        defer w.at += bytes.len;
+        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
+    }
+};
+
+/// What an area call refuses with; lib.zig answers it through `failure`.
+pub const failure = @import("failure.zig");
+pub const CallError = failure.CallError;
+
+/// A copy of `s` in `a`; empty gives the empty slice (`free` ignores it).
+pub fn dupeStr(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error![]const u8 {
+    return a.dupe(u8, s.slice());
 }
 
 /// An `ANOLE_EV_SENT` record for a body about to be borrowed, built by the
@@ -578,7 +858,6 @@ pub const Exec = struct {
         const s = &x.slots[i];
         s.deadline = deadline;
         s.list = list;
-        s.timed_out = false;
         s.linked = true;
         s.next = no_slot;
         const l = &x.lists[list];
@@ -630,19 +909,15 @@ pub const Exec = struct {
             s.trailer_bytes.clearAndFree(gpa);
             s.trailers.clearAndFree(gpa);
         }
-        s.detached = null;
-        s.orphan = false;
+        s.owner = .task;
         s.gone.store(false, .monotonic);
-        s.abandoned = false;
         s.body_error = null;
         s.claims = "";
-        s.ws_upgrade = false;
-        s.sse_subscribe = false;
         s.ws_slot = no_slot;
         s.subprotocol_off = 0;
         s.subprotocol_len = 0;
-        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
-        s.kind.store(@backingInt(Handle.Kind.request), .monotonic);
+        if (isGrpc(s)) grpc.onRelease(x, i);
+        s.what.store(.request, .monotonic);
         _ = x.engine.inflight.fetchSub(1, .monotonic);
         // 0 is skipped so that no handle is ever 0.
         const next = nextGen(gen);
@@ -891,8 +1166,7 @@ pub const Exec = struct {
     }
 
     pub fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
-        const kind: Handle.Kind = @fromBackingInt(@intCast(x.slots[i].kind.load(.monotonic)));
-        return Handle.encode(.{ .gen = @intCast(gen), .kind = kind, .slot = @intCast(i), .exec = x.index });
+        return Handle.encode(.{ .gen = @intCast(gen), .kind = x.slots[i].handleKind(.monotonic), .slot = @intCast(i), .exec = x.index });
     }
 };
 
@@ -1052,21 +1326,30 @@ pub const Route = struct {
     list: u8 = 0,
     /// Its requests may detach: nothing in its chain waits.
     detachable: bool = true,
-    /// A WebSocket route whose handshakes the consumer decides
-    /// (`"accept": "consumer"`).
-    ws_consumer: bool = false,
-    /// A WebSocket route that is also a plain route (`handler` and
-    /// `websocket` together): the route plain requests go to.
-    plain: ?*const Route = null,
-    /// A WebSocket endpoint's settings.
-    ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
-    /// A WebTransport endpoint's settings.
-    wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
-    /// A server-sent events endpoint: its topic templates.
-    sse: ?SseRoute = null,
+    /// What it serves, fixed when it is registered: each kind's handler
+    /// (`consumerHandler`, `ws.handler`, `wt.handler`, `sse.handler`) is
+    /// registered only for routes of its kind and reads its payload.
+    kind: Kind = .request,
+
+    pub const Kind = union(enum) {
+        request,
+        websocket: if (features.websocket) WsRoute else void,
+        webtransport: if (features.http3) wt.Options else void,
+        sse: SseRoute,
+    };
 };
 
-/// An `"sse"` route's settings (`sse.handler`, `sse.nativeHandler`).
+/// A `"websocket"` route's settings (`ws.handler`).
+pub const WsRoute = struct {
+    opts: anole.websocket.UpgradeOptions,
+    /// The consumer decides its handshakes (`"accept": "consumer"`).
+    consumer: bool,
+    /// `handler` beside `websocket`: the route plain requests of the path
+    /// go to.
+    plain: ?*const Route,
+};
+
+/// An `"sse"` route's settings (`sse.handler`).
 pub const SseRoute = struct {
     topics: []const []const u8,
     last: u16,
@@ -1124,14 +1407,15 @@ pub const Engine = struct {
     signals: bool,
     /// `anole_console_close` is closing the console: no event 132.
     console_quiet: std.atomic.Value(bool) = .init(false),
-    /// On the server's drain hooks while it serves: posts
-    /// `ANOLE_EV_DRAINING` when the drain starts, whatever started it
-    /// (`anole_server_drain`, the console's drain, a listener failing).
+    /// On the server's drain hooks while it serves: starts the engine's
+    /// drain (`beginDrain`) however the server's drain started
+    /// (`anole_server_drain`, a signal, the console, a hand-off, a listener
+    /// failing).
     drain_hook: dusty.DrainHooks.Hook = .{ .callback = onServerDrain },
-    /// `ANOLE_EV_DRAINING` went out: swapped by `onServerDrain` and by
-    /// `drain` before it stops the engine's areas, so whichever comes first
-    /// posts it, and an explicit drain has it in the queue before its area
-    /// drains post anything and before `anole_server_drain` returns.
+    /// `ANOLE_EV_DRAINING` went out: swapped in `beginDrain` before the
+    /// areas stop, so it is posted once however the drain started, and is
+    /// in the queue before the area drains post anything and before
+    /// `anole_server_drain` returns.
     draining_posted: std.atomic.Value(bool) = .init(false),
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
@@ -1273,7 +1557,6 @@ pub const Engine = struct {
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
         e.brokers = try a.alloc(nats.Broker, cfg.brokers.len);
         for (e.brokers, cfg.brokers, 0..) |*b, bc, i| b.* = .{ .engine = e, .config = bc, .index = @intCast(i) };
-        e.nats_state.init(e.first_gen);
         var nkafka: usize = 0;
         for (cfg.brokers) |bc| nkafka += @intFromBool(bc.kafka != null);
         e.kafka_brokers = try a.alloc(kafka.Broker, nkafka);
@@ -1282,15 +1565,10 @@ pub const Engine = struct {
             e.kafka_brokers[ki] = .{ .engine = e, .config = bc, .index = @intCast(i) };
             ki += 1;
         };
-        e.kafka_state.init(e.first_gen);
-        e.net_state.init(e.first_gen);
-        e.jobs_state.init(e.first_gen);
-        e.webhooks_state.init(e.first_gen);
-        e.sse_state.init(e.first_gen);
-        e.watch_state.init(e.first_gen);
-        e.s3_state.init(e.first_gen);
-        e.smtp_state.init(e.first_gen);
-        try sse.create(e, why);
+        inline for (state_areas) |n| {
+            const s = &@field(e, n ++ "_state");
+            if (comptime @hasDecl(@TypeOf(s.*), "init")) s.init(e.first_gen);
+        }
         // The modes (docs/config.md): resolved once, here, so a binding sees
         // $PORT and the filled addresses before it starts.
         var opts = try e.serverOptions(a);
@@ -1416,7 +1694,7 @@ pub const Engine = struct {
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
-        e.openAreas(&app) catch |err| {
+        inline for (areas) |n| if (comptime @hasDecl(mod(n), "open")) mod(n).open(e, &app) catch |err| {
             e.closeAreas();
             return e.failStartDeinit(&app, err);
         };
@@ -1465,7 +1743,9 @@ pub const Engine = struct {
         for (e.execs) |*x| x.db.cancel(app.io());
         for (e.execs) |*x| x.nats.cancel(app.io());
         for (e.execs) |*x| x.kafka.cancel(app.io());
-        for (e.execs) |*x| cancelAreas(x, app.io());
+        for (e.execs) |*x| inline for (areas_rev) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(x, n)), "cancel")) @field(x, n).cancel(app.io());
+        };
         e.closeAreas();
         db.close(e);
         nats.close(e);
@@ -1709,15 +1989,17 @@ pub const Engine = struct {
                     .engine = e,
                     .id = wc.handler,
                     .list = e.listFor(rc.timeout_ms),
-                    .ws_consumer = wc.accept == .consumer,
-                    .plain = plain,
-                    .ws = .{
-                        .max_message_size = cfg.limits.ws_max_message,
-                        .compression = wc.compression and features.compression,
-                        .close_on_drain = wc.close_on_drain,
-                        .allowed_origins = wsOrigins(wc.origins),
-                        .subprotocols = wc.subprotocols,
-                    },
+                    .kind = .{ .websocket = .{
+                        .opts = .{
+                            .max_message_size = cfg.limits.ws_max_message,
+                            .compression = wc.compression and features.compression,
+                            .close_on_drain = wc.close_on_drain,
+                            .allowed_origins = wsOrigins(wc.origins),
+                            .subprotocols = wc.subprotocols,
+                        },
+                        .consumer = wc.accept == .consumer,
+                        .plain = plain,
+                    } },
                 };
                 // An extended CONNECT never arrives whole, so handshakes
                 // always get a task; `no_wait` is for the plain requests.
@@ -1735,7 +2017,7 @@ pub const Engine = struct {
                     .id = sc.handler orelse 0,
                     .list = e.listFor(rc.timeout_ms),
                     .detachable = false,
-                    .sse = .{ .topics = sc.topics, .last = sc.last, .consumer = sc.handler != null },
+                    .kind = .{ .sse = .{ .topics = sc.topics, .last = sc.last, .consumer = sc.handler != null } },
                 };
                 group.inner.addRouteWith(.get, rc.path, sse.handler, .{ .data = route });
             } else if (rc.handler) |id| {
@@ -1750,13 +2032,13 @@ pub const Engine = struct {
             } else if (rc.webtransport) |wc| {
                 if (comptime !features.http3) unreachable;
                 const route = try a.create(Route);
-                route.* = .{ .engine = e, .id = wc.handler, .wt = .{
+                route.* = .{ .engine = e, .id = wc.handler, .kind = .{ .webtransport = .{
                     .accept = .{
                         .allowed_origins = wtOrigins(wc.origins),
                         .close_on_drain = wc.close_on_drain,
                     },
                     .datagram_queue = wc.datagram_queue,
-                } };
+                } } };
                 // Extended CONNECT is routed as GET.
                 group.inner.addRouteWith(.get, rc.path, wt.handler, .{ .data = route, .kind = .wt });
             }
@@ -1957,30 +2239,35 @@ pub const Engine = struct {
         // on its own.
         const app = e.enter() orelse return;
         defer e.leave();
-        // The first drain call tells the consumers (unless the server's hook
-        // did already) and stops the engine's own areas; a drain started
-        // elsewhere reaches the consumers through `onServerDrain` alone.
-        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
-            e.notifyDraining();
-            kafka.draining(e);
-            jobs.draining(e);
-            webhooks.draining(e);
-            watch.draining(e);
-            s3.draining(e);
-            smtp.draining(e);
-        }
+        e.beginDrain();
+        watch.stop(e);
         app.stop();
     }
 
-    /// A drain hook: `ANOLE_EV_DRAINING` for a drain started anywhere (if
-    /// `drain` has not posted it already). Runs once per drain, on the task
-    /// that started it, before the server closes sockets or cuts requests
-    /// (and before the hooks registered later, the connections'). Never
-    /// waits.
+    /// A drain hook: the drain started anywhere (a signal, the console, a
+    /// hand-off, a failed listener, `drain`'s `app.stop`). Runs once per
+    /// drain, on the task that started it, before the server closes sockets
+    /// or cuts requests (and before the hooks registered later, the
+    /// connections'). Never waits.
     fn onServerDrain(hook: *dusty.DrainHooks.Hook) void {
         // SAFETY: the only hook registered with this callback is `Engine.drain_hook`.
         const e: *Engine = @alignCast(@fieldParentPtr("drain_hook", hook));
+        e.beginDrain();
+    }
+
+    /// The drain starts, however it started (`drain` or `onServerDrain`):
+    /// the phase moves `.running -> .draining` once, the consumers hear
+    /// `ANOLE_EV_DRAINING` (once, before any area posts), and only the
+    /// winner of the phase change stops the areas that take new work. Never
+    /// waits: the hook runs under the drain-hook registry's lock. Watches
+    /// stop through their own drain hook (a task: stopping one waits on the
+    /// hub), and `drain` also stops them itself, off the hook.
+    fn beginDrain(e: *Engine) void {
+        const first = e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null;
         e.notifyDraining();
+        if (!first) return;
+        kafka.draining(e);
+        eachArea(areas, "draining", e);
     }
 
     /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once
@@ -2120,14 +2407,13 @@ pub const Engine = struct {
         var last = e.first_gen;
         for (e.execs) |*x| {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
-            last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
-            last = @max(last, x.net.maxGen(), x.jobs.maxGen(), x.webhooks.maxGen(), x.sse.maxGen());
-            last = @max(last, x.watch.maxGen(), x.s3.maxGen(), x.smtp.maxGen());
+            inline for (exec_areas) |n| {
+                if (comptime @hasDecl(@TypeOf(@field(x, n)), "maxGen")) last = @max(last, @field(x, n).maxGen());
+            }
         }
-        last = @max(last, e.nats_state.maxGen());
-        last = @max(last, e.kafka_state.maxGen());
-        last = @max(last, e.net_state.maxGen(), e.jobs_state.maxGen(), e.webhooks_state.maxGen(), e.sse_state.maxGen());
-        last = @max(last, e.watch_state.maxGen(), e.s3_state.maxGen(), e.smtp_state.maxGen());
+        inline for (state_areas) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(e, n ++ "_state")), "maxGen")) last = @max(last, @field(e, n ++ "_state").maxGen());
+        }
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -2151,24 +2437,15 @@ pub const Engine = struct {
                 c.next = null;
                 c.run(c, x);
             }
-            x.ws.deinit();
-            x.grpc.deinit();
-            x.wt.deinit();
-            x.db.deinit();
-            x.nats.deinit();
-            x.kafka.deinit();
-            x.net.deinit();
-            x.jobs.deinit();
-            x.webhooks.deinit();
-            x.sse.deinit();
-            x.watch.deinit();
-            x.s3.deinit();
-            x.smtp.deinit();
+            inline for (exec_areas_rev) |n| {
+                if (comptime @hasDecl(@TypeOf(@field(x, n)), "deinit")) @field(x, n).deinit();
+            }
         }
-        e.destroyAreas();
-        e.nats_state.deinit();
+        eachArea(areas_rev, "destroy", e);
         kafka.destroy(e);
-        e.kafka_state.deinit();
+        inline for (state_areas_rev) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(e, n ++ "_state")), "deinit")) @field(e, n ++ "_state").deinit();
+        }
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
@@ -2208,41 +2485,9 @@ pub const Engine = struct {
         return out;
     }
 
-    /// Pass 3's `open` hooks (R42's order), after `db`, `nats` and `kafka`.
-    fn openAreas(e: *Engine, app: *anole.App) !void {
-        try s3.open(e, app);
-        try smtp.open(e, app);
-        try jobs.open(e, app);
-        try webhooks.open(e, app);
-        try watch.open(e, app);
-    }
-
-    /// Their `close` hooks, in the reverse order.
+    /// The areas' `close` hooks, in reverse open order.
     fn closeAreas(e: *Engine) void {
-        net.close(e);
-        watch.close(e);
-        webhooks.close(e);
-        jobs.close(e);
-        smtp.close(e);
-        s3.close(e);
-        sse.close(e);
-    }
-
-    /// Their `destroy` hooks, in the reverse order, then their states.
-    fn destroyAreas(e: *Engine) void {
-        watch.destroy(e);
-        webhooks.destroy(e);
-        jobs.destroy(e);
-        smtp.destroy(e);
-        s3.destroy(e);
-        sse.destroy(e);
-        e.smtp_state.deinit();
-        e.s3_state.deinit();
-        e.watch_state.deinit();
-        e.sse_state.deinit();
-        e.webhooks_state.deinit();
-        e.jobs_state.deinit();
-        e.net_state.deinit();
+        eachArea(areas_rev, "close", e);
     }
 
     /// `anole_server_set_ready`.
@@ -2431,31 +2676,34 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     return serveConsumer(route, req, res);
 }
 
-/// A WebSocket handshake being decided by the consumer: the WebSocket slot
-/// reserved for it, and what the answer was.
+/// A WebSocket handshake or SSE subscription being decided by the consumer:
+/// the slot reserved for it, and what the answer was.
 pub const Upgrade = struct {
-    /// A WebSocket slot, or (`sse`) an SSE slot.
+    /// A WebSocket slot, or (`accept.sse`) an SSE slot.
     ws_slot: u32,
-    /// An SSE subscription (ANOLE_EV_SSE_SUBSCRIBE), not a WebSocket upgrade.
-    sse: bool = false,
-    /// `sse`, accepted: the topics and `last` the consumer chose.
-    sse_topics: []const []const u8 = &.{},
-    sse_last: u32 = 0,
-    accepted: bool = false,
-    /// `accepted`: the subprotocol and extra headers the consumer chose,
-    /// copied into the request's arena.
-    subprotocol: []const u8 = "",
-    headers: []const std.http.Header = &.{},
+    /// The tag is what the handshake is (set by the caller); the payload is
+    /// what the consumer chose, copied into the request's arena: null while
+    /// undecided or when it answered some other way (the answer is in `res`).
+    accept: Accept,
+
+    pub const Accept = union(enum) { ws: ?WsAccept, sse: ?SseAccept };
 };
+
+pub const WsAccept = struct { subprotocol: []const u8, headers: []const std.http.Header };
+pub const SseAccept = struct { topics: []const []const u8, last: u32, headers: []const std.http.Header };
+
+/// The flavour of the slot an upgrade is admitted as.
+const upgrade_what: std.EnumArray(std.meta.Tag(Upgrade.Accept), What) = .init(.{ .ws = .ws_upgrade, .sse = .sse_subscribe });
 
 /// A plain request of `route`, handed to the consumer (`ANOLE_EV_REQUEST`).
 pub fn serveConsumer(route: *const Route, req: *http.Request, res: *http.Response) anyerror!void {
     return serve(route, req, res, null);
 }
 
-/// A WebSocket handshake of `route`, handed to the consumer
-/// (`ANOLE_EV_WS_UPGRADE`); `up.accepted` tells whether it was accepted.
-/// Any other answer was applied to `res`.
+/// A WebSocket handshake (`ANOLE_EV_WS_UPGRADE`) or SSE subscription
+/// (`ANOLE_EV_SSE_SUBSCRIBE`) of `route`, handed to the consumer; a non-null
+/// `up.accept` payload tells it was accepted. Any other answer was applied
+/// to `res`.
 pub fn serveUpgrade(route: *const Route, req: *http.Request, res: *http.Response, up: *Upgrade) anyerror!void {
     return serve(route, req, res, up);
 }
@@ -2527,11 +2775,13 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
         @atomicStore(usize, &s.route_ptr, @intFromPtr(path.ptr), .monotonic);
         @atomicStore(usize, &s.route_len, path.len, .monotonic);
     }
-    s.detached = d;
+    s.owner = .of(d);
     s.body = "";
-    s.ws_upgrade = up != null and !up.?.sse;
-    s.sse_subscribe = up != null and up.?.sse;
-    s.ws_slot = if (up) |u| u.ws_slot else no_slot;
+    // A free slot is `.request` with no `ws_slot` (`release`).
+    if (up) |u| {
+        s.what.store(upgrade_what.get(std.meta.activeTag(u.accept)), .monotonic);
+        s.ws_slot = u.ws_slot;
+    }
     s.event.reset();
     s.pump_event.reset();
     s.drained.store(true, .monotonic);
@@ -2568,10 +2818,11 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        // `destroy` (`abandonAll` may have marked the slot already): the
-        // consumer will never make room.
-        const stopping = s.abandoned or e.abandon.load(.acquire);
-        if (stopping or s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
+        // `destroy` (`abandonAll` may have marked the slot already, which
+        // it does only once `abandon` is set): the consumer will never
+        // make room.
+        const stopping = e.abandon.load(.acquire);
+        if (stopping or s.owner.over() or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
             x.unlink(si);
             x.release(si);
             if (stopping) {
@@ -2634,21 +2885,21 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
                 continue;
             },
             .queued, .out => {
-                if (canceled or s.timed_out or s.body_error != null) {
+                if (canceled or s.owner.over() or s.body_error != null) {
                     // Why it is over, for the consumer that saw it.
                     var reason: u16 = abi.ABORT_BODY;
                     var status: u16 = if (s.body_error) |b| @intCast(@backingInt(b)) else 0;
                     if (canceled) {
                         reason = e.clientReason();
                         status = 0;
-                    } else if (s.timed_out) {
+                    } else if (s.owner.over()) {
                         reason = abi.ABORT_DEADLINE;
                         status = 504;
                     }
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
                         // The consumer saw it: it hears that it is over
                         // (not when the server is going away under it).
-                        if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
+                        if (stateOf(w) == .out and s.owner != .abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
                     }
                     continue;
@@ -2667,7 +2918,7 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
     switch (outcome) {
         .expired => {
             const body_error = s.body_error;
-            const abandoned = s.abandoned;
+            const abandoned = s.owner == .abandoned;
             x.release(si);
             if (abandoned and !canceled) {
                 res.fail(.service_unavailable, "the server is stopping");
@@ -2694,52 +2945,36 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             if (canceled) io.recancel();
             x.unlink(si);
             defer x.release(si);
-            if (s.reply == .sse_accept) {
-                // The subscription is accepted: the topics (packed after the
-                // headers in `bytes`, `u16` length first), `last` and the
-                // headers the consumer chose, out of the slot before it is
-                // freed.
-                const u = up.?;
-                const bytes = s.bytes.items;
-                const list = try req.arena.alloc(std.http.Header, s.headers.items.len);
-                for (s.headers.items, list) |h, *out| out.* = .{
-                    .name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
-                    .value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
-                };
-                u.headers = list;
-                var topics: std.ArrayList([]const u8) = .empty;
-                var at: usize = s.subprotocol_off;
-                const end = at + s.subprotocol_len;
-                while (at + 2 <= end) {
-                    const n = std.mem.readInt(u16, bytes[at..][0..2], .little);
-                    at += 2;
-                    try topics.append(req.arena, try req.arena.dupe(u8, bytes[at..][0..n]));
-                    at += n;
-                }
-                u.sse_topics = topics.items;
-                u.sse_last = s.sse_last;
-                u.accepted = true;
-                return;
+            // An accept: what the consumer chose, out of the slot before it
+            // is freed.
+            switch (s.reply) {
+                .ws_accept => {
+                    const subprotocol = try req.arena.dupe(u8, s.bytes.items[s.subprotocol_off..][0..s.subprotocol_len]);
+                    up.?.accept = .{ .ws = .{ .subprotocol = subprotocol, .headers = try copyHeaders(req.arena, s) } };
+                },
+                .sse_accept => {
+                    // The topics are packed after the headers in `bytes`,
+                    // `u16` length first.
+                    const headers = try copyHeaders(req.arena, s);
+                    const bytes = s.bytes.items;
+                    var topics: std.ArrayList([]const u8) = .empty;
+                    var at: usize = s.subprotocol_off;
+                    const end = at + s.subprotocol_len;
+                    while (at + 2 <= end) {
+                        const n = std.mem.readInt(u16, bytes[at..][0..2], .little);
+                        at += 2;
+                        try topics.append(req.arena, try req.arena.dupe(u8, bytes[at..][0..n]));
+                        at += n;
+                    }
+                    up.?.accept = .{ .sse = .{ .topics = topics.items, .last = s.sse_last, .headers = headers } };
+                },
+                .respond, .fail, .abort, .fd => {
+                    try applyAnswer(x, si, req, res);
+                    // A borrowed body must be out before the consumer hears
+                    // it may let go of it.
+                    if (s.borrowed != null) try res.write();
+                },
             }
-            if (s.reply == .ws_accept) {
-                // The handshake is accepted: what the consumer chose, out
-                // of the slot before it is freed.
-                const u = up.?;
-                const bytes = s.bytes.items;
-                u.subprotocol = try req.arena.dupe(u8, bytes[s.subprotocol_off..][0..s.subprotocol_len]);
-                const list = try req.arena.alloc(std.http.Header, s.headers.items.len);
-                for (s.headers.items, list) |h, *out| out.* = .{
-                    .name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
-                    .value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
-                };
-                u.headers = list;
-                u.accepted = true;
-                return;
-            }
-            try applyAnswer(x, si, req, res);
-            // A borrowed body must be out before the consumer hears it may
-            // let go of it.
-            if (s.borrowed != null) try res.write();
         },
         .streaming => {
             while (!s.drained.load(.acquire)) zio.yield() catch {
@@ -2751,6 +2986,17 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             return streamAnswer(x, si, gen, req, res);
         },
     }
+}
+
+/// The extra headers an accept stored in the slot, copied into `arena`.
+fn copyHeaders(arena: std.mem.Allocator, s: *const Slot) ![]const std.http.Header {
+    const bytes = s.bytes.items;
+    const list = try arena.alloc(std.http.Header, s.headers.items.len);
+    for (s.headers.items, list) |h, *out| out.* = .{
+        .name = try arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
+        .value = try arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
+    };
+    return list;
 }
 
 /// The consumer's answer (`done`) into `res`.
@@ -3006,7 +3252,6 @@ pub fn detachedAborted(ctx: *anyopaque) void {
     const e = global.?;
     const x = execOfSlot(e, s);
     const si: u32 = @intCast(s - x.slots.ptr);
-    s.detached = null;
     _ = e.aborted_count.fetchAdd(1, .monotonic);
     while (true) {
         const w = s.word.load(.acquire);
@@ -3030,7 +3275,7 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             // memory went, and a pin taken before this saw it is waited
             // out (never a freed pointer).
             .responding, .done, .streaming => {
-                s.orphan = true;
+                s.owner.orphaned();
                 s.gone.store(true, .seq_cst);
                 while (true) {
                     const now_w = s.word.load(.seq_cst);
@@ -3057,7 +3302,8 @@ fn execOfSlot(e: *Engine, s: *Slot) *Exec {
 /// one (a stream, a file).
 fn finishDetached(x: *Exec, si: u32) void {
     const s = &x.slots[si];
-    const d = s.detached.?;
+    // Kept `detached` while the task starts: `attachedTask` takes it.
+    const d = s.owner.detached;
     const w = s.word.load(.acquire);
     const gen = genOf(w);
     x.unlink(si);
@@ -3072,7 +3318,7 @@ fn finishDetached(x: *Exec, si: u32) void {
         };
         return;
     }
-    s.detached = null;
+    _ = s.owner.take();
     const result = applyAnswer(x, si, d.request, d.response);
     // `finish` lets the request's memory go, which a streamed request body
     // may still be read from: the reads end first.
@@ -3084,8 +3330,7 @@ fn finishDetached(x: *Exec, si: u32) void {
 /// A detached answer that needs a task: a streamed body or a file.
 fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
     const s = &x.slots[si];
-    const d = s.detached.?;
-    s.detached = null;
+    const d = s.owner.take();
     d.enter();
     const result: anyerror!void = if (stateOf(s.word.load(.acquire)) == .streaming)
         streamAnswer(x, si, gen, d.request, d.response)
@@ -3097,15 +3342,9 @@ fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
 }
 
-/// A detached request past its deadline: 504 now. The consumer, if it saw
-/// it, hears it is over.
-fn expireDetached(x: *Exec, si: u32, w: u64) void {
-    endDetached(x, si, w, false);
-}
-
-/// A detached request ended by the sweeper: 504 at its deadline, or 503
-/// when the server is being destroyed (`abandon`: the consumer hears
-/// nothing more).
+/// A detached request ended by the sweeper: 504 at its deadline (the
+/// consumer, if it saw it, hears it is over), or 503 when the server is
+/// being destroyed (`abandon`: the consumer hears nothing more).
 fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
@@ -3114,16 +3353,94 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
         if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, 504);
         _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     }
-    if (s.detached) |d| {
-        s.detached = null;
-        x.closePipe(&s.in, gen, si);
-        if (abandoning)
-            d.response.fail(.service_unavailable, "the server is stopping")
-        else
-            d.response.fail(.gateway_timeout, "the application did not answer in time");
-        d.finish({});
-    }
+    const d = s.owner.take();
+    x.closePipe(&s.in, gen, si);
+    if (abandoning)
+        d.response.fail(.service_unavailable, "the server is stopping")
+    else
+        d.response.fail(.gateway_timeout, "the application did not answer in time");
+    d.finish({});
     x.release(si);
+}
+
+/// The capi task's move for slot `si` (its word `w`) at `ev`, by owner: the
+/// table above `Owner`, one arm per cell. Inline with a comptime event, so
+/// each caller is one switch on the owner's tag.
+pub inline fn finish(x: *Exec, si: u32, w: u64, comptime ev: Event) void {
+    const s = &x.slots[si];
+    const io = x.engine.io;
+    switch (s.owner) {
+        .task => switch (ev) {
+            .answered => s.event.set(io),
+            .deadline => {
+                x.unlink(si);
+                s.owner.timeout();
+                s.event.set(io);
+            },
+            .abandon => {
+                x.unlink(si);
+                s.owner.abandon();
+                if (isGrpc(s)) grpc.stop(x, s) else s.event.set(io);
+            },
+        },
+        .timed_out => switch (ev) {
+            .answered => s.event.set(io),
+            .deadline => unreachable, // unlinked when timed out
+            // The task answers 503, not 504; already unlinked.
+            .abandon => {
+                s.owner.abandon();
+                if (isGrpc(s)) grpc.stop(x, s) else s.event.set(io);
+            },
+        },
+        .abandoned => switch (ev) {
+            .answered => s.event.set(io),
+            .deadline => unreachable, // unlinked when abandoned
+            .abandon => {},
+        },
+        .detached => switch (ev) {
+            .answered => if (isGrpc(s)) grpc.finishDetached(x, si) else finishDetached(x, si),
+            .deadline, .abandon => if (isGrpc(s)) grpc.endDetached(x, si, w, ev == .abandon) else endDetached(x, si, w, ev == .abandon),
+        },
+        .orphan => {
+            const gen = genOf(w);
+            // `answered` meets `done` or `streaming`: the executor's already.
+            if (ev != .answered) if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
+            const tell = switch (ev) {
+                .answered => stateOf(w) == .streaming,
+                .deadline => stateOf(w) == .out,
+                .abandon => false,
+            };
+            if (tell) x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);
+            x.release(si);
+        },
+    }
+}
+
+/// How `abandonAll` cuts a gRPC call `streaming` toward its client, by
+/// owner. A call's task is told once (`stop` rewrites the call's status, so
+/// not again while the task finishes with the consumer's); one still held
+/// by its Detached is told each round until its task takes it (the owner
+/// cannot say abandoned and keep the Detached); an orphaned call's memory
+/// went with its stream (its done-list entry releases it). A new owner is
+/// a new row here.
+pub const StreamCut = enum { skip, stop_once, stop };
+pub const grpc_stream_cut: std.EnumArray(std.meta.Tag(Owner), StreamCut) = .init(.{
+    .task = .stop_once,
+    .timed_out = .stop_once,
+    .abandoned = .skip,
+    .detached = .stop,
+    .orphan = .skip,
+});
+
+test "capi engine: destroy cuts a streaming gRPC call by its owner" {
+    const rows = [_]struct { std.meta.Tag(Owner), StreamCut }{
+        .{ .task, .stop_once }, .{ .timed_out, .stop_once }, .{ .abandoned, .skip },
+        .{ .detached, .stop },  .{ .orphan, .skip },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("owner: {t}\n", .{r[0]});
+        try std.testing.expectEqual(r[1], grpc_stream_cut.get(r[0]));
+    }
 }
 
 /// Run by the capi task while `abandon` is set (`destroy` on a server not
@@ -3135,25 +3452,17 @@ fn abandonAll(x: *Exec) void {
     for (x.slots, 0..) |*s, i| {
         const si: u32 = @intCast(i);
         const w = s.word.load(.acquire);
-        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
-            grpc.abandon(x, si, w);
-            continue;
-        };
         switch (stateOf(w)) {
-            .queued, .out => {
-                if (s.orphan) {
-                    if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
-                    x.release(si);
-                } else if (s.detached != null) {
-                    endDetached(x, si, w, true);
-                } else if (!s.abandoned) {
-                    x.unlink(si);
-                    s.abandoned = true;
-                    s.timed_out = true;
-                    s.event.set(io);
-                }
-            },
-            .streaming => {
+            .queued, .out => finish(x, si, w, .abandon),
+            // A stream is cut whoever owns it; a gRPC call by its owner.
+            .streaming => if (isGrpc(s)) switch (grpc_stream_cut.get(s.owner)) {
+                .skip => {},
+                .stop_once => {
+                    s.owner.abandon();
+                    grpc.stop(x, s);
+                },
+                .stop => grpc.stop(x, s),
+            } else {
                 s.out.acquire();
                 s.out.failed = true;
                 s.out.exec_waiting = false;
@@ -3192,17 +3501,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
             const s = &x.slots[si];
             rev = s.next_done;
             s.drained.store(true, .release);
-            if (s.orphan) {
-                const w = s.word.load(.acquire);
-                if (stateOf(w) == .streaming) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
-                x.release(si);
-            } else if (s.detached != null) {
-                if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
-                    grpc.finishDetached(x, si);
-                    continue;
-                };
-                finishDetached(x, si);
-            } else s.event.set(io);
+            finish(x, si, s.word.load(.acquire), .answered);
         }
         // Commands.
         var cmds = x.inbox.swap(null, .acquire);
@@ -3228,19 +3527,9 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                 if (s.deadline > now) break;
                 const w = s.word.load(.acquire);
                 switch (stateOf(w)) {
-                    .queued, .out => {
-                        if (s.orphan) {
-                            if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
-                            if (stateOf(w) == .out) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
-                            x.release(si);
-                        } else if (s.detached != null) {
-                            expireDetached(x, si, w);
-                        } else {
-                            x.unlink(si);
-                            s.timed_out = true;
-                            s.event.set(io);
-                        }
-                    },
+                    // Each move unlinks it, or (a lost CAS) leaves it for
+                    // the next look.
+                    .queued, .out => finish(x, si, w, .deadline),
                     // The consumer is in a call on it: look again shortly.
                     else => {
                         until = @min(until, now + std.time.ns_per_ms);
@@ -3495,7 +3784,8 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     popped = true;
                     continue;
                 }
-                const is_grpc = features.grpc and h.kind == .grpc_call;
+                const what = s.what.load(.monotonic);
+                const is_grpc = features.grpc and what == .grpc_call;
                 const size = if (is_grpc) grpc.recordSize(s) else headOf(s, now).size();
                 if (size > out.len - pos) {
                     s.word.store(queued, .release);
@@ -3506,7 +3796,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else if (s.sse_subscribe) .sse_subscribe else .request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(record_type.get(what), entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
                 popped = true;
@@ -3741,7 +4031,7 @@ pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *
     const x = &e.execs[h.exec];
     if (h.slot >= x.slots.len) return error.Over;
     const s = &x.slots[h.slot];
-    if (s.kind.load(.acquire) != @backingInt(kind)) return error.Over;
+    if (s.handleKind(.acquire) != kind) return error.Over;
     return .{ x, s, h };
 }
 
@@ -3889,7 +4179,7 @@ pub fn wsAccept(e: *Engine, hv: u64, subprotocol: []const u8, headers: []const C
     if (subprotocol.len > 0 and (subprotocol.len > 255 or !anole.websocket.isToken(subprotocol))) return error.Invalid;
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
-    if (!s.ws_upgrade) return error.State;
+    if (s.what.load(.monotonic) != .ws_upgrade) return error.State;
     // The request's memory is alive: its task waits for this answer.
     if (subprotocol.len > 0) {
         var offered = anole.websocket.offeredSubprotocols(s.req);
@@ -3929,7 +4219,7 @@ pub fn sseAccept(e: *Engine, hv: u64, topics: []const []const u8, headers: []con
     }
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
-    if (!s.sse_subscribe) return error.State;
+    if (s.what.load(.monotonic) != .sse_subscribe) return error.State;
     try storeHeaders(&s.headers, &s.bytes, headers, packed_len);
     s.subprotocol_off = @intCast(s.bytes.items.len);
     s.subprotocol_len = @intCast(packed_len);
@@ -3946,17 +4236,6 @@ pub fn sseAccept(e: *Engine, hv: u64, topics: []const []const u8, headers: []con
     const handle = sse.openReserved(x, s.ws_slot);
     handBack(x, s, h, .done);
     return handle;
-}
-
-/// Pass 3's per-executor tasks, canceled at the stop.
-fn cancelAreas(x: *Exec, io: std.Io) void {
-    x.net.cancel(io);
-    x.jobs.cancel(io);
-    x.webhooks.cancel(io);
-    x.sse.cancel(io);
-    x.watch.cancel(io);
-    x.s3.cancel(io);
-    x.smtp.cancel(io);
 }
 
 /// `anole_handle_release`: ends whatever the handle is, the way the
@@ -4204,7 +4483,35 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
     }
 }
 
+test "findByName: hit, miss, empty, first of duplicates, both name shapes" {
+    const A = struct { config: struct { name: []const u8 }, id: u8 };
+    const B = struct { name: []const u8, id: u8 };
+    var a = [_]A{ .{ .config = .{ .name = "x" }, .id = 1 }, .{ .config = .{ .name = "y" }, .id = 2 }, .{ .config = .{ .name = "y" }, .id = 3 } };
+    var b = [_]B{ .{ .name = "x", .id = 1 }, .{ .name = "y", .id = 2 } };
+    try std.testing.expectEqual(@as(u8, 2), findByName(A, &a, "y").?.id);
+    try std.testing.expectEqual(@as(u8, 2), findByName(B, &b, "y").?.id);
+    try std.testing.expect(findByName(A, &a, "z") == null);
+    try std.testing.expect(findByName(A, &a, "") == null);
+    try std.testing.expect(findByName(A, a[0..0], "x") == null);
+}
+
+test "ownedBy: null, foreign engine, own engine" {
+    const T = struct { engine: *Engine };
+    const saved = global;
+    defer global = saved;
+    var own: Engine = undefined;
+    var other: Engine = undefined;
+    global = &own;
+    var mine: T = .{ .engine = &own };
+    var foreign: T = .{ .engine = &other };
+    try std.testing.expect(ownedBy(T, null) == null);
+    try std.testing.expect(ownedBy(T, &foreign) == null);
+    try std.testing.expectEqual(&mine, ownedBy(T, &mine).?);
+}
+
 test {
+    _ = @import("slot_table.zig");
+    _ = @import("lane.zig");
     _ = config_mod;
     _ = @import("engine_test.zig");
     _ = @import("nats_test.zig");

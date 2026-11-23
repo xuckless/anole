@@ -75,6 +75,17 @@ const AppRoutes = struct {
         while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
     }
 
+    fn echoSubprotocol(ws: *websocket.Socket) !void {
+        try ws.send(.text, ws.subprotocol orelse "none");
+        while (try ws.next()) |_| {}
+    }
+
+    const EchoCallbacks = struct {
+        pub fn message(ws: *websocket.Socket, msg: websocket.Message) !void {
+            try ws.send(msg.type, msg.data);
+        }
+    };
+
     var spans_seen: std.Io.Event = .unset;
 
     fn collect(req: *Request, res: *Response) !void {
@@ -131,6 +142,32 @@ test "anole.App: function middleware runs on every route, with() adds one to a s
             try std.testing.expectEqualStrings("fn-middleware", refused.stamp.?);
             const allowed = try get(io_, arena, try urlOf(arena, port, "/secret"), &.{.{ "X-Api-Key", "k" }});
             try std.testing.expectEqualStrings("secret", allowed.body);
+        }
+    }.check);
+}
+
+test "anole.App: a fake clock leaves a real socket's timeouts and the client on real time" {
+    // Far from the runtime's own clock: a deadline computed on it would never come.
+    var clock: http.Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
+    var app = try App.init(alloc, .{ .executors = .exact(1), .clock = &clock, .timeouts = .{ .request = .fromMilliseconds(100) } });
+    defer app.deinit();
+    app.get("/hello", AppRoutes.hello);
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            try std.testing.expectEqualStrings("hello", (try get(io_, arena, try urlOf(arena, port, "/hello"), &.{})).body);
+            // A head that never ends: timeouts.request cuts the connection, unanswered.
+            const stream = try (try std.Io.net.IpAddress.parseIp4("127.0.0.1", port)).connect(io_, .{ .mode = .stream });
+            defer stream.close(io_);
+            var write_buf: [64]u8 = undefined;
+            var writer = stream.writer(io_, &write_buf);
+            try writer.interface.writeAll("GET /hello HTTP/1.1\r\nHost: a\r\n");
+            try writer.interface.flush();
+            var read_buf: [256]u8 = undefined;
+            var reader = stream.reader(io_, &read_buf);
+            var sink: std.Io.Writer.Allocating = .init(arena);
+            _ = reader.interface.streamRemaining(&sink.writer) catch {};
+            try std.testing.expectEqualStrings("", sink.written());
         }
     }.check);
 }
@@ -241,6 +278,137 @@ test "anole.App: ws answers a plain GET with 426 and echoes over a WebSocket" {
             try ws.close(.normal, "");
             const answer = try ws.receive();
             try std.testing.expectEqual(http.core.WebSocket.MessageType.close, answer.type);
+        }
+    }.check);
+}
+
+test "anole.App: wsWith and wsCallbacksWith accept runtime allowed_origins that do not outlive registration" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+
+    // Build runtime option strings in a temporary arena and free it before the
+    // server starts, proving the server owns a deep copy of every slice.
+    {
+        var tmp: std.heap.ArenaAllocator = .init(alloc);
+        defer tmp.deinit();
+        const ta = tmp.allocator();
+
+        const dev_origin = try ta.dupe(u8, "http://localhost:8081");
+        const prod_origin = try ta.dupe(u8, "https://app.example.com");
+        const empty_origin = try ta.dupe(u8, "");
+
+        const single = [_][]const u8{dev_origin};
+        const multi = [_][]const u8{ dev_origin, prod_origin };
+        const empty_list = [_][]const u8{empty_origin};
+
+        app.wsWith("/ws-single", AppRoutes.echo, .{ .allowed_origins = .{ .list = &single } });
+        app.wsWith("/ws-multi", AppRoutes.echo, .{ .allowed_origins = .{ .list = &multi } });
+        app.wsWith("/ws-empty", AppRoutes.echo, .{ .allowed_origins = .{ .list = &empty_list } });
+        app.wsWith("/ws-same", AppRoutes.echo, .{ .allowed_origins = .same_origin });
+        app.wsWith("/ws-any", AppRoutes.echo, .{ .allowed_origins = .any });
+
+        app.wsCallbacksWith("/cb-single", AppRoutes.EchoCallbacks, .{ .allowed_origins = .{ .list = &single } });
+        app.wsCallbacksWith("/cb-any", AppRoutes.EchoCallbacks, .{ .allowed_origins = .any });
+
+        const grp = app.group("/g", .{});
+        grp.wsWith("/single", AppRoutes.echo, .{ .allowed_origins = .{ .list = &single } });
+        grp.wsCallbacksWith("/cb-single", AppRoutes.EchoCallbacks, .{ .allowed_origins = .{ .list = &single } });
+
+        const proto = try ta.dupe(u8, "chat.v1");
+        const hdr_name = try ta.dupe(u8, "X-Ws-Runtime");
+        const hdr_value = try ta.dupe(u8, "cloned");
+        const drain_msg = try ta.dupe(u8, "bye runtime");
+        const subprotocols = [_][]const u8{proto};
+        const extra_headers = [_]std.http.Header{.{ .name = hdr_name, .value = hdr_value }};
+        app.wsWith("/ws-cloned", AppRoutes.echoSubprotocol, .{
+            .allowed_origins = .{ .list = &single },
+            .subprotocols = &subprotocols,
+            .headers = &extra_headers,
+            .drain_reason = drain_msg,
+        });
+    }
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            const same = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{port});
+            const Case = struct {
+                name: []const u8,
+                path: []const u8,
+                origin: ?[]const u8,
+                allowed: bool,
+            };
+            const cases = [_]Case{
+                // Single runtime origin
+                .{ .name = "ws single: matching runtime origin", .path = "/ws-single", .origin = "http://localhost:8081", .allowed = true },
+                .{ .name = "ws single: same-origin still allowed", .path = "/ws-single", .origin = same, .allowed = true },
+                .{ .name = "ws single: missing origin (non-browser)", .path = "/ws-single", .origin = null, .allowed = true },
+                .{ .name = "ws single: unlisted origin rejected", .path = "/ws-single", .origin = "https://evil.example", .allowed = false },
+                // Multiple runtime origins
+                .{ .name = "ws multi: first origin", .path = "/ws-multi", .origin = "http://localhost:8081", .allowed = true },
+                .{ .name = "ws multi: second origin", .path = "/ws-multi", .origin = "https://app.example.com", .allowed = true },
+                .{ .name = "ws multi: unlisted origin rejected", .path = "/ws-multi", .origin = "https://other.example", .allowed = false },
+                // Empty runtime origin (e.g. unset CORS_ORIGIN)
+                .{ .name = "ws empty: same-origin allowed", .path = "/ws-empty", .origin = same, .allowed = true },
+                .{ .name = "ws empty: missing origin allowed", .path = "/ws-empty", .origin = null, .allowed = true },
+                .{ .name = "ws empty: cross-origin rejected", .path = "/ws-empty", .origin = "http://localhost:8081", .allowed = false },
+                .{ .name = "ws empty: empty origin header rejected", .path = "/ws-empty", .origin = "", .allowed = false },
+                // .same_origin and .any
+                .{ .name = "ws same_origin: same allowed", .path = "/ws-same", .origin = same, .allowed = true },
+                .{ .name = "ws same_origin: cross rejected", .path = "/ws-same", .origin = "http://localhost:8081", .allowed = false },
+                .{ .name = "ws any: cross allowed", .path = "/ws-any", .origin = "https://anything.example", .allowed = true },
+                // Callbacks variant
+                .{ .name = "cb single: matching runtime origin", .path = "/cb-single", .origin = "http://localhost:8081", .allowed = true },
+                .{ .name = "cb single: unlisted origin rejected", .path = "/cb-single", .origin = "https://evil.example", .allowed = false },
+                .{ .name = "cb any: cross allowed", .path = "/cb-any", .origin = "https://anything.example", .allowed = true },
+                // Group variants
+                .{ .name = "group ws single: matching runtime origin", .path = "/g/single", .origin = "http://localhost:8081", .allowed = true },
+                .{ .name = "group ws single: unlisted origin rejected", .path = "/g/single", .origin = "https://evil.example", .allowed = false },
+                .{ .name = "group cb single: matching runtime origin", .path = "/g/cb-single", .origin = "http://localhost:8081", .allowed = true },
+                .{ .name = "group cb single: unlisted origin rejected", .path = "/g/cb-single", .origin = "https://evil.example", .allowed = false },
+            };
+
+            var dc = http.Client.init(alloc, io_, .{});
+            defer dc.deinit();
+            for (cases) |tc| {
+                const url = try std.fmt.allocPrint(arena, "ws://127.0.0.1:{d}{s}", .{ port, tc.path });
+                var hdrs = try http.Headers.init(arena, 4);
+                if (tc.origin) |o| try hdrs.add("Origin", o);
+                const opts: http.core.WebSocketUpgradeOptions = .{
+                    .headers = if (tc.origin != null) &hdrs else null,
+                };
+                if (tc.allowed) {
+                    var ws = dc.connectWebSocket(url, opts) catch |err| {
+                        std.debug.print("case '{s}' expected allow, got {t}\n", .{ tc.name, err });
+                        return err;
+                    };
+                    defer ws.deinit();
+                    try ws.send(.text, "ok");
+                    try std.testing.expectEqualStrings("ok", (try ws.receive()).data);
+                    try ws.close(.normal, "");
+                    _ = ws.receive() catch {};
+                } else {
+                    if (dc.connectWebSocket(url, opts)) |ws_val| {
+                        var ws = ws_val;
+                        ws.deinit();
+                        std.debug.print("case '{s}' expected reject, but upgrade succeeded\n", .{tc.name});
+                        return error.TestExpectedError;
+                    } else |_| {}
+                }
+            }
+
+            // Runtime subprotocols, headers, and drain_reason survive temp arena teardown.
+            var proto_hdrs = try http.Headers.init(arena, 4);
+            try proto_hdrs.add("Origin", "http://localhost:8081");
+            try proto_hdrs.add("Sec-WebSocket-Protocol", "chat.v1");
+            var ws = try dc.connectWebSocket(
+                try std.fmt.allocPrint(arena, "ws://127.0.0.1:{d}/ws-cloned", .{port}),
+                .{ .headers = &proto_hdrs },
+            );
+            defer ws.deinit();
+            try std.testing.expectEqualStrings("chat.v1", (try ws.receive()).data);
+            try ws.close(.normal, "");
+            _ = ws.receive() catch {};
         }
     }.check);
 }

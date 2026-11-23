@@ -68,8 +68,7 @@ pub fn Serving(comptime Ctx: type) type {
             connection.initPlain(self.server.allocator, io, stream) catch return;
             defer connection.deinit();
             connection.write_pool = &self.server.request_buffers;
-            var busy = false;
-            E.serve(self.server, &self.listener, false, &connection, &busy) catch |err| switch (err) {
+            E.serve(self.server, &self.listener, false, &connection) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {},
             };
