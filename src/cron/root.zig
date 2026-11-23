@@ -340,24 +340,25 @@ fn bits(text: []const u8, f: Field, base: usize, d: *Diagnostic) error{Bad}!stru
 
 fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Fields) error{Bad}!void {
     var items = std.mem.splitScalar(u8, text, ',');
+    const field = specs.get(.day_of_week).name;
     while (items.next()) |item| {
-        if (item.len == 0) return fail(d, "day-of-week", base, "empty item");
+        if (item.len == 0) return fail(d, field, base, "empty item");
         if (std.mem.indexOfScalar(u8, item, '#')) |h| {
-            const wd = dowValue(item[0..h]) orelse return fail(d, "day-of-week", base, "bad weekday");
-            const k = std.fmt.parseInt(u8, item[h + 1 ..], 10) catch return fail(d, "day-of-week", base + h + 1, "bad ordinal");
-            if (k < 1 or k > 5) return fail(d, "day-of-week", base + h + 1, "the ordinal must be 1 to 5");
+            const wd = dowValue(item[0..h]) orelse return fail(d, field, base, "bad weekday");
+            const k = std.fmt.parseInt(u8, item[h + 1 ..], 10) catch return fail(d, field, base + h + 1, "bad ordinal");
+            if (k < 1 or k > 5) return fail(d, field, base + h + 1, "the ordinal must be 1 to 5");
             s.dow_nth[wd] |= @as(u8, 1) << @intCast(k);
             continue;
         }
         if (item.len >= 2 and (item[item.len - 1] == 'L' or item[item.len - 1] == 'l') and item[0] != '*') {
-            const wd = dowValue(item[0 .. item.len - 1]) orelse return fail(d, "day-of-week", base, "bad weekday");
+            const wd = dowValue(item[0 .. item.len - 1]) orelse return fail(d, field, base, "bad weekday");
             s.dow_last |= @as(u8, 1) << @intCast(wd);
             continue;
         }
         if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
             if (std.mem.indexOfScalar(u8, item, '/') == null) {
-                const a = dowValue(item[0..dash]) orelse return fail(d, "day-of-week", base, "bad weekday");
-                const b = dowValue(item[dash + 1 ..]) orelse return fail(d, "day-of-week", base, "bad weekday");
+                const a = dowValue(item[0..dash]) orelse return fail(d, field, base, "bad weekday");
+                const b = dowValue(item[dash + 1 ..]) orelse return fail(d, field, base, "bad weekday");
                 // A range may wrap past Saturday ("sat-sun", "5-7").
                 var v = a;
                 while (true) : (v = (v + 1) % 7) {
@@ -373,7 +374,7 @@ fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Fields) error{Bad
         var i: usize = 0;
         while (i < item.len and w < buf.len - 2) {
             if (i + 3 <= item.len and std.ascii.isAlphabetic(item[i])) {
-                const v = dowValue(item[i .. i + 3]) orelse return fail(d, "day-of-week", base, "bad weekday name");
+                const v = dowValue(item[i .. i + 3]) orelse return fail(d, field, base, "bad weekday name");
                 buf[w] = '0' + v;
                 w += 1;
                 i += 3;
