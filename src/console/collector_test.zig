@@ -72,10 +72,10 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
     const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = try std.fmt.bufPrint(&path_buf, "{s}/c.sock", .{dir_buf[0..dir_len]});
-    rooms = .init(alloc, .{});
-    defer rooms.deinit();
     var app = try App.init(alloc, .{ .executors = .exact(2), .console = .{ .enabled = true, .socket = sock } });
     defer app.deinit();
+    rooms = .init(alloc, app.io(), .{});
+    defer rooms.deinit();
     const live = try app.sseTopics(.{ .heartbeat = null });
     app.sse("/live", live, .{ .topics = &.{"news"} });
     app.ws("/lobby", lobby);

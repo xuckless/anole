@@ -1526,11 +1526,8 @@ pub fn _readBlocksHeld() usize {
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
     options: Options = .{},
-    /// The runtime's `std.Io`, taken from the first socket to join, so
-    /// `init` needs none (the rooms can be made before the server).
-    io: std.Io = undefined,
-    io_set: std.atomic.Value(bool) = .init(false),
-    io_lock: std.atomic.Mutex = .unlocked,
+    /// The runtime's `std.Io` (`app.io()`) the sockets run on; set at `init`.
+    io: std.Io,
     /// Over `rooms` and every member's queue and flags; never held across
     /// I/O.
     mutex: std.Io.Mutex = .init,
@@ -1683,28 +1680,10 @@ pub const Rooms = struct {
     /// No rooms yet. `allocator` holds the room names, members and queued
     /// messages; it must be thread-safe when sockets on several executors
     /// join.
-    /// `Rooms.init(gpa, .{})` takes the defaults.
-    pub fn init(allocator: std.mem.Allocator, options: Options) Rooms {
-        return .{ .allocator = allocator, .options = options };
-    }
-
-    /// The `std.Io` to lock with: `io` (a joining or leaving socket's)
-    /// unless an earlier one was taken.
-    fn bind(self: *Rooms, io: std.Io) std.Io {
-        if (!self.io_set.load(.acquire)) {
-            while (!self.io_lock.tryLock()) std.atomic.spinLoopHint();
-            defer self.io_lock.unlock();
-            if (!self.io_set.load(.monotonic)) {
-                self.io = io;
-                self.io_set.store(true, .release);
-            }
-        }
-        return self.io;
-    }
-
-    /// Null until a socket has joined: until then every room is empty.
-    fn bound(self: *Rooms) ?std.Io {
-        return if (self.io_set.load(.acquire)) self.io else null;
+    /// `io` is the runtime's (`app.io()`, never `init.io`): the sockets lock
+    /// with it. `Rooms.init(gpa, app.io(), .{})` takes the defaults.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) Rooms {
+        return .{ .allocator = allocator, .io = io, .options = options };
     }
 
     /// Frees every room. Call it once no broadcast is under way; a socket
@@ -1742,7 +1721,7 @@ pub const Rooms = struct {
         while (!registry_lock.tryLock()) std.atomic.spinLoopHint();
         defer registry_lock.unlock();
         for (registry.items) |r| {
-            const io = r.bound() orelse continue;
+            const io = r.io;
             if (!r.mutex.tryLock()) continue;
             defer r.mutex.unlock(io);
             var it = r.rooms.iterator();
@@ -1804,7 +1783,7 @@ pub const Rooms = struct {
 
     /// Takes `socket` out of every room of these rooms.
     fn leaveAllOf(self: *Rooms, socket: *Socket) void {
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         // The socket's memberships here, out of its list into `mine`.
         var mine: ?*Member = null;
@@ -1902,7 +1881,7 @@ pub const Rooms = struct {
         var used = false;
         defer if (!used) self.allocator.destroy(member);
         member.* = .{ .socket = socket, .rooms = self };
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (!self.registered) {
@@ -1939,7 +1918,7 @@ pub const Rooms = struct {
     /// dropped; a send under way is given `Options.leave_grace_ms` to finish
     /// and then canceled, so a socket is never sent to once `leave` returns.
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         // The socket's own memberships, not the room's members: as many as
         // the rooms it is in.
@@ -1974,7 +1953,7 @@ pub const Rooms = struct {
     /// `Payload.create`, one reference of the caller's, which it keeps):
     /// each queue takes a reference of its own. Internal.
     pub fn broadcastPayload(self: *Rooms, room: []const u8, payload: *Payload, except: ?*Socket) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
 
         var stack: [stack_snapshot]*Member = undefined;
         var buf: []*Member = &stack;
@@ -2106,7 +2085,7 @@ pub const Rooms = struct {
 
     /// How many sockets are in `room`.
     pub fn count(self: *Rooms, room: []const u8) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return if (self.rooms.get(room)) |m| m.items.len else 0;

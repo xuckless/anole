@@ -9,6 +9,7 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
 
 ### Changed
 
+- **`Rooms.init(allocator, io, options)` and `Topics.init/create(gpa, io, options)` take the runtime's io (`app.io()`)**; the lazy bind (`Topics.bind`) and its spin lock are gone. Set a `Rooms` after `Server.init` (docs/migrating.md, "0.6 to 1.0"). The C ABI is unchanged.
 - **HTTP/2 and HTTP/3 transport state as explicit enums with declared transition tables** (#215). No behaviour change: wire bytes, frame order, error and reset codes and C ABI results are as before. Each state has one `next` (an exhaustive state x event switch) and a test row per cell; switches that only map a state to a value are comptime `std.EnumArray` tables.
   - HTTP/2 engine (src/http/core/h2/server.zig): a stream's response side (`Resp`: none, head sent, ended, waiting for its send), its dispatch (`Dispatch`) and its request body (`ReqBody`) are one value each; a connection's output, life and drain are one `Writer`, `Life` and `Drain` value each, with the in-flight holds derived instead of counted beside them. The test seams are one comptime `Probe`, a no-op outside tests.
   - HTTP/2 core: the inbound parser phase is one `In` union, the server's SETTINGS come from a declared table, and the never-read `Local.max_concurrent_streams` is gone; header names are classified by the core's name tokens in `onField` and the response head.

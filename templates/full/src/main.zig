@@ -272,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
 
     var state: App = .{
         .db = undefined,
-        .rooms = .init(init.gpa, .{}),
+        .rooms = undefined,
         .live = undefined,
         .jobs = undefined,
         .jwt_keys = .{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = cfg.jwt_secret.expose() } }},
@@ -280,7 +280,6 @@ pub fn main(init: std.process.Init) !void {
         .session_key = undefined,
         .upstream_url = cfg.upstream_url,
     };
-    defer state.rooms.deinit();
 
     var app = try anole.Server(App).init(init.gpa, .{
         .http = .{ .port = cfg.port, .h2c = true },
@@ -289,6 +288,8 @@ pub fn main(init: std.process.Init) !void {
     }, &state);
     defer app.deinit();
     const io = app.io();
+    state.rooms = .init(init.gpa, io, .{});
+    defer state.rooms.deinit();
 
     state.session_key = if (cfg.session_key) |k| try anole.session.keyFromBase64(k.expose()) else anole.session.devKey(io);
     const key = try auth.apikey.generate(arena, io);

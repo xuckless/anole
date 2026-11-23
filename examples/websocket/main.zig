@@ -106,10 +106,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     if (args.next()) |p| tls_port = try std.fmt.parseInt(u16, p, 10);
 
-    // The rooms take the runtime's Io from the first socket that joins, so
-    // they can be made before the server.
-    var state: App = .{ .rooms = .init(init.gpa, .{}) };
-    defer state.rooms.deinit();
+    // The rooms take the runtime's io (`app.io()`, not `init.io`): set them
+    // once the server exists.
+    var state: App = .{ .rooms = undefined };
     var app = try anole.Server(App).init(init.gpa, .{
         // HTTP/1.1, plus HTTP/2 (h2c) for clients that open with its preface.
         .http = .{ .port = port },
@@ -124,6 +123,8 @@ pub fn main(init: std.process.Init) !void {
         .timeouts = .{ .shutdown = .fromSeconds(5) },
     }, &state);
     defer app.deinit();
+    state.rooms = .init(init.gpa, app.io(), .{});
+    defer state.rooms.deinit();
 
     app.use(anole.middleware.Logger.init(.{}));
     app.get("/", page);

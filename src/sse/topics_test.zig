@@ -31,7 +31,7 @@ const Harness = struct {
         const h = try gpa.create(Harness);
         var o = options;
         o._manual_ticks = true;
-        h.* = .{ .hub = try Topics.init(gpa, o) };
+        h.* = .{ .hub = try Topics.init(gpa, io, o) };
         h.hub.fake_now_ms.store(1000, .monotonic);
         return h;
     }
@@ -533,13 +533,25 @@ test "sse: the drain gives each subscriber a retry from the spread, then ends th
 test "sse: publish to an unknown topic is 0 and allocates nothing; bad input is an error" {
     const h = try Harness.init(.{});
     defer h.deinit();
+    // Set up at init: one exec list on a Threaded io, nothing counted yet.
+    try std.testing.expectEqual(@as(usize, 1), h.hub.execs.len);
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.stats().topics);
     _ = try h.add(&.{"t"}, null);
     try std.testing.expectEqual(@as(usize, 0), try h.hub.publish("nobody", .{ .data = "x" }));
     try std.testing.expectError(error.InvalidTopic, h.hub.publish("", .{ .data = "x" }));
     const long: [256]u8 = @splat('x');
     try std.testing.expectError(error.InvalidTopic, h.hub.publish(&long, .{ .data = "x" }));
     try std.testing.expectError(error.InvalidEventField, h.hub.publish("t", .{ .data = "x", .event = "a\nb" }));
-    try std.testing.expectError(error.InvalidEventField, Topics.init(gpa, .{ .gap_event = "g\n" }));
+    try std.testing.expectError(error.InvalidEventField, Topics.init(gpa, io, .{ .gap_event = "g\n" }));
+}
+
+test "sse: Topics sizes one exec list per executor of the runtime at init" {
+    const rt = try @import("zio").Runtime.init(gpa, .{ .executors = .exact(3) });
+    defer rt.deinit();
+    var hub = try Topics.init(gpa, rt.io(), .{});
+    defer hub.deinit();
+    try std.testing.expectEqual(@as(usize, 3), hub.execs.len);
 }
 
 test "sse: Subscriber.join and leave: events after the call" {
@@ -630,7 +642,7 @@ const ZioCase = struct {
         const rio = c.rt.io();
         var o = options;
         o._manual_ticks = true;
-        c.hub = try Topics.init(gpa, o);
+        c.hub = try Topics.init(gpa, rio, o);
         c.hub.fake_now_ms.store(1000, .monotonic);
         c.f = .init(gpa, rio);
         c.f.hold = true;

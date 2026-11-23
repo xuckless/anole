@@ -84,10 +84,9 @@ pub const Topics = struct {
     idle: std.Io.Condition = .init,
     topics: std.StringHashMapUnmanaged(*Topic) = .empty,
     store: replay.Store = .{},
-    execs: []ExecList = &.{},
-    io: std.Io = undefined,
-    io_set: std.atomic.Value(bool) = .init(false),
-    io_lock: std.atomic.Mutex = .unlocked,
+    execs: []ExecList,
+    /// The runtime's `std.Io` (`app.io()`); set at `init`.
+    io: std.Io,
     ends: std.Io.Group = .init,
     tickers: std.Io.Group = .init,
     draining: std.atomic.Value(bool) = .init(false),
@@ -179,27 +178,34 @@ pub const Topics = struct {
 
     /// `error.InvalidEventField` for a gap_event with CR or LF;
     /// `error.InvalidOptions` for replay.events 0 or > 65535, a RetrySpread with min > max.
-    pub fn init(gpa: std.mem.Allocator, options: Options) error{ InvalidEventField, InvalidOptions, OutOfMemory }!Topics {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) error{ InvalidEventField, InvalidOptions, OutOfMemory }!Topics {
         if (options.gap_event) |g| if (!validField(g)) return error.InvalidEventField;
         if (options.replay) |r| if (r.events == 0 or r.events > 65535) return error.InvalidOptions;
         if (options.drain_retry) |d| if (d.min.nanoseconds > d.max.nanoseconds) return error.InvalidOptions;
         const hb = try Payload.create(gpa, .heartbeat, ":\n\n");
         errdefer hb.release(gpa);
         const end_p = try Payload.create(gpa, .end, "");
+        errdefer end_p.release(gpa);
+        var epoch_bytes: [4]u8 = undefined;
+        io.random(&epoch_bytes);
+        const execs = try gpa.alloc(ExecList, placement.executorCount(io) orelse 1);
+        for (execs) |*e| e.* = .{};
         return .{
             .gpa = gpa,
+            .io = io,
             .options = options,
-            .epoch = 0,
+            .epoch = std.mem.readInt(u32, &epoch_bytes, .little),
+            .execs = execs,
             .heartbeat_payload = hb,
             .end_payload = end_p,
         };
     }
 
     /// `init` on the heap, freed by `deinit` (the server's topics).
-    pub fn create(gpa: std.mem.Allocator, options: Options) error{ InvalidEventField, InvalidOptions, OutOfMemory }!*Topics {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, options: Options) error{ InvalidEventField, InvalidOptions, OutOfMemory }!*Topics {
         const t = try gpa.create(Topics);
         errdefer gpa.destroy(t);
-        t.* = try init(gpa, options);
+        t.* = try init(gpa, io, options);
         t.heap_owned = true;
         while (!hub_registry_lock.tryLock()) std.atomic.spinLoopHint();
         defer hub_registry_lock.unlock();
@@ -220,7 +226,7 @@ pub const Topics = struct {
         while (!hub_registry_lock.tryLock()) std.atomic.spinLoopHint();
         defer hub_registry_lock.unlock();
         for (hub_registry.items) |hub| {
-            const io = hub.bound() orelse continue;
+            const io = hub.io;
             if (!hub.mutex.tryLock()) continue;
             defer hub.mutex.unlock(io);
             var it = hub.topics.iterator();
@@ -245,10 +251,8 @@ pub const Topics = struct {
             };
             if (hub_registry.items.len == 0) hub_registry.clearAndFree(std.heap.page_allocator);
         }
-        if (self.io_set.load(.acquire)) {
-            self.tickers.cancel(self.io);
-            self.ends.cancel(self.io);
-        }
+        self.tickers.cancel(self.io);
+        self.ends.cancel(self.io);
         // The entries point into the topics' rings: first.
         self.store.clear(self.gpa);
         var it = self.topics.iterator();
@@ -261,7 +265,7 @@ pub const Topics = struct {
         self.topics.deinit(self.gpa);
         self.heartbeat_payload.release(self.gpa);
         self.end_payload.release(self.gpa);
-        if (self.execs.len > 0) self.gpa.free(self.execs);
+        self.gpa.free(self.execs);
         if (self.heap_owned) self.gpa.destroy(self);
     }
 
@@ -319,30 +323,6 @@ pub const Topics = struct {
         m.resumes_exact.value.store(resumed -| gaps, .monotonic);
     }
 
-    /// The `std.Io` to lock with: `io` (a subscriber's) unless an earlier
-    /// one was taken.
-    pub fn bind(self: *Topics, io: std.Io) std.Io {
-        if (!self.io_set.load(.acquire)) {
-            while (!self.io_lock.tryLock()) std.atomic.spinLoopHint();
-            defer self.io_lock.unlock();
-            if (!self.io_set.load(.monotonic)) {
-                self.io = io;
-                var epoch_bytes: [4]u8 = undefined;
-                io.random(&epoch_bytes);
-                self.epoch = std.mem.readInt(u32, &epoch_bytes, .little);
-                const n = placement.executorCount(io) orelse 1;
-                self.execs = self.gpa.alloc(ExecList, n) catch &.{};
-                for (self.execs) |*e| e.* = .{};
-                self.io_set.store(true, .release);
-            }
-        }
-        return self.io;
-    }
-
-    fn bound(self: *Topics) ?std.Io {
-        return if (self.io_set.load(.acquire)) self.io else null;
-    }
-
     fn nowMs(self: *Topics) i64 {
         const fake = self.fake_now_ms.load(.monotonic);
         if (fake != std.math.minInt(i64)) return fake;
@@ -352,7 +332,6 @@ pub const Topics = struct {
     /// Registers the drain hook with `hooks` (once); a hook added after
     /// the drain started runs at once.
     pub fn _registerDrain(self: *Topics, io: std.Io, hooks: *dusty.DrainHooks) void {
-        _ = self.bind(io);
         self.mutex.lockUncancelable(io);
         const already = self.drain_hooks != null;
         if (!already) self.drain_hooks = hooks;
@@ -394,7 +373,7 @@ pub const Topics = struct {
     /// are numbered (S16: a cluster bus would assign `seq` and `epoch` and
     /// call this on every instance).
     pub fn _publishPayload(self: *Topics, topic: []const u8, p: *Payload, record: bool) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
         var stack: [stack_snapshot]*Subscriber = undefined;
         var heap: []*Subscriber = &.{};
         defer self.gpa.free(heap);
@@ -477,7 +456,7 @@ pub const Topics = struct {
     }
 
     fn gapMatching(self: *Topics, name: []const u8, prefix: bool) void {
-        const io = self.bound() orelse return;
+        const io = self.io;
         var started: std.ArrayList(*Subscriber) = .empty;
         defer started.deinit(self.gpa);
         self.mutex.lockUncancelable(io);
@@ -526,7 +505,7 @@ pub const Topics = struct {
     }
 
     pub fn count(self: *Topics, topic: []const u8) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return if (self.topics.get(topic)) |t| t.members.items.len else 0;
@@ -535,12 +514,10 @@ pub const Topics = struct {
     pub fn stats(self: *Topics) Stats {
         var topics_n: usize = 0;
         var replay_bytes: usize = 0;
-        if (self.bound()) |io| {
-            self.mutex.lockUncancelable(io);
-            topics_n = self.topics.count();
-            replay_bytes = self.store.bytes;
-            self.mutex.unlock(io);
-        }
+        self.mutex.lockUncancelable(self.io);
+        topics_n = self.topics.count();
+        replay_bytes = self.store.bytes;
+        self.mutex.unlock(self.io);
         return .{
             .subscribers = self.subscribers.load(.monotonic),
             .topics = topics_n,
@@ -574,7 +551,6 @@ pub const Topics = struct {
         if (req.method == .head) return;
 
         const io = req.io;
-        _ = self.bind(io);
         if (opts.on_drain_hooks) |hooks| self._registerDrain(io, hooks) else if (req._drain_hooks) |hooks| self._registerDrain(io, hooks);
         const last_header: ?[]const u8 = req.headers.get("Last-Event-ID") orelse req.queryParam("lastEventId");
 
@@ -686,7 +662,6 @@ pub const Topics = struct {
     /// subscriber's end was asked for while it was opened (`on_open`
     /// closing it, a failed first write, `_gone` from another task).
     pub fn _attach(self: *Topics, io: std.Io, out: Out, opts: ServeOptions, last_header: ?[]const u8) !*Subscriber {
-        _ = self.bind(io);
         for (opts.topics) |t| if (!validTopic(t)) return error.InvalidTopic;
         const sub = try self.newSubscriber(io, .{ .context = opts.context, .on_close = opts.on_close });
         sub.out = out;
@@ -722,7 +697,7 @@ pub const Topics = struct {
         } else {
             for (opts.topics) |name| try self.joinLocked(sub, name);
         }
-        if (self.execs.len > 0) self.execs[sub.execIndex(self)].subscribers.append(&sub.exec_node);
+        self.execs[sub.execIndex(self)].subscribers.append(&sub.exec_node);
         sub.linked = true;
         _ = self.subscribers.fetchAdd(1, .monotonic);
         try self.queueOpenLine(sub);
@@ -798,7 +773,7 @@ pub const Topics = struct {
 
     /// Takes `sub` out of every topic and its executor's list.
     fn unlinkLocked(self: *Topics, sub: *Subscriber) void {
-        const now = if (self.io_set.load(.acquire)) self.nowMs() else 0;
+        const now = self.nowMs();
         for (sub.memberships.items) |m| {
             removeMember(m.topic, sub, m.index);
             if (m.topic.members.items.len == 0) m.topic.empty_since_ms = now;
@@ -806,7 +781,7 @@ pub const Topics = struct {
         sub.memberships.clearRetainingCapacity();
         if (sub.linked) {
             sub.linked = false;
-            if (self.execs.len > 0) self.execs[sub.execIndex(self)].subscribers.remove(&sub.exec_node);
+            self.execs[sub.execIndex(self)].subscribers.remove(&sub.exec_node);
             _ = self.subscribers.fetchSub(1, .monotonic);
         }
     }
@@ -1213,7 +1188,7 @@ pub const Topics = struct {
     // -- tickers (heartbeats, stuck senders, the sweep) ------------------
 
     fn ensureTickers(self: *Topics, io: std.Io, sub: *Subscriber) void {
-        if (self.options._manual_ticks or self.execs.len == 0) return;
+        if (self.options._manual_ticks) return;
         const exec = sub.execIndex(self);
         self.mutex.lockUncancelable(io);
         const want0 = !self.execs[0].ticker_running;
@@ -1533,7 +1508,7 @@ pub const Subscriber = struct {
 
     fn execIndex(sub: *const Subscriber, hub: *const Topics) usize {
         const e = sub.executor orelse return 0;
-        return if (hub.execs.len == 0) 0 else e % hub.execs.len;
+        return e % hub.execs.len;
     }
 
     fn pop(sub: *Subscriber) ?*Payload {
