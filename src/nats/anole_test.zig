@@ -325,43 +325,60 @@ test "publish cap: past outbound_bytes a publish is ServiceUnavailable (outbound
     try testing.expect(!r.client.writable(&ctx));
 }
 
-test "lifecycle: start and drain run once; after a drain nothing begins, readiness fails, start is a no-op" {
-    var r: Rig = undefined;
-    try r.startWith(.{ .stall = true, .transcript = undefined }, .{});
-    defer r.deinit();
+test "lifecycle: start and drain run once; a drain first or a lambda deployment begins nothing; after a drain readiness fails" {
+    const Act = enum { add, start, drain };
+    // Each row: an action, then the hooks begun so far, the phase, whether
+    // the core is connected, and readiness (null before start adds its check).
+    const Row = struct { name: []const u8, act: Act, begun: u32, phase: nats.Phase, up: bool, ready: ?bool };
+    const Scenario = struct { suppress: bool, checks: usize, rows: []const Row };
+    const scenarios = [_]Scenario{
+        .{ .suppress = false, .checks = 1, .rows = &.{
+            .{ .name = "hook before start waits", .act = .add, .begun = 0, .phase = .idle, .up = false, .ready = null },
+            .{ .name = "start begins it", .act = .start, .begun = 1, .phase = .serving, .up = true, .ready = true },
+            .{ .name = "second start is a no-op", .act = .start, .begun = 1, .phase = .serving, .up = true, .ready = true },
+            .{ .name = "hook while serving begins at once", .act = .add, .begun = 2, .phase = .serving, .up = true, .ready = true },
+            .{ .name = "drain", .act = .drain, .begun = 2, .phase = .closing, .up = false, .ready = false },
+            .{ .name = "second drain", .act = .drain, .begun = 2, .phase = .closing, .up = false, .ready = false },
+            .{ .name = "hook after drain is not begun", .act = .add, .begun = 2, .phase = .closing, .up = false, .ready = false },
+            .{ .name = "start after drain is a no-op", .act = .start, .begun = 2, .phase = .closing, .up = false, .ready = false },
+        } },
+        .{ .suppress = false, .checks = 0, .rows = &.{
+            .{ .name = "drain before start", .act = .drain, .begun = 0, .phase = .closing, .up = false, .ready = null },
+            .{ .name = "hook after an early drain is not begun", .act = .add, .begun = 0, .phase = .closing, .up = false, .ready = null },
+            .{ .name = "start after an early drain neither connects nor adds its check", .act = .start, .begun = 0, .phase = .closing, .up = false, .ready = null },
+        } },
+        .{ .suppress = true, .checks = 1, .rows = &.{
+            .{ .name = "lambda: start connects, begins nothing", .act = .start, .begun = 0, .phase = .serving, .up = true, .ready = true },
+            .{ .name = "lambda: hook while serving is not begun", .act = .add, .begun = 0, .phase = .serving, .up = true, .ready = true },
+        } },
+    };
     const Count = struct {
         fn begin(c: *anyopaque) anyerror!void {
             @as(*u32, @ptrCast(@alignCast(c))).* += 1;
         }
         fn free(_: *anyopaque) void {}
     };
-    var begun: u32 = 0;
-    const hook: nats.Client.Hook = .{ .context = &begun, .begin = Count.begin, .free = Count.free };
-    var health: @import("../observe/root.zig").Health = .init(.{});
-    const now: Io.Clock.Timestamp = .now(r.rt.io(), .awake);
-    // Each row: an action, then the hooks begun so far and readiness (once
-    // checked: start adds its check once).
-    const rows = [_]struct { name: []const u8, act: enum { add, start, drain }, begun: u32, ready: bool }{
-        .{ .name = "hook before start waits", .act = .add, .begun = 0, .ready = true },
-        .{ .name = "start begins it", .act = .start, .begun = 1, .ready = true },
-        .{ .name = "second start is a no-op", .act = .start, .begun = 1, .ready = true },
-        .{ .name = "hook while serving begins at once", .act = .add, .begun = 2, .ready = true },
-        .{ .name = "drain", .act = .drain, .begun = 2, .ready = false },
-        .{ .name = "second drain", .act = .drain, .begun = 2, .ready = false },
-        .{ .name = "hook after drain is not begun", .act = .add, .begun = 2, .ready = false },
-        .{ .name = "start after drain is a no-op", .act = .start, .begun = 2, .ready = false },
-    };
-    for (rows) |row| {
-        errdefer std.debug.print("row: {s}\n", .{row.name});
-        switch (row.act) {
-            .add => try r.client.addHook(hook),
-            .start => try r.client.start(null, null, &health),
-            .drain => r.client.drain(now),
+    for (scenarios) |s| {
+        var r: Rig = undefined;
+        try r.startWith(.{ .stall = true, .transcript = undefined }, .{});
+        defer r.deinit();
+        r.client.suppress_consumers = s.suppress;
+        var begun: u32 = 0;
+        var health: @import("../observe/root.zig").Health = .init(.{});
+        for (s.rows) |row| {
+            errdefer std.debug.print("row: {s}\n", .{row.name});
+            switch (row.act) {
+                .add => try r.client.addHook(.{ .context = &begun, .begin = Count.begin, .free = Count.free }),
+                .start => try r.client.start(null, null, &health),
+                .drain => r.client.drain(.now(r.rt.io(), .awake)),
+            }
+            try testing.expectEqual(row.begun, begun);
+            try testing.expectEqual(row.phase, r.client.phase.load(.acquire));
+            try testing.expectEqual(row.up, r.client.cores[0].isConnected());
+            if (row.ready) |want| try testing.expectEqual(want, health.checks[0].ready(health.checks[0].ctx));
         }
-        try testing.expectEqual(row.begun, begun);
-        if (health.len > 0) try testing.expectEqual(row.ready, health.checks[0].ready(health.checks[0].ctx));
+        try testing.expectEqual(s.checks, health.len);
     }
-    try testing.expectEqual(1, health.len);
 }
 
 fn pickOn(c: *nats.Client, out: *?*nats.core.Client) void {
