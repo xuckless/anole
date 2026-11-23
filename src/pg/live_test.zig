@@ -324,11 +324,13 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
             try testing.expectEqual(@as(i64, 1), (try rows.next()).?);
         }
         try testing.expectEqual(@as(i64, 7), try tx.one(i64, &c, "SELECT 7::int8", .{}));
-        var rows = try tx.iterate(i64, &c, "SELECT (10 / (x - 2))::int8 FROM generate_series(1, 3) x", .{});
-        defer rows.deinit();
-        try testing.expectEqual(@as(i64, -10), (try rows.next()).?);
-        try testing.expectError(error.Database, rows.next());
-        try testing.expect(try rows.next() == null);
+        {
+            var rows = try tx.iterate(i64, &c, "SELECT (10 / (x - 2))::int8 FROM generate_series(1, 3) x", .{});
+            defer rows.deinit();
+            try testing.expectEqual(@as(i64, -10), (try rows.next()).?);
+            try testing.expectError(error.Database, rows.next());
+            try testing.expect(try rows.next() == null);
+        }
         try testing.expectError(error.Database, tx.commit(&c));
     }
 
