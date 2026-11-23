@@ -1026,15 +1026,30 @@ pub const Connection = struct {
     }
 };
 
-/// The one reply that cannot go through `Response`: what overran is the head
-/// that would have said how to frame it. Fixed bytes instead, and
-/// `Connection: close`, because the rest of that head is still queued on the
-/// socket and there is no framing to skip it by.
-fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("HTTP/1.1 503 Service Unavailable\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n");
+/// The replies the HTTP/1.x loop writes as fixed bytes rather than through
+/// `Response`: there is no request to answer (a head refused, or a request
+/// the drain turned away before reading it), and `Connection: close`,
+/// because the rest of what the peer sent is still queued on the socket and
+/// there is no framing to skip it by. A new one is one entry here.
+const FixedReply = enum { headers_too_large, bad_request, service_unavailable };
+
+const fixed_replies: std.EnumArray(FixedReply, []const u8) = .init(.{
+    .headers_too_large = fixedReply("431 Request Header Fields Too Large"),
+    .bad_request = fixedReply("400 Bad Request"),
+    .service_unavailable = fixedReply("503 Service Unavailable"),
+});
+
+fn fixedReply(comptime status: []const u8) []const u8 {
+    return "HTTP/1.1 " ++ status ++ "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+}
+
+comptime {
+    // Each is a whole head: the peer must not wait for more of it.
+    for (fixed_replies.values) |reply| std.debug.assert(std.mem.endsWith(u8, reply, "\r\n\r\n"));
+}
+
+fn sendFixed(w: *std.Io.Writer, reply: FixedReply) std.Io.Writer.Error!void {
+    try w.writeAll(fixed_replies.get(reply));
     return w.flush();
 }
 
@@ -1074,25 +1089,6 @@ fn lingerTimeout() std.Io.Duration {
 /// How long an unread request body is drained for when `timeout.keepalive`
 /// is off.
 const drain_timeout_fallback: std.Io.Duration = .fromSeconds(10);
-
-fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n");
-    return w.flush();
-}
-
-/// For a head llhttp refused: fixed bytes, since there is no request to
-/// answer through `Response`, and `Connection: close`, since there is no
-/// framing to find the next request by.
-fn sendBadRequest(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("HTTP/1.1 400 Bad Request\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n");
-    return w.flush();
-}
 
 /// The first line of the HTTP/2 connection preface (RFC 9113 3.4).
 const h2_preface_line = "PRI * HTTP/2.0\r\n";
@@ -2817,7 +2813,7 @@ pub fn Server(comptime Ctx: type) type {
             conn.count = .held;
             if (was.draining) {
                 self.giveCount(&conn.count);
-                sendServiceUnavailable(connection.writer) catch
+                sendFixed(connection.writer, .service_unavailable) catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
             }
@@ -3658,14 +3654,14 @@ pub fn Server(comptime Ctx: type) type {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.HeadersTooLarge => {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
-                        sendHeadersTooLarge(connection.writer) catch
+                        sendFixed(connection.writer, .headers_too_large) catch
                             return connection.getWriteError() orelse error.Unexpected;
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                         return .close;
                     },
                     error.TooManyHeaders => {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
-                        sendHeadersTooLarge(connection.writer) catch
+                        sendFixed(connection.writer, .headers_too_large) catch
                             return connection.getWriteError() orelse error.Unexpected;
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                         return .close;
@@ -3701,7 +3697,7 @@ pub fn Server(comptime Ctx: type) type {
                             !(build_options.use_tls and l.config.tls != null);
                         const bad_preface = h2c and first and e == error.InvalidMethod;
                         if (!bad_preface and !std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
-                            sendBadRequest(connection.writer) catch
+                            sendFixed(connection.writer, .bad_request) catch
                                 return connection.getWriteError() orelse error.Unexpected;
                         }
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
