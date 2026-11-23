@@ -874,7 +874,8 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
             if (note.done) done += 1;
         }
         rows.deinit();
-        // Closed: a second deinit gives nothing back again (one reader).
+        // Closed: a second deinit gives nothing back again; the file pass
+        // (one reader) is the check, :memory:'s writer would not notice.
         rows.deinit();
         try testing.expectEqual(@as(?Note, null), try rows.next());
         try testing.expectEqual(@as(usize, 300), n);

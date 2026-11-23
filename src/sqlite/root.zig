@@ -964,6 +964,8 @@ fn failedWith(d: *Client, cx: anytype, comptime message: []const u8) Error {
 }
 
 /// The writer connection, held (`Client.acquire`) for the driver's own calls.
+/// The `Conn` and its copies share one checkout record in the ctx's arena:
+/// release before that arena is reset or freed.
 pub const Conn = struct {
     db: *Client,
     io: std.Io,
@@ -984,7 +986,8 @@ pub const Conn = struct {
     }
 
     /// Gives the writer back, for the next call or transaction; a second
-    /// call does nothing (it logs). Don't call anything on it after.
+    /// call does nothing (it logs) while the ctx's arena that holds the
+    /// checkout record lives. Don't call anything on it after.
     pub fn release(self: *const Conn) void {
         if (!self.checkout.once()) {
             log.err("sqlite \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.db.name});
