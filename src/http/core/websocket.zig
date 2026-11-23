@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Transport = @import("transport.zig").Transport;
 const placement = @import("placement.zig");
 const admission = @import("admission.zig");
@@ -52,9 +53,8 @@ pub const WebSocket = struct {
     /// allocated nothing (a borrowed payload) leaves the reset for the next
     /// one that did (`resetMessages`).
     msg_arena_used: bool = false,
-    fragmented_type: ?MessageType = null,
-    /// The message in pieces had RSV1 on its first frame.
-    fragmented_compressed: bool = false,
+    /// Set while a message arrives in pieces; null otherwise.
+    fragment: ?Fragment = null,
     /// An extension that claims RSV1 (permessage-deflate, RFC 7692) was
     /// negotiated: RSV1 on a message's first frame is passed on as
     /// `Message.compressed` rather than refused. The extension itself is
@@ -415,12 +415,11 @@ pub const WebSocket = struct {
         // its bytes stay in the message arena until the next receive.
         defer self.held.release();
         self.fragmented_data = .empty;
-        self.fragmented_type = null;
-        self.fragmented_compressed = false;
+        self.fragment = null;
         while (true) {
             // The batch ends where reading would wait for the peer: what
             // it held goes out first.
-            if (self.batch.deferred.load(.monotonic) and bufferedFrame(self.transport.reader.buffered()) == null and
+            if (self.batch.isHeld() and bufferedFrame(self.transport.reader.buffered()) == null and
                 !(bufferedHeader(self.transport.reader.buffered()) and self.transport.bufferedBelow()))
             {
                 try self.flushDeferred();
@@ -472,19 +471,17 @@ pub const WebSocket = struct {
                     return .{ .type = .close, .data = reason, .close_code = close_code };
                 },
                 .continuation => {
-                    if (self.fragmented_type == null) {
-                        return Error.UnexpectedContinuation;
-                    }
+                    const fragment = self.fragment orelse return Error.UnexpectedContinuation;
                     if (self.fragmented_data.items.len + frame.payload.len > self.max_message_size) {
                         return Error.MessageTooLarge;
                     }
                     try self.hold(frame.payload.len);
                     try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     if (frame.fin) {
-                        const msg_type = self.fragmented_type.?;
+                        const msg_type = fragment.type;
+                        const compressed = fragment.compressed;
                         const data = try self.fragmented_data.toOwnedSlice(self.messageAllocator());
-                        self.fragmented_type = null;
-                        const compressed = self.fragmented_compressed;
+                        self.fragment = null;
                         if (!compressed and msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
                             return Error.InvalidUtf8;
                         }
@@ -494,7 +491,7 @@ pub const WebSocket = struct {
                 .text, .binary => {
                     // A message may not begin while another is still in
                     // pieces, whether or not the new one is whole.
-                    if (self.fragmented_type != null) {
+                    if (self.fragment != null) {
                         return Error.NestedFragment;
                     }
                     if (frame.fin) {
@@ -508,8 +505,7 @@ pub const WebSocket = struct {
                         if (frame.payload.len > self.max_message_size) {
                             return Error.MessageTooLarge;
                         }
-                        self.fragmented_type = frame.opcode;
-                        self.fragmented_compressed = frame.rsv1;
+                        self.fragment = .{ .type = frame.opcode, .compressed = frame.rsv1 };
                         self.fragmented_data.clearRetainingCapacity();
                         try self.hold(frame.payload.len);
                         try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
@@ -522,17 +518,33 @@ pub const WebSocket = struct {
 
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.writeSent(msg_type, data);
+        return self.sendFrame(msg_type, data, .{});
     }
 
-    /// `writeFrame` for `send` and `ping`, with `sendFlush` decided under
-    /// the write lock.
-    fn writeSent(self: *WebSocket, opcode: MessageType, data: []const u8) !void {
+    /// A message arriving in pieces: its type and whether its first frame had RSV1.
+    const Fragment = struct { type: MessageType, compressed: bool };
+
+    /// What a send variant is, as comptime options: each wrapper compiles to
+    /// straight-line code. Add a send kind as an option, not as a copy.
+    const SendOpts = struct {
+        /// RSV1 set: a message the negotiated extension compressed.
+        compressed: bool = false,
+        /// `.manual`: left in the buffer for `flush`; `.auto`: `sendFlush`.
+        flush: enum { auto, manual } = .auto,
+        /// A control frame (ping): no text/binary opcode check.
+        control: bool = false,
+    };
+
+    /// Every send ends here. Checks in order: opcode, RSV1, then under the
+    /// write lock the socket being open; `sendFlush` is decided under the lock.
+    inline fn sendFrame(self: *WebSocket, opcode: MessageType, data: []const u8, comptime o: SendOpts) !void {
+        if (!o.control and opcode != .text and opcode != .binary) return Error.InvalidOpcode;
+        if (o.compressed and !self.rsv1_allowed) return Error.ReservedFlags;
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, true, self.sendFlush(data.len)));
+        const after: Flush = if (o.flush == .manual) .manual else self.sendFlush(data.len);
+        return self.resolveWrite(self.writeFrameRsv(opcode, data, true, after, if (o.compressed) 0x40 else 0));
     }
 
     /// The biggest payload a batch holds back; a bigger frame goes out at
@@ -562,39 +574,25 @@ pub const WebSocket = struct {
     /// follows a run of them with one `flush`. For a task that sends many
     /// messages to this socket in a row (a broadcast, the C ABI's sender).
     pub fn sendNoFlush(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, .manual, 0));
+        return self.sendFrame(msg_type, data, .{ .flush = .manual });
     }
 
     /// `sendNoFlush` for a message the negotiated extension compressed
     /// (`sendCompressed`).
     pub fn sendCompressedNoFlush(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        if (!self.rsv1_allowed) return Error.ReservedFlags;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, .manual, 0x40));
+        return self.sendFrame(msg_type, data, .{ .compressed = true, .flush = .manual });
     }
 
     /// Sends `data`, already compressed by the negotiated extension, as one
     /// message with RSV1 set. Needs `rsv1_allowed`.
     pub fn sendCompressed(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        if (!self.rsv1_allowed) return Error.ReservedFlags;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, self.sendFlush(data.len), 0x40));
+        return self.sendFrame(msg_type, data, .{ .compressed = true });
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
         if (data.len > 125) return Error.LargeControlFrame;
-        try self.writeSent(.ping, data);
+        try self.sendFrame(.ping, data, .{ .control = true });
     }
 
     /// Write out whatever is left in the write buffer. Safe to call from
@@ -614,7 +612,7 @@ pub const WebSocket = struct {
     fn flushDeferred(self: *WebSocket) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        if (!self.batch.isHeld() or self.closed) return;
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
@@ -647,7 +645,7 @@ pub const WebSocket = struct {
     /// the next frame is buffered and no message is half assembled. Where it
     /// can stop reading (`detachBuffers`) until the peer sends again.
     pub fn atRest(self: *const WebSocket) bool {
-        return self.fragmented_type == null and self.transport.reader.bufferedLen() == 0;
+        return self.fragment == null and self.transport.reader.bufferedLen() == 0;
     }
 
     /// For a socket that waits with no task reading it (a parked
@@ -692,7 +690,7 @@ pub const WebSocket = struct {
         r.seek = 0;
         r.end = 0;
         self.fragmented_data = .empty;
-        self.fragmented_type = null;
+        self.fragment = null;
         _ = self.msg_arena.reset(.free_all);
         self.msg_arena_used = false;
     }
@@ -845,11 +843,7 @@ pub const WebSocket = struct {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin, after));
-    }
-
-    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush) std.Io.Writer.Error!void {
-        return self.writeFrameRsv(opcode, data, fin, after, 0);
+        return self.resolveWrite(self.writeFrameRsv(opcode, data, fin, after, 0));
     }
 
     fn writeFrameRsv(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush, rsv: u8) std.Io.Writer.Error!void {
@@ -968,7 +962,7 @@ pub const WebSocket = struct {
         std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, .now));
+        try self.resolveWrite(self.writeFrameRsv(.close, buf[0 .. 2 + reason_len], true, .now, 0));
     }
 
     /// Whether `key` is a `Sec-WebSocket-Key` as RFC 6455 §4.1 has it: 16
@@ -991,6 +985,12 @@ pub const WebSocket = struct {
         _ = std.base64.standard.Encoder.encode(out, &hash);
     }
 };
+
+/// The task (`placement.taskId`) on this thread that is inside a batch of
+/// some socket right now: it read a message with another already buffered
+/// behind it. Frames it sends to other sockets wait for their backstops
+/// (`WebSocket.sendFlush`). 0 when none.
+threadlocal var batching_task: usize = 0;
 
 /// One write per read: the frames the reading task sends while the peer's
 /// next message is already in the read buffer stay in the write buffer
@@ -1027,19 +1027,74 @@ pub const WebSocket = struct {
 /// Shared with layers that frame WebSocket messages themselves (over
 /// HTTP/2 and HTTP/3): the owner gives it a flush function and calls
 /// `flushing` under its write lock as every flush starts.
-/// The task (`placement.taskId`) on this thread that is inside a batch of
-/// some socket right now: it read a message with another already buffered
-/// behind it. Frames it sends to other sockets wait for their backstops
-/// (`WebSocket.sendFlush`). 0 when none.
-threadlocal var batching_task: usize = 0;
-
+///
+/// A batch's four lifecycles, each one value with its own writer and lock
+/// (one word for all would cost a compare-and-swap on every send, since
+/// `flushing` writes Held per flush):
+///
+/// Round: `owner`, the reading task's id while a batch lasts, else 0, with
+/// the thread's `batching_task`. Written only by the reader (`round`,
+/// `endRound`, `deinit`), read lock-free by senders (`holds`) as a hint:
+/// a stale "mine" is a frame the reader's next send or read flushes, a
+/// stale "not mine" one that goes out now.
+///
+/// | event        | owner | batching_task                    |
+/// |--------------|-------|----------------------------------|
+/// | round(true)  | me    | me                               |
+/// | round(false) | 0     | 0 if it is me, else kept         |
+/// | endRound     | 0     | 0 if it was the owner, else kept |
+/// | deinit       | kept  | 0 if it was the owner, else kept |
+///
+/// Held: `deferred` (`isHeld`), frames sit in the write buffer for the
+/// batch. Every write under the owner's write lock; read lock-free by the
+/// reader and under `home.mutex` by `Backstop.run` and `endIfIdle`, so
+/// `hold` sets it BEFORE it queues, and `flushing` runs BEFORE the write
+/// that parks.
+///
+/// | state | hold                           | flushing | hold refused a backstop |
+/// |-------|--------------------------------|----------|-------------------------|
+/// | out   | held (the batch's first frame) | out      | unreachable: a refusal follows a move to held |
+/// | held  | held (no-op: one load)         | out      | out (the caller flushes now) |
+///
+/// Membership (`member`, with `home` valid iff not free) x MemberEvent:
+///
+/// | state  | queue (`hold`)       | pop (`Backstop.run`) | leave (`deinit`) |
+/// |--------|----------------------|----------------------|------------------|
+/// | free   | queued (join; the backstop may refuse: stays free) | unreachable: only queued batches are listed | free (never reached: `deinit` leaves only with a `home`) |
+/// | joined | queued (append, wake)| unreachable          | free             |
+/// | queued | queued (no re-append, no second wake: `queue` returns before the move) | joined | free (unlink) |
+///
+/// Lock: `free` under the owner's write lock (only a sender joins),
+/// `joined`/`queued` under `home.mutex`; free -> queued under both, in
+/// that order. `deinit` leaves only a batch with a `home`.
+///
+/// Task (`task`, the flusher) x TaskEvent:
+///
+/// | state   | start (`hold`, `run`) | idle (`endIfIdle`)    | stop (`stopFlusher`) |
+/// |---------|-----------------------|-----------------------|----------------------|
+/// | none    | running (spawned; a failed spawn stays none, the caller learns) | none (no-op: a second flusher, see below) | none (no-op) |
+/// | running | running (no spawn, the caller wakes it) | none (only when not Held; the task returns) | none (after awaiting the task) |
+///
+/// Lock: while `member == .free` the owner's write lock (off zio's
+/// executors: such a flusher has no `home` and never goes idle); while
+/// joined or queued `home.mutex`. `stopFlusher` runs with nothing held and
+/// no reader running, and clears a free batch's task with no lock.
+///
+/// Across the axes: `Backstop.run` pops, and if Held starts the flusher
+/// (Task start) then wakes it; `endIfIdle` stays running while Held;
+/// `leave` does not touch Task, and `deinit` cancels the flusher's group
+/// whatever Task says: a flusher past `endIfIdle` (Task none) is still
+/// returning, and its `Group` lives in this struct. Kept as today, not
+/// fixed here: a `hold` off zio's executors on a joined batch takes the
+/// thread path, writing Task under the write lock while `endIfIdle`
+/// writes it under `home.mutex`, so it and `Backstop.run` can both spawn
+/// a flusher; the second to go idle finds Task none and leaves it there
+/// (the none x idle no-op); and a flusher started off the executors
+/// keeps its null `home` (never idles) if the batch later joins.
 pub const Batch = struct {
-    /// The reading task (`placement.taskId`) while the batch lasts; 0
-    /// when there is none.
+    /// Round: the reading task while the batch lasts; 0 when none.
     owner: std.atomic.Value(usize) = .init(0),
-    /// Frames sit in the write buffer for the batch. Set by the reading
-    /// task, cleared by whichever flush sends them, as it starts; both
-    /// under the owner's write lock.
+    /// Held (`isHeld`). Under the owner's write lock.
     deferred: std.atomic.Value(bool) = .init(false),
     /// The socket's own flusher: one task, started when a batch needs it
     /// and, on zio's executors, ended when it has nothing more to flush
@@ -1047,20 +1102,45 @@ pub const Batch = struct {
     flusher: std.Io.Group = .init,
     /// Set when a held batch needs the flusher; it waits on it.
     wake: placement.Signal = .{},
-    /// The flusher task is running. Under the owner's write lock off zio's
-    /// executors, under `home`'s lock on them.
-    started: bool = false,
+    task: Task = .none,
     /// Starts the flusher with the owner's flush function (`hold`).
     start_flusher: ?*const fn (*Batch, std.Io) std.Io.ConcurrentError!void = null,
-    /// The executor backstop this batch is queued on, from its first batch
-    /// on zio's executors.
+    /// The executor backstop this batch joined; set iff `member != .free`.
     home: ?*Backstop = null,
-    /// In `home`'s queue. Under its lock.
+    /// In `home`'s queue while `member == .queued`.
     node: std.DoublyLinkedList.Node = .{},
-    queued: bool = false,
-    /// Off only for tests that count writes, where a backstop on another
-    /// thread (`std.Io.Threaded`) would flush at a moment of its choosing.
-    backstop_on: bool = true,
+    member: Membership = .free,
+    /// Tests that count writes turn it off: a backstop on another thread
+    /// (`std.Io.Threaded`) would flush at a moment of its choosing.
+    backstop_on: if (builtin.is_test) bool else void = if (builtin.is_test) true else {},
+
+    const Membership = enum { free, joined, queued };
+    const MemberEvent = enum { queue, pop, leave };
+    const Task = enum { none, running };
+    const TaskEvent = enum { start, idle, stop };
+
+    /// The tables above (null: unreachable). Every move of `member` and
+    /// `task` is a cell here: add behaviour as a cell, not a branch. Two
+    /// cells only record what control flow guards: queued x queue
+    /// (`Backstop.queue` returns first) and free x leave (`deinit` checks
+    /// `home`).
+    const member_table = std.EnumArray(Membership, std.EnumArray(MemberEvent, ?Membership)).init(.{
+        .free = .init(.{ .queue = .queued, .pop = null, .leave = .free }),
+        .joined = .init(.{ .queue = .queued, .pop = null, .leave = .free }),
+        .queued = .init(.{ .queue = .queued, .pop = .joined, .leave = .free }),
+    });
+    const task_table = std.EnumArray(Task, std.EnumArray(TaskEvent, ?Task)).init(.{
+        .none = .init(.{ .start = .running, .idle = .none, .stop = .none }),
+        .running = .init(.{ .start = .running, .idle = .none, .stop = .none }),
+    });
+
+    fn moveMember(self: *Batch, ev: MemberEvent) void {
+        self.member = member_table.get(self.member).get(ev).?;
+    }
+
+    fn moveTask(self: *Batch, ev: TaskEvent) void {
+        self.task = task_table.get(self.task).get(ev).?;
+    }
 
     /// The reading task, as it hands a message on: `more` when another
     /// whole message (or a close) is already buffered behind it.
@@ -1095,6 +1175,11 @@ pub const Batch = struct {
         return owner != 0 and owner == placement.taskId(io);
     }
 
+    /// Held: frames sit in the write buffer for the batch.
+    pub inline fn isHeld(self: *const Batch) bool {
+        return self.deferred.load(.monotonic);
+    }
+
     /// Under the owner's write lock, with a frame left in the buffer for
     /// the batch. The first frame of a batch queues it for the backstop,
     /// which has `flushFn(self)` flush what the batch still holds once the
@@ -1103,11 +1188,11 @@ pub const Batch = struct {
     pub fn hold(self: *Batch, io: std.Io, comptime flushFn: fn (*Batch) std.Io.Cancelable!void) bool {
         if (self.deferred.load(.monotonic)) return true;
         self.deferred.store(true, .monotonic);
-        if (!self.backstop_on) return true;
+        if (comptime builtin.is_test) if (!self.backstop_on) return true;
         self.start_flusher = Flusher(flushFn).start;
         if (placement.currentExecutor(io) != null) {
-            if (Backstop.queue(self, io)) return true;
-        } else if (self.started or self.startFlusher(io)) {
+            if ((self.home orelse &Backstop.local).queue(self, io)) return true;
+        } else if (self.startFlusher(io)) {
             self.wake.set(io);
             return true;
         }
@@ -1115,9 +1200,10 @@ pub const Batch = struct {
         return false;
     }
 
+    /// Task `start`: spawns from `none` only. False when the spawn fails.
     fn startFlusher(self: *Batch, io: std.Io) bool {
-        self.start_flusher.?(self, io) catch return false;
-        self.started = true;
+        if (self.task == .none) self.start_flusher.?(self, io) catch return false;
+        self.moveTask(.start);
         return true;
     }
 
@@ -1142,17 +1228,17 @@ pub const Batch = struct {
         };
     }
 
-    /// The flusher, after a flush on zio's executors: it ends when the
+    /// The flusher, after a flush on zio's executors: Task `idle` when the
     /// batch holds nothing more, so a socket keeps no task between
     /// batches; the backstop starts one again for the next batch that
     /// needs it. Under `home`'s lock, which the backstop holds to see
-    /// `started` and wake the flusher, so a batch that started holding
-    /// meanwhile (`deferred`, set before it queues) keeps this one running.
+    /// `task` and wake the flusher, so a batch that started holding
+    /// meanwhile (Held, set before it queues) keeps this one running.
     fn endIfIdle(self: *Batch, home: *Backstop, io: std.Io) bool {
         home.mutex.lockUncancelable(io);
         defer home.mutex.unlock(io);
-        if (self.deferred.load(.monotonic)) return false;
-        self.started = false;
+        if (self.isHeld()) return false;
+        self.moveTask(.idle);
         return true;
     }
 
@@ -1165,22 +1251,23 @@ pub const Batch = struct {
         self.deferred.store(false, .monotonic);
     }
 
-    /// Ends the socket's flusher task, if it has one: for a socket that
-    /// waits with no task reading it. With nothing held (`deferred` clear),
-    /// so no backstop starts it again meanwhile; started again with the
-    /// next batch that needs it.
+    /// Task `stop`: ends the socket's flusher task, if it has one, for a
+    /// socket that waits with no task reading it. With nothing held, so no
+    /// backstop starts it again meanwhile; started again with the next
+    /// batch that needs it.
     pub fn stopFlusher(self: *Batch, io: std.Io) void {
-        if (!self.started) return;
+        if (self.task == .none) return;
         self.flusher.cancel(io);
         if (self.home) |home| {
             home.mutex.lockUncancelable(io);
             defer home.mutex.unlock(io);
-            self.started = false;
-        } else self.started = false;
+            self.moveTask(.stop);
+        } else self.moveTask(.stop);
     }
 
     /// Takes the batch off its executor's backstop and stops its flusher.
-    /// Before the owner goes away.
+    /// Before the owner goes away. The cancel is unconditional, not
+    /// `stopFlusher`: see the tables above.
     pub fn deinit(self: *Batch, io: std.Io) void {
         const owner = self.owner.load(.monotonic);
         if (owner != 0 and batching_task == owner) batching_task = 0;
@@ -1200,40 +1287,66 @@ pub const Batch = struct {
 /// so the lock is never contended there; it is for a socket whose reading
 /// task the handler started elsewhere. Lock order: an owner's write lock,
 /// then this one; nothing under this lock takes a write lock or waits.
+///
+/// State x Event, all under `mutex` (`live` counts the joined batches):
+///
+/// | state    | join (a free batch queues) | leave_other (live stays > 0) | leave_last (live becomes 0) | task_ended (`leave`, after the cancel) |
+/// |----------|----------------------------|------------------------------|-----------------------------|-----------------------------------------|
+/// | stopped  | running (task spawned; a failed spawn refuses: stays stopped) | unreachable: live is 0 | unreachable: live is 0 | unreachable: no task |
+/// | running  | running                    | running                      | stopping                    | unreachable: only `leave` cancels it |
+/// | stopping | stopping: refused before the move (`queue`), the caller flushes at once (the hand-over) | unreachable: live is 0 | unreachable: live is 0 | stopped |
+///
+/// `leave_last` and `task_ended` are two lock acquisitions: the cancel in
+/// between awaits the task, which takes `mutex`, and no lock is held
+/// across a wait. running implies live >= 1; stopped and stopping imply
+/// live 0 and nothing pending; every pending batch is queued with this
+/// home.
 const Backstop = struct {
     mutex: std.Io.Mutex = .init,
-    /// Batches to look at, each queued once (`Batch.queued`).
+    /// Batches to look at, each queued once (`Batch.member`).
     pending: std.DoublyLinkedList = .{},
-    /// Batches that have queued here and not left.
+    /// Batches that have joined and not left.
     live: usize = 0,
     task: std.Io.Group = .init,
     wake: placement.Signal = .{},
-    running: bool = false,
-    /// `leave` is waiting for the task to end: nothing joins meanwhile.
-    stopping: bool = false,
+    state: State = .stopped,
 
     threadlocal var local: Backstop = .{};
 
-    /// Queues `batch` on the calling task's executor, or on the one it
-    /// joined: false when there is no backstop to be had.
-    fn queue(batch: *Batch, io: std.Io) bool {
-        const self = batch.home orelse &local;
+    const State = enum { stopped, running, stopping };
+    const Event = enum { join, leave_other, leave_last, task_ended };
+
+    /// The table above (null: unreachable). stopping x join only records
+    /// the refusal: `queue` returns false before it moves.
+    const table = std.EnumArray(State, std.EnumArray(Event, ?State)).init(.{
+        .stopped = .init(.{ .join = .running, .leave_other = null, .leave_last = null, .task_ended = null }),
+        .running = .init(.{ .join = .running, .leave_other = .running, .leave_last = .stopping, .task_ended = null }),
+        .stopping = .init(.{ .join = .stopping, .leave_other = null, .leave_last = null, .task_ended = .stopped }),
+    });
+
+    fn move(self: *Backstop, ev: Event) void {
+        self.state = table.get(self.state).get(ev).?;
+    }
+
+    /// Queues `batch` here (its `home`, or the calling thread's backstop
+    /// for a free batch): false when the batch cannot join.
+    fn queue(self: *Backstop, batch: *Batch, io: std.Io) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (batch.home == null) {
-            if (self.stopping) return false;
-            if (!self.running) {
-                placement.concurrent(&self.task, io, .local, run, .{ self, io }) catch return false;
-                self.running = true;
+        if (batch.member == .free) {
+            switch (self.state) {
+                .stopping => return false,
+                .stopped => placement.concurrent(&self.task, io, .local, run, .{ self, io }) catch return false,
+                .running => {},
             }
+            self.move(.join);
             self.live += 1;
             batch.home = self;
         }
-        if (!batch.queued) {
-            self.pending.append(&batch.node);
-            batch.queued = true;
-            self.wake.set(io);
-        }
+        if (batch.member == .queued) return true;
+        batch.moveMember(.queue);
+        self.pending.append(&batch.node);
+        self.wake.set(io);
         return true;
     }
 
@@ -1245,10 +1358,10 @@ const Backstop = struct {
             defer self.mutex.unlock(io);
             while (self.pending.popFirst()) |node| {
                 const batch: *Batch = @fieldParentPtr("node", node);
-                batch.queued = false;
+                batch.moveMember(.pop);
                 // Flushed by its reader, as it went to read: the usual case.
-                if (!batch.deferred.load(.monotonic)) continue;
-                if (batch.started or batch.startFlusher(io)) {
+                if (!batch.isHeld()) continue;
+                if (batch.startFlusher(io)) {
                     batch.wake.set(io);
                 } else {
                     // No task for it: what it holds goes out with its
@@ -1261,26 +1374,22 @@ const Backstop = struct {
 
     fn leave(self: *Backstop, batch: *Batch, io: std.Io) void {
         self.mutex.lockUncancelable(io);
-        if (batch.queued) {
-            self.pending.remove(&batch.node);
-            batch.queued = false;
-        }
+        if (batch.member == .queued) self.pending.remove(&batch.node);
+        batch.moveMember(.leave);
         batch.home = null;
         self.live -= 1;
         const last = self.live == 0;
-        if (last) self.stopping = true;
+        self.move(if (last) .leave_last else .leave_other);
         self.mutex.unlock(io);
         if (!last) return;
         // Waits for the task to end; a batch that starts meanwhile flushes
-        // at once (`queue`).
+        // at once (`queue` refuses it while stopping).
         self.task.cancel(io);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.running = false;
-        self.stopping = false;
+        self.move(.task_ended);
     }
 };
-
 /// XORs `payload` with the 4-byte mask `key` (RFC 6455 §5.3), from the
 /// key's first byte: a vector at a time, the tail a word and then a byte
 /// at a time. About ten times the byte loop's speed from 64 bytes up.
@@ -1912,6 +2021,162 @@ fn maskedFrame(comptime opcode: u8, comptime payload: []const u8) [6 + payload.l
     return [_]u8{ 0x80 | opcode, 0x80 | @as(u8, payload.len), 0, 0, 0, 0 } ++ payload[0..payload.len].*;
 }
 
+const SendVariant = enum { send, send_no_flush, send_compressed, send_compressed_no_flush };
+
+fn callVariant(ws: *WebSocket, v: SendVariant, t: WebSocket.MessageType, data: []const u8) !void {
+    return switch (v) {
+        .send => ws.send(t, data),
+        .send_no_flush => ws.sendNoFlush(t, data),
+        .send_compressed => ws.sendCompressed(t, data),
+        .send_compressed_no_flush => ws.sendCompressedNoFlush(t, data),
+    };
+}
+
+const send_variant_rows = [_]struct { v: SendVariant, compressed: bool, manual: bool }{
+    .{ .v = .send, .compressed = false, .manual = false },
+    .{ .v = .send_no_flush, .compressed = false, .manual = true },
+    .{ .v = .send_compressed, .compressed = true, .manual = false },
+    .{ .v = .send_compressed_no_flush, .compressed = true, .manual = true },
+};
+
+test "WebSocket: the send variants set RSV1 and flush as each says" {
+    const gpa = std.testing.allocator;
+    for (send_variant_rows) |row| for ([_]WebSocket.MessageType{ .text, .binary }) |t| for ([_]bool{ true, false }) |autoflush| {
+        errdefer std.debug.print("variant {s} type {s} autoflush {}\n", .{ @tagName(row.v), @tagName(t), autoflush });
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.batch.backstop_on = false;
+        ws.rsv1_allowed = true;
+        ws.autoflush = autoflush;
+        try callVariant(&ws, row.v, t, "m");
+        const out_now = !row.manual and autoflush;
+        try std.testing.expectEqual(@as(usize, @intFromBool(out_now)), probe.writes);
+        if (!out_now) try ws.flush();
+        try std.testing.expectEqual(@as(usize, 1), probe.writes);
+        const op: u8 = if (t == .text) 0x1 else 0x2;
+        try std.testing.expectEqual(@as(u8, 0x80 | op | if (row.compressed) @as(u8, 0x40) else 0), probe.out.items[0]);
+    };
+}
+
+test "WebSocket: ping follows autoflush" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |autoflush| {
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.batch.backstop_on = false;
+        ws.autoflush = autoflush;
+        try ws.ping("p");
+        try std.testing.expectEqual(@as(usize, @intFromBool(autoflush)), probe.writes);
+        try ws.flush();
+        try std.testing.expectEqual(@as(u8, 0x89), probe.out.items[0]);
+    }
+}
+
+test "WebSocket: send errors keep their order: opcode, RSV1, closed" {
+    const gpa = std.testing.allocator;
+    const E = WebSocket.Error;
+    const bad = [_]WebSocket.MessageType{ .ping, .pong, .close, .continuation, @fromBackingInt(@intCast(0x3)) };
+    // rsv1_allowed x closed -> the error a compressed and a plain variant give for a text message.
+    const rows = [_]struct { rsv1: bool, closed: bool, compressed_err: anyerror, plain_err: ?anyerror }{
+        .{ .rsv1 = false, .closed = false, .compressed_err = E.ReservedFlags, .plain_err = null },
+        .{ .rsv1 = false, .closed = true, .compressed_err = E.ReservedFlags, .plain_err = error.EndOfStream },
+        .{ .rsv1 = true, .closed = true, .compressed_err = error.EndOfStream, .plain_err = error.EndOfStream },
+    };
+    for (rows) |row| for (send_variant_rows) |v| {
+        errdefer std.debug.print("variant {s} rsv1 {} closed {}\n", .{ @tagName(v.v), row.rsv1, row.closed });
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.rsv1_allowed = row.rsv1;
+        ws.closed = row.closed;
+        for (bad) |t| try std.testing.expectError(E.InvalidOpcode, callVariant(&ws, v.v, t, "x"));
+        const want: ?anyerror = if (v.compressed) row.compressed_err else row.plain_err;
+        if (want) |e| {
+            try std.testing.expectError(@as(anyerror, e), @as(anyerror!void, callVariant(&ws, v.v, .text, "x")));
+        } else {
+            try callVariant(&ws, v.v, .text, "x");
+        }
+        try std.testing.expect(probe.writes == 0 or want == null);
+    };
+}
+
+test "WebSocket: ping takes 125 bytes, refuses 126, and fails once closed" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    var reader: std.Io.Reader = .fixed("");
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+    const big: [126]u8 = @splat('p');
+    try ws.ping(big[0..125]);
+    try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.ping(&big));
+    ws.closed = true;
+    try std.testing.expectError(error.EndOfStream, ws.ping("p"));
+}
+
+test "WebSocket: a compressed fragmented message skips UTF-8 checks, and the flag does not outlive it" {
+    const bad = [_]u8{ 0xFF, 0xFE };
+    // RSV1 on the first frame or not; the pieces are masked with a zero key.
+    for ([_]bool{ true, false }) |rsv1| {
+        errdefer std.debug.print("rsv1 {}\n", .{rsv1});
+        var frames = [_]u8{ if (rsv1) 0x41 else 0x01, 0x81, 0, 0, 0, 0, bad[0], 0x80, 0x81, 0, 0, 0, 0, bad[1] } ++ maskedFrame(0x1, "ok");
+        var reader: std.Io.Reader = undefined;
+        var out: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var ws = serverSocketOver(&frames, &reader, &w);
+        defer ws.deinit();
+        ws.rsv1_allowed = true;
+        if (!rsv1) {
+            try std.testing.expectError(WebSocket.Error.InvalidUtf8, ws.receive());
+            continue;
+        }
+        const msg = try ws.receive();
+        try std.testing.expect(msg.compressed);
+        try std.testing.expectEqualSlices(u8, &bad, msg.data);
+        const next = try ws.receive();
+        try std.testing.expect(!next.compressed);
+    }
+}
+
+test "WebSocket: atRest follows the fragment, and a continuation needs one" {
+    var frames = [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'a', 0x80, 0x81, 0, 0, 0, 0, 'b' } ++ maskedFrame(0x0, "c");
+    var reader: std.Io.Reader = undefined;
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var ws = serverSocketOver(&frames, &reader, &w);
+    defer ws.deinit();
+    // Whole message first: "ab" delivered, nothing half assembled.
+    const msg = try ws.receive();
+    try std.testing.expectEqualStrings("ab", msg.data);
+    try std.testing.expect(ws.fragment == null);
+    // A continuation with no message in pieces.
+    try std.testing.expectError(WebSocket.Error.UnexpectedContinuation, ws.receive());
+
+    // Mid-message: not at rest; detachBuffers puts it back.
+    var r2: std.Io.Reader = .fixed("");
+    var w2: std.Io.Writer = .fixed(&out);
+    var ws2 = serverSocketOver(&.{}, &r2, &w2);
+    defer ws2.deinit();
+    try std.testing.expect(ws2.atRest());
+    ws2.fragment = .{ .type = .text, .compressed = true };
+    try std.testing.expect(!ws2.atRest());
+    ws2.detachBuffers();
+    try std.testing.expect(ws2.atRest());
+}
+
 test "WebSocket: messages read together are answered in one write" {
     const gpa = std.testing.allocator;
     var wbuf: [256]u8 = undefined;
@@ -2064,7 +2329,7 @@ test "WebSocket: from a task mid-batch, a big frame, or one the buffer has no ro
     try std.testing.expect(b_probe.writes > writes);
     try std.testing.expectEqual(@as(usize, 0), b_probe.interface.end);
     try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len + 4 + big.len), b_probe.out.items.len);
-    try std.testing.expect(!b.batch.deferred.load(.monotonic));
+    try std.testing.expect(!b.batch.isHeld());
 }
 
 test "WebSocket: sendNoFlush leaves frames for one flush, in order" {
@@ -2142,6 +2407,205 @@ test "WebSocket: what a batch holds goes out when the reader waits for something
     try ws.write_mutex.lock(io);
     defer ws.write_mutex.unlock(io);
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A' }, probe.out.items);
+}
+
+/// Every (state, event) cell of one of `Batch`'s or `Backstop`'s tables,
+/// against the cells written out in `want` (null: unreachable).
+fn expectCells(comptime S: type, comptime E: type, table: std.EnumArray(S, std.EnumArray(E, ?S)), want: std.EnumArray(S, [std.enums.values(E).len]?S)) !void {
+    for (std.enums.values(S)) |from| {
+        errdefer std.debug.print("state: {s}\n", .{@tagName(from)});
+        for (std.enums.values(E), want.get(from)) |ev, cell| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            try std.testing.expectEqual(cell, table.get(from).get(ev));
+        }
+    }
+}
+
+/// What the `Batch` and `Backstop` doc comments promise between moves.
+fn expectInvariants(b: *Backstop, batches: []const *Batch, io: std.Io) !void {
+    b.mutex.lockUncancelable(io);
+    defer b.mutex.unlock(io);
+    if (b.state == .running) try std.testing.expect(b.live >= 1) else {
+        try std.testing.expectEqual(@as(usize, 0), b.live);
+        try std.testing.expectEqual(@as(?*std.DoublyLinkedList.Node, null), b.pending.first);
+    }
+    for (batches) |batch| {
+        try std.testing.expectEqual(batch.home == null, batch.member == .free);
+        var listed: usize = 0;
+        var it = b.pending.first;
+        while (it) |node| : (it = node.next) {
+            const in: *Batch = @fieldParentPtr("node", node);
+            try std.testing.expectEqual(.queued, in.member);
+            try std.testing.expectEqual(@as(?*Backstop, b), in.home);
+            if (in == batch) listed += 1;
+        }
+        try std.testing.expectEqual(@as(usize, @intFromBool(batch.member == .queued)), listed);
+    }
+}
+
+test "WebSocket batch: every membership, flusher task and backstop state x event cell" {
+    try expectCells(Batch.Membership, Batch.MemberEvent, Batch.member_table, .init(.{
+        // queue, pop, leave
+        .free = .{ .queued, null, .free },
+        .joined = .{ .queued, null, .free },
+        .queued = .{ .queued, .joined, .free },
+    }));
+    try expectCells(Batch.Task, Batch.TaskEvent, Batch.task_table, .init(.{
+        // start, idle, stop
+        .none = .{ .running, .none, .none },
+        .running = .{ .running, .none, .none },
+    }));
+    try expectCells(Backstop.State, Backstop.Event, Backstop.table, .init(.{
+        // join, leave_other, leave_last, task_ended
+        .stopped = .{ .running, null, null, null },
+        .running = .{ .running, .running, .stopping, null },
+        .stopping = .{ .stopping, null, null, .stopped },
+    }));
+}
+
+test "WebSocket batch: a backstop that is stopping refuses a join, and the batch keeps what it holds" {
+    const io = std.testing.io;
+    // The hand-over: the last batch's `leave` waits for the task to end.
+    var b: Backstop = .{ .state = .stopping };
+    var batch: Batch = .{};
+    batch.deferred.store(true, .monotonic);
+    try std.testing.expect(!b.queue(&batch, io));
+    try std.testing.expectEqual(.free, batch.member);
+    try std.testing.expectEqual(@as(?*Backstop, null), batch.home);
+    try std.testing.expectEqual(.stopping, b.state);
+    // Held is `hold`'s to clear as it answers false.
+    try std.testing.expect(batch.isHeld());
+    try expectInvariants(&b, &.{&batch}, io);
+}
+
+test "WebSocket batch: with no backstop a hold only marks the frames held, once, until a flush starts" {
+    const io = std.testing.io;
+    const flushFn = struct {
+        fn flush(_: *Batch) std.Io.Cancelable!void {}
+    }.flush;
+    var batch: Batch = .{};
+    batch.backstop_on = false;
+    defer batch.deinit(io);
+    for ([_]bool{ true, true, false, true }) |hold| {
+        if (hold) try std.testing.expect(batch.hold(io, flushFn)) else batch.flushing();
+        try std.testing.expectEqual(hold, batch.isHeld());
+        try std.testing.expectEqual(.free, batch.member);
+        try std.testing.expectEqual(.none, batch.task);
+    }
+}
+
+test "WebSocket batch: the backstop starts with its first batch, lists each once, and stops with its last" {
+    const io = std.testing.io;
+    var b: Backstop = .{};
+    var x: Batch = .{};
+    var y: Batch = .{};
+    const both = [_]*Batch{ &x, &y };
+    try std.testing.expect(b.queue(&x, io));
+    try std.testing.expect(b.queue(&y, io));
+    // Listed still or already looked at (the task runs on its own thread):
+    // listed once either way.
+    try std.testing.expect(b.queue(&x, io));
+    try expectInvariants(&b, &both, io);
+    {
+        b.mutex.lockUncancelable(io);
+        defer b.mutex.unlock(io);
+        try std.testing.expectEqual(.running, b.state);
+        try std.testing.expectEqual(@as(usize, 2), b.live);
+        for (both) |batch| try std.testing.expectEqual(@as(?*Backstop, &b), batch.home);
+    }
+    b.leave(&x, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.running, b.state);
+    try std.testing.expectEqual(@as(usize, 1), b.live);
+    try std.testing.expectEqual(.free, x.member);
+    b.leave(&y, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.stopped, b.state);
+    try std.testing.expectEqual(.free, y.member);
+    // A new first batch starts a new task.
+    try std.testing.expect(b.queue(&x, io));
+    try std.testing.expectEqual(.running, b.state);
+    try std.testing.expectEqual(@as(usize, 1), b.live);
+    b.leave(&x, io);
+    try expectInvariants(&b, &both, io);
+    try std.testing.expectEqual(.stopped, b.state);
+}
+
+test "WebSocket batch: a flusher goes idle only once its batch holds nothing" {
+    const io = std.testing.io;
+    const rows = [_]struct { member: Batch.Membership, from: Batch.Task, held: bool, ends: bool, task: Batch.Task }{
+        .{ .member = .joined, .from = .running, .held = true, .ends = false, .task = .running },
+        .{ .member = .joined, .from = .running, .held = false, .ends = true, .task = .none },
+        .{ .member = .queued, .from = .running, .held = true, .ends = false, .task = .running },
+        .{ .member = .queued, .from = .running, .held = false, .ends = true, .task = .none },
+        // A second flusher (the off-executor hold and `Backstop.run` both
+        // spawned one on a joined batch): the first already went idle.
+        .{ .member = .joined, .from = .none, .held = false, .ends = true, .task = .none },
+        .{ .member = .joined, .from = .none, .held = true, .ends = false, .task = .none },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("member: {s}, from: {s}, held: {}\n", .{ @tagName(r.member), @tagName(r.from), r.held });
+        // The states alone: no backstop or flusher task runs.
+        var b: Backstop = .{ .state = .running, .live = 1 };
+        var batch: Batch = .{ .member = r.member, .home = &b, .task = r.from };
+        if (r.member == .queued) b.pending.append(&batch.node);
+        batch.deferred.store(r.held, .monotonic);
+        try std.testing.expectEqual(r.ends, batch.endIfIdle(&b, io));
+        try std.testing.expectEqual(r.task, batch.task);
+        try std.testing.expectEqual(r.member, batch.member);
+        try expectInvariants(&b, &.{&batch}, io);
+    }
+}
+
+test "WebSocket batch: off zio's executors a hold starts the socket's flusher, stopFlusher ends it, the next hold starts it again" {
+    const io = std.testing.io;
+    const Counted = struct {
+        batch: Batch = .{},
+        flushed: std.atomic.Value(u32) = .init(0),
+        fn flush(batch: *Batch) std.Io.Cancelable!void {
+            const self: *@This() = @fieldParentPtr("batch", batch);
+            _ = self.flushed.fetchAdd(1, .release);
+        }
+    };
+    var c: Counted = .{};
+    // Ends the flusher the second hold starts.
+    defer c.batch.deinit(io);
+    const wait = @import("anole_test_wait");
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expectEqual(.running, c.batch.task);
+    try std.testing.expectEqual(.free, c.batch.member);
+    try wait.waitAtLeast(io, "the flusher flushed", &c.flushed, 1);
+    c.batch.flushing();
+    c.batch.stopFlusher(io);
+    try std.testing.expectEqual(.none, c.batch.task);
+    c.batch.stopFlusher(io);
+    try std.testing.expectEqual(.none, c.batch.task);
+    try std.testing.expect(c.batch.hold(io, Counted.flush));
+    try std.testing.expectEqual(.running, c.batch.task);
+    try wait.waitAtLeast(io, "the new flusher flushed", &c.flushed, 2);
+}
+
+test "WebSocket batch: deinit ends the reader's round, and the last joined batch stops the backstop" {
+    const io = std.testing.io;
+    var reading: Batch = .{};
+    reading.round(io, true);
+    try std.testing.expect(Batch.sendingFromBatch(io));
+    reading.deinit(io);
+    try std.testing.expect(!Batch.sendingFromBatch(io));
+
+    var never: Batch = .{};
+    never.deinit(io);
+    try std.testing.expectEqual(.free, never.member);
+    try std.testing.expectEqual(.none, never.task);
+
+    var b: Backstop = .{};
+    var joined: Batch = .{};
+    try std.testing.expect(b.queue(&joined, io));
+    joined.deinit(io);
+    try std.testing.expectEqual(.stopped, b.state);
+    try std.testing.expectEqual(@as(usize, 0), b.live);
+    try expectInvariants(&b, &.{&joined}, io);
 }
 
 test "applyMask: matches the byte-by-byte XOR at every length and through the tail" {
