@@ -715,7 +715,7 @@ pub const Topics = struct {
     /// Everything after the head is out: `on_open`, the first sender.
     /// Its last touch of `sub` ends the opening: an end asked for since
     /// the subscriber was made (the peer gone while `on_open` ran or the
-    /// head went out, a failed first write) starts only then (`opened`).
+    /// head went out, a failed first write) starts only then (`endStep(.opened)`).
     fn arm(self: *Topics, io: std.Io, sub: *Subscriber, opts: ServeOptions) void {
         if (opts.on_open) |f| f(sub);
         var launch = false;
@@ -727,7 +727,8 @@ pub const Topics = struct {
         }
         if (launch) self.startSender(io, sub);
         self.ensureTickers(io, sub);
-        self.opened(sub);
+        // The opening is done: an end asked for meanwhile starts now.
+        if (sub.endStep(.opened)) self.startEnd(sub);
     }
 
     fn joinLocked(self: *Topics, sub: *Subscriber, name: []const u8) error{ OutOfMemory, TooManyTopics, InvalidTopic }!void {
@@ -1068,31 +1069,9 @@ pub const Topics = struct {
     }
 
     /// Starts the task that ends `sub`, once; while it is being opened,
-    /// only notes that it is to start (`opened` starts it). Must not wait.
+    /// only notes that it is to start (the end of `arm` starts it). Must not wait.
     fn spawnEnd(self: *Topics, sub: *Subscriber) void {
-        var cur = sub.end.load(.acquire);
-        while (true) {
-            const next: Subscriber.EndTask = switch (cur) {
-                .none => .started,
-                .opening => .asked,
-                .asked, .started => return,
-            };
-            cur = sub.end.cmpxchgWeak(cur, next, .acq_rel, .acquire) orelse {
-                if (next == .started) self.startEnd(sub);
-                return;
-            };
-        }
-    }
-
-    /// The opening is done (the end of `arm`, the caller's last touch of
-    /// `sub`): an end asked for meanwhile starts now.
-    fn opened(self: *Topics, sub: *Subscriber) void {
-        // Only `spawnEnd` moves it on from `opening`, to `asked`.
-        if (sub.end.cmpxchgStrong(.opening, .none, .acq_rel, .acquire)) |cur| {
-            std.debug.assert(cur == .asked);
-            sub.end.store(.started, .release);
-            self.startEnd(sub);
-        }
+        if (sub.endStep(.ask)) self.startEnd(sub);
     }
 
     fn startEnd(self: *Topics, sub: *Subscriber) void {
@@ -1100,7 +1079,7 @@ pub const Topics = struct {
         const where: placement.Where = if (sub.executor) |i| .{ .executor = i } else .local;
         placement.concurrent(&self.ends, io, where, endTask, .{ self, sub }) catch {
             // A tick tries again.
-            sub.end.store(.none, .release);
+            _ = sub.endStep(.start_failed);
         };
     }
 
@@ -1235,7 +1214,7 @@ pub const Topics = struct {
                 // failed): claimed here, under the mutex, while `sub` is
                 // linked and so not freed; started below.
                 if (sub.end.load(.acquire) == .none and sub.wantsEnd()) {
-                    if (ne < ends.len and sub.end.cmpxchgStrong(.none, .started, .acq_rel, .acquire) == null) {
+                    if (ne < ends.len and sub.endStep(.tick)) {
                         ends[ne] = sub;
                         ne += 1;
                     }
@@ -1411,15 +1390,46 @@ pub const Subscriber = struct {
     /// can come as soon as `Response._park` has the owner (the peer
     /// leaving while the head goes out or `on_open` runs), and an end
     /// started then would free the subscriber under `arm`.
+    ///
+    /// Lock-free (the engine's `gone`, senders, the ticker and `arm` move
+    /// it from any task), so it is not under the hub's mutex: `endStep` is its
+    /// only writer, one CAS over `table`. `*`: the caller starts the end
+    /// task; `-`: no change; `!`: never raised there (no change).
+    ///
+    ///   state   | ask (gone, sender done) | opened (end of arm) | start_failed | tick (wanted, none)
+    ///   opening | asked                   | none                | !            | -
+    ///   asked   | -                       | started *           | !            | -
+    ///   none    | started *               | !                   | !            | started *
+    ///   started | -                       | !                   | none         | -
     pub const EndTask = enum(u8) {
         /// Being opened (`serve`, `_attach`): an end asked for waits.
         opening,
-        /// Asked for while opening: `opened` starts it.
+        /// Asked for while opening: the end of `arm` starts it.
         asked,
         /// Not asked for (or its start failed: a tick tries again).
         none,
         started,
+
+        /// Every move of the end task is a cell here, not a branch in a caller.
+        pub const table = std.EnumArray(EndTask, std.EnumArray(EndEvent, ?EndTask)).init(.{
+            .opening = .init(.{ .ask = .asked, .opened = .none, .start_failed = null, .tick = null }),
+            .asked = .init(.{ .ask = null, .opened = .started, .start_failed = null, .tick = null }),
+            .none = .init(.{ .ask = .started, .opened = null, .start_failed = null, .tick = .started }),
+            .started = .init(.{ .ask = null, .opened = null, .start_failed = .none, .tick = null }),
+        });
     };
+
+    pub const EndEvent = enum { ask, opened, start_failed, tick };
+
+    /// Moves `end` by `ev`; true when this call moved it to `started` (the
+    /// caller starts the end task). Must not wait.
+    fn endStep(sub: *Subscriber, ev: EndEvent) bool {
+        var cur = sub.end.load(.acquire);
+        while (true) {
+            const next = EndTask.table.get(cur).get(ev) orelse return false;
+            cur = sub.end.cmpxchgWeak(cur, next, .acq_rel, .acquire) orelse return next == .started;
+        }
+    }
 
     pub const Membership = struct { topic: *Topics.Topic, index: u32 };
 

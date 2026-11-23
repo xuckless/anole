@@ -800,3 +800,21 @@ test "sse: the peer leaving while on_open runs: the end waits for the open, then
     try std.testing.expectEqual(@as(usize, 0), h.hub.stats().subscribers);
     try std.testing.expect(f.released);
 }
+
+test "sse: the subscriber's state tables: every decided cell" {
+    const EndTask = Subscriber.EndTask;
+    const end_rows = [_]struct { from: EndTask, ev: Subscriber.EndEvent, to: ?EndTask }{
+        .{ .from = .opening, .ev = .ask, .to = .asked },
+        .{ .from = .opening, .ev = .opened, .to = .none },
+        .{ .from = .opening, .ev = .tick, .to = null },
+        .{ .from = .asked, .ev = .ask, .to = null },
+        .{ .from = .asked, .ev = .opened, .to = .started },
+        .{ .from = .asked, .ev = .tick, .to = null },
+        .{ .from = .none, .ev = .ask, .to = .started },
+        .{ .from = .none, .ev = .tick, .to = .started },
+        .{ .from = .started, .ev = .ask, .to = null },
+        .{ .from = .started, .ev = .tick, .to = null },
+        .{ .from = .started, .ev = .start_failed, .to = .none },
+    };
+    for (end_rows) |row| try std.testing.expectEqual(row.to, EndTask.table.get(row.from).get(row.ev));
+}
