@@ -25,7 +25,8 @@
 //! written from where they lie: `body_bytes` from the stream's copy, a
 //! streamed body from two 16 KiB blocks it fills in turn (the server
 //! engine's sink pattern). Such memory is let go only once the writer has
-//! written past it (`Stream.retire_mark`), even after the stream closed.
+//! written past it (`Stream.retire`), even after the stream closed: the
+//! lend lifecycle is the core's blocks.zig.
 //!
 //! Its own module (`anole_h2_client`), because the core's client takes it as
 //! its `h2_client` import: when a server picks "h2" through ALPN, the core
@@ -41,6 +42,7 @@ const Deadline = dusty.Deadline;
 const Signal = dusty.Signal;
 const proto = dusty.h2_proto;
 const hpack = proto.hpack;
+const blocks = proto.blocks;
 const ErrorCode = proto.conn.ErrorCode;
 /// The core's stream (the protocol side of a `Stream`).
 const PStream = proto.conn.Stream;
@@ -205,7 +207,7 @@ pub const ClientConnection = struct {
     /// Streams the caller still holds or `proto` still knows.
     live: std.DoublyLinkedList = .{},
     /// Freed streams whose request body `out` may still be writing from,
-    /// in `retire_mark` order.
+    /// in `Stream.retire` mark order.
     retiring: std.DoublyLinkedList = .{},
     /// Tests only: writes of the writer task (each a flush of whatever the
     /// core held: concurrent requests share them).
@@ -404,9 +406,7 @@ pub const ClientConnection = struct {
         // so a stream's queue never overflows. Into the heap connection:
         // no copy of the core's HPACK tables through this frame (#223).
         try self.proto.initAt(gpa, &self.handler, .{
-            .initial_window = stream_window,
-            .connection_window = max_data,
-            .max_header_list_size = max_header_list_size,
+            .http2 = .{ .stream_window = stream_window, .connection_window = max_data, .max_header_list_size = max_header_list_size },
             .seed = seed,
         });
         errdefer self.proto.deinit();
@@ -444,8 +444,8 @@ pub const ClientConnection = struct {
             self.proto.deinit();
             self.phase = self.phase.next(.freed);
             // Nothing writes any more: what waited for the writer goes.
-            while (self.retiring.popFirst()) |node| {
-                const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node)); // SAFETY: `retire_node` is that field of a live container, so the parent is aligned
+            while (blocks.Retire.popPassed(&self.retiring, std.math.maxInt(u64))) |r| {
+                const stream: *Stream = @alignCast(@fieldParentPtr("retire", r)); // SAFETY: `retire` is that field of a live container, so the parent is aligned
                 stream.free();
             }
             // Streams released but never closed by the server.
@@ -532,7 +532,6 @@ pub const ClientConnection = struct {
                     stream.ps = ps;
                     stream.id = ps.id;
                     if (fixed != null) {
-                        stream.borrowed = true;
                         self.proto.submitData(ps, &stream.fixed_part, true) catch |err| {
                             self.proto.reset(ps, .internal_error) catch {};
                             return err;
@@ -696,11 +695,8 @@ pub const ClientConnection = struct {
     /// The freed streams whose marks `out` has passed are let go. Under
     /// the lock.
     fn retire(self: *ClientConnection) void {
-        const sent = self.proto.out.sent_total;
-        while (self.retiring.first) |node| {
-            const stream: *Stream = @alignCast(@fieldParentPtr("retire_node", node)); // SAFETY: `retire_node` is that field of a live container, so the parent is aligned
-            if (stream.retire_mark > sent) break;
-            _ = self.retiring.popFirst();
+        while (blocks.Retire.popPassed(&self.retiring, self.proto.out.sent_total)) |r| {
+            const stream: *Stream = @alignCast(@fieldParentPtr("retire", r)); // SAFETY: `retire` is that field of a live container, so the parent is aligned
             stream.free();
         }
     }
@@ -862,20 +858,18 @@ pub const Stream = struct {
     out_writer: std.Io.Writer,
     /// The request body's writer (`Req`). Under the connection's mutex.
     req: Req,
-    /// `RequestOptions.body_bytes`, copied: one part for `submitData`.
+    /// `RequestOptions.body_bytes`, copied: one part for `submitData`,
+    /// lent to the core for the stream's life when not empty.
     fixed_part: [1][]const u8 = .{""},
-    /// A streamed body's blocks: the writer fills `blocks[cur]` (its
+    /// A streamed body's blocks: the writer fills `pair.current()` (its
     /// buffer), and a full or flushed one goes to the core by reference.
-    blocks: [2]Block = .{ .{}, .{} },
-    cur: u1 = 0,
-    /// Some of the request body went to the core by reference: freeing
-    /// the stream waits for the writer to pass it (`retire_mark`). A
-    /// lifetime fact beside `req`, not a mode of it: a body given whole
-    /// (`req` none) is lent too, so folding it in would double `Req` for
-    /// its one reader (`letGo`).
-    borrowed: bool = false,
-    retire_node: std.DoublyLinkedList.Node = .{},
-    retire_mark: u64 = 0,
+    pair: blocks.Pair = .{},
+    /// One part list per block: `submitData` keeps the slice until it is
+    /// framed, and the stream outlives that.
+    parts: [2][1][]const u8 = .{ .{""}, .{""} },
+    /// In `ClientConnection.retiring` while `out` may still write from
+    /// what the stream lent.
+    retire: blocks.Retire = .{},
     /// Who still needs the stream: the caller until `release`, the core
     /// until it closes the stream. Freed once neither does (`letGo`).
     holders: std.EnumSet(Holder) = .full,
@@ -991,15 +985,6 @@ pub const Stream = struct {
         }
     };
 
-    const Block = struct {
-        mem: []u8 = &.{},
-        part: [1][]const u8 = .{""},
-        /// Submitted, and not yet known to be framed and written.
-        inflight: bool = false,
-        /// `out`'s position once the block was framed.
-        mark: ?u64 = null,
-    };
-
     fn of(s: *PStream) ?*Stream {
         // SAFETY: `user` is only ever a Stream (`request`).
         return @ptrCast(@alignCast(s.user orelse return null));
@@ -1024,8 +1009,8 @@ pub const Stream = struct {
         self.body = .init(&.{});
         self.body_reader.buffer = try a.alloc(u8, 16 * 1024);
         if (has_body) {
-            for (&self.blocks) |*b| b.mem = try a.alloc(u8, block_len);
-            self.out_writer.buffer = self.blocks[0].mem;
+            for (&self.pair.blocks) |*b| b.mem = try a.alloc(u8, block_len);
+            self.out_writer.buffer = self.pair.current().mem;
         }
         if (fixed_body) |b| self.fixed_part[0] = try a.dupe(u8, b);
         conn.lock();
@@ -1082,14 +1067,10 @@ pub const Stream = struct {
         self.holders.remove(who);
         if (self.holders.count() != 0) return;
         const conn = self.conn;
-        if (self.borrowed and conn.phase != .freed) {
-            const mark = conn.proto.out.mark();
-            if (conn.proto.out.sent_total < mark) {
-                self.retire_mark = mark;
-                conn.retiring.append(&self.retire_node);
-                return;
-            }
-        }
+        // Lent: the whole body, or a streamed block (once one went, one
+        // stays lent until the next goes, so this is "any block went").
+        const lent = self.fixed_part[0].len > 0 or self.pair.lent();
+        if (lent and conn.phase != .freed and self.retire.park(&conn.retiring, &conn.proto.out)) return;
         self.free();
     }
 
@@ -1304,7 +1285,7 @@ pub const Stream = struct {
         return n;
     }
 
-    /// Hands the writer's buffered bytes (`blocks[cur]`) to the core and
+    /// Hands the writer's buffered bytes (`pair.current()`) to the core and
     /// waits until the other block is free to fill.
     fn sendBuffered(self: *Stream) std.Io.Writer.Error!void {
         const w = &self.out_writer;
@@ -1322,26 +1303,23 @@ pub const Stream = struct {
                 self.write_err = self.resp.cause() orelse error.ConnectionClosed;
                 return error.WriteFailed;
             }
-            const b = &self.blocks[self.cur];
-            b.part[0] = bytes;
-            conn.proto.submitData(ps, &b.part, false) catch {
+            const part = &self.parts[self.pair.cur];
+            part[0] = bytes;
+            conn.proto.submitData(ps, part, false) catch {
                 self.write_err = error.StreamReset;
                 return error.WriteFailed;
             };
-            b.inflight = true;
-            b.mark = null;
-            self.borrowed = true;
-            self.cur ^= 1;
+            self.pair.lend();
             // Nothing to write into until the next block is free.
             w.buffer = &.{};
             w.end = 0;
         }
         conn.kickWriter();
         try self.waitRoom();
-        w.buffer = self.blocks[self.cur].mem;
+        w.buffer = self.pair.current().mem;
     }
 
-    /// Waits until `blocks[cur]` is free, within the request's budget.
+    /// Waits until `pair.current()` is free, within the request's budget.
     fn waitRoom(self: *Stream) std.Io.Writer.Error!void {
         const conn = self.conn;
         while (true) {
@@ -1356,7 +1334,7 @@ pub const Stream = struct {
                     self.write_err = self.resp.cause() orelse if (conn.phase.reached(.dead)) error.ConnectionClosed else error.StreamReset;
                     return error.WriteFailed;
                 }
-                if (self.roomFree()) {
+                if (self.pair.roomFree(&self.ps.?.pending, &conn.proto.out)) {
                     if (self.resp.cause()) |e| {
                         self.write_err = e;
                         return error.WriteFailed;
@@ -1379,30 +1357,6 @@ pub const Stream = struct {
                 return error.WriteFailed;
             };
         }
-    }
-
-    /// Whether the block the writer wants next (`blocks[cur]`) is free:
-    /// never submitted, or framed (the stream's queue no longer holds it:
-    /// blocks go in order, the other one after it) and written
-    /// (`out.sent_total` past a mark taken once it was framed). Only while
-    /// the stream is open (`waitRoom` checks). Under the lock.
-    fn roomFree(self: *Stream) bool {
-        const conn = self.conn;
-        const b = &self.blocks[self.cur];
-        if (!b.inflight) return true;
-        const ps = self.ps.?;
-        if (b.mark == null) {
-            var queued: usize = 0;
-            var it = ps.pending.first;
-            while (it) |n| : (it = n.next) queued += 1;
-            const after: usize = if (self.blocks[self.cur ^ 1].inflight) 1 else 0;
-            if (queued > after) return false;
-            b.mark = conn.proto.out.mark();
-        }
-        if (conn.proto.out.sent_total < b.mark.?) return false;
-        b.inflight = false;
-        b.mark = null;
-        return true;
     }
 
     fn drainOut(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {

@@ -30,13 +30,12 @@ pub fn nv(name: []const u8, value: []const u8) Field {
 /// defaults (a 65535-byte window, nothing raised), so the flow-control
 /// tests keep their numbers.
 pub const default_options: conn.Options = .{
-    .initial_window = conn.default_window,
-    .connection_window = conn.default_window,
+    .http2 = .{ .stream_window = conn.default_window, .connection_window = conn.default_window },
 };
 
 /// The HPACK scratch `Conn.recv` wants.
 pub fn scratch(gpa: Allocator, opts: conn.Options) ![]u8 {
-    return gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
+    return gpa.alloc(u8, @max(opts.http2.max_header_list_size, hpack.table_capacity));
 }
 
 /// Writes everything the core has queued to `w` (not flushed), framing

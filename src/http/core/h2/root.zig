@@ -15,6 +15,7 @@ pub const fields = @import("fields.zig");
 pub const limits = @import("limits.zig");
 pub const streams = @import("streams.zig");
 pub const out = @import("out.zig");
+pub const blocks = @import("blocks.zig");
 pub const conn = @import("conn.zig");
 pub const server = @import("server.zig");
 /// Tests only: connections served by `server` without `Server.run`.
@@ -29,6 +30,7 @@ test {
     _ = @import("fields_test.zig");
     _ = @import("limits_test.zig");
     _ = @import("streams_test.zig");
+    _ = @import("blocks_test.zig");
     _ = @import("conn_test.zig");
     _ = @import("conn_client_test.zig");
     _ = @import("conn_limits_test.zig");

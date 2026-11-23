@@ -775,10 +775,13 @@ test "h2 engine: POST body echoed, with and without content-length" {
     const body = try pattern(100 * 1024 + 3);
     defer testing.allocator.free(body);
     const small = try c.requestWith("POST", "/echo", &.{.{ .name = "content-length", .value = "11" }}, "hello world");
+    // Declared past the window: the buffer and the raises are capped by the total.
+    const sized = try c.requestWith("POST", "/echo", &.{.{ .name = "content-length", .value = "102403" }}, body);
     const unsized = try c.request("POST", "/echo", body);
     const inline_echo = try c.request("POST", "/nw/echo", "whole in one read");
     try c.untilAll();
     try expectEqualStrings("hello world", c.get(small).body.items);
+    try expect(std.mem.eql(u8, body, c.get(sized).body.items));
     try expect(std.mem.eql(u8, body, c.get(unsized).body.items));
     try expectEqualStrings("whole in one read", c.get(inline_echo).body.items);
 }
@@ -891,6 +894,29 @@ test "h2 engine: a noWait request reset before its body ends never runs, and its
     try expectEqualStrings("hello", (try c.until(next)).body.items);
     try wait.waitAtLeast(testing.io, "the next stream was freed", engine.probe.at(.freed), freed + 2);
     try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
+}
+
+test "h2 engine: a request whose DATA does not match its content-length is reset with PROTOCOL_ERROR while its handler runs" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const rows = [_]struct { name: []const u8, declared: []const u8, body: []const u8, end: bool }{
+        .{ .name = "more than declared", .declared = "3", .body = "hello world", .end = false },
+        .{ .name = "less than declared, then END_STREAM", .declared = "20", .body = "hello", .end = true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{s}\n", .{row.name});
+        const freed = engine.probe.at(.freed).load(.acquire);
+        const id = try c.open("POST", "/echo", &.{.{ .name = "content-length", .value = row.declared }}, false);
+        try c.sendBody(id, row.body, row.end);
+        try expectEqual(ErrorCode.protocol_error, (try c.until(id)).rst.?);
+        try wait.waitAtLeast(testing.io, "the reset stream was freed", engine.probe.at(.freed), freed + 1);
+        const next = try c.request("GET", "/hello", null);
+        try expectEqualStrings("hello", (try c.until(next)).body.items);
+        try wait.waitAtLeast(testing.io, "the next stream was freed", engine.probe.at(.freed), freed + 2);
+        try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
+    }
 }
 
 test "h2 engine: a streamed body larger than the window" {
@@ -1592,40 +1618,32 @@ test "h2 engine: a response head that can't be submitted is reset with INTERNAL_
     }
 }
 
-test "h2 engine: Resp, the response side: every state x event cell, and its predicates" {
+test "h2 engine: Resp, the response side: every state x event cell, and its predicate" {
     const R = engine.Resp;
     const rows = [_]struct { from: R, ev: R.Event, to: R }{
-        .{ .from = .none, .ev = .head, .to = .head_sent },
-        .{ .from = .none, .ev = .end, .to = .ended },
-        .{ .from = .none, .ev = .wait, .to = .none },
-        .{ .from = .none, .ev = .drained, .to = .none },
-        .{ .from = .head_sent, .ev = .head, .to = .head_sent },
-        .{ .from = .head_sent, .ev = .end, .to = .ended },
-        .{ .from = .head_sent, .ev = .wait, .to = .head_sent },
-        .{ .from = .head_sent, .ev = .drained, .to = .head_sent },
-        .{ .from = .ended, .ev = .head, .to = .ended },
+        .{ .from = .open, .ev = .end, .to = .ended },
+        .{ .from = .open, .ev = .wait, .to = .open },
+        .{ .from = .open, .ev = .drained, .to = .open },
         .{ .from = .ended, .ev = .end, .to = .ended },
         .{ .from = .ended, .ev = .wait, .to = .waiting },
         .{ .from = .ended, .ev = .drained, .to = .ended },
-        .{ .from = .waiting, .ev = .head, .to = .waiting },
         .{ .from = .waiting, .ev = .end, .to = .waiting },
         .{ .from = .waiting, .ev = .wait, .to = .waiting },
         .{ .from = .waiting, .ev = .drained, .to = .ended },
     };
+    try expectEqual(std.enums.values(R).len * std.enums.values(R.Event).len, rows.len);
     for (rows) |row| {
         errdefer std.debug.print("{t} x {t}\n", .{ row.from, row.ev });
         try expectEqual(row.to, row.from.next(row.ev));
     }
-    const preds = [_]struct { r: R, ended: bool, head_out: bool }{
-        .{ .r = .none, .ended = false, .head_out = false },
-        .{ .r = .head_sent, .ended = false, .head_out = true },
-        .{ .r = .ended, .ended = true, .head_out = true },
-        .{ .r = .waiting, .ended = true, .head_out = true },
+    const preds = [_]struct { r: R, ended: bool }{
+        .{ .r = .open, .ended = false },
+        .{ .r = .ended, .ended = true },
+        .{ .r = .waiting, .ended = true },
     };
     for (preds) |row| {
         errdefer std.debug.print("{t}\n", .{row.r});
         try expectEqual(row.ended, row.r.isEnded());
-        try expectEqual(row.head_out, row.r.headOut());
     }
 }
 

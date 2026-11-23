@@ -505,7 +505,7 @@ const Pair = struct {
         errdefer gpa.destroy(p);
         p.* = .{ .gpa = gpa, .cn = undefined, .ng = .{ .run = run }, .ours = try .init(gpa), .theirs = try .init(gpa), .scratch = undefined, .opts = opts };
         p.h.plant = plant;
-        p.scratch = try gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
+        p.scratch = try gpa.alloc(u8, @max(opts.http2.max_header_list_size, hpack.table_capacity));
         p.cn = try C.init(gpa, &p.h, opts);
         p.h.c = &p.cn;
         return p;
@@ -620,8 +620,8 @@ const Pair = struct {
     /// total out of bounds, or null.
     fn checkWindows(p: *Pair, a: Allocator) !?[]const u8 {
         if (p.dead != null or p.ng.fatal != null or p.ours.goaway != null or p.theirs.goaway != null) return null;
-        const conn_half: u64 = @max(conn.default_window, p.opts.connection_window) / 2;
-        const stream_half: u64 = @max(conn.default_window, p.opts.initial_window) / 2;
+        const conn_half: u64 = @max(conn.default_window, p.opts.http2.connection_window) / 2;
+        const stream_half: u64 = @max(conn.default_window, p.opts.http2.stream_window) / 2;
         var ids: std.AutoHashMapUnmanaged(u31, void) = .empty;
         for ([_]*Tracer{ &p.ours, &p.theirs }) |t| {
             var it = t.granted.keyIterator();
@@ -704,7 +704,7 @@ fn alone(gpa: Allocator, a: Allocator, opts: conn.Options, input: []const u8, cu
     var cn: C = try .init(gpa, &h, opts);
     defer cn.deinit();
     h.c = &cn;
-    const scratch = try gpa.alloc(u8, @max(opts.max_header_list_size, hpack.table_capacity));
+    const scratch = try gpa.alloc(u8, @max(opts.http2.max_header_list_size, hpack.table_capacity));
     defer gpa.free(scratch);
     var tail: std.ArrayList(u8) = .empty;
     defer tail.deinit(gpa);
@@ -732,7 +732,7 @@ fn expectSameOutput(a: Allocator, opts: conn.Options, one: []const u8, split: []
     try testing.expectEqualSlices(u8, x.bytes, y.bytes);
     var it = x.granted.iterator();
     while (it.next()) |e| {
-        const half: u64 = @max(conn.default_window, if (e.key_ptr.* == 0) opts.connection_window else opts.initial_window) / 2;
+        const half: u64 = @max(conn.default_window, if (e.key_ptr.* == 0) opts.http2.connection_window else opts.http2.stream_window) / 2;
         const o = y.granted.get(e.key_ptr.*) orelse 0;
         try testing.expect(@max(o, e.value_ptr.*) - @min(o, e.value_ptr.*) <= half);
     }
@@ -766,16 +766,18 @@ const Profile = struct { name: []const u8, opts: conn.Options };
 const profiles = [_]Profile{
     .{ .name = "default", .opts = .{} },
     .{ .name = "tight", .opts = .{
-        .max_concurrent_streams = 4,
-        .initial_window = 1024,
-        .connection_window = conn.default_window,
-        .max_header_list_size = 512,
+        .http2 = .{
+            .max_concurrent_streams = 4,
+            .stream_window = 1024,
+            .connection_window = conn.default_window,
+            .max_header_list_size = 512,
+            .max_continuations = 2,
+            .stream_reset_burst = 10,
+            .stream_reset_rate = 0,
+            .refused_stream_burst = 5,
+            .refused_stream_rate = 0,
+        },
         .max_header_count = 8,
-        .max_continuations = 2,
-        .stream_reset_burst = 10,
-        .stream_reset_rate = 0,
-        .refused_stream_burst = 5,
-        .refused_stream_rate = 0,
         .limits = .{ .control_frame_budget = 20, .empty_frame_rate = 10, .empty_frame_burst = 10, .glitch_burst = 10, .glitch_rate = 0 },
     } },
 };
@@ -1222,7 +1224,7 @@ const Gen = struct {
             },
             86 => try g.raw(7, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00bye"),
             // Past max_continuations now and then.
-            87...92 => try g.newRequest(if (g.chance(20)) g.opts.max_continuations + 1 else 1 + g.r.uintLessThan(usize, g.opts.max_continuations)),
+            87...92 => try g.newRequest(if (g.chance(20)) g.opts.http2.max_continuations + 1 else 1 + g.r.uintLessThan(usize, g.opts.http2.max_continuations)),
             93...95 => if (g.pick(true)) |s| if (!g.bounded or g.empties < 60) try g.data(s.id, 0, false, null),
             else => try g.ping(true),
         }
