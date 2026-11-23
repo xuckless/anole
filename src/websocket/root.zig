@@ -428,19 +428,26 @@ pub const Socket = struct {
     /// the socket's own handler from other tasks (`Rooms.broadcast`).
     /// A text message must be valid UTF-8; that is the caller's to keep.
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
+        return self.sendMsg(msg_type, data, true);
+    }
+
+    /// One body for `send` and `_sendDeferred`: they differ only in the leaf
+    /// call, chosen at comptime by `flush`.
+    inline fn sendMsg(self: *Socket, msg_type: MessageType, data: []const u8, comptime flush: bool) !void {
         try self._send_mutex.lock(self.io);
         defer self._send_mutex.unlock(self.io);
         if (comptime features.compression) {
             if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
                 const packed_data = try d.compress(data);
                 return switch (self._conn) {
-                    .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
-                    .stream => |ws| ws.sendMessage(msg_type, packed_data, true),
+                    .h1 => |ws| if (flush) ws.sendCompressed(msg_type, packed_data) else ws.sendCompressedNoFlush(msg_type, packed_data),
+                    .stream => |ws| if (flush) ws.sendMessage(msg_type, packed_data, true) else ws.sendNoFlush(msg_type, packed_data, true),
                 };
             };
         }
         return switch (self._conn) {
-            inline else => |ws| ws.send(msg_type, data),
+            .h1 => |ws| if (flush) ws.send(msg_type, data) else ws.sendNoFlush(msg_type, data),
+            .stream => |ws| if (flush) ws.send(msg_type, data) else ws.sendNoFlush(msg_type, data, false),
         };
     }
 
@@ -448,21 +455,7 @@ pub const Socket = struct {
     /// them with one `_flushOut`, so they leave together (a room's sender, the
     /// C ABI's). Internal.
     pub fn _sendDeferred(self: *Socket, msg_type: MessageType, data: []const u8) !void {
-        try self._send_mutex.lock(self.io);
-        defer self._send_mutex.unlock(self.io);
-        if (comptime features.compression) {
-            if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
-                const packed_data = try d.compress(data);
-                return switch (self._conn) {
-                    .h1 => |ws| ws.sendCompressedNoFlush(msg_type, packed_data),
-                    .stream => |ws| ws.sendNoFlush(msg_type, packed_data, true),
-                };
-            };
-        }
-        return switch (self._conn) {
-            .h1 => |ws| ws.sendNoFlush(msg_type, data),
-            .stream => |ws| ws.sendNoFlush(msg_type, data, false),
-        };
+        return self.sendMsg(msg_type, data, false);
     }
 
     /// Sends what `_sendDeferred` left. Internal.
