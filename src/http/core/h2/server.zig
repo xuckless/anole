@@ -34,7 +34,8 @@
 //! until its keep-alive deadline); the HPACK scratch one per executor (`scratch`); a request body
 //! sized by `BodyBuf`; a streamed response in at most
 //! two 16 KiB blocks. A stream's arena, body and blocks are reused or freed
-//! only once `out` no longer borrows them (`retiring`).
+//! only once `out` no longer borrows them (`retiring`; the lend lifecycle is
+//! blocks.zig's).
 //!
 //! **Seams** (PLAN §3.5): detached
 //! responses (the C ABI's; `detach_engine`), parked ones (SSE; `H2Parked`)
@@ -64,6 +65,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const blocks_mod = @import("blocks.zig");
 const conn_mod = @import("conn.zig");
 const fields = @import("fields.zig");
 const hpack = @import("hpack.zig");
@@ -960,12 +962,9 @@ pub fn Engine(comptime Ctx: type) type {
                     // calls back into `proto` (we are inside its call).
                     conn.abortDetached(es);
                 }
-                // The response's bytes may still be borrowed by `out`.
-                const mark = conn.proto.out.mark();
-                if (conn.proto.out.sent_total < mark) {
-                    es.retire_mark = mark;
-                    conn.retiring.append(&es.retire_node);
-                }
+                // The response's bytes may still be borrowed by `out`
+                // (`held` reads whether it parked).
+                _ = es.retire.park(&conn.retiring, &conn.proto.out);
                 conn.maybeFree(es);
             }
 
@@ -1764,12 +1763,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// The closed streams whose marks `out` has passed are let go.
             /// Under the lock.
             fn retire(conn: *Conn) void {
-                const sent = conn.proto.out.sent_total;
-                while (conn.retiring.first) |node| {
-                    const es: *EStream = @fieldParentPtr("retire_node", node);
-                    if (es.retire_mark.? > sent) break;
-                    _ = conn.retiring.popFirst();
-                    es.retire_mark = null;
+                while (blocks_mod.Retire.popPassed(&conn.retiring, conn.proto.out.sent_total)) |r| {
+                    const es: *EStream = @fieldParentPtr("retire", r);
                     conn.maybeFree(es);
                 }
             }
@@ -1811,30 +1806,20 @@ pub fn Engine(comptime Ctx: type) type {
                 es.room.notify(conn.io);
             }
 
-            /// Whether the block the writer wants next (`es.cur`) is free:
-            /// never submitted, or framed (the stream's queue no longer
-            /// holds it: blocks go in order, the other one after it) and
-            /// written (`out.sent_total` past a mark taken once it was
-            /// framed). True as well when the stream or the connection is
-            /// gone (a connection error frames no more DATA), for the
-            /// waiter to find out. Under the lock.
+            /// The stream or the connection died: no block is handed to the
+            /// writer (`out` may still borrow it). A connection error
+            /// resets every stream at once, so `reset` covers `in == .dead`
+            /// by the time a waiter runs. Under the lock.
+            fn gone(conn: *const Conn, es: *const EStream) bool {
+                return es.cs == null or es.reset or conn.writer == .shut or conn.proto.in == .dead;
+            }
+
+            /// Whether the block the writer wants next is free
+            /// (`blocks_mod.Pair.roomFree`), or the stream is gone: either
+            /// way the waiter runs, and `nextBlock` finds out which. Under
+            /// the lock.
             fn roomFree(conn: *Conn, es: *EStream) bool {
-                const b = &es.blocks[es.cur];
-                if (!b.inflight) return true;
-                const s = es.cs orelse return true;
-                if (es.reset or conn.writer == .shut or conn.proto.in == .dead) return true;
-                if (b.mark == null) {
-                    var queued: usize = 0;
-                    var it = s.pending.first;
-                    while (it) |n| : (it = n.next) queued += 1;
-                    const after: usize = if (es.blocks[es.cur ^ 1].inflight) 1 else 0;
-                    if (queued > after) return false;
-                    b.mark = conn.proto.out.mark();
-                }
-                if (conn.proto.out.sent_total < b.mark.?) return false;
-                b.inflight = false;
-                b.mark = null;
-                return true;
+                return conn.gone(es) or es.pair.roomFree(&es.cs.?.pending, &conn.proto.out);
             }
 
             // -- Seams: tunnels, chains, detached streams -----------------
@@ -2132,15 +2117,6 @@ pub fn Engine(comptime Ctx: type) type {
             }
         };
 
-        /// One block of a streamed response.
-        const Block = struct {
-            mem: []u8 = &.{},
-            /// Submitted, and maybe still borrowed by `out`.
-            inflight: bool = false,
-            /// `out.mark()` once framed (`Conn.roomFree`).
-            mark: ?u64 = null,
-        };
-
         /// Who runs a stream's handler, and who owns its response
         /// (`EStream.dispatch`), one value (h2o's
         /// `h2o_http2_stream_set_state`, hyperium/h2's `state.rs`). Every
@@ -2270,7 +2246,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// The engine's side of a stream (`conn.Stream.user`). Freed (to
         /// the spares) once nothing holds it (`held`): the protocol stream
         /// (`cs`), the handler (`dispatch`), and `out`'s borrowed bytes
-        /// after the close (`retire_mark`).
+        /// after the close (`retire`, blocks.zig).
         const EStream = struct {
             conn: *Conn,
             arena: LocalArena,
@@ -2283,10 +2259,8 @@ pub fn Engine(comptime Ctx: type) type {
             cs: ?*PStream = null,
             id: u31 = 0,
 
-            /// In `Conn.retiring` while `out` may still borrow its bytes,
-            /// until `out.sent_total` passes this mark.
-            retire_mark: ?u64 = null,
-            retire_node: std.DoublyLinkedList.Node = .{},
+            /// In `Conn.retiring` while `out` may still borrow its bytes.
+            retire: blocks_mod.Retire = .{},
             /// In `Conn.to_start` until its task is spawned.
             start_node: std.DoublyLinkedList.Node = .{},
             dispatch: Dispatch = .head,
@@ -2349,9 +2323,8 @@ pub fn Engine(comptime Ctx: type) type {
             resp: Resp = .open,
             status: http.Status = .ok,
             resp_fields: []hpack.Field = &.{},
-            /// A streamed body's blocks: the writer fills `blocks[cur]`.
-            blocks: [2]Block = .{ .{}, .{} },
-            cur: u1 = 0,
+            /// A streamed body's blocks: the writer fills `pair.current()`.
+            pair: blocks_mod.Pair = .{},
             /// An inline stream's submitted blocks, which it never waits
             /// for (the reader can't): freed with the stream.
             spent: std.ArrayList([]u8) = .empty,
@@ -2373,7 +2346,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             fn held(es: *const EStream) bool {
-                return es.cs != null or es.dispatch.holdsStream() or es.retire_mark != null;
+                return es.cs != null or es.dispatch.holdsStream() or es.retire.mark != null;
             }
 
             fn windowSize(es: *const EStream, conn: *const Conn) u31 {
@@ -2408,7 +2381,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn releaseMemory(es: *EStream, gpa: std.mem.Allocator) void {
                 es.body_buf.free(gpa);
                 es.body = .{};
-                for (&es.blocks) |*b| {
+                for (&es.pair.blocks) |*b| {
                     if (b.mem.len > 0) gpa.free(b.mem);
                     b.* = .{};
                 }
@@ -3834,12 +3807,9 @@ pub fn Engine(comptime Ctx: type) type {
                         if (es.dispatch.onReader()) {
                             // The reader can't wait for the writer: the
                             // block is kept until the stream is freed.
-                            es.spent.appendAssumeCapacity(es.blocks[es.cur].mem);
-                            es.blocks[es.cur] = .{};
-                        } else {
-                            es.blocks[es.cur].inflight = true;
-                            es.cur ^= 1;
-                        }
+                            es.spent.appendAssumeCapacity(es.pair.current().mem);
+                            es.pair.current().* = .{};
+                        } else es.pair.lend();
                         w.buffer = &.{};
                         w.end = 0;
                     }
@@ -3848,7 +3818,7 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             /// The writer's next block: on the reader a fresh one; on a
-            /// task `blocks[cur]`, once free (waiting on `room` while the
+            /// task `pair.current()`, once free (waiting on `room` while the
             /// other one is still borrowed by `out`).
             fn nextBlock(self: *StreamSink) std.Io.Writer.Error!void {
                 const es = self.es;
@@ -3859,8 +3829,8 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.lock();
                         defer conn.unlock();
                         if (es.dispatch.onReader() or conn.roomFree(es)) {
-                            if (es.cs == null or es.reset or conn.writer == .shut) return self.fail(error.ConnectionResetByPeer);
-                            const b = &es.blocks[es.cur];
+                            if (conn.gone(es)) return self.fail(error.ConnectionResetByPeer);
+                            const b = es.pair.current();
                             if (b.mem.len == 0) {
                                 b.mem = conn.allocator.alloc(u8, block_len) catch return self.fail(error.SystemResources);
                                 probe.bump(.blocks);
