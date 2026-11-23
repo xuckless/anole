@@ -22,6 +22,22 @@ const close_reason = std.EnumArray(ui.run.Exit, CloseReason).init(.{
     .server_gone = .quit,
 });
 
+test "inprocess: every Exit maps to its CloseReason, a failed handshake (no Exit) to quit" {
+    const rows = [_]struct { exit: ?ui.run.Exit, want: CloseReason }{
+        .{ .exit = .quit, .want = .quit },
+        .{ .exit = .back_to_logs, .want = .quit },
+        .{ .exit = .interrupt, .want = .interrupt },
+        .{ .exit = .restarted, .want = .restarting },
+        .{ .exit = .server_gone, .want = .quit },
+        .{ .exit = null, .want = .quit },
+    };
+    for (rows) |r| try std.testing.expectEqual(r.want, reasonOf(r.exit));
+}
+
+fn reasonOf(exit: ?ui.run.Exit) CloseReason {
+    return if (exit) |e| close_reason.get(e) else .quit;
+}
+
 pub const OpenError = error{ AlreadyOpen, NotRunning, Busy, SystemResources, OutOfMemory } || ui.term.OpenError;
 
 pub const Closed = *const fn (ctx: ?*anyopaque, reason: CloseReason) void;
@@ -145,7 +161,7 @@ fn cleanup(self: *InProcess) void {
     sys.close(self.wake[1]);
     const cb = self.on_closed;
     const ctx = self.ctx;
-    const reason = if (self.exit) |e| close_reason.get(e) else .quit;
+    const reason = reasonOf(self.exit);
     const interrupted = self.exit == .interrupt;
     active.store(null, .release);
     if (cb) |f| f(ctx, reason);

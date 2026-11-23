@@ -18,7 +18,7 @@ pub const Exit = enum {
     quit,
     /// Esc with nothing to close, in-process.
     back_to_logs,
-    /// Ctrl-C in-process: the terminal is restored and `on_interrupt` has run.
+    /// Ctrl-C in-process: the terminal is restored; the caller re-raises SIGINT.
     interrupt,
     /// The app announced a restart (hand-off or exec), or a kill restart was
     /// asked for (see `RunOptions.kill`). The CLI reattaches.
@@ -35,9 +35,6 @@ pub const RunOptions = struct {
     mode: Mode,
     term: *term_mod.Terminal,
     conn: *client.Conn,
-    /// In-process: called on Ctrl-C after the terminal is restored.
-    on_interrupt: ?*const fn (ctx: ?*anyopaque) void = null,
-    ctx: ?*anyopaque = null,
     /// Written (from another thread) to stop the loop; -1 for none.
     wake_fd: sys.fd_t = -1,
     wedge_timeout_ms: u32 = 5000,
@@ -252,11 +249,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
 
     // Restore the terminal before anything else runs.
     t.leave();
-    const result = exit.?;
-    if (result == .interrupt) {
-        if (opts.on_interrupt) |f| f(opts.ctx);
-    }
-    return result;
+    return exit.?;
 }
 
 fn sendOutbox(app: *app_mod.App, conn: *client.Conn) !?KillRequest {

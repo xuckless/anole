@@ -20,10 +20,10 @@ pub const Link = enum { live, not_answering, exited };
 /// Every change goes through `App.frame` or `App.connectionClosed`.
 pub const Peer = union(enum) {
     attached,
-    restarting: []const u8,
+    restarting,
     gone: Gone,
 
-    pub const Gone = enum { stop, drain, connection_lost, restarted };
+    pub const Gone = enum { stopped, restarted };
 };
 
 /// What the run loop does after a key.
@@ -290,10 +290,10 @@ pub const App = struct {
             },
             .error5xx => |e| if (self.errors_sub != null and e.sub == self.errors_sub.?) self.addError(e),
             .restarting => |r| {
-                self.peer = if (self.peer == .gone) .{ .gone = .restarted } else .{ .restarting = r.mode };
+                self.setPeer(.restarting);
                 self.setNotice("restarting ({s})...", .{r.mode});
             },
-            .bye => |b| self.setGone(if (std.mem.eql(u8, b.reason, "drain")) .drain else .stop),
+            .bye => self.setPeer(.{ .gone = .stopped }),
             .err => |e| self.setNotice("{s}: {s}", .{ e.code, e.message orelse "" }),
             .hello, .req, .unknown => {},
         }
@@ -301,12 +301,17 @@ pub const App = struct {
 
     /// The connection ended without a bye.
     pub fn connectionClosed(self: *App) void {
-        self.setGone(.connection_lost);
+        self.setPeer(.{ .gone = .stopped });
     }
 
-    fn setGone(self: *App, why: Peer.Gone) void {
-        const g: Peer.Gone = if (self.isRestarting()) .restarted else why;
-        self.peer = .{ .gone = g };
+    /// The one place the peer changes: a restart beats a stop or a loss, in either order.
+    fn setPeer(self: *App, next: Peer) void {
+        const restart = self.isRestarting() or next == .restarting;
+        self.peer = switch (next) {
+            .gone => if (restart) .{ .gone = .restarted } else next,
+            .restarting => if (self.peer == .gone) .{ .gone = .restarted } else next,
+            .attached => next,
+        };
     }
 
     /// The app announced a restart (it may have gone away since).

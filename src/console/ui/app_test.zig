@@ -558,10 +558,10 @@ test "app: peer transitions (bye, restarting, connection loss)" {
     const Gone = app_mod.Peer.Gone;
     const peer_rows = [_]struct { name: []const u8, evs: []const Ev, exited: bool, restarting: bool, gone: ?Gone }{
         .{ .name = "none", .evs = &.{}, .exited = false, .restarting = false, .gone = null },
-        .{ .name = "bye drain", .evs = &.{.{ .bye = "drain" }}, .exited = true, .restarting = false, .gone = .drain },
-        .{ .name = "bye stop", .evs = &.{.{ .bye = "stop" }}, .exited = true, .restarting = false, .gone = .stop },
+        .{ .name = "bye drain", .evs = &.{.{ .bye = "drain" }}, .exited = true, .restarting = false, .gone = .stopped },
+        .{ .name = "bye stop", .evs = &.{.{ .bye = "stop" }}, .exited = true, .restarting = false, .gone = .stopped },
         .{ .name = "restarting", .evs = &.{.restarting}, .exited = false, .restarting = true, .gone = null },
-        .{ .name = "connection loss", .evs = &.{.lost}, .exited = true, .restarting = false, .gone = .connection_lost },
+        .{ .name = "connection loss", .evs = &.{.lost}, .exited = true, .restarting = false, .gone = .stopped },
         .{ .name = "restarting then loss", .evs = &.{ .restarting, .lost }, .exited = true, .restarting = true, .gone = .restarted },
         .{ .name = "restarting then bye", .evs = &.{ .restarting, .{ .bye = "stop" } }, .exited = true, .restarting = true, .gone = .restarted },
         .{ .name = "bye then restarting", .evs = &.{ .{ .bye = "drain" }, .restarting }, .exited = true, .restarting = true, .gone = .restarted },
