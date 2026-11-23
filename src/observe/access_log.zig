@@ -15,7 +15,7 @@ const common = @import("common.zig");
 
 /// `text`: `GET /users/42 200 153us 10.0.0.7:51234 id=...`; `json`: one
 /// record per line with the same fields.
-pub const Format = enum { text, json };
+pub const Format = anole_log.Format;
 
 /// `AccessLog` settings.
 pub const Options = struct {
@@ -76,8 +76,7 @@ pub const AccessLog = struct {
     fn write(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start: std.Io.Clock.Timestamp) anyerror!void {
         const micros = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
         const status = statusOf(req, res, result);
-        const fmt: Format = self.options.format orelse (if (anole_log.currentFormat() == .json) .json else .text);
-        const line = formatLine(req.arena, .{ .format = fmt, .log_query = self.options.log_query }, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
+        const line = formatLine(req.arena, .{ .format = self.options.format orelse .auto, .log_query = self.options.log_query }, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
         if (self.options.file) |file| {
             file.writeStreamingAll(req.io, line) catch |err| switch (err) {
                 // The request's cancel (its deadline, the drain) is for what runs next.
@@ -99,13 +98,6 @@ pub const AccessLog = struct {
 /// (`anole.errorStatus`, else 500), unless the head had already gone out.
 pub const statusOf = common.statusOf;
 
-/// One log line for `req`, ending in a newline, in `arena`: what the
-/// middleware writes, for a logger of your own. The query is left out
-/// (`formatLine` with `log_query` keeps it).
-pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
-    return formatLine(arena, .{ .format = fmt }, req, status, micros, now_ms, err);
-}
-
 /// `formatLine`'s settings.
 pub const LineOptions = struct {
     format: Format = .text,
@@ -120,9 +112,14 @@ pub fn target(req: *const dusty.Request, log_query: bool) []const u8 {
     return if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[0..q] else req.url;
 }
 
-/// `format` with `LineOptions`.
+/// One log line for `req`, ending in a newline, in `arena`: what the
+/// middleware writes, for a logger of your own. `.auto` follows `anole.log`.
 pub fn formatLine(arena: std.mem.Allocator, opts: LineOptions, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
-    const fmt = opts.format;
+    const fmt: enum { text, json } = switch (opts.format) {
+        .auto => if (anole_log.currentFormat() == .json) .json else .text,
+        .text => .text,
+        .json => .json,
+    };
     const path = target(req, opts.log_query);
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;

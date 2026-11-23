@@ -18,7 +18,7 @@ pub const Context = record.Context;
 /// Which names and types the logger redacts (`password`, `Secret`...).
 pub const redact = @import("redact.zig");
 
-pub const Format = enum { auto, text, json };
+pub const Format = enum(u8) { auto, text, json };
 
 pub const Options = struct {
     /// .auto: json when ServerOptions.environment is .production, else text.
@@ -57,9 +57,11 @@ var suppress_stderr: std.atomic.Value(bool) = .init(false);
 /// (`fromStd`) must not tap it a second time.
 threadlocal var tl_tapped: bool = false;
 
-var format_state: std.atomic.Value(u8) = .init(@backingInt(Format.text));
-/// 255: no runtime filter.
-var level_state: std.atomic.Value(u8) = .init(255);
+/// Never `.auto`: `setFormat` stores `.text` for it.
+var format_state: std.atomic.Value(Format) = .init(.text);
+/// Runtime level filter; the order matches std.log.Level.
+const Gate = enum(u8) { err, warn, info, debug, none };
+var level_state: std.atomic.Value(Gate) = .init(.none);
 var sink_state: std.atomic.Value(?*const Callback) = .init(null);
 var service_buf: [64]u8 = undefined;
 var service_len: std.atomic.Value(usize) = .init(0);
@@ -70,16 +72,16 @@ threadlocal var tl_busy: bool = false;
 
 /// `.auto` stores `.text`: resolve it from the environment first.
 pub fn setFormat(f: Format) void {
-    format_state.store(@backingInt(if (f == .auto) Format.text else f), .release);
+    format_state.store(if (f == .auto) .text else f, .release);
 }
 
 /// `.text` or `.json`.
 pub fn currentFormat() Format {
-    return @fromBackingInt(@intCast(format_state.load(.acquire)));
+    return format_state.load(.acquire);
 }
 
 pub fn setLevel(l: ?std.log.Level) void {
-    level_state.store(if (l) |x| @backingInt(x) else 255, .release);
+    level_state.store(if (l) |x| @fromBackingInt(@backingInt(x)) else .none, .release);
 }
 
 pub fn setService(name: ?[]const u8) void {
@@ -139,7 +141,7 @@ pub fn hasSink() bool {
 
 fn enabled(level: std.log.Level) bool {
     const l = level_state.load(.acquire);
-    return l == 255 or @backingInt(level) <= l;
+    return @backingInt(level) <= @backingInt(l);
 }
 
 fn now() std.Io.Timestamp {
