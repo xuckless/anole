@@ -1036,6 +1036,9 @@ const r = try conn.pipeline(req, .{ .{"MULTI"}, .{ "SET", key, stock - 1 }, .{"E
 if (r[2] == .nil) return error.Conflict; // the key changed: nothing was set
 ```
 
+Release the connection before the arena of the request or `Ctx` given to
+`acquire` is reset or freed: the pool's record of it lives there.
+
 A connection that a call leaves inside MULTI or WATCH, on another
 database (SELECT), subscribed, or with other connection state (`CLIENT
 SETNAME`, `CLIENT TRACKING`...) is closed rather than given to the next
