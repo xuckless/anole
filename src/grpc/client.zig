@@ -325,7 +325,8 @@ pub const Channel = struct {
 
     /// `.auto`: the HTTP/3 connection if there is one to use, dialing it
     /// when Alt-Svc advertised it. Null: go over HTTP/2. Never waits for
-    /// another call's dial.
+    /// another call's dial. A dial the calling task's cancel ends is no
+    /// HTTP/3 failure: `error.Canceled`, re-armed.
     fn autoH3(self: *Channel) !?*H3Connection {
         const owned = self._owned.?;
         const io_ = self.runtime();
@@ -354,6 +355,11 @@ pub const Channel = struct {
         const dialed = dialH3(owned, io_, port);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
+        if (dialed == error.Canceled) {
+            owned.h3 = owned.h3.next(.dial_canceled);
+            io_.recancel();
+            return error.Canceled;
+        }
         // A connection that cannot be retired (out of memory) counts as a failed dial.
         const fresh: ?*H3Connection = if (dialed) |c| retire: {
             if (self.h3) |old| owned.retired3.append(owned.gpa, old) catch {
@@ -429,15 +435,16 @@ pub const Channel = struct {
 /// (`worked = true` when there is a link); `gate`, by this table (`t`: the
 /// event's retry deadline; "worked": `link.worked`):
 ///
-/// | gate \ event | dial_start    | dial_ok                | dial_failed(t) | call_worked | call_failed(t)                |
-/// |--------------|---------------|------------------------|----------------|-------------|-------------------------------|
-/// | idle         | dialing(null) | idle                   | broken(t)      | idle        | worked: idle; else broken(t)  |
-/// | dialing(p)   | dialing(p)    | p: broken(p); else idle | broken(t)     | dialing(p)  | worked: dialing(p); else dialing(t) |
-/// | broken(u)    | dialing(null) | broken(u)              | broken(t)      | broken(u)   | worked: broken(u); else broken(t) |
+/// | gate \ event | dial_start    | dial_ok, dial_canceled  | dial_failed(t) | call_worked | call_failed(t)                |
+/// |--------------|---------------|-------------------------|----------------|-------------|-------------------------------|
+/// | idle         | dialing(null) | idle                    | broken(t)      | idle        | worked: idle; else broken(t)  |
+/// | dialing(p)   | dialing(p)    | p: broken(p); else idle | broken(t)      | dialing(p)  | worked: dialing(p); else dialing(t) |
+/// | broken(u)    | dialing(null) | broken(u)               | broken(t)      | broken(u)   | worked: broken(u); else broken(t) |
 ///
 /// `dialing(p)`: a call failure while the dial runs is kept as `p` and
-/// applies once the dial lands. dial_start while dialing and dial_ok while
-/// not dialing cannot happen (`dialPort` guards `dial_start`). A lost
+/// applies once the dial lands. `dial_canceled`: the dialing call's task
+/// was canceled, which says nothing about HTTP/3. dial_start while dialing
+/// and dial_ok while not dialing cannot happen (`dialPort` guards `dial_start`). A lost
 /// connection is not an event: `autoH3` finds it with `isOpen` and asks
 /// `dialPort`, which redials a worked link on its port. Add behaviour as a
 /// cell here, not as a branch in `autoH3`.
@@ -470,6 +477,7 @@ const H3State = struct {
         dial_ok: u16,
         /// No dial until then.
         dial_failed: Timestamp,
+        dial_canceled,
         call_worked,
         /// No dial until then, unless the link worked.
         call_failed: Timestamp,
@@ -485,8 +493,8 @@ const H3State = struct {
                 .idle, .broken => .{ .dialing = null },
                 .dialing => s.gate,
             },
-            .dial_ok => |port| {
-                n.link = .{ .port = port, .worked = false };
+            .dial_ok, .dial_canceled => {
+                if (ev == .dial_ok) n.link = .{ .port = ev.dial_ok, .worked = false };
                 n.gate = switch (s.gate) {
                     .dialing => |p| if (p) |u| .{ .broken = u } else .idle,
                     .idle, .broken => s.gate,
@@ -1043,16 +1051,16 @@ test "grpc channel .auto: h3 state, every gate x event cell, and dialPort" {
     const p = at(5);
     const u = at(6);
     const t = at(9);
-    const events = [_]H3State.Event{ .dial_start, .{ .dial_ok = 443 }, .{ .dial_failed = t }, .call_worked, .{ .call_failed = t } };
+    const events = [_]H3State.Event{ .dial_start, .{ .dial_ok = 443 }, .dial_canceled, .{ .dial_failed = t }, .call_worked, .{ .call_failed = t } };
     const unproven: H3State.Link = .{ .port = 80, .worked = false };
     const worked: H3State.Link = .{ .port = 80, .worked = true };
     // From each gate with an unproven link: the gate per the doc table, and the link each event leaves.
-    const links = [events.len]H3State.Link{ unproven, .{ .port = 443, .worked = false }, unproven, worked, unproven };
-    const rows = [_]struct { from: H3State.Gate, want: [5]H3State.Gate }{
-        .{ .from = .idle, .want = .{ .{ .dialing = null }, .idle, .{ .broken = t }, .idle, .{ .broken = t } } },
-        .{ .from = .{ .dialing = null }, .want = .{ .{ .dialing = null }, .idle, .{ .broken = t }, .{ .dialing = null }, .{ .dialing = t } } },
-        .{ .from = .{ .dialing = p }, .want = .{ .{ .dialing = p }, .{ .broken = p }, .{ .broken = t }, .{ .dialing = p }, .{ .dialing = t } } },
-        .{ .from = .{ .broken = u }, .want = .{ .{ .dialing = null }, .{ .broken = u }, .{ .broken = t }, .{ .broken = u }, .{ .broken = t } } },
+    const links = [events.len]H3State.Link{ unproven, .{ .port = 443, .worked = false }, unproven, unproven, worked, unproven };
+    const rows = [_]struct { from: H3State.Gate, want: [6]H3State.Gate }{
+        .{ .from = .idle, .want = .{ .{ .dialing = null }, .idle, .idle, .{ .broken = t }, .idle, .{ .broken = t } } },
+        .{ .from = .{ .dialing = null }, .want = .{ .{ .dialing = null }, .idle, .idle, .{ .broken = t }, .{ .dialing = null }, .{ .dialing = t } } },
+        .{ .from = .{ .dialing = p }, .want = .{ .{ .dialing = p }, .{ .broken = p }, .{ .broken = p }, .{ .broken = t }, .{ .dialing = p }, .{ .dialing = t } } },
+        .{ .from = .{ .broken = u }, .want = .{ .{ .dialing = null }, .{ .broken = u }, .{ .broken = u }, .{ .broken = t }, .{ .broken = u }, .{ .broken = t } } },
     };
     try std.testing.expectEqual(std.enums.values(std.meta.Tag(H3State.Gate)).len + 1, rows.len);
     const alt: H3State.Alt = .{ .port = 443, .until = t };
