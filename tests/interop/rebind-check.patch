@@ -1,0 +1,41 @@
+diff --git a/testcases_quic.py b/testcases_quic.py
+index 076f302..0c7573d 100644
+--- a/testcases_quic.py
++++ b/testcases_quic.py
+@@ -1010,9 +1010,11 @@ class TestCasePortRebinding(TestCaseTransfer):
+         cur = None
+         last = None
+         paths = set()
+-        challenges = set()
++        challenges = {}  # new path -> every PATH_CHALLENGE sent on it
+         for p in tr_server:
+             cur = self._path(p)
++            if cur in challenges and hasattr(p["quic"], "path_challenge.data"):
++                challenges[cur].add(getattr(p["quic"], "path_challenge.data"))
+             if last is None:
+                 last = cur
+                 continue
+@@ -1029,7 +1031,7 @@ class TestCasePortRebinding(TestCaseTransfer):
+                     logging.info(p["quic"])
+                     return TestResult.FAILED
+                 else:
+-                    challenges.add(getattr(p["quic"], "path_challenge.data"))
++                    challenges[cur] = {getattr(p["quic"], "path_challenge.data")}
+         paths.add(cur)
+ 
+         logging.info("Server saw these paths used: %s", paths)
+@@ -1049,9 +1051,11 @@ class TestCasePortRebinding(TestCaseTransfer):
+             )
+         )
+ 
+-        unresponded = [c for c in challenges if c not in responses]
+-        if unresponded != []:
+-            logging.info("PATH_CHALLENGE without a PATH_RESPONSE: %s", unresponded)
++        # A lost first probe is re-sent with new data (RFC 9000 8.2.1): a path is
++        # validated when any of its challenges was answered.
++        unvalidated = [x for x, c in challenges.items() if not c & set(responses)]
++        if unvalidated != []:
++            logging.info("Paths without a PATH_RESPONSE: %s", unvalidated)
+             return TestResult.FAILED
+ 
+         return TestResult.SUCCEEDED

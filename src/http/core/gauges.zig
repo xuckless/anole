@@ -18,6 +18,11 @@ pub const Kind = enum {
     ws_h3,
     /// Open WebTransport sessions a server accepted.
     wt_sessions,
+    /// TCP connections the HTTP/2 engine serves (HTTP/1.x is
+    /// `connections - h2_conns`, so its loop counts nothing more).
+    h2_conns,
+    /// gRPC calls in flight (Zig services and the C ABI's).
+    grpc_calls,
 };
 
 const kinds = @typeInfo(Kind).@"enum".field_names.len;
@@ -30,7 +35,7 @@ const Row = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Row) == 64);
+    std.debug.assert(@sizeOf(Row) % 64 == 0);
     std.debug.assert(@alignOf(Row) == 64);
 }
 
@@ -42,7 +47,13 @@ fn slot(io: std.Io) usize {
 
 /// Adds `delta` (negative to remove) on the calling task's executor.
 pub fn add(io: std.Io, kind: Kind, delta: i64) void {
-    _ = rows[slot(io)].counts[@backingInt(kind)].fetchAdd(delta, .monotonic);
+    addAt(slot(io), kind, delta);
+}
+
+/// Adds `delta` on executor `index` (a C ABI call released on a consumer
+/// thread counts on the executor it ran on).
+pub fn addAt(index: usize, kind: Kind, delta: i64) void {
+    _ = rows[@min(index, max_executors - 1)].counts[@backingInt(kind)].fetchAdd(delta, .monotonic);
 }
 
 /// The count on executor `index`. A connection closed on another executor

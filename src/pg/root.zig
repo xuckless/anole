@@ -748,7 +748,7 @@ pub const Client = struct {
     /// `app.tracing` and `app.health`. With `connect_at_start`, it opens
     /// a connection per executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        self.observer = try .init(.postgresql, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);

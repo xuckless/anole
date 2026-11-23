@@ -5,7 +5,7 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
-S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247. S3 batch 3 does it for the HTTP/1.x server loop and the C ABI engine, and fixes #220. S3 batch 5 does it for the data connectors' and the jobs' lifecycles (the query cache's flights, watches, the MongoDB change stream and topology, cron schedules, the jobs client and its runs), with five behaviour fixes. S3 batch 6 does it for the messaging connectors (NATS, Kafka), the services (S3, SMTP, Lambda), the console, the trace exporter and the DX code (OpenAPI, logging, validate, config), with seven behaviour fixes.
+S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247. S3 batch 3 does it for the HTTP/1.x server loop and the C ABI engine, and fixes #220. S3 batch 5 does it for the data connectors' and the jobs' lifecycles (the query cache's flights, watches, the MongoDB change stream and topology, cron schedules, the jobs client and its runs), with five behaviour fixes. S3 batch 6 does it for the messaging connectors (NATS, Kafka), the services (S3, SMTP, Lambda), the console, the trace exporter and the DX code (OpenAPI, logging, validate, config), with seven behaviour fixes. S3 step 3 finishes the console's database and connection stats (#128) and gets the QUIC and WebTransport interop CI jobs working again (#243, #244).
 
 ### Changed
 
@@ -65,12 +65,17 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
 - **The in-process console no longer closes its socketpair end twice** when adopting the connection fails, and **the console counts its client cap and adds a client in one lock section**, so two connections at once can't both pass the cap.
 - **NATS and Kafka `start()` after `drain()` is a no-op**: it half-started a closed client (NATS connected and began handlers on a canceled group; Kafka re-ran its setup on a drained client). A NATS drain that lands during `start` stops it before JetStream setup and handlers. A Kafka consumer's start after a stop is a no-op too, and a drain canceled while it waits for a consumer's members passes the cancel on instead of swallowing it.
 - **`anole console` read an uninitialised kill request after a restart**: a hand-off or exec restart now waits for the successor (20 s) without killing and relaunching it.
+- **The console's `/db` shows call rates and latencies per database, and `/conns` counts HTTP/1.x, WebSocket, WebTransport and gRPC connections** (#128): `/db` listed the databases without their numbers (still open in 0.6.1) and `/conns` had no HTTP/1.x or gRPC counts.
+- **A connector whose late start fails no longer leaves its entry behind**: the server kept the failed connector registered, so deinit freed it a second time and a console `/db` read reached freed memory. The entry is now dropped when the start fails.
+- **C ABI gRPC: calls transcoded from REST JSON are no longer counted as gRPC on the console's `/conns`**; only gRPC, gRPC-Web and Connect calls are.
 - The C ABI test of a WebSocket handshake past its deadline no longer races (#234): it runs on one executor, so a barrier request orders the check after the handshake's record instead of waiting for a delivery that may never come.
 
 ### Tests
 
 - An hq-interop round trip on aioquic's H0 ALPN, run by tests/h3/run.sh and CI; an HTTP/3 row for requests past the task cap (rejected unprocessed, stream credit returned); HTTP/2 rows for a response head too large to submit (whole, streamed, bare and on a tunnel: reset with INTERNAL_ERROR, the connection carries on).
 - test-flags builds without WebSocket or HTTP/3 compile again: the C ABI slot-size test reads those slots only with their features.
+- WebTransport interop CI (#243): the handshake case closes its session and the datagram case spaces its answers, so both pass; after a timed-out case the runner's `docker compose stop` works again (its empty.env got a value for every variable), so the next case no longer captures the old container's ports.
+- QUIC interop CI (#244): the simulator waits for its packet captures before it exits, so the short cases (handshake, retry) keep both; the interop server sets no handshake deadline (the product's `handshake_timeout` default stays 10 s); the rebind checks pass when every new path has an answered PATH_CHALLENGE, not only its first. Known flakes left: quic-go with handshakeloss and handshakecorruption, documented in tests/interop/run.sh.
 
 ## 0.6.1 (2026-11-22)
 

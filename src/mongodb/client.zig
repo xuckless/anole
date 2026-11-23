@@ -506,7 +506,7 @@ pub const Client = struct {
     /// What the server hands over when serving starts (`app.mongodb`): the
     /// app's metrics registry, tracer and health checks, when it has them.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        self.observer = try .init(.mongodb, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| {
