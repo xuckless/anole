@@ -10,6 +10,7 @@ const dusty = @import("dusty");
 const ui = @import("anole_console_ui");
 const SpinLock = @import("anole_mem").SpinLock;
 const observe_common = @import("../observe/common.zig");
+const db_observe = @import("../db/observe.zig");
 
 pub const bucket_count = ui.protocol.bucket_count;
 
@@ -43,6 +44,29 @@ pub const Sum = struct {
     s3: u32 = 0,
     s4: u32 = 0,
     s5: u32 = 0,
+    h: [bucket_count]u32 = @splat(0),
+};
+
+/// Databases counted one by one (console slots 1..max_dbs, a connector's
+/// index plus one); every database past them shares slot `max_dbs + 1`,
+/// "other databases", which `/db` reports under `i = max_dbs`: the index
+/// of the first connector past the cap.
+pub const max_dbs = 32;
+/// Slot 0 unused (not counted), 1..max_dbs, the shared other slot.
+pub const db_slots = max_dbs + 2;
+
+/// One database on one executor.
+pub const DbCounters = struct {
+    n: Counter = .init(0),
+    /// Calls that failed.
+    e: Counter = .init(0),
+    h: [bucket_count]Counter = @splat(.init(0)),
+};
+
+/// The sums over executors of one database, wrapping.
+pub const DbSum = struct {
+    n: u32 = 0,
+    e: u32 = 0,
     h: [bucket_count]u32 = @splat(0),
 };
 
@@ -152,6 +176,8 @@ pub const Stats = struct {
     /// Published once by `ensureTables` (compare and swap), freed only by
     /// `deinit` (process-wide).
     tables: std.atomic.Value(?[*]Counters) = .init(null),
+    /// `[executors + 1][db_slots]`, published and freed like `tables`.
+    db_tables: std.atomic.Value(?[*]DbCounters) = .init(null),
     errors: ErrorRing,
 
     pub fn init(gpa: std.mem.Allocator, executors: u32, max_routes: u32, errors_kept: u32) !Stats {
@@ -165,22 +191,45 @@ pub const Stats = struct {
     }
 
     pub fn deinit(self: *Stats) void {
-        if (self.tables.load(.acquire)) |t| self.gpa.free(t[0..self.tableLen()]);
+        if (self.tables.load(.acquire)) |t| self.gpa.free(t[0..self.rows(self.route_slots)]);
+        if (self.db_tables.load(.acquire)) |t| self.gpa.free(t[0..self.rows(db_slots)]);
         self.errors.deinit(self.gpa);
     }
 
-    fn tableLen(self: *const Stats) usize {
-        return @as(usize, self.executors + 1) * self.route_slots;
+    fn rows(self: *const Stats, slots: u32) usize {
+        return @as(usize, self.executors + 1) * slots;
     }
 
-    /// Allocates the counters on first use (the first `stats` subscription):
-    /// a table made with no lock held is published by compare and swap, and
-    /// the thread that loses the race frees its own.
+    /// Allocates the counters on first use (the first `stats` subscription).
     pub fn ensureTables(self: *Stats) !void {
-        if (self.tables.load(.acquire) != null) return;
-        const t = try self.gpa.alloc(Counters, self.tableLen());
+        try self.publish(Counters, &self.tables, self.route_slots);
+        try self.publish(DbCounters, &self.db_tables, db_slots);
+    }
+
+    /// A table made with no lock held is published by compare and swap, and
+    /// the thread that loses the race frees its own.
+    fn publish(self: *Stats, comptime T: type, table: *std.atomic.Value(?[*]T), slots: u32) !void {
+        if (table.load(.acquire) != null) return;
+        const t = try self.gpa.alloc(T, self.rows(slots));
         for (t) |*c| c.* = .{};
-        if (self.tables.cmpxchgStrong(null, t.ptr, .acq_rel, .acquire) != null) self.gpa.free(t);
+        if (table.cmpxchgStrong(null, t.ptr, .acq_rel, .acquire) != null) self.gpa.free(t);
+    }
+
+    /// The row a thread counts on: its executor's own (single writer,
+    /// plain load-add-store) or, for a thread that is none, the shared
+    /// last row (atomic adds).
+    const Row = struct { index: usize, shared: bool };
+
+    fn rowOf(self: *const Stats, exec: ?usize) Row {
+        const e = exec orelse return .{ .index = self.executors, .shared = true };
+        if (e >= self.executors) return .{ .index = self.executors, .shared = true };
+        return .{ .index = e, .shared = false };
+    }
+
+    inline fn add(c: *Counter, shared: bool) void {
+        if (shared) {
+            _ = c.fetchAdd(1, .monotonic);
+        } else c.store(c.load(.monotonic) +% 1, .monotonic);
     }
 
     /// The slot index of a route for counting: 0 no route, past
@@ -195,23 +244,37 @@ pub const Stats = struct {
     /// a thread that is none (the shared slot, atomic adds).
     pub fn count(self: *Stats, exec: ?usize, route_index: u32, status: u16, ns: u64) void {
         const t = self.tables.load(.acquire) orelse return;
-        const shared = exec == null or exec.? >= self.executors;
-        const e: usize = if (shared) self.executors else exec.?;
-        const c = &t[e * self.route_slots + self.routeSlot(route_index)];
-        const b = bucketOf(ns);
-        if (shared) {
-            _ = c.n.fetchAdd(1, .monotonic);
-            _ = statusCounter(c, status).fetchAdd(1, .monotonic);
-            _ = c.h[b].fetchAdd(1, .monotonic);
-        } else {
-            bump(&c.n);
-            bump(statusCounter(c, status));
-            bump(&c.h[b]);
-        }
+        const r = self.rowOf(exec);
+        const c = &t[r.index * self.route_slots + self.routeSlot(route_index)];
+        add(&c.n, r.shared);
+        add(statusCounter(c, status), r.shared);
+        add(&c.h[bucketOf(ns)], r.shared);
     }
 
-    inline fn bump(c: *Counter) void {
-        c.store(c.load(.monotonic) +% 1, .monotonic);
+    /// Counts one database call ended on console slot `slot` (0: not
+    /// counted; past `max_dbs`: the shared other slot).
+    pub fn countDb(self: *Stats, exec: ?usize, slot: u32, ns: u64, failed: bool) void {
+        if (slot == 0) return;
+        const t = self.db_tables.load(.acquire) orelse return;
+        const r = self.rowOf(exec);
+        const c = &t[r.index * db_slots + @min(slot, max_dbs + 1)];
+        add(&c.n, r.shared);
+        if (failed) add(&c.e, r.shared);
+        add(&c.h[bucketOf(ns)], r.shared);
+    }
+
+    /// The wrapping sums over executors of database slot `slot`.
+    pub fn sumDb(self: *const Stats, slot: u32) DbSum {
+        var s: DbSum = .{};
+        const t = self.db_tables.load(.acquire) orelse return s;
+        var e: u32 = 0;
+        while (e <= self.executors) : (e += 1) {
+            const c = &t[@as(usize, e) * db_slots + slot];
+            s.n +%= c.n.load(.monotonic);
+            s.e +%= c.e.load(.monotonic);
+            for (&s.h, 0..) |*h, i| h.* +%= c.h[i].load(.monotonic);
+        }
+        return s;
     }
 
     fn statusCounter(c: *Counters, status: u16) *Counter {
@@ -279,12 +342,20 @@ pub fn requestEnd(req: *dusty.Request, res: *dusty.Response, err: ?anyerror, ans
     }
 }
 
+/// `db.observe.console_call`: a database call ended while a console collects.
+fn dbCall(slot: u32, exec: ?usize, ns: u64, failed: bool) void {
+    const st = global orelse return;
+    st.countDb(exec, slot, ns, failed);
+}
+
 pub fn install(st: *Stats) void {
     global = st;
     dusty.hooks.request_end = requestEnd;
+    db_observe.console_call = dbCall;
 }
 
 pub fn uninstall() void {
+    db_observe.console_call = null;
     dusty.hooks.request_end = null;
     global = null;
 }
@@ -339,6 +410,39 @@ test "stats: nothing recorded without tables; per-executor sums; other routes" {
     try std.testing.expectEqual(@as(u32, 1), s.s5);
     try std.testing.expectEqual(@as(u32, 1), st.sum(0).n);
     try std.testing.expectEqual(@as(u32, 1), st.sum(4).n);
+}
+
+test "stats: db calls" {
+    var st = try Stats.init(std.testing.allocator, 2, 3, 16);
+    defer st.deinit();
+    st.countDb(0, 1, 20_000, false);
+    try std.testing.expectEqual(@as(u32, 0), st.sumDb(1).n); // before ensureTables: dropped
+    try st.ensureTables();
+    const calls = [_]struct { exec: ?usize, slot: u32, ns: u64, failed: bool }{
+        .{ .exec = 0, .slot = 2, .ns = 20_000, .failed = false },
+        .{ .exec = 1, .slot = 2, .ns = 20_000, .failed = true },
+        .{ .exec = null, .slot = 2, .ns = 20_000, .failed = false }, // no executor: the shared row
+        .{ .exec = 7, .slot = 3, .ns = 1_000, .failed = false }, // exec >= executors: the shared row
+        .{ .exec = 0, .slot = 0, .ns = 1_000, .failed = false }, // slot 0: not counted
+        .{ .exec = 0, .slot = max_dbs + 1, .ns = 1_000, .failed = false }, // past the cap: other
+        .{ .exec = 1, .slot = max_dbs + 9, .ns = 1_000, .failed = false },
+    };
+    for (calls) |r| st.countDb(r.exec, r.slot, r.ns, r.failed);
+    const s = st.sumDb(2);
+    try std.testing.expectEqual(@as(u32, 3), s.n);
+    try std.testing.expectEqual(@as(u32, 1), s.e);
+    try std.testing.expectEqual(@as(u32, 3), s.h[bucketOf(20_000)]);
+    try std.testing.expectEqual(@as(u8, 2), bucketOf(20_000));
+    var in_bucket: u32 = 0;
+    for (s.h) |h| in_bucket += h;
+    try std.testing.expectEqual(@as(u32, 3), in_bucket); // in that bucket only
+    try std.testing.expectEqual(@as(u32, 1), st.sumDb(3).n);
+    try std.testing.expectEqual(@as(u32, 0), st.sumDb(0).n);
+    try std.testing.expectEqual(@as(u32, 2), st.sumDb(max_dbs + 1).n);
+    // Wraps like the route counters.
+    st.db_tables.load(.acquire).?[0 * db_slots + 4].n.store(std.math.maxInt(u32), .monotonic);
+    st.countDb(0, 4, 1_000, false);
+    try std.testing.expectEqual(@as(u32, 0), st.sumDb(4).n);
 }
 
 test "stats: the 5xx ring wraps at its size and reads after a sequence" {

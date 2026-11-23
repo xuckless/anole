@@ -350,7 +350,7 @@ pub const Client = struct {
     /// registry, tracer and health checks, when it has them.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         if (self.started) return;
-        self.observer = try .init(.smtp, self.name, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         if (health) |h| if (self.readiness_on) try self.readiness.register(h, self.name);
         self.started = true;

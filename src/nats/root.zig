@@ -369,7 +369,7 @@ pub const Client = struct {
     /// consumers, starts handlers. `app` calls it when serving starts.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         if (self.phase.load(.acquire) != .idle) return;
-        self.observer = try .init(.nats, self.label, registry, tracer);
+        try self.observer.attach(registry, tracer);
         try self.guard.observe(self.gpa, registry);
         if (health) |h| if (self.readiness_on) try h.addCheck(self.label, readyCheck, self);
         const need_js = self.js_options.streams.len > 0 or self.js_options.consumers.len > 0;
