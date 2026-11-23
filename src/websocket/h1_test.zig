@@ -573,3 +573,207 @@ test "WebSocket over HTTP/1.1: Sec-WebSocket-Accept among the extra handshake he
     const head = try upgradeHead(io, server.address.ip, "/bad", "", &buf);
     try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 500"));
 }
+
+var close_done: std.atomic.Value(usize) = .init(0);
+var close_saw_peer: std.atomic.Value(bool) = .init(false);
+
+fn closeTimeoutHandler(comptime options: websocket.UpgradeOptions) dusty.Router(void).Handler {
+    return struct {
+        fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            var ws = (try websocket.upgrade(req, res, options)) orelse {
+                res.status = .bad_request;
+                return;
+            };
+            defer {
+                ws.deinit();
+                _ = close_done.fetchAdd(1, .acq_rel);
+            }
+            while (true) {
+                const msg = ws.receive() catch return;
+                switch (msg.type) {
+                    .text => {
+                        if (std.mem.eql(u8, msg.data, "close")) {
+                            try ws.close(.going_away, "bye");
+                        } else {
+                            try ws.send(msg.type, msg.data);
+                        }
+                    },
+                    .close => {
+                        close_saw_peer.store(true, .release);
+                        return;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }.h;
+}
+
+test "WebSocket over HTTP/1.1: drain cuts an unresponsive client after close_timeout, not timeout.shutdown" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    close_done.store(0, .release);
+    close_saw_peer.store(false, .release);
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+        .timeout = .{ .shutdown = .fromSeconds(20) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/ws", closeTimeoutHandler(.{ .close_timeout = .fromMilliseconds(150) }));
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var c: Raw = undefined;
+    try c.open(io, server.address.ip);
+    defer c.stream.close(io);
+    try c.send(0x1, "hi");
+    var buf: [125]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", (try c.next(&buf)).payload);
+
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    var drain = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(io_));
+        }
+    }.run, .{ &future, io });
+    defer drain.cancel(io) catch {};
+    try std.testing.expectEqualStrings("server shutting down", try c.expectClose(1001, &buf));
+    // Never answer the close: the server cuts the connection after close_timeout.
+    try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+    try drain.await(io);
+    if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    try std.testing.expectEqual(@as(usize, 1), close_done.load(.acquire));
+    try std.testing.expect(!close_saw_peer.load(.acquire));
+}
+
+test "WebSocket over HTTP/1.1: handler ws.close cuts an unresponsive client after close_timeout and completes cleanly when answered" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/ws", closeTimeoutHandler(.{ .close_timeout = .fromMilliseconds(150) }));
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+    var buf: [125]u8 = undefined;
+
+    // Unresponsive client: server closes TCP after close_timeout.
+    close_done.store(0, .release);
+    close_saw_peer.store(false, .release);
+    {
+        var c: Raw = undefined;
+        try c.open(io, server.address.ip);
+        defer c.stream.close(io);
+        try c.send(0x1, "close");
+        try std.testing.expectEqualStrings("bye", try c.expectClose(1001, &buf));
+        try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+        try test_wait.waitAtLeast(io, "handler exited after close_timeout", &close_done, 1);
+        try std.testing.expect(!close_saw_peer.load(.acquire));
+    }
+
+    // Responsive client: answers close before close_timeout, handler sees .close.
+    close_done.store(0, .release);
+    close_saw_peer.store(false, .release);
+    {
+        var c: Raw = undefined;
+        try c.open(io, server.address.ip);
+        defer c.stream.close(io);
+        try c.send(0x1, "close");
+        try std.testing.expectEqualStrings("bye", try c.expectClose(1001, &buf));
+        try c.send(0x8, &.{ 0x03, 0xe9 });
+        try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+        try test_wait.waitAtLeast(io, "handler exited after peer close", &close_done, 1);
+        try std.testing.expect(close_saw_peer.load(.acquire));
+    }
+}
+
+test "WebSocket over HTTP/1.1: close_timeout null or zero disables the close-handshake timer" {
+    const cases = [_]struct { name: []const u8, timeout: ?std.Io.Duration }{
+        .{ .name = "null", .timeout = null },
+        .{ .name = "zero", .timeout = .zero },
+    };
+    inline for (cases) |case| {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{});
+        defer rt.deinit();
+        const io = rt.io();
+        close_done.store(0, .release);
+        close_saw_peer.store(false, .release);
+        var server = dusty.Server(void).init(gpa, io, .{
+            .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+        }, {});
+        defer server.deinit();
+        server.router.get("/ws", closeTimeoutHandler(.{ .close_timeout = case.timeout }));
+        var future = try io.concurrent(struct {
+            fn run(s: *dusty.Server(void)) anyerror!void {
+                try s.run();
+            }
+        }.run, .{&server});
+        defer future.cancel(io) catch {};
+        try server.waitReady(io);
+
+        var c: Raw = undefined;
+        try c.open(io, server.address.ip);
+        defer c.stream.close(io);
+        try c.send(0x1, "close");
+        var buf: [125]u8 = undefined;
+        try std.testing.expectEqualStrings("bye", try c.expectClose(1001, &buf));
+        // Stays open while unanswered.
+        try test_wait.expectStays(io, "socket stays open with close_timeout " ++ case.name, &close_done, struct {
+            fn stillOpen(done: *std.atomic.Value(usize)) bool {
+                return done.load(.acquire) == 0;
+            }
+        }.stillOpen, test_wait.short_window);
+        // Once the client answers, the handler finishes cleanly.
+        try c.send(0x8, &.{ 0x03, 0xe9 });
+        try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+        try test_wait.waitAtLeast(io, "handler exited once peer answered (" ++ case.name ++ ")", &close_done, 1);
+        try std.testing.expect(close_saw_peer.load(.acquire));
+    }
+}
+
+test "WebSocket over HTTP/1.1: close_on_drain false still applies close_timeout to handler ws.close" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    close_done.store(0, .release);
+    close_saw_peer.store(false, .release);
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/ws", closeTimeoutHandler(.{ .close_on_drain = false, .close_timeout = .fromMilliseconds(150) }));
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var c: Raw = undefined;
+    try c.open(io, server.address.ip);
+    defer c.stream.close(io);
+    try c.send(0x1, "close");
+    var buf: [125]u8 = undefined;
+    try std.testing.expectEqualStrings("bye", try c.expectClose(1001, &buf));
+    try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+    try test_wait.waitAtLeast(io, "handler exited after close_timeout with close_on_drain false", &close_done, 1);
+    try std.testing.expect(!close_saw_peer.load(.acquire));
+}

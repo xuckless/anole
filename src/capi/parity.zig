@@ -369,6 +369,7 @@ pub const websocket_options = [_]Entry{
     .{ .zig = "deflate", .omitted = "permessage-deflate runs on its defaults" },
     .{ .zig = "close_on_drain", .json = "routes[].websocket.close_on_drain" },
     .{ .zig = "drain_reason", .omitted = "the drain's close carries the default reason" },
+    .{ .zig = "close_timeout", .omitted = "the close handshake runs on its default (5 s)" },
     .{ .zig = "subprotocols", .json = "routes[].websocket.subprotocols", .note = "\"accept\": \"auto\" only; with \"consumer\" the application picks in anole_ws_accept" },
     .{ .zig = "headers", .omitted = "Zig only: the consumer passes headers per accept (anole_ws_accept_options.headers)" },
 };

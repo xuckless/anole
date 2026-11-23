@@ -130,6 +130,11 @@ pub const UpgradeOptions = struct {
     close_on_drain: bool = true,
     /// The reason sent with the drain's close 1001.
     drain_reason: []const u8 = "server shutting down",
+    /// How long to wait for the client's close frame after the server sends
+    /// one (from the drain's 1001 or `Socket.close`) before ending the
+    /// underlying connection or stream (RFC 6455 §7.1.1). Null or zero waits
+    /// until the client answers or `timeout.shutdown` cuts it.
+    close_timeout: ?std.Io.Duration = .fromSeconds(5),
     /// The subprotocols this endpoint speaks, most preferred first. The
     /// first of them that the client offered (`Sec-WebSocket-Protocol`,
     /// every line, comma-separated) is selected, echoed in the handshake's
@@ -257,8 +262,10 @@ pub const Socket = struct {
     /// The server's drain signal (`Request.drain`); null in a request the
     /// server did not build.
     _drain: ?*std.Io.Event = null,
-    /// Sends 1001 when the drain starts (`UpgradeOptions.close_on_drain`).
-    _drain_watch: ?*DrainWatch = null,
+    /// Sends 1001 on drain (`UpgradeOptions.close_on_drain`) and cuts the
+    /// connection if the peer never answers a server-initiated close
+    /// (`UpgradeOptions.close_timeout`).
+    _close_watch: ?*CloseWatch = null,
     /// A close went out through `close`, or came in through `receive` (and
     /// was answered), or `next` saw the connection end.
     _closed: std.atomic.Value(bool) = .init(false),
@@ -361,6 +368,7 @@ pub const Socket = struct {
         if (msg.type == .close) {
             self.close_code = msg.close_code;
             self._closed.store(true, .release);
+            if (self._close_watch) |w| w.stop();
         }
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
@@ -464,12 +472,14 @@ pub const Socket = struct {
     }
 
     /// Sends a close frame. The peer's answer still arrives through
-    /// `receive`.
+    /// `receive`; if it does not arrive within `UpgradeOptions.close_timeout`,
+    /// the underlying connection or stream is closed.
     pub noinline fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
         self._closed.store(true, .release);
-        return switch (self._conn) {
+        try switch (self._conn) {
             inline else => |ws| ws.close(code, reason),
         };
+        if (self._close_watch) |w| w.arm();
     }
 
     /// Releases the socket: its rooms (every `Rooms` it joined), the drain
@@ -488,7 +498,7 @@ pub const Socket = struct {
             self._admission = null;
             a.release();
         }
-        if (self._drain_watch) |w| w.stop();
+        if (self._close_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
         if (self._read.conn != null) {
             self._read.release(self._conn.h1.transport.reader);
@@ -518,60 +528,106 @@ const abort_cancels_h1_reader = builtin.os.tag == .windows;
 /// serving it has not returned.
 fn abortConnection(socket: *Socket) void {
     socket._closed.store(true, .release);
-    switch (socket._conn) {
+    abortConn(socket.io, socket._conn, socket._task);
+}
+
+fn abortConn(io: std.Io, conn: Socket.Conn, task: ?placement.Task) void {
+    switch (conn) {
         .h1 => |ws| {
-            ws.write_mutex.lockUncancelable(socket.io);
+            ws.write_mutex.lockUncancelable(io);
             ws.closed = true;
-            ws.write_mutex.unlock(socket.io);
+            ws.write_mutex.unlock(io);
             // Not a cancelation point: a cancel meant for the stuck send
             // may still be pending here, and is kept for later.
-            const protection = socket.io.swapCancelProtection(.blocked);
-            defer _ = socket.io.swapCancelProtection(protection);
-            if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
-            if (comptime abort_cancels_h1_reader) if (socket._task) |t| placement.cancelTask(t);
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            if (ws.transport.tcp_reader) |r| r.stream.shutdown(io, .both) catch {};
+            if (comptime abort_cancels_h1_reader) if (task) |t| placement.cancelTask(t);
         },
         .stream => |ws| {
-            ws.write_mutex.lockUncancelable(socket.io);
+            ws.write_mutex.lockUncancelable(io);
             ws.closed = true;
-            ws.write_mutex.unlock(socket.io);
-            if (socket._task) |t| placement.cancelTask(t);
+            ws.write_mutex.unlock(io);
+            if (task) |t| placement.cancelTask(t);
         },
     }
 }
 
-/// Sends close 1001 when the server starts to drain, through the server's
-/// drain hooks (`Request.drain_hooks`): a socket keeps no task of its own
-/// waiting for the drain, only this, in the request's arena. The close is
-/// sent from a task started when the drain does, on the socket's executor,
-/// so a peer that does not read holds up only its own.
-const DrainWatch = struct {
+/// Manages a socket's server-initiated close lifecycle: sending close 1001 on
+/// drain (`UpgradeOptions.close_on_drain`) and cutting the underlying
+/// connection or stream if the peer does not answer within
+/// `UpgradeOptions.close_timeout`. Lives in the socket's allocator so it keeps
+/// a stable address even while `Socket` is returned by value from `openSocket`.
+const CloseWatch = struct {
+    const State = enum { open, closing, stopped };
+
     hook: dusty.DrainHooks.Hook = .{ .callback = onDrain },
-    hooks: *dusty.DrainHooks,
+    hooks: ?*dusty.DrainHooks,
     io: std.Io,
     conn: Socket.Conn,
+    task: ?placement.Task,
     reason: []const u8,
-    /// The socket's executor, where the close goes.
+    close_timeout: ?std.Io.Duration,
+    /// The socket's executor, where the close and its timer run.
     executor: ?usize,
-    sender: std.Io.Group = .init,
+    mutex: std.Io.Mutex = .init,
+    state: State = .open,
+    group: std.Io.Group = .init,
 
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
-        const self: *DrainWatch = @fieldParentPtr("hook", hook);
+        const self: *CloseWatch = @alignCast(@fieldParentPtr("hook", hook));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .open) return;
+        self.state = .closing;
         const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
         // Without a task to spare, the socket lives on until the handler
         // ends it or the drain's deadline does.
-        placement.concurrent(&self.sender, self.io, where, send, .{self}) catch {};
+        placement.concurrent(&self.group, self.io, where, drainSend, .{self}) catch {
+            self.state = .open;
+        };
     }
 
-    fn send(self: *DrainWatch) std.Io.Cancelable!void {
+    fn drainSend(self: *CloseWatch) std.Io.Cancelable!void {
         switch (self.conn) {
-            inline else => |ws| ws.close(.going_away, self.reason) catch {},
+            inline else => |ws| ws.close(.going_away, self.reason) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+            },
         }
+        if (self.close_timeout != null) try self.sleepAndAbort();
     }
 
-    /// Out of the hooks, and any close under way finished or canceled.
-    fn stop(self: *DrainWatch) void {
-        self.hooks.remove(self.io, &self.hook);
-        self.sender.cancel(self.io);
+    /// Arms the close-handshake timer once a server-initiated close frame has
+    /// gone out (`Socket.close`). Re-entering while already closing or stopped
+    /// is a no-op so a second close never resets the timer.
+    fn arm(self: *CloseWatch) void {
+        if (self.close_timeout == null) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .open) return;
+        self.state = .closing;
+        const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
+        placement.concurrent(&self.group, self.io, where, sleepAndAbort, .{self}) catch {
+            self.state = .open;
+        };
+    }
+
+    fn sleepAndAbort(self: *CloseWatch) std.Io.Cancelable!void {
+        try self.io.sleep(self.close_timeout.?, .awake);
+        self.mutex.lockUncancelable(self.io);
+        const active = self.state == .closing;
+        self.mutex.unlock(self.io);
+        if (active) abortConn(self.io, self.conn, self.task);
+    }
+
+    /// Out of the drain hooks, and any close or timer task finished or canceled.
+    fn stop(self: *CloseWatch) void {
+        if (self.hooks) |h| h.remove(self.io, &self.hook);
+        self.mutex.lockUncancelable(self.io);
+        const was_stopped = self.state == .stopped;
+        self.state = .stopped;
+        self.mutex.unlock(self.io);
+        if (!was_stopped) self.group.cancel(self.io);
     }
 };
 
@@ -698,21 +754,28 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         };
     }
     req.setDeadline(options.timeout);
-    if (options.close_on_drain) if (req._drain_hooks) |hooks| {
-        const watch = try alloc.create(DrainWatch);
+    const drain_hooks = if (options.close_on_drain) req._drain_hooks else null;
+    const close_timeout: ?std.Io.Duration = if (options.close_timeout) |d|
+        (if (d.toNanoseconds() > 0) d else null)
+    else
+        null;
+    if (drain_hooks != null or close_timeout != null) {
+        const watch = try alloc.create(CloseWatch);
         watch.* = .{
-            .hooks = hooks,
+            .hooks = drain_hooks,
             .io = req.io,
             .conn = socket._conn,
+            .task = socket._task,
             // Copied for a socket in the request's arena, where `options`
             // may be a caller's temporary; a socket that outlives the
             // request has comptime options.
-            .reason = if (owner != null and !h2) options.drain_reason else try req.arena.dupe(u8, options.drain_reason),
+            .reason = if (drain_hooks == null) "" else if (owner != null and !h2) options.drain_reason else try req.arena.dupe(u8, options.drain_reason),
+            .close_timeout = close_timeout,
             .executor = placement.currentExecutor(req.io),
         };
-        hooks.add(req.io, &watch.hook);
-        socket._drain_watch = watch;
-    };
+        if (drain_hooks) |hooks| hooks.add(req.io, &watch.hook);
+        socket._close_watch = watch;
+    }
     socket._gauged = true;
     dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
     if (req._ws_admission == .held) {
@@ -750,7 +813,7 @@ fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
     const ws = socket._conn.h1;
     socket.deinit();
     if (comptime features.compression) if (socket._deflate) |d| owner.destroy(d);
-    if (socket._drain_watch) |w| owner.destroy(w);
+    if (socket._close_watch) |w| owner.destroy(w);
     if (socket.subprotocol) |sp| owner.free(sp);
     owner.destroy(ws);
 }
