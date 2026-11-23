@@ -1404,40 +1404,9 @@ pub fn giveSession(client: *Client, sess: *Session, io: std.Io) void {
 /// A call's context with its type erased: the request (or `anole.db.Ctx`)
 /// a call was made with, so cursors can keep it and the command loop is
 /// compiled once.
-pub const Context = struct {
-    io: std.Io,
-    arena: std.mem.Allocator,
-    any: *anyopaque,
-    record: *const fn (any: *anyopaque, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error,
-    /// For spans.
-    request: ?*const dusty.Request,
-    last: *const fn (any: *anyopaque) ?shared.ErrorDetail,
-
-    /// The last error recorded on the context it stands for.
-    pub fn lastDetail(self: *const Context) ?shared.ErrorDetail {
-        return self.last(self.any);
-    }
-
-    /// `internal.fail` on the context it stands for.
-    pub fn fail(self: *const Context, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
-        return self.record(self.any, map, detail);
-    }
-};
-
+pub const Context = internal.ErasedCtx(.mongodb);
 /// `c` (a `*anole.Request` or a `*anole.db.Ctx`) as a `Context`.
-pub fn erase(c: anytype) Context {
-    const C = @TypeOf(c);
-    if (C == *Context or C == *const Context) return c.*;
-    const R = struct {
-        fn record(any: *anyopaque, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
-            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
-        }
-        fn last(any: *anyopaque) ?shared.ErrorDetail {
-            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
-        }
-    };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(@constCast(c)), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
-}
+pub const erase = Context.erase;
 
 /// What every call can fail with: the shared errors (`anole.db.Error`),
 /// a cancel, memory.
