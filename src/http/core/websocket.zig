@@ -53,9 +53,8 @@ pub const WebSocket = struct {
     /// allocated nothing (a borrowed payload) leaves the reset for the next
     /// one that did (`resetMessages`).
     msg_arena_used: bool = false,
-    fragmented_type: ?MessageType = null,
-    /// The message in pieces had RSV1 on its first frame.
-    fragmented_compressed: bool = false,
+    /// Set while a message arrives in pieces; null otherwise.
+    fragment: ?Fragment = null,
     /// An extension that claims RSV1 (permessage-deflate, RFC 7692) was
     /// negotiated: RSV1 on a message's first frame is passed on as
     /// `Message.compressed` rather than refused. The extension itself is
@@ -416,8 +415,7 @@ pub const WebSocket = struct {
         // its bytes stay in the message arena until the next receive.
         defer self.held.release();
         self.fragmented_data = .empty;
-        self.fragmented_type = null;
-        self.fragmented_compressed = false;
+        self.fragment = null;
         while (true) {
             // The batch ends where reading would wait for the peer: what
             // it held goes out first.
@@ -473,19 +471,17 @@ pub const WebSocket = struct {
                     return .{ .type = .close, .data = reason, .close_code = close_code };
                 },
                 .continuation => {
-                    if (self.fragmented_type == null) {
-                        return Error.UnexpectedContinuation;
-                    }
+                    const fragment = self.fragment orelse return Error.UnexpectedContinuation;
                     if (self.fragmented_data.items.len + frame.payload.len > self.max_message_size) {
                         return Error.MessageTooLarge;
                     }
                     try self.hold(frame.payload.len);
                     try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     if (frame.fin) {
-                        const msg_type = self.fragmented_type.?;
+                        const msg_type = fragment.type;
+                        const compressed = fragment.compressed;
                         const data = try self.fragmented_data.toOwnedSlice(self.messageAllocator());
-                        self.fragmented_type = null;
-                        const compressed = self.fragmented_compressed;
+                        self.fragment = null;
                         if (!compressed and msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
                             return Error.InvalidUtf8;
                         }
@@ -495,7 +491,7 @@ pub const WebSocket = struct {
                 .text, .binary => {
                     // A message may not begin while another is still in
                     // pieces, whether or not the new one is whole.
-                    if (self.fragmented_type != null) {
+                    if (self.fragment != null) {
                         return Error.NestedFragment;
                     }
                     if (frame.fin) {
@@ -509,8 +505,7 @@ pub const WebSocket = struct {
                         if (frame.payload.len > self.max_message_size) {
                             return Error.MessageTooLarge;
                         }
-                        self.fragmented_type = frame.opcode;
-                        self.fragmented_compressed = frame.rsv1;
+                        self.fragment = .{ .type = frame.opcode, .compressed = frame.rsv1 };
                         self.fragmented_data.clearRetainingCapacity();
                         try self.hold(frame.payload.len);
                         try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
@@ -523,17 +518,33 @@ pub const WebSocket = struct {
 
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.writeSent(msg_type, data);
+        return self.sendFrame(msg_type, data, .{});
     }
 
-    /// `writeFrame` for `send` and `ping`, with `sendFlush` decided under
-    /// the write lock.
-    fn writeSent(self: *WebSocket, opcode: MessageType, data: []const u8) !void {
+    /// A message arriving in pieces: its type and whether its first frame had RSV1.
+    const Fragment = struct { type: MessageType, compressed: bool };
+
+    /// What a send variant is, as comptime options: each wrapper compiles to
+    /// straight-line code. Add a send kind as an option, not as a copy.
+    const SendOpts = struct {
+        /// RSV1 set: a message the negotiated extension compressed.
+        compressed: bool = false,
+        /// `.manual`: left in the buffer for `flush`; `.auto`: `sendFlush`.
+        flush: enum { auto, manual } = .auto,
+        /// A control frame (ping): no text/binary opcode check.
+        control: bool = false,
+    };
+
+    /// Every send ends here. Checks in order: opcode, RSV1, then under the
+    /// write lock the socket being open; `sendFlush` is decided under the lock.
+    inline fn sendFrame(self: *WebSocket, opcode: MessageType, data: []const u8, comptime o: SendOpts) !void {
+        if (!o.control and opcode != .text and opcode != .binary) return Error.InvalidOpcode;
+        if (o.compressed and !self.rsv1_allowed) return Error.ReservedFlags;
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, true, self.sendFlush(data.len)));
+        const after: Flush = if (o.flush == .manual) .manual else self.sendFlush(data.len);
+        return self.resolveWrite(self.writeFrameRsv(opcode, data, true, after, if (o.compressed) 0x40 else 0));
     }
 
     /// The biggest payload a batch holds back; a bigger frame goes out at
@@ -563,39 +574,25 @@ pub const WebSocket = struct {
     /// follows a run of them with one `flush`. For a task that sends many
     /// messages to this socket in a row (a broadcast, the C ABI's sender).
     pub fn sendNoFlush(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, .manual, 0));
+        return self.sendFrame(msg_type, data, .{ .flush = .manual });
     }
 
     /// `sendNoFlush` for a message the negotiated extension compressed
     /// (`sendCompressed`).
     pub fn sendCompressedNoFlush(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        if (!self.rsv1_allowed) return Error.ReservedFlags;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, .manual, 0x40));
+        return self.sendFrame(msg_type, data, .{ .compressed = true, .flush = .manual });
     }
 
     /// Sends `data`, already compressed by the negotiated extension, as one
     /// message with RSV1 set. Needs `rsv1_allowed`.
     pub fn sendCompressed(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        if (!self.rsv1_allowed) return Error.ReservedFlags;
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, self.sendFlush(data.len), 0x40));
+        return self.sendFrame(msg_type, data, .{ .compressed = true });
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
         if (data.len > 125) return Error.LargeControlFrame;
-        try self.writeSent(.ping, data);
+        try self.sendFrame(.ping, data, .{ .control = true });
     }
 
     /// Write out whatever is left in the write buffer. Safe to call from
@@ -648,7 +645,7 @@ pub const WebSocket = struct {
     /// the next frame is buffered and no message is half assembled. Where it
     /// can stop reading (`detachBuffers`) until the peer sends again.
     pub fn atRest(self: *const WebSocket) bool {
-        return self.fragmented_type == null and self.transport.reader.bufferedLen() == 0;
+        return self.fragment == null and self.transport.reader.bufferedLen() == 0;
     }
 
     /// For a socket that waits with no task reading it (a parked
@@ -693,7 +690,7 @@ pub const WebSocket = struct {
         r.seek = 0;
         r.end = 0;
         self.fragmented_data = .empty;
-        self.fragmented_type = null;
+        self.fragment = null;
         _ = self.msg_arena.reset(.free_all);
         self.msg_arena_used = false;
     }
@@ -846,11 +843,7 @@ pub const WebSocket = struct {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin, after));
-    }
-
-    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush) std.Io.Writer.Error!void {
-        return self.writeFrameRsv(opcode, data, fin, after, 0);
+        return self.resolveWrite(self.writeFrameRsv(opcode, data, fin, after, 0));
     }
 
     fn writeFrameRsv(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush, rsv: u8) std.Io.Writer.Error!void {
@@ -969,7 +962,7 @@ pub const WebSocket = struct {
         std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, .now));
+        try self.resolveWrite(self.writeFrameRsv(.close, buf[0 .. 2 + reason_len], true, .now, 0));
     }
 
     /// Whether `key` is a `Sec-WebSocket-Key` as RFC 6455 §4.1 has it: 16
@@ -2026,6 +2019,162 @@ test "WebSocket: RSV1 is refused until an extension allows it, then marks a data
 /// A masked client frame (zero mask key, so the payload reads as is).
 fn maskedFrame(comptime opcode: u8, comptime payload: []const u8) [6 + payload.len]u8 {
     return [_]u8{ 0x80 | opcode, 0x80 | @as(u8, payload.len), 0, 0, 0, 0 } ++ payload[0..payload.len].*;
+}
+
+const SendVariant = enum { send, send_no_flush, send_compressed, send_compressed_no_flush };
+
+fn callVariant(ws: *WebSocket, v: SendVariant, t: WebSocket.MessageType, data: []const u8) !void {
+    return switch (v) {
+        .send => ws.send(t, data),
+        .send_no_flush => ws.sendNoFlush(t, data),
+        .send_compressed => ws.sendCompressed(t, data),
+        .send_compressed_no_flush => ws.sendCompressedNoFlush(t, data),
+    };
+}
+
+const send_variant_rows = [_]struct { v: SendVariant, compressed: bool, manual: bool }{
+    .{ .v = .send, .compressed = false, .manual = false },
+    .{ .v = .send_no_flush, .compressed = false, .manual = true },
+    .{ .v = .send_compressed, .compressed = true, .manual = false },
+    .{ .v = .send_compressed_no_flush, .compressed = true, .manual = true },
+};
+
+test "WebSocket: the send variants set RSV1 and flush as each says" {
+    const gpa = std.testing.allocator;
+    for (send_variant_rows) |row| for ([_]WebSocket.MessageType{ .text, .binary }) |t| for ([_]bool{ true, false }) |autoflush| {
+        errdefer std.debug.print("variant {s} type {s} autoflush {}\n", .{ @tagName(row.v), @tagName(t), autoflush });
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.batch.backstop_on = false;
+        ws.rsv1_allowed = true;
+        ws.autoflush = autoflush;
+        try callVariant(&ws, row.v, t, "m");
+        const out_now = !row.manual and autoflush;
+        try std.testing.expectEqual(@as(usize, @intFromBool(out_now)), probe.writes);
+        if (!out_now) try ws.flush();
+        try std.testing.expectEqual(@as(usize, 1), probe.writes);
+        const op: u8 = if (t == .text) 0x1 else 0x2;
+        try std.testing.expectEqual(@as(u8, 0x80 | op | if (row.compressed) @as(u8, 0x40) else 0), probe.out.items[0]);
+    };
+}
+
+test "WebSocket: ping follows autoflush" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |autoflush| {
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.batch.backstop_on = false;
+        ws.autoflush = autoflush;
+        try ws.ping("p");
+        try std.testing.expectEqual(@as(usize, @intFromBool(autoflush)), probe.writes);
+        try ws.flush();
+        try std.testing.expectEqual(@as(u8, 0x89), probe.out.items[0]);
+    }
+}
+
+test "WebSocket: send errors keep their order: opcode, RSV1, closed" {
+    const gpa = std.testing.allocator;
+    const E = WebSocket.Error;
+    const bad = [_]WebSocket.MessageType{ .ping, .pong, .close, .continuation, @fromBackingInt(@intCast(0x3)) };
+    // rsv1_allowed x closed -> the error a compressed and a plain variant give for a text message.
+    const rows = [_]struct { rsv1: bool, closed: bool, compressed_err: anyerror, plain_err: ?anyerror }{
+        .{ .rsv1 = false, .closed = false, .compressed_err = E.ReservedFlags, .plain_err = null },
+        .{ .rsv1 = false, .closed = true, .compressed_err = E.ReservedFlags, .plain_err = error.EndOfStream },
+        .{ .rsv1 = true, .closed = true, .compressed_err = error.EndOfStream, .plain_err = error.EndOfStream },
+    };
+    for (rows) |row| for (send_variant_rows) |v| {
+        errdefer std.debug.print("variant {s} rsv1 {} closed {}\n", .{ @tagName(v.v), row.rsv1, row.closed });
+        var wbuf: [256]u8 = undefined;
+        var probe = SocketProbe.init(gpa, &wbuf);
+        defer probe.out.deinit(gpa);
+        var reader: std.Io.Reader = .fixed("");
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+        defer ws.deinit();
+        ws.rsv1_allowed = row.rsv1;
+        ws.closed = row.closed;
+        for (bad) |t| try std.testing.expectError(E.InvalidOpcode, callVariant(&ws, v.v, t, "x"));
+        const want: ?anyerror = if (v.compressed) row.compressed_err else row.plain_err;
+        if (want) |e| {
+            try std.testing.expectError(@as(anyerror, e), @as(anyerror!void, callVariant(&ws, v.v, .text, "x")));
+        } else {
+            try callVariant(&ws, v.v, .text, "x");
+        }
+        try std.testing.expect(probe.writes == 0 or want == null);
+    };
+}
+
+test "WebSocket: ping takes 125 bytes, refuses 126, and fails once closed" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    var reader: std.Io.Reader = .fixed("");
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+    const big: [126]u8 = @splat('p');
+    try ws.ping(big[0..125]);
+    try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.ping(&big));
+    ws.closed = true;
+    try std.testing.expectError(error.EndOfStream, ws.ping("p"));
+}
+
+test "WebSocket: a compressed fragmented message skips UTF-8 checks, and the flag does not outlive it" {
+    const bad = [_]u8{ 0xFF, 0xFE };
+    // RSV1 on the first frame or not; the pieces are masked with a zero key.
+    for ([_]bool{ true, false }) |rsv1| {
+        errdefer std.debug.print("rsv1 {}\n", .{rsv1});
+        var frames = [_]u8{ if (rsv1) 0x41 else 0x01, 0x81, 0, 0, 0, 0, bad[0], 0x80, 0x81, 0, 0, 0, 0, bad[1] } ++ maskedFrame(0x1, "ok");
+        var reader: std.Io.Reader = undefined;
+        var out: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var ws = serverSocketOver(&frames, &reader, &w);
+        defer ws.deinit();
+        ws.rsv1_allowed = true;
+        if (!rsv1) {
+            try std.testing.expectError(WebSocket.Error.InvalidUtf8, ws.receive());
+            continue;
+        }
+        const msg = try ws.receive();
+        try std.testing.expect(msg.compressed);
+        try std.testing.expectEqualSlices(u8, &bad, msg.data);
+        const next = try ws.receive();
+        try std.testing.expect(!next.compressed);
+    }
+}
+
+test "WebSocket: atRest follows the fragment, and a continuation needs one" {
+    var frames = [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'a', 0x80, 0x81, 0, 0, 0, 0, 'b' } ++ maskedFrame(0x0, "c");
+    var reader: std.Io.Reader = undefined;
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var ws = serverSocketOver(&frames, &reader, &w);
+    defer ws.deinit();
+    // Whole message first: "ab" delivered, nothing half assembled.
+    const msg = try ws.receive();
+    try std.testing.expectEqualStrings("ab", msg.data);
+    try std.testing.expect(ws.fragment == null);
+    // A continuation with no message in pieces.
+    try std.testing.expectError(WebSocket.Error.UnexpectedContinuation, ws.receive());
+
+    // Mid-message: not at rest; detachBuffers puts it back.
+    var r2: std.Io.Reader = .fixed("");
+    var w2: std.Io.Writer = .fixed(&out);
+    var ws2 = serverSocketOver(&.{}, &r2, &w2);
+    defer ws2.deinit();
+    try std.testing.expect(ws2.atRest());
+    ws2.fragment = .{ .type = .text, .compressed = true };
+    try std.testing.expect(!ws2.atRest());
+    ws2.detachBuffers();
+    try std.testing.expect(ws2.atRest());
 }
 
 test "WebSocket: messages read together are answered in one write" {
