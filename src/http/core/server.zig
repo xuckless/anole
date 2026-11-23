@@ -908,6 +908,17 @@ pub const Connection = struct {
         if (self.getWriteError()) |err| if (err == error.Canceled) return error.Canceled;
     }
 
+    /// Shuts both directions, uncancelably: it runs after a failed or
+    /// canceled write, when a cancel already delivered to the caller is on
+    /// its way out (a park here would be a swallowed one, and a cancel that
+    /// stopped the shutdown would leave the socket open); a pending one is
+    /// kept for the caller's next cancelation point.
+    pub fn shutdownBoth(self: *Connection, io: std.Io) void {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        self.stream.shutdown(io, .both) catch {};
+    }
+
     /// The protocol the client and server agreed on through ALPN, or null
     /// for a plain connection or a TLS one that negotiated none. Points into
     /// `ServerConfig.Tls.alpn_protocols`.

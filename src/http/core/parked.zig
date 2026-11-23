@@ -410,9 +410,7 @@ pub const H1Parked = struct {
     fn shutdownBoth(self: *H1Parked) void {
         // Not a cancelation point: a cancel meant for the stuck write may
         // still be pending here, and is kept for later.
-        const protection = self.io.swapCancelProtection(.blocked);
-        defer _ = self.io.swapCancelProtection(protection);
-        self.connection.stream.shutdown(self.io, .both) catch {};
+        self.connection.shutdownBoth(self.io);
         if (comptime abort_cancels_reader) {
             self.lockFlags();
             const task = self.reader_task;

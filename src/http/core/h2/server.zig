@@ -1743,7 +1743,7 @@ pub fn Engine(comptime Ctx: type) type {
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
-                        conn.connection.stream.shutdown(conn.io, .both) catch {};
+                        conn.connection.shutdownBoth(conn.io);
                         return err;
                     };
                 }
@@ -1766,7 +1766,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// reader stops too, the streams waiting for room are told, and
             /// the token goes (nobody takes it again).
             fn writeFailed(conn: *Conn) void {
-                conn.connection.stream.shutdown(conn.io, .both) catch {};
+                conn.connection.shutdownBoth(conn.io);
                 conn.lock();
                 defer conn.unlock();
                 conn.writer = conn.writer.next(.fail);
@@ -2965,7 +2965,7 @@ pub fn Engine(comptime Ctx: type) type {
                     if (t.canBound()) t.set(conn.io, .{ .duration = .{ .raw = server_mod.linger_timeout, .clock = .awake } });
                     defer t.clear(conn.io);
                     conn.connection.closeNotify() catch |err| {
-                        conn.connection.stream.shutdown(conn.io, .both) catch {};
+                        conn.connection.shutdownBoth(conn.io);
                         return err;
                     };
                 }
