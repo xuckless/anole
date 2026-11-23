@@ -41,6 +41,31 @@ pub const End = enum {
     closed,
 };
 
+/// Where the queue is in its life. A drain of its subscription and the
+/// client's drain are two causes: the client's drain still owes its UNSUB
+/// for a queue its subscription began to drain, and only once.
+///
+/// | event         | open          | by_subscription | by_client     | ended                      |
+/// |---------------|---------------|-----------------|---------------|----------------------------|
+/// | enterDrain    | by_sub, true  | false           | false         | false                      |
+/// | drainForClient| by_client,true| by_client, true | false         | false                      |
+/// | finishDrain   | -             | ended finished  | ended finished| -                          |
+/// | end(how)      | ended how     | ended how       | ended how     | only .closed replaces it   |
+/// | cancel        | ended finished| ended finished  | ended finished| finished, unless .closed   |
+const Phase = union(enum) {
+    open,
+    draining_by_subscription,
+    draining_by_client,
+    ended: Ended,
+};
+
+const Ended = struct {
+    how: End,
+    /// The client closed it after it had finished and everything in it was
+    /// taken: a drain of it had nothing left to wait for (how == .closed).
+    closed_after_drain: bool = false,
+};
+
 /// What `next` fails with: the errors of a subscription and those of a
 /// requestMany's responses.
 pub const NextError = error{
@@ -60,20 +85,15 @@ overflow: OverflowPolicy,
 /// The queue finishes once this many messages came; null: never.
 last: ?u64,
 /// Guards everything below.
-// SAFETY: NATS engine lock, outside the ranked wrappers until a single-owner
-// connection replaces the nesting (research/s15/retrofit-9-rest.md Q1): order
-// Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> MessageQueue.mutex, never
-// the other way; held across no suspension but an inner lock's wait and its
-// own condition's wait.
+// Lock order: Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> this, never back.
 mutex: Io.Mutex = .init,
 /// Signaled when a message comes or the queue ends.
-// SAFETY: the condition of the NATS engine lock above (same order and rule).
 not_empty: Io.Condition = .init,
 /// The messages, oldest first.
 messages: std.Deque(Message) = .empty,
 /// The bytes of the messages queued.
 bytes: usize = 0,
-ended: ?End = null,
+phase: Phase = .open,
 /// A task waits in `next`.
 receiving: bool = false,
 /// Messages that came, kept or dropped: the server counts them so for
@@ -86,18 +106,9 @@ dropped: u64 = 0,
 /// The last message that came did not fit: a slow consumer, warned about
 /// once per run of drops.
 overflowing: bool = false,
-/// Its subscription drains: the server was told to stop sending, it takes
-/// what still comes until it ends, and a new connection does not subscribe
-/// it again.
-draining: bool = false,
 /// `next` handed out a message, and the owner has not asked for the next
 /// one since: it may still be working on it.
 in_hand: bool = false,
-/// The client's drain queued an UNSUB for it.
-client_unsub: bool = false,
-/// The client closed it after it had finished and everything in it was
-/// taken: a drain of it had nothing left to wait for.
-drained_when_closed: bool = false,
 /// `drain()` calls of its subscription that are inside now: each still
 /// uses the subscription, so its `deinit` waits for them. Atomic, outside
 /// the mutex: leaving is the very last thing a drain does with it.
@@ -118,7 +129,7 @@ pub fn deinit(q: *MessageQueue) void {
 pub fn isOpen(q: *MessageQueue, io: Io) bool {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    return q.ended == null;
+    return q.phase != .ended;
 }
 
 /// A task waits in `next`; tests use it to know that one does.
@@ -132,7 +143,15 @@ pub fn isReceiving(q: *MessageQueue, io: Io) bool {
 pub fn endedHow(q: *MessageQueue, io: Io) ?End {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    return q.ended;
+    return q.endedAs();
+}
+
+/// How the queue ended; null before. Under the mutex.
+fn endedAs(q: *const MessageQueue) ?End {
+    return switch (q.phase) {
+        .ended => |e| e.how,
+        .open, .draining_by_subscription, .draining_by_client => null,
+    };
 }
 
 /// What a new connection needs to know about a subscription: null when it
@@ -143,7 +162,7 @@ pub const Resume = struct { remaining: ?u64 };
 pub fn resumeState(q: *MessageQueue, io: Io) ?Resume {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (q.ended != null or q.draining) return null;
+    if (q.phase != .open) return null;
     return .{ .remaining = if (q.last) |last| last -| q.received else null };
 }
 
@@ -155,8 +174,8 @@ pub fn enterDrain(q: *MessageQueue, io: Io) bool {
     _ = q.drainers.fetchAdd(1, .acquire);
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (q.ended != null or q.draining) return false;
-    q.draining = true;
+    if (q.phase != .open) return false;
+    q.phase = .draining_by_subscription;
     return true;
 }
 
@@ -178,7 +197,7 @@ pub fn awaitNoDrains(q: *MessageQueue, io: Io) void {
 pub fn takesSubscribe(q: *MessageQueue, io: Io) bool {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    return q.ended == null and !q.draining;
+    return q.phase == .open;
 }
 
 /// The client drains: true when its UNSUB must go out, once for each queue
@@ -188,10 +207,13 @@ pub fn takesSubscribe(q: *MessageQueue, io: Io) bool {
 pub fn drainForClient(q: *MessageQueue, io: Io) bool {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (q.ended != null or q.client_unsub) return false;
-    q.draining = true;
-    q.client_unsub = true;
-    return true;
+    switch (q.phase) {
+        .open, .draining_by_subscription => {
+            q.phase = .draining_by_client;
+            return true;
+        },
+        .draining_by_client, .ended => return false,
+    }
 }
 
 /// Waits until the queue has ended and is settled, polling every 5 ms,
@@ -201,8 +223,13 @@ pub fn awaitDrained(q: *MessageQueue, io: Io, deadline: ?Io.Clock.Timestamp) err
         {
             q.mutex.lockUncancelable(io);
             defer q.mutex.unlock(io);
-            if (q.ended == .closed) return if (q.drained_when_closed) {} else error.ConnectionClosed;
-            if (q.ended != null and q.isSettled()) return;
+            switch (q.phase) {
+                .ended => |e| {
+                    if (e.how == .closed) return if (e.closed_after_drain) {} else error.ConnectionClosed;
+                    if (q.isSettled()) return;
+                },
+                .open, .draining_by_subscription, .draining_by_client => {},
+            }
         }
         if (deadline) |d| if (time.expired(io, d)) return error.Timeout;
         try io.sleep(.fromMilliseconds(5), .awake);
@@ -213,8 +240,11 @@ pub fn awaitDrained(q: *MessageQueue, io: Io, deadline: ?Io.Clock.Timestamp) err
 pub fn finishDrain(q: *MessageQueue, io: Io) void {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (!q.draining or q.ended != null) return;
-    q.ended = .finished;
+    switch (q.phase) {
+        .draining_by_subscription, .draining_by_client => {},
+        .open, .ended => return,
+    }
+    q.phase = .{ .ended = .{ .how = .finished } };
     q.not_empty.broadcast(io);
 }
 
@@ -225,17 +255,25 @@ pub fn finishDrain(q: *MessageQueue, io: Io) void {
 pub fn end(q: *MessageQueue, io: Io, how: End, discard: bool) bool {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    const was_open = q.ended == null;
-    if (!was_open and how != .closed) return false;
-    if (how == .closed and q.ended == .finished and q.isSettled()) q.drained_when_closed = true;
-    q.ended = how;
+    const earlier: ?Ended = switch (q.phase) {
+        .ended => |e| e,
+        .open, .draining_by_subscription, .draining_by_client => null,
+    };
+    if (earlier != null and how != .closed) return false;
+    // A second close keeps what the first recorded.
+    const after_drain = if (earlier) |e| switch (e.how) {
+        .closed => e.closed_after_drain,
+        .finished => q.isSettled(),
+        .slow_consumer, .permission_denied, .no_responders, .disconnected => false,
+    } else false;
+    q.phase = .{ .ended = .{ .how = how, .closed_after_drain = after_drain } };
     if (discard or how == .closed) {
         q.freeAll();
         // Its owner ended it, or the client closed: no message is worked on.
         q.in_hand = false;
     }
     q.not_empty.broadcast(io);
-    return was_open;
+    return earlier == null;
 }
 
 /// Ends the open queue `how`, freeing what it holds with `discard`, and
@@ -245,8 +283,8 @@ pub fn end(q: *MessageQueue, io: Io, how: End, discard: bool) bool {
 pub fn endOpen(q: *MessageQueue, io: Io, how: End, discard: bool) ?End {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (q.ended) |earlier| return earlier;
-    q.ended = how;
+    if (q.endedAs()) |earlier| return earlier;
+    q.phase = .{ .ended = .{ .how = how } };
     if (discard) {
         q.freeAll();
         q.in_hand = false;
@@ -272,7 +310,7 @@ pub fn dropAll(q: *MessageQueue, io: Io) void {
 pub fn cancel(q: *MessageQueue, io: Io) void {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
-    if (q.ended != .closed) q.ended = .finished;
+    if (q.endedAs() != .closed) q.phase = .{ .ended = .{ .how = .finished } };
     q.freeAll();
     q.in_hand = false;
     q.not_empty.broadcast(io);
@@ -300,7 +338,7 @@ pub fn push(q: *MessageQueue, io: Io, message: ?Message) Pushed {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
     var pushed: Pushed = .{};
-    if (q.ended != null) {
+    if (q.phase == .ended) {
         if (message) |m| release(m);
         return pushed;
     }
@@ -319,8 +357,9 @@ pub fn push(q: *MessageQueue, io: Io, message: ?Message) Pushed {
     }
     q.dropped += pushed.dropped;
     if (q.last) |last| {
-        if (q.ended == null and q.received >= last) {
-            q.ended = .finished;
+        // An overflow may have ended it above.
+        if (q.phase != .ended and q.received >= last) {
+            q.phase = .{ .ended = .{ .how = .finished } };
             pushed.ended = .finished;
             q.not_empty.broadcast(io);
         }
@@ -348,7 +387,7 @@ fn handleOverflow(q: *MessageQueue, io: Io, m: Message, pushed: *Pushed) void {
         .close_subscription => {
             release(m);
             pushed.dropped += 1;
-            q.ended = .slow_consumer;
+            q.phase = .{ .ended = .{ .how = .slow_consumer } };
             pushed.ended = .slow_consumer;
             q.not_empty.broadcast(io);
         },
@@ -384,14 +423,15 @@ pub fn next(q: *MessageQueue, io: Io, timeout: Io.Timeout) NextError!?Message {
     // The owner is done with the message it took before.
     q.in_hand = false;
     while (true) {
-        if (q.ended == .closed) return error.ConnectionClosed;
+        const how = q.endedAs();
+        if (how == .closed) return error.ConnectionClosed;
         if (q.messages.popFront()) |m| {
             q.bytes -= m.buffer.len;
             q.delivered += 1;
             q.in_hand = true;
             return m;
         }
-        if (q.ended) |how| return switch (how) {
+        if (how) |h| return switch (h) {
             .finished => null,
             .slow_consumer => error.SlowConsumer,
             .permission_denied => error.PermissionDenied,
@@ -414,7 +454,7 @@ pub fn settled(q: *MessageQueue, io: Io) bool {
 }
 
 fn isSettled(q: *const MessageQueue) bool {
-    return q.messages.len == 0 and !q.in_hand and !(q.receiving and q.ended != null);
+    return q.messages.len == 0 and !q.in_hand and !(q.receiving and q.phase == .ended);
 }
 
 /// The messages waiting to be taken, and their bytes.
@@ -453,6 +493,73 @@ test "a queue is open until it ends, and closed wins over any other end" {
     try testing.expectEqual(.permission_denied, q.endedHow(io).?);
     _ = q.end(io, .closed, false);
     try testing.expectEqual(.closed, q.endedHow(io).?);
+}
+
+test "the phase table: each event from each phase, its next phase and its result" {
+    const io = testing.io;
+    const Event = union(enum) { enter_drain, client_drain, finish_drain, end: End, end_open: End, cancel, last_push };
+    const sub: Phase = .draining_by_subscription;
+    const cli: Phase = .draining_by_client;
+    const fin: Phase = .{ .ended = .{ .how = .finished } };
+    const denied: Phase = .{ .ended = .{ .how = .permission_denied } };
+    const closed: Phase = .{ .ended = .{ .how = .closed } };
+    const drained: Phase = .{ .ended = .{ .how = .closed, .closed_after_drain = true } };
+    // The result: what the call returned; for endOpen, that it ended the queue;
+    // for the last push, that it finished it; finishDrain and cancel: true.
+    const rows = [_]struct { []const u8, Phase, Event, Phase, bool }{
+        .{ "enterDrain begins", .open, .enter_drain, sub, true },
+        .{ "enterDrain twice", sub, .enter_drain, sub, false },
+        .{ "enterDrain in a client drain", cli, .enter_drain, cli, false },
+        .{ "enterDrain after the end", fin, .enter_drain, fin, false },
+        .{ "client drain of an open queue", .open, .client_drain, cli, true },
+        .{ "client drain of a subscription drain", sub, .client_drain, cli, true },
+        .{ "client drain twice", cli, .client_drain, cli, false },
+        .{ "client drain after the end", fin, .client_drain, fin, false },
+        .{ "finishDrain of an open queue", .open, .finish_drain, .open, true },
+        .{ "finishDrain of a subscription drain", sub, .finish_drain, fin, true },
+        .{ "finishDrain of a client drain", cli, .finish_drain, fin, true },
+        .{ "finishDrain after the end", denied, .finish_drain, denied, true },
+        .{ "end of a draining queue", cli, .{ .end = .disconnected }, .{ .ended = .{ .how = .disconnected } }, true },
+        .{ "end after an end", fin, .{ .end = .slow_consumer }, fin, false },
+        .{ "close of a settled finished queue", fin, .{ .end = .closed }, drained, false },
+        .{ "close of a denied queue", denied, .{ .end = .closed }, closed, false },
+        .{ "close of an open queue", .open, .{ .end = .closed }, closed, true },
+        .{ "close twice keeps the drain", drained, .{ .end = .closed }, drained, false },
+        .{ "endOpen of a subscription drain", sub, .{ .end_open = .no_responders }, .{ .ended = .{ .how = .no_responders } }, true },
+        .{ "endOpen after an end", denied, .{ .end_open = .finished }, denied, false },
+        .{ "cancel of a draining queue", sub, .cancel, fin, true },
+        .{ "cancel after another end", denied, .cancel, fin, true },
+        .{ "cancel after a close", closed, .cancel, closed, true },
+        .{ "last push of a draining queue", cli, .last_push, fin, true },
+        .{ "last push after the end", denied, .last_push, denied, false },
+    };
+    for (rows) |row| {
+        const name, const from, const event, const to, const result = row;
+        errdefer std.debug.print("row: {s}\n", .{name});
+        var q: MessageQueue = .init(testing.allocator, .{ .messages = 4, .bytes = 1024 }, .drop_newest, 1);
+        defer q.deinit();
+        q.phase = from;
+        const got = switch (event) {
+            .enter_drain => q.enterDrain(io),
+            .client_drain => q.drainForClient(io),
+            .finish_drain => b: {
+                q.finishDrain(io);
+                break :b true;
+            },
+            .end => |how| q.end(io, how, false),
+            .end_open => |how| q.endOpen(io, how, false) == null,
+            .cancel => b: {
+                q.cancel(io);
+                break :b true;
+            },
+            .last_push => q.push(io, null).ended == .finished,
+        };
+        if (event == .enter_drain) q.leaveDrain();
+        try testing.expectEqual(result, got);
+        try testing.expectEqualDeep(to, q.phase);
+        try testing.expectEqual(to == .open, q.takesSubscribe(io));
+        try testing.expectEqual(to == .open, q.resumeState(io) != null);
+    }
 }
 
 /// A message of `size` bytes in all: subject "s" and the rest payload.
@@ -700,7 +807,7 @@ test "a reader still inside next() when the queue ends is waited for" {
     try testing.expect(q.settled(io));
     // Ended under the reader, which has not returned yet.
     q.mutex.lockUncancelable(io);
-    q.ended = .finished;
+    q.phase = .{ .ended = .{ .how = .finished } };
     q.mutex.unlock(io);
     try testing.expect(!q.settled(io));
     q.mutex.lockUncancelable(io);
