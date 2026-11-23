@@ -2894,54 +2894,6 @@ pub fn Server(comptime Ctx: type) type {
             return false;
         }
 
-        /// Hangs up on a peer whose input was not all read, so the peer
-        /// still gets the answer. Closing with input unread makes the kernel
-        /// send a reset instead of a FIN, and a peer can throw the buffered
-        /// answer away when a reset arrives. So the send side is shut first,
-        /// which tells the peer there is nothing more to wait for, and what
-        /// it sent is thrown away until it hangs up, or `linger_timeout`
-        /// passes, or `linger_limit` bytes for a peer that keeps sending.
-        ///
-        /// Without a deadline to bound the reads, it waits out
-        /// `linger_timeout` without reading instead, as Go's net/http does:
-        /// time for the peer to read the answer before a reset can arrive.
-        ///
-        /// Throwing input away needs no request buffers, so the set is given
-        /// back first and the reads go through `idle_read_buffer`.
-        noinline fn lingeringClose(
-            self: *Self,
-            connection: *Connection,
-            timer: *Timer,
-            idle_read_buffer: []u8,
-            buffers: *?*RequestBuffers,
-        ) !void {
-            // Responses corked behind the one that closes (a head refused
-            // without an answer) still go out first.
-            try connection.flushOwedBeforeClose();
-            if (buffers.*) |b| {
-                connection.replaceReadBuffer(idle_read_buffer);
-                connection.releaseWriteBuffer();
-                self.request_buffers.release(b);
-                buffers.* = null;
-            }
-            try self.closeNotify(connection, timer);
-            connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
-                // Already gone: nothing left to throw away.
-                error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
-                else => |e| return e,
-            };
-            if (!timer.canBound()) return self.io.sleep(lingerTimeout(), .awake);
-            timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
-            defer timer.clear(self.io);
-            _ = connection.reader.discardShort(linger_limit) catch {
-                const cause = connection.getReadError() orelse error.Unexpected;
-                // The peer hanging up is the end this waits for. The
-                // deadline arrives as a cancel, and stays one.
-                if (Connection.isPeerGone(cause)) return;
-                return cause;
-            };
-        }
-
         /// `Connection.closeNotify`, bounded by `linger_timeout` where the
         /// timer can bound it: a peer that stopped reading must not hold the
         /// task on the last 24 bytes.
@@ -3459,27 +3411,37 @@ pub fn Server(comptime Ctx: type) type {
         /// Returns `.park` when the connection waited `timeout.idle_park`
         /// for its next request with nothing in flight, ready to park: its
         /// deadline set, its request buffers given back.
-        fn handleRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
+        ///
+        /// Out of line, so its frame is the loop's alone, not added to its
+        /// callers' (#223). Its phases (`Loop`) are plain functions with
+        /// one caller each, which LLVM inlines here: unlike Zig's `inline
+        /// fn`, its inliner lets their locals share stack slots, and the
+        /// frame came out 288 bytes smaller than the one-function loop's
+        /// (ReleaseFast, x86_64, 2026-11-22). The refusals stay out of
+        /// line (`refuse`, `refuseHead`, `lingeringClose`).
+        noinline fn handleRequests(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
             const l = conn.listener;
             const connection = &conn.connection;
-            const accepted_at = conn.accepted_at;
-            // A connection woken after a long park parks again once it has
-            // served a request (`park.Shelf.long_park`).
-            var repark_after: ?usize = if (conn.parked.woke_from_long) conn.request_count + 1 else null;
-            // What ends a wait for the next request at the park delay, with
-            // no timer per wait: the shelf's driver (`park.Watch`). Without
-            // a shelf to watch it, the connection does not park.
-            var park_watch: park.Watch = .{};
-            const watch_shelf = if (self.parkAfter(null) == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null;
-            if (watch_shelf) |s| s.watch(&park_watch);
-            defer if (watch_shelf) |s| s.unwatch(&park_watch);
-            var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
-            connection.useReadBuffer(&idle_read_buffer);
+            var lp: Loop = .{
+                .conn = conn,
+                .timer = timer,
+                .h2c = build_options.use_http2 and l.config.http2_prior_knowledge and
+                    !(build_options.use_tls and l.config.tls != null),
+                // A connection woken after a long park parks again once it
+                // has served a request (`park.Shelf.long_park`).
+                .repark_after = if (conn.parked.woke_from_long) conn.request_count + 1 else null,
+                // Without a shelf to watch the wait, the connection does
+                // not park.
+                .watch_shelf = if (self.parkAfter(null) == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null,
+                .request = undefined,
+            };
+            if (lp.watch_shelf) |s| s.watch(&lp.park_watch);
+            defer if (lp.watch_shelf) |s| s.unwatch(&lp.park_watch);
+            connection.useReadBuffer(&lp.idle_read_buffer);
             // Last: the reader must not point into this frame once it is
             // gone, as a connection that parks outlives it.
             defer connection.replaceReadBuffer(&.{});
-            var buffers: ?*RequestBuffers = null;
-            defer if (buffers) |b| {
+            defer if (lp.buffers) |b| {
                 // An adopter's writer is its own, under its lock: it took
                 // it out of the buffers before it returned.
                 if (connection.mode.adopter() == null) {
@@ -3496,14 +3458,21 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 self.request_buffers.release(b);
             };
-            // A handler that handed the connection over (`Response.adopt`)
-            // but whose request did not get as far as the first run, which
-            // takes the adopter's windows out of the buffers: the adopter is
-            // done with before they go back.
-            var adopter_ran = false;
-            defer if (!adopter_ran) connection.releaseAdopter();
+            // Where the loop is. A handler that handed the connection over
+            // (`Response.adopt`) but whose request did not get as far as the
+            // first run (`.adopt`), which takes the adopter's windows out of
+            // the buffers, has its adopter done with before they go back.
+            // Assigned only from a phase's result, so an error leaves the
+            // last one, never `.adopt` or `.h2c`.
+            var step: Step = .next;
+            defer switch (step) {
+                .next, .close, .park => connection.releaseAdopter(),
+                // The adopter (or the engine) serves on: `closeConn`
+                // releases it.
+                .adopt, .h2c => {},
+            };
 
-            var request: Request = .{
+            lp.request = .{
                 // The pooled arena, once a request has arrived.
                 .arena = undefined,
                 .io = self.io,
@@ -3523,33 +3492,116 @@ pub fn Server(comptime Ctx: type) type {
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
             };
-            request.session._empty();
+            lp.request.session._empty();
 
-            var parser: RequestParser = undefined;
-            try parser.init(&request);
-            defer parser.deinit();
+            try lp.parser.init(&lp.request);
+            defer lp.parser.deinit();
 
-            request._parser = &parser;
+            lp.request._parser = &lp.parser;
 
-            while (true) {
+            while (step == .next) {
+                // Read before the request is counted: whether it is the
+                // connection's first.
+                const first = conn.request_count == 0;
+                step = try lp.admit(first);
+                if (step == .next) step = try lp.serve(first);
+            }
+            return switch (step) {
+                .next => unreachable,
+                .close => .close,
+                .park => .park,
+                .adopt => self.serveAdopted(conn, timer),
+                // Only `admit` returns it, and only with HTTP/2 built in.
+                .h2c => if (build_options.use_http2) self.startH2c(conn, timer) else unreachable,
+            };
+        }
+
+        /// Where the HTTP/1.x request loop (`handleRequests`) goes after
+        /// one of its phases: every phase returns one, the loop goes on
+        /// while it is `.next`, and its exit switch acts on the rest. A
+        /// new way out of the loop is a value here, a cell below and an
+        /// arm of that switch, not a flag beside them.
+        ///
+        ///   phase      next                  close                         park        adopt         h2c
+        ///   admit      a request's bytes     the peer is gone; the drain   idle and    -             the first bytes
+        ///              are here              refused it (after a linger);  parkable                  are the HTTP/2
+        ///                                    no preface on a cleartext                               preface
+        ///                                    HTTP/2-only listener
+        ///   readHead   the head is in        the end before a request;     -           -             -
+        ///                                    the head refused (refuseHead)
+        ///   checkHead  the head is accepted  refused: 413, Host, 417       -           -             -
+        ///                                    (refuse)
+        ///   dispatch   the chain ran         the router refused the URL    -           -             -
+        ///                                    (refuse); Response.abort
+        ///   finish     kept alive, ready     not kept alive, no adopter    -           an adopter    -
+        ///              for the next request                                            took it over
+        ///
+        /// Errors leave from any phase; the cleanup in `handleRequests`
+        /// runs either way.
+        const Step = enum { next, close, park, adopt, h2c };
+
+        /// Why a request head was refused (`readHead`); `headReply` says
+        /// how it is answered. Every error `parseHeaders` can return is an
+        /// arm of `readHead`'s switch, so a new one asks for a decision.
+        const HeadRefusal = enum { too_large, too_many_headers, bad_method, malformed };
+
+        /// The fixed reply to a refused head, or null to close without one.
+        /// An HTTP/2 preface (a client that went ahead with HTTP/2 although
+        /// ALPN did not agree on it) gets the close alone: it would read an
+        /// HTTP/1.1 answer as a frame. So does a first request line that
+        /// does not start with a method on a listener that also takes
+        /// HTTP/2 with prior knowledge (`h2c_first`): it may be an HTTP/2
+        /// client's preface gone wrong, which RFC 9113 section 3.4 makes a
+        /// connection error, and that client would read a 400 as a broken
+        /// frame. A malformed HTTP/1.x head after a method still gets the
+        /// 400.
+        fn headReply(refusal: HeadRefusal, h2c_first: bool, buffered: []const u8) ?FixedReply {
+            switch (refusal) {
+                .too_large, .too_many_headers => return .headers_too_large,
+                .bad_method => if (h2c_first) return null,
+                .malformed => {},
+            }
+            if (std.mem.startsWith(u8, buffered, h2_preface_line)) return null;
+            return .bad_request;
+        }
+
+        /// What the phases of `handleRequests` share for the whole
+        /// connection: its locals, on its frame. Not copied once the loop
+        /// starts (the reader and the request point into it). What lasts
+        /// one request (`first`, the request deadline) is passed instead.
+        const Loop = struct {
+            conn: *Conn,
+            timer: *Timer,
+            /// Cleartext HTTP/2 with prior knowledge on this listener.
+            h2c: bool,
+            repark_after: ?usize,
+            /// What ends a wait for the next request at the park delay,
+            /// with no timer per wait: the shelf's driver (`park.Watch`).
+            park_watch: park.Watch = .{},
+            watch_shelf: ?*park.Shelf,
+            idle_read_buffer: [idle_read_buffer_len]u8 = undefined,
+            buffers: ?*RequestBuffers = null,
+            request: Request,
+            parser: RequestParser = undefined,
+
+            /// Waits for the next request with nothing in flight (or
+            /// parks), and takes the connection to HTTP/2 when its first
+            /// bytes are the preface.
+            fn admit(lp: *Loop, first: bool) !Step {
+                const self = lp.conn.server;
+                const conn = lp.conn;
+                const connection = &conn.connection;
+                const timer = lp.timer;
                 // Nothing buffered means the next request has not begun.
                 // The first is waited for under the request deadline, which
                 // runs from accept; a later one under the keepalive
                 // deadline, and its request deadline runs from arrival. A
                 // request pipelined behind the last one is already here.
-                const first = conn.request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
                     // A guard: a response is corked only while the next
                     // request is buffered, so nothing is owed here.
                     try connection.flushOwed();
-                    if (!self.config.request.keep_buffers_between_requests) {
-                        if (buffers) |b| {
-                            connection.useReadBuffer(&idle_read_buffer);
-                            connection.releaseWriteBuffer();
-                            self.request_buffers.release(b);
-                            buffers = null;
-                        }
-                    }
+                    if (!self.config.request.keep_buffers_between_requests) lp.dropBuffers();
                     const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
                     // The wait's deadline, up to a second late, for as long
                     // as the connection waits: on this task, and parked.
@@ -3560,25 +3612,20 @@ pub fn Server(comptime Ctx: type) type {
                     // with nothing by then parks. One woken after a long
                     // park parks again as soon as it has answered what woke
                     // it, as if the delay had passed.
-                    const park_after = if (watch_shelf != null) self.parkAfter(wait_timeout) else null;
-                    const repark_now = if (repark_after) |n| conn.request_count >= n else false;
-                    if (repark_now) repark_after = null;
+                    const park_after = if (lp.watch_shelf != null) self.parkAfter(wait_timeout) else null;
+                    const repark_now = if (lp.repark_after) |n| conn.request_count >= n else false;
+                    if (repark_now) lp.repark_after = null;
                     // Nothing in flight from here: the request just served
                     // is done, and a connection that parks holds no count.
                     self.giveCount(&conn.count);
                     var arrival: RequestWait = if (repark_now and park_after != null)
                         .idle
                     else
-                        try self.waitForRequest(conn, if (park_after != null) &park_watch else null);
+                        try self.waitForRequest(conn, if (park_after != null) &lp.park_watch else null);
                     if (arrival == .idle) {
                         const shelf = self.shelfHere();
                         if (shelf != null and !shelf.?.closed and connection.parkable()) {
-                            if (buffers) |b| {
-                                connection.useReadBuffer(&idle_read_buffer);
-                                connection.releaseWriteBuffer();
-                                self.request_buffers.release(b);
-                                buffers = null;
-                            }
+                            lp.dropBuffers();
                             // The wait's own deadline, which a parked
                             // connection keeps to the shelf's sweep.
                             conn.parked.deadline = if (wait_deadline) |d| d.raw else null;
@@ -3593,7 +3640,7 @@ pub fn Server(comptime Ctx: type) type {
                         .peer_gone => return .close,
                         // The request it refused was not read.
                         .refused => {
-                            try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                            try lp.lingeringClose();
                             return .close;
                         },
                         .idle => unreachable,
@@ -3601,20 +3648,30 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 // Cleartext HTTP/2 with prior knowledge: the first bytes are
                 // the HTTP/2 preface rather than a request line.
-                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !(build_options.use_tls and l.config.tls != null)) {
+                if (build_options.use_http2 and first and lp.h2c) {
                     const is_h2 = h2.sniffPreface(connection.reader) catch
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
                         timer.clear(self.io);
-                        adopter_ran = true;
-                        return self.startH2c(conn, timer);
+                        return .h2c;
                     }
                 }
                 // An HTTP/2-only cleartext listener: no preface, no service.
-                if (!l.config.http1 and !(build_options.use_tls and l.config.tls != null)) {
+                if (!conn.listener.config.http1 and !(build_options.use_tls and conn.listener.config.tls != null)) {
                     log.debug("closing a connection that did not open with the HTTP/2 preface on an HTTP/2-only listener", .{});
                     return .close;
                 }
+                return .next;
+            }
+
+            /// Reads the head of the request whose bytes `admit` found,
+            /// under its deadlines, into the request buffers, and sets
+            /// `request_deadline`.
+            fn readHead(lp: *Loop, first: bool, request_deadline: *?std.Io.Clock.Timestamp) !Step {
+                const self = lp.conn.server;
+                const conn = lp.conn;
+                const connection = &conn.connection;
+                const timer = lp.timer;
                 // A request runs to `timeout.request` from its arrival (the
                 // first from accept), and its head must arrive within
                 // `timeout.read_header` of the same point, whichever is
@@ -3631,114 +3688,98 @@ pub fn Server(comptime Ctx: type) type {
                 const head_buffered = headBuffered(connection.reader.buffered());
                 const needs_clock = self.config.timeout.request != null or
                     (!head_buffered and self.config.timeout.read_header != null);
-                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else self.tickNow();
-                const request_deadline = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
-                const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
-                timer.setLazy(self.io, if (head_buffered) request_deadline else header_deadline);
+                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) conn.accepted_at else self.tickNow();
+                request_deadline.* = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
+                const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline.*);
+                timer.setLazy(self.io, if (head_buffered) request_deadline.* else header_deadline);
                 conn.request_count += 1;
 
-                if (buffers == null) {
+                if (lp.buffers == null) {
                     const b = try self.request_buffers.acquire(@intFromPtr(connection));
-                    buffers = b;
+                    lp.buffers = b;
                     // The write buffer once the response writes.
                     connection.useReadBuffer(b.read_buffer);
-                    request.arena = b.arena.allocator();
+                    lp.request.arena = b.arena.allocator();
                 }
 
                 // The rest of the head is still to come: the responses
                 // corked so far go out before the read waits for it.
                 if (!head_buffered) try connection.flushOwed();
 
-                parseHeaders(connection.reader, &parser) catch |err| switch (err) {
-                    error.EndOfStream => return .close,
-                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
-                    error.HeadersTooLarge => {
-                        log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
-                        sendFixed(connection.writer, .headers_too_large) catch
-                            return connection.getWriteError() orelse error.Unexpected;
-                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
-                    },
-                    error.TooManyHeaders => {
-                        log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
-                        sendFixed(connection.writer, .headers_too_large) catch
-                            return connection.getWriteError() orelse error.Unexpected;
-                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
-                    },
-                    // A head that is not HTTP/1.x: 400, and a lingering
-                    // close, so the peer reads the answer and a FIN rather
-                    // than a reset for the bytes it sent after. An HTTP/2
-                    // preface (a client that went ahead with HTTP/2 although
-                    // ALPN did not agree on it) gets the close alone: it
-                    // would read an HTTP/1.1 answer as a frame. Logged at
-                    // info, as `runConnection` logs the other malformed
-                    // requests: any peer can send one.
-                    //
-                    // So does a first request line that does not start with
-                    // a method on a listener that also takes HTTP/2 with
-                    // prior knowledge: it may be an HTTP/2 client's preface
-                    // gone wrong, which RFC 9113 section 3.4 makes a
-                    // connection error, and that client would read a 400 as
-                    // a broken frame. A malformed HTTP/1.x head after a
-                    // method still gets the 400.
-                    error.InvalidMethod,
-                    error.InvalidUrl,
-                    error.InvalidHeaderToken,
-                    error.InvalidHeaderValue,
-                    error.InvalidVersion,
-                    error.InvalidStatus,
-                    error.InvalidChunkSize,
-                    error.UnexpectedContentLength,
-                    error.ParseFailed,
-                    => |e| {
-                        log.info("Malformed request: {}", .{e});
-                        const h2c = build_options.use_http2 and l.config.http2_prior_knowledge and
-                            !(build_options.use_tls and l.config.tls != null);
-                        const bad_preface = h2c and first and e == error.InvalidMethod;
-                        if (!bad_preface and !std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
-                            sendFixed(connection.writer, .bad_request) catch
-                                return connection.getWriteError() orelse error.Unexpected;
-                        }
-                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
-                    },
-                    else => |e| return e,
+                parseHeaders(connection.reader, &lp.parser) catch |err| {
+                    const refusal: HeadRefusal = switch (err) {
+                        error.EndOfStream => return .close,
+                        error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                        // No head to answer: the connection ended inside
+                        // it, or there was no room for it.
+                        error.IncompleteRequest, error.ClosedConnection, error.OutOfMemory => |e| return e,
+                        error.HeadersTooLarge => .too_large,
+                        error.TooManyHeaders => .too_many_headers,
+                        error.InvalidMethod => .bad_method,
+                        error.InvalidUrl,
+                        error.InvalidHeaderToken,
+                        error.InvalidHeaderValue,
+                        error.InvalidVersion,
+                        error.InvalidStatus,
+                        error.InvalidChunkSize,
+                        error.UnexpectedContentLength,
+                        error.ParseFailed,
+                        => .malformed,
+                    };
+                    return lp.refuseHead(refusal, err, first);
                 };
                 // The head is in: from here the request deadline alone.
-                if (!head_buffered and header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
-                    timer.setLazy(self.io, request_deadline);
+                if (!head_buffered and header_deadline != null and (request_deadline.* == null or !header_deadline.?.compare(.eq, request_deadline.*.?))) {
+                    timer.setLazy(self.io, request_deadline.*);
                 }
+                return .next;
+            }
+
+            /// One request, from its head to its answer: the one place a
+            /// `Response` lives, so it ends with the request.
+            fn serve(lp: *Loop, first: bool) !Step {
+                const self = lp.conn.server;
+                const connection = &lp.conn.connection;
+                const request = &lp.request;
+                var request_deadline: ?std.Io.Clock.Timestamp = null;
+                const head = try lp.readHead(first, &request_deadline);
+                if (head != .next) return head;
 
                 // This is per request, not per connection: a keepalive
                 // connection may carry a different forwarding chain on every
                 // request. Starting from the socket peer also makes an absent
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
-                request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
-                applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
-                self.applyRequestIdHeader(&request);
+                request.secure = (build_options.use_tls and lp.conn.listener.config.tls != null) or connection.proxied_secure;
+                applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
+                self.applyRequestIdHeader(request);
 
                 var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
-                response._request = &request;
+                response._request = request;
                 request._response = &response;
 
+                const checked = try lp.checkHead(&response);
+                if (checked != .next) return checked;
+                const ran = try lp.dispatch(&response);
+                if (ran != .next) return ran;
+                return lp.finish(&response, request_deadline);
+            }
+
+            /// Refuses a head the server will not serve, and sets whether
+            /// the connection may carry on after it.
+            fn checkHead(lp: *Loop, response: *Response) !Step {
+                const self = lp.conn.server;
+                const request = &lp.request;
                 // A body declared longer than allowed is refused unread
                 // (and before any 100 Continue): 413, and the connection
                 // closes, since the body may still be coming.
                 if (self.config.request.max_content_length) |max| {
                     if (request.content_length) |len| if (len > max) {
-                        response.status = .payload_too_large;
-                        response.content_type = .text;
-                        response.body = "413 Content Too Large\n";
-                        response.keepalive = false;
-                        try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
+                        return lp.refuse(response, .payload_too_large, "413 Content Too Large\n");
                     };
                 }
 
@@ -3750,11 +3791,7 @@ pub fn Server(comptime Ctx: type) type {
                         if (std.ascii.eqlIgnoreCase(h.key, "Host")) hosts += 1;
                     }
                     if (hosts > 1 or (hosts == 0 and !response.http10)) {
-                        response.status = .bad_request;
-                        response.keepalive = false;
-                        try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
+                        return lp.refuse(response, .bad_request, null);
                     }
                 }
 
@@ -3765,42 +3802,43 @@ pub fn Server(comptime Ctx: type) type {
                         request._expects_continue = !response.http10;
                     } else {
                         // Unknown Expect value - return 417
-                        response.status = .expectation_failed;
-                        response.keepalive = false;
-                        try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
+                        return lp.refuse(response, .expectation_failed, null);
                     }
                 }
 
                 // llhttp ends a CONNECT at its head, Content-Length or not,
                 // so whatever follows is not a request.
-                if (!parser.shouldKeepAlive() or request.method == .connect) {
+                if (!lp.parser.shouldKeepAlive() or request.method == .connect) {
                     response.keepalive = false;
                 }
 
                 // Check if we've reached the request count limit
                 if (self.config.timeout.request_count) |max_count| {
-                    if (conn.request_count >= max_count) {
+                    if (lp.conn.request_count >= max_count) {
                         response.keepalive = false;
                     }
                 }
+                return .next;
+            }
 
-                const found = self.router.findHandler(&request) catch |err| switch (err) {
+            /// Routes the request and runs its handler with the
+            /// middleware, and says what the handler's error means for the
+            /// connection.
+            fn dispatch(lp: *Loop, response: *Response) !Step {
+                const self = lp.conn.server;
+                const connection = &lp.conn.connection;
+                const request = &lp.request;
+                const found = self.router.findHandler(request) catch |err| switch (err) {
                     // The request's own doing, and the connection is fine.
                     error.InvalidEscapeSequence, error.TooManyQueryParams, error.TooManyParams => {
-                        response.status = .bad_request;
-                        response.keepalive = false;
-                        try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return .close;
+                        return lp.refuse(response, .bad_request, null);
                     },
                     else => |e| return e,
                 };
-                const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(&request) else null;
+                const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(request) else null;
                 var executor = Chain(Ctx){
-                    .req = &request,
-                    .res = &response,
+                    .req = request,
+                    .res = response,
                     .ctx = self.ctx,
                     .action = if (found) |r| r.action else null,
                     .middlewares = if (found) |r| r.middlewares else miss.?.middlewares,
@@ -3812,14 +3850,14 @@ pub fn Server(comptime Ctx: type) type {
                 // arrive), so its wait does not hold them back.
                 if (connection.writer.end != 0) {
                     const never_waits = found != null and found.?.no_wait and
-                        (parser.isBodyComplete() or
+                        (lp.parser.isBodyComplete() or
                             (request.content_length != null and request.content_length.? <= connection.reader.bufferedLen()));
                     if (!never_waits) try connection.flushOwed();
                 }
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
                 request._body_held.release();
-                hooks.end(&request, &response, run_result, executor.answered, t0);
+                hooks.end(request, response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
                     error.ReadFailed => {
                         connection.dropOwed();
@@ -3831,7 +3869,7 @@ pub fn Server(comptime Ctx: type) type {
                     // responses corked before it still go out first.
                     error.ResponseAborted => {
                         log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
-                        try closeOwed(connection, &response);
+                        try closeOwed(connection, response);
                         return .close;
                     },
                     error.Canceled => {
@@ -3839,11 +3877,21 @@ pub fn Server(comptime Ctx: type) type {
                         return error.Canceled;
                     },
                     else => |e| {
-                        try closeOwed(connection, &response);
+                        try closeOwed(connection, response);
                         return e;
                     },
                 };
+                return .next;
+            }
 
+            /// Throws away what the handler left of the body, writes the
+            /// response, and readies the connection for the next request,
+            /// or hands it to its adopter, or ends it.
+            fn finish(lp: *Loop, response: *Response, request_deadline: ?std.Io.Clock.Timestamp) !Step {
+                const self = lp.conn.server;
+                const connection = &lp.conn.connection;
+                const request = &lp.request;
+                const parser = &lp.parser;
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
@@ -3869,7 +3917,7 @@ pub fn Server(comptime Ctx: type) type {
                         const drain_deadline = earlier(request_deadline, request._handler_deadline);
                         // The drain reads, and may wait for the body.
                         try connection.flushOwed();
-                        if (!try self.boundedDiscard(&parser, connection, max, timer, drain_deadline)) response.keepalive = false;
+                        if (!try self.boundedDiscard(parser, connection, max, lp.timer, drain_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }
@@ -3890,29 +3938,31 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
-                    if (!connection.mode.upgraded() and !response._parked and hasUnreadInput(connection, &parser)) {
-                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                    if (!connection.mode.upgraded() and !response._parked and hasUnreadInput(connection, parser)) {
+                        try lp.lingeringClose();
                     }
-                    if (connection.mode.adopter() != null) {
-                        // The count stays held: in flight until it closes
-                        // (`Count`).
-                        // The adopter keeps nothing of the request's
-                        // (`Response.adopt`), so its buffers go back before
-                        // the first run, rather than when the socket first
-                        // parks: a burst of upgrades does not hold a set
-                        // each meanwhile. Unless the peer sent something
-                        // behind the handshake already, which the first run
-                        // reads from the window the upgrade left in them,
-                        // and they go back after it.
-                        if (connection.reader.bufferedLen() == 0) if (buffers) |b| {
-                            connection.replaceReadBuffer(&.{});
-                            self.request_buffers.release(b);
-                            buffers = null;
-                        };
-                        adopter_ran = true;
-                        return self.serveAdopted(conn, timer);
-                    }
-                    break;
+                    if (connection.mode.adopter() == null) return .close;
+                    // The count stays held: in flight until it closes
+                    // (`Count`).
+                    // The adopter keeps nothing of the request's
+                    // (`Response.adopt`), so its buffers go back before
+                    // the first run, rather than when the socket first
+                    // parks: a burst of upgrades does not hold a set
+                    // each meanwhile. Unless the peer sent something
+                    // behind the handshake already, which the first run
+                    // reads from the window the upgrade left in them,
+                    // and they go back after it.
+                    //
+                    // Not `dropBuffers`: the write buffer stays, since the
+                    // adopter's writes borrow pooled buffers of their own
+                    // (`Connection.shrinkForUpgrade`), and the reader gets
+                    // no window, the adopter's first run gives it one.
+                    if (connection.reader.bufferedLen() == 0) if (lp.buffers) |b| {
+                        connection.replaceReadBuffer(&.{});
+                        self.request_buffers.release(b);
+                        lp.buffers = null;
+                    };
+                    return .adopt;
                 }
 
                 // The write buffer goes back between requests, so the next
@@ -3923,11 +3973,104 @@ pub fn Server(comptime Ctx: type) type {
                 if (connection.writer.end == 0) connection.releaseWriteBuffer();
                 parser.reset();
                 request._reset();
-                buffers.?.resetArena();
+                lp.buffers.?.resetArena();
                 connection.rewindReader();
+                return .next;
             }
-            return .close;
-        }
+
+            /// Answers a request refused before its handler ran, and closes:
+            /// the one refusal path (h2o's `entity_read_do_send_error`, Go's
+            /// `badRequest` before `closeWriteAndWait`). With input unread
+            /// (the body, or a request behind it), the close lingers, so the
+            /// peer reads the answer rather than a reset.
+            noinline fn refuse(lp: *Loop, response: *Response, status: @FieldType(Response, "status"), body: ?[]const u8) !Step {
+                @branchHint(.cold);
+                response.status = status;
+                if (body) |b| {
+                    response.content_type = .text;
+                    response.body = b;
+                }
+                response.keepalive = false;
+                try response.write();
+                if (hasUnreadInput(&lp.conn.connection, &lp.parser)) try lp.lingeringClose();
+                return .close;
+            }
+
+            /// Answers a head `parseHeaders` refused (`headReply`), then
+            /// closes, lingering so the peer reads the answer and a FIN
+            /// rather than a reset for the bytes it sent after. Malformed
+            /// heads are logged at info, as `runConnection` logs the other
+            /// malformed requests: any peer can send one.
+            noinline fn refuseHead(lp: *Loop, refusal: HeadRefusal, err: anyerror, first: bool) !Step {
+                @branchHint(.cold);
+                const self = lp.conn.server;
+                const connection = &lp.conn.connection;
+                switch (refusal) {
+                    .too_large => log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size}),
+                    .too_many_headers => log.debug("Request had more than {d} headers", .{self.config.request.max_header_count}),
+                    .bad_method, .malformed => log.info("Malformed request: {}", .{err}),
+                }
+                if (headReply(refusal, lp.h2c and first, connection.reader.buffered())) |reply| {
+                    sendFixed(connection.writer, reply) catch
+                        return connection.getWriteError() orelse error.Unexpected;
+                }
+                try lp.lingeringClose();
+                return .close;
+            }
+
+            /// Gives the request buffers back, if held, with the reader on
+            /// `idle_read_buffer` and whatever it held thrown away: where
+            /// nothing is buffered (between requests), or nothing buffered
+            /// is wanted (a lingering close).
+            fn dropBuffers(lp: *Loop) void {
+                const b = lp.buffers orelse return;
+                const connection = &lp.conn.connection;
+                connection.replaceReadBuffer(&lp.idle_read_buffer);
+                connection.releaseWriteBuffer();
+                lp.conn.server.request_buffers.release(b);
+                lp.buffers = null;
+            }
+
+            /// Hangs up on a peer whose input was not all read, so the peer
+            /// still gets the answer. Closing with input unread makes the kernel
+            /// send a reset instead of a FIN, and a peer can throw the buffered
+            /// answer away when a reset arrives. So the send side is shut first,
+            /// which tells the peer there is nothing more to wait for, and what
+            /// it sent is thrown away until it hangs up, or `linger_timeout`
+            /// passes, or `linger_limit` bytes for a peer that keeps sending.
+            ///
+            /// Without a deadline to bound the reads, it waits out
+            /// `linger_timeout` without reading instead, as Go's net/http does:
+            /// time for the peer to read the answer before a reset can arrive.
+            ///
+            /// Throwing input away needs no request buffers, so the set is given
+            /// back first and the reads go through `idle_read_buffer`.
+            noinline fn lingeringClose(lp: *Loop) !void {
+                const self = lp.conn.server;
+                const connection = &lp.conn.connection;
+                const timer = lp.timer;
+                // Responses corked behind the one that closes (a head refused
+                // without an answer) still go out first.
+                try connection.flushOwedBeforeClose();
+                lp.dropBuffers();
+                try self.closeNotify(connection, timer);
+                connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
+                    // Already gone: nothing left to throw away.
+                    error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
+                    else => |e| return e,
+                };
+                if (!timer.canBound()) return self.io.sleep(lingerTimeout(), .awake);
+                timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
+                defer timer.clear(self.io);
+                _ = connection.reader.discardShort(linger_limit) catch {
+                    const cause = connection.getReadError() orelse error.Unexpected;
+                    // The peer hanging up is the end this waits for. The
+                    // deadline arrives as a cancel, and stays one.
+                    if (Connection.isPeerGone(cause)) return;
+                    return cause;
+                };
+            }
+        };
     };
 }
 
