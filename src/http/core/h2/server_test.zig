@@ -775,10 +775,13 @@ test "h2 engine: POST body echoed, with and without content-length" {
     const body = try pattern(100 * 1024 + 3);
     defer testing.allocator.free(body);
     const small = try c.requestWith("POST", "/echo", &.{.{ .name = "content-length", .value = "11" }}, "hello world");
+    // Declared past the window: the buffer and the raises are capped by the total.
+    const sized = try c.requestWith("POST", "/echo", &.{.{ .name = "content-length", .value = "102403" }}, body);
     const unsized = try c.request("POST", "/echo", body);
     const inline_echo = try c.request("POST", "/nw/echo", "whole in one read");
     try c.untilAll();
     try expectEqualStrings("hello world", c.get(small).body.items);
+    try expect(std.mem.eql(u8, body, c.get(sized).body.items));
     try expect(std.mem.eql(u8, body, c.get(unsized).body.items));
     try expectEqualStrings("whole in one read", c.get(inline_echo).body.items);
 }
@@ -891,6 +894,29 @@ test "h2 engine: a noWait request reset before its body ends never runs, and its
     try expectEqualStrings("hello", (try c.until(next)).body.items);
     try wait.waitAtLeast(testing.io, "the next stream was freed", engine.probe.at(.freed), freed + 2);
     try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
+}
+
+test "h2 engine: a request whose DATA does not match its content-length is reset with PROTOCOL_ERROR while its handler runs" {
+    var fx: Fixture = undefined;
+    try fx.start(testing.allocator, testing.io, .{});
+    defer fx.stop();
+    const c = &fx.client;
+    const rows = [_]struct { name: []const u8, declared: []const u8, body: []const u8, end: bool }{
+        .{ .name = "more than declared", .declared = "3", .body = "hello world", .end = false },
+        .{ .name = "less than declared, then END_STREAM", .declared = "20", .body = "hello", .end = true },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("{s}\n", .{row.name});
+        const freed = engine.probe.at(.freed).load(.acquire);
+        const id = try c.open("POST", "/echo", &.{.{ .name = "content-length", .value = row.declared }}, false);
+        try c.sendBody(id, row.body, row.end);
+        try expectEqual(ErrorCode.protocol_error, (try c.until(id)).rst.?);
+        try wait.waitAtLeast(testing.io, "the reset stream was freed", engine.probe.at(.freed), freed + 1);
+        const next = try c.request("GET", "/hello", null);
+        try expectEqualStrings("hello", (try c.until(next)).body.items);
+        try wait.waitAtLeast(testing.io, "the next stream was freed", engine.probe.at(.freed), freed + 2);
+        try expectEqual(freed + 2, engine.probe.at(.freed).load(.acquire));
+    }
 }
 
 test "h2 engine: a streamed body larger than the window" {

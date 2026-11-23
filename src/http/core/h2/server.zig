@@ -863,8 +863,6 @@ pub fn Engine(comptime Ctx: type) type {
                         @field(es, @tagName(p)) = v;
                         return;
                     },
-                    // fields.zig has checked it (and holds the DATA to it).
-                    .content_length => es.content_length = std.fmt.parseInt(u64, v, 10) catch null,
                     else => {},
                 };
                 // `:status` or an unknown pseudo-header (the core rejects both).
@@ -879,6 +877,9 @@ pub fn Engine(comptime Ctx: type) type {
                     if (end_stream) conn.bodyEnded(es);
                     return;
                 }
+                // The total the core validated (fields.zig, which holds the
+                // DATA to it); no DATA came yet, so what is left is all.
+                es.content_length = if (s.content_left >= 0) @intCast(s.content_left) else null;
                 if (end_stream) es.recv = .complete;
                 if (es.protocol.len > 0) {
                     // A tunnel's output is copied to its chain
