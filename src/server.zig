@@ -291,6 +291,10 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
+    /// Optional fake clock (`anole.testing.Clock`) for deterministic tests of
+    /// expiry, rate limits, sessions and caches without sleeping. Null (the
+    /// default) reads the system clock. Must outlive the server.
+    clock: ?*http.Clock = null,
     /// The I/O engine. `.auto`: io_uring on Linux, epoll when the kernel
     /// refuses a ring (the startup line says why). `.io_uring`: refuse to
     /// start on epoll (and off Linux) with the cause named.
@@ -833,6 +837,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         gpa: std.mem.Allocator,
         /// The zio runtime the server owns; `io()` is its `std.Io`.
         rt: *zio.Runtime,
+        /// Optional test-clock `std.Io` binding (`Options.clock`), freed in `deinit`.
+        clock_io: ?*http.Clock.IoBinding = null,
         /// Holds what the server points into for its whole life: the
         /// listeners, certificates and middleware copies. So `Self` can
         /// move after `init`.
@@ -1265,12 +1271,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false, rt) catch "" else "";
             const rt_io = rt.io();
+            var clock_io: ?*http.Clock.IoBinding = null;
+            if (opts.clock) |c| {
+                const binding = try a.create(http.Clock.IoBinding);
+                binding.* = c.io(rt_io);
+                clock_io = binding;
+            }
+            errdefer if (clock_io) |b| b.deinit();
+            const effective_io = if (clock_io) |b| b.io() else rt_io;
             server_on_thread = true;
             errdefer server_on_thread = false;
 
             const server_config = coreConfig(opts, mode);
             const server = try a.create(http.Server(Ctx));
-            server.* = .init(gpa, rt_io, server_config, ctx);
+            server.* = .init(gpa, effective_io, server_config, ctx);
             errdefer server.deinit();
             const stopped = try a.create(std.Io.Event);
             stopped.* = .unset;
@@ -1284,7 +1298,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer if (pool) |p| p.deinit();
 
             const extras = try a.create(Extras);
-            extras.* = .{ .client = http.Client.init(gpa, rt_io, opts.client), .client_entry = undefined, .client_registered = false };
+            extras.* = .{ .client = http.Client.init(gpa, effective_io, opts.client), .client_entry = undefined, .client_registered = false };
             extras.client_entry = .{ .rt = rt, .client = &extras.client };
             extras.client_registered = client_mod.register(&extras.client_entry);
             errdefer {
@@ -1302,6 +1316,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .console_embedded = opts._resolved != null,
                 .gpa = gpa,
                 .rt = rt,
+                .clock_io = clock_io,
                 .arena = arena,
                 .server = server,
                 .router = &server.router,
@@ -1975,6 +1990,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
             // Nothing can reach it any more: every task has stopped.
+            if (self.clock_io) |b| b.deinit();
             if (extras.exporter) |e| e.deinit();
             if (comptime features.console) if (self.console_stopped) |stopped| stopped.release();
             server_on_thread = false;
@@ -1983,9 +1999,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.* = undefined;
         }
 
-        /// The runtime's `std.Io`, for work beside the server.
+        /// The runtime's `std.Io`, for work beside the server (carrying the
+        /// test clock when `Options.clock` is set).
         pub fn io(self: *const Self) std.Io {
-            return self.rt.io();
+            return if (self.clock_io) |b| b.io() else self.rt.io();
         }
 
         /// Serves on `address`, in Go's notation, until SIGINT, SIGTERM or
@@ -2199,7 +2216,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn rateLimit(self: *Self, opts: RateLimitOptions) void {
             const a = self.arena.allocator();
             const limiter = self.gpa.create(ratelimit.MemoryLimiter) catch @panic("OOM");
-            limiter.* = .init(self.gpa, self.rt.io(), .{ .max_entries = opts.max_entries });
+            limiter.* = .init(self.gpa, self.io(), .{ .max_entries = opts.max_entries });
             const key: ratelimit.Key = switch (opts.key) {
                 .ip => .ip,
                 .header => |h| .{ .header = a.dupe(u8, h) catch @panic("OOM") },
@@ -2320,7 +2337,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     app.with(.{pages}).get("/about", about);
         ///     pages.invalidate(.{ .path = "/about" });
         pub fn responseCache(self: *Self, settings: ResponseCache.Options) *ResponseCache {
-            const cache = ResponseCache.init(self.gpa, self.rt.io(), settings) catch @panic("OOM");
+            const cache = ResponseCache.init(self.gpa, self.io(), settings) catch @panic("OOM");
             self.extras.connectors.append(self.arena.allocator(), .of(ResponseCache, cache)) catch @panic("OOM");
             if (self.extras.connectors_started) cache.start(self.extras.metrics, self.extras.exporter, self.extras.health) catch {};
             return cache;
@@ -3295,7 +3312,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
             if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
-            const w = try wh.Client.init(self.gpa, self.rt.io(), config);
+            const w = try wh.Client.init(self.gpa, self.io(), config);
             errdefer w.deinit();
             try w.register(self);
             try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
@@ -3314,7 +3331,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn webhookVerify(self: *Self, config: @import("webhooks/root.zig").Verify.Options) *@import("webhooks/root.zig").Verify {
             if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
-            const v = wh.Verify.init(self.gpa, self.rt.io(), config) catch |err| @panic(@errorName(err));
+            const v = wh.Verify.init(self.gpa, self.io(), config) catch |err| @panic(@errorName(err));
             self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
             return v;
         }

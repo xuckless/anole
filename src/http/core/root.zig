@@ -51,6 +51,8 @@ pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// Deterministic fake clock for tests (re-exported as `anole.testing.Clock`).
+pub const Clock = @import("clock.zig").Clock;
 /// Internal, for tests on the real runtime: the per-executor shelf and its
 /// deadline sweep, and the timer that keeps a connection's deadlines.
 pub const _park = @import("server/park.zig");
@@ -240,6 +242,7 @@ comptime {
     _ = @import("middleware/middleware.zig");
     _ = @import("locals.zig");
     _ = @import("placement.zig");
+    _ = @import("clock.zig");
     _ = @import("admission.zig");
     _ = @import("exec_counter.zig");
     _ = @import("push_list.zig");

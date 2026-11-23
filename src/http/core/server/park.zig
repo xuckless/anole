@@ -584,5 +584,5 @@ pub fn spawnOn(group: *std.Io.Group, index: usize, func: anytype, args: std.meta
 /// (see `spawnOn` for the scheduling part).
 pub fn usable(io: std.Io) bool {
     if (comptime !supported) return false;
-    return zio.Runtime.fromIo(io) != null;
+    return placement.runtime(io) != null;
 }

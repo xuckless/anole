@@ -75,6 +75,59 @@ makes the client leave: further writes fail as for a reset stream, the
 handler's task is canceled, and it is awaited. There is no timeout: a test
 that waits for an event that never comes hangs.
 
+## Clock
+
+`anole.testing.Clock` is a thread-safe fake clock for testing expiry rules,
+rate limits, sessions and response caches without sleeping:
+
+```zig
+test "rate limit refills after its window" {
+    var clock = anole.testing.Clock.fromSeconds(1_700_000_000);
+    var app = try anole.App.init(std.testing.allocator, .{
+        .executors = .exact(1),
+        .clock = &clock,
+    });
+    defer app.deinit();
+    app.rateLimit(.{ .limit = 2, .window = .fromSeconds(60) });
+    app.get("/hello", hello);
+
+    var t = try anole.testing.client(&app);
+    defer t.deinit();
+    for (0..2) |_| {
+        var ok = try t.get("/hello", .{});
+        defer ok.deinit();
+        try ok.expectStatus(.ok);
+    }
+    var denied = try t.get("/hello", .{});
+    defer denied.deinit();
+    try denied.expectStatus(.too_many_requests);
+
+    clock.advance(.fromSeconds(60));
+    var again = try t.get("/hello", .{});
+    defer again.deinit();
+    try again.expectStatus(.ok);
+}
+```
+
+Passing `.clock = &clock` to `App.init` / `Server.init` threads the clock
+through `app.io()` and every `req.io`, so handlers (`std.Io.Clock.real.now(req.io)`,
+`std.Io.Clock.awake.now(req.io)`), `app.rateLimit`, `anole.ratelimit.MemoryLimiter`
+created with `app.io()`, `anole.session`, `anole.auth` and `ResponseCache` all
+read the same simulated time.
+
+When an app is already built by a helper that does not take options, attach a
+clock at the test client instead with `anole.testing.clientWith(&app, .{ .clock = &clock })`;
+this overrides `req.io` for handlers, `app.rateLimit`, `anole.auth`,
+`anole.session` and `ResponseCache`. For standalone unit tests outside a
+server, `var bio = clock.io(std.testing.io); defer bio.deinit();` wraps any
+`std.Io` so only its clock reads come from `clock` while all other I/O goes to
+the inner `std.Io`.
+
+Methods on `Clock`: `init(timestamp)`, `fromSeconds(seconds)`, `now()`,
+`nowSeconds()`, `nowMilliseconds()`, `advance(duration)` (positive advances,
+negative rewinds, saturating at `i64` nanoseconds), `set(timestamp)`,
+`setSeconds(seconds)` and `io(inner)`.
+
 ## Logs
 
 ```zig
@@ -95,7 +148,8 @@ tests) in place of stderr until `deinit`; `lines()` gives them.
   loopback pattern of `tests/rest_test.zig`: `app.listen("127.0.0.1:0")` on
   the test's runtime, a task that connects with `anole.client` or a
   WebSocket client, `app.stop()`.
-- Time: nothing is simulated, and nothing times out.
+- Time: `anole.testing.Clock` simulates clock reads (`std.Io.Clock.*.now` and
+  `std.Io.Timestamp.now`), while sleeps and socket timeouts still use real time.
 - Sockets, TLS, HTTP/2 and HTTP/3 framing: use the loopback pattern.
 
 The examples: `tests/rest_memory_test.zig` (the REST example through
