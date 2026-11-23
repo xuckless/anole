@@ -13,6 +13,10 @@ breaking changes are listed anyway.
 
 - SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.
 
+### Fixed
+
+- Request and response header values lose trailing spaces and tabs (RFC 9110 5.5): `x-trim: spaced   ` reached the app with its spaces, and `Content-Length: 5 ` read as no length. Closes #247.
+
 ### Changed
 
 - `Response.detached` is gone: ask `res.isDetached()` (the engines read `res._detachment()`).
