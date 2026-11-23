@@ -146,6 +146,32 @@ test "anole.App: function middleware runs on every route, with() adds one to a s
     }.check);
 }
 
+test "anole.App: a fake clock leaves a real socket's timeouts and the client on real time" {
+    // Far from the runtime's own clock: a deadline computed on it would never come.
+    var clock: http.Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
+    var app = try App.init(alloc, .{ .executors = .exact(1), .clock = &clock, .timeouts = .{ .request = .fromMilliseconds(100) } });
+    defer app.deinit();
+    app.get("/hello", AppRoutes.hello);
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            try std.testing.expectEqualStrings("hello", (try get(io_, arena, try urlOf(arena, port, "/hello"), &.{})).body);
+            // A head that never ends: timeouts.request cuts the connection, unanswered.
+            const stream = try (try std.Io.net.IpAddress.parseIp4("127.0.0.1", port)).connect(io_, .{ .mode = .stream });
+            defer stream.close(io_);
+            var write_buf: [64]u8 = undefined;
+            var writer = stream.writer(io_, &write_buf);
+            try writer.interface.writeAll("GET /hello HTTP/1.1\r\nHost: a\r\n");
+            try writer.interface.flush();
+            var read_buf: [256]u8 = undefined;
+            var reader = stream.reader(io_, &read_buf);
+            var sink: std.Io.Writer.Allocating = .init(arena);
+            _ = reader.interface.streamRemaining(&sink.writer) catch {};
+            try std.testing.expectEqualStrings("", sink.written());
+        }
+    }.check);
+}
+
 test "anole.App: staticDir serves files, health answers /healthz and /readyz, and metrics counts requests per route" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

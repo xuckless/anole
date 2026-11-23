@@ -427,7 +427,7 @@ pub const OwnedMiddleware = struct {
             .ip => clientAddress(req, &key_buf),
             .header => |h| req.headers.get(h) orelse "",
         };
-        const r = self.limiter.takeAt(key, 1, self.policy, std.Io.Clock.real.now(req.io).toMilliseconds()) catch return next.call();
+        const r = self.limiter.limiter().take(key, 1, self.policy) catch return next.call();
         try res.header("RateLimit-Limit", try std.fmt.allocPrint(res.arena, "{d}", .{r.limit}));
         try res.header("RateLimit-Remaining", try std.fmt.allocPrint(res.arena, "{d}", .{r.remaining}));
         try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));

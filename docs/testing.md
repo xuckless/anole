@@ -82,7 +82,7 @@ rate limits, sessions and response caches without sleeping:
 
 ```zig
 test "rate limit refills after its window" {
-    var clock = anole.testing.Clock.fromSeconds(1_700_000_000);
+    var clock: anole.testing.Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
     var app = try anole.App.init(std.testing.allocator, .{
         .executors = .exact(1),
         .clock = &clock,
@@ -109,24 +109,28 @@ test "rate limit refills after its window" {
 }
 ```
 
-Passing `.clock = &clock` to `App.init` / `Server.init` threads the clock
-through `app.io()` and every `req.io`, so handlers (`std.Io.Clock.real.now(req.io)`,
-`std.Io.Clock.awake.now(req.io)`), `app.rateLimit`, `anole.ratelimit.MemoryLimiter`
-created with `app.io()`, `anole.session`, `anole.auth` and `ResponseCache` all
-read the same simulated time.
+The clock is fake for clock reads only (`std.Io.Clock.*.now`,
+`std.Io.Timestamp.now`). Sleeps, timers and every socket timeout still run on
+real time.
 
-When an app is already built by a helper that does not take options, attach a
-clock at the test client instead with `anole.testing.clientWith(&app, .{ .clock = &clock })`;
-this overrides `req.io` for handlers, `app.rateLimit`, `anole.auth`,
-`anole.session` and `ResponseCache`. For standalone unit tests outside a
-server, `var bio = clock.io(std.testing.io); defer bio.deinit();` wraps any
-`std.Io` so only its clock reads come from `clock` while all other I/O goes to
-the inner `std.Io`.
+What reads it:
 
-Methods on `Clock`: `init(timestamp)`, `fromSeconds(seconds)`, `now()`,
-`nowSeconds()`, `nowMilliseconds()`, `advance(duration)` (positive advances,
-negative rewinds, saturating at `i64` nanoseconds), `set(timestamp)`,
-`setSeconds(seconds)` and `io(inner)`.
+| Clock set on | Reads the fake clock | Stays real |
+|---|---|---|
+| `App.init` / `Server.init` (`.clock = &clock`) | `app.io()`, and what is built on it: `app.rateLimit`, `app.responseCache`, `app.webhooks`, a `MemoryLimiter`, session store or key ring made with `app.io()`; `req.io` of `anole.testing` requests, so handlers, cookie sessions, bearer tokens and `anole.cached` | the server's sockets and their timeouts (`timeouts.request`, `keepalive`, ...), the HTTP client, `req.io` of requests over a real socket |
+| `anole.testing.clientWith(&app, .{ .clock = &clock })` | `req.io` of that client's requests: handlers, cookie sessions, bearer tokens, `anole.cached` | everything built on `app.io()`, such as `app.rateLimit` |
+| `clock.io(inner)` (a unit test without a server) | the returned binding's `io()` | every other operation on it, which goes to `inner` |
+
+`clientWith` suits an app built by a helper that takes no options. For a unit
+test without a server, `var bio = clock.io(std.testing.io); defer bio.deinit();`
+gives an `Io` whose clock reads come from `clock`; do not use `bio.io()` after
+`deinit`.
+
+`Clock` has `init(timestamp)` (or `.{}` for time zero), `now()`,
+`advance(duration)` (a negative duration rewinds; saturates at `i64`
+nanoseconds), `set(timestamp)` and `io(inner)`. It works in test builds only:
+`clock.io` does not compile elsewhere, and `.clock` on a server outside a test
+build panics.
 
 ## Logs
 
@@ -148,8 +152,8 @@ tests) in place of stderr until `deinit`; `lines()` gives them.
   loopback pattern of `tests/rest_test.zig`: `app.listen("127.0.0.1:0")` on
   the test's runtime, a task that connects with `anole.client` or a
   WebSocket client, `app.stop()`.
-- Time: `anole.testing.Clock` simulates clock reads (`std.Io.Clock.*.now` and
-  `std.Io.Timestamp.now`), while sleeps and socket timeouts still use real time.
+- Time: `anole.testing.Clock` fakes clock reads only (see [Clock](#clock));
+  sleeps, timers and socket timeouts run on real time.
 - Sockets, TLS, HTTP/2 and HTTP/3 framing: use the loopback pattern.
 
 The examples: `tests/rest_memory_test.zig` (the REST example through

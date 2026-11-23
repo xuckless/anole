@@ -30,18 +30,19 @@ pub const RequestError = error{ OutOfMemory, InvalidTarget, WebSocketNotSupporte
 pub const Header = struct { name: []const u8, value: []const u8 };
 
 /// A deterministic, thread-safe fake clock for tests of expiry, rate limits,
-/// sessions and caches without sleeping. Pass `&clock` to `App.init(..., .{
-/// .clock = &clock })`, `clientWith(&app, .{ .clock = &clock })`, or bind it
-/// directly to a `std.Io` with `clock.io(inner)`.
+/// sessions and caches without sleeping (clock reads only: sleeps and
+/// timeouts stay real). Pass `&clock` to `App.init(..., .{ .clock = &clock })`,
+/// `clientWith(&app, .{ .clock = &clock })`, or bind it to a `std.Io` with
+/// `clock.io(inner)`.
 pub const Clock = dusty.Clock;
 
 /// Options for `clientWith`.
 pub const ClientOptions = struct {
-    /// Optional test clock for requests made through this client (overrides
-    /// `req.io`'s clock for handlers, `app.rateLimit`, `anole.auth`,
-    /// `anole.session` and `ResponseCache`). For standalone limiters or stores
-    /// initialized with `app.io()` before `client()`, pass `.clock` to
-    /// `App.init` / `Server.init` instead. Must outlive the client.
+    /// A test clock for `req.io` of the requests made through this client:
+    /// what reads `req.io` (handlers, cookie sessions, bearer tokens,
+    /// `anole.cached`) sees it. Features built on `app.io()` (`app.rateLimit`,
+    /// a `MemoryLimiter` or store made with it) do not: pass `.clock` to
+    /// `App.init` / `Server.init` for those. Must outlive the client.
     clock: ?*Clock = null,
 };
 
@@ -1175,49 +1176,38 @@ test "app.sse: the {room} parameter picks the topic" {
     stream.close();
 }
 
-test "Clock: app.rateLimit refills deterministically without sleeping (ServerOptions.clock and clientWith)" {
-    const Mode = enum { server_option, client_option };
-    inline for (.{ Mode.server_option, Mode.client_option }) |mode| {
-        var clock = Clock.fromSeconds(1_700_000_000);
-        var app = try anole.App.init(std.testing.allocator, .{
-            .executors = .exact(1),
-            .clock = if (mode == .server_option) &clock else null,
-        });
-        defer app.deinit();
-        app.rateLimit(.{ .limit = 2, .window = .fromSeconds(60) });
-        app.get("/hello", Routes.hello);
+test "Clock: app.rateLimit refills deterministically without sleeping" {
+    var clock: Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
+    var app = try anole.App.init(std.testing.allocator, .{ .executors = .exact(1), .clock = &clock });
+    defer app.deinit();
+    app.rateLimit(.{ .limit = 2, .window = .fromSeconds(60) });
+    app.get("/hello", Routes.hello);
 
-        var t = if (mode == .server_option)
-            try client(&app)
-        else
-            try clientWith(&app, .{ .clock = &clock });
-        defer t.deinit();
+    var t = try client(&app);
+    defer t.deinit();
 
-        // Exhaust the 2-request window.
-        for (0..2) |_| {
-            var ok = try t.get("/hello", .{});
-            defer ok.deinit();
-            try ok.expectStatus(.ok);
-        }
-        {
-            var denied = try t.get("/hello", .{});
-            defer denied.deinit();
-            try denied.expectStatus(.too_many_requests);
-            try std.testing.expect(denied.header("retry-after") != null);
-        }
-        // Advance past the 60 s window: full bucket returns without sleeping.
-        clock.advance(.fromSeconds(60));
-        {
-            var again = try t.get("/hello", .{});
-            defer again.deinit();
-            try again.expectStatus(.ok);
-            try again.expectBody("hello");
-        }
+    // Exhaust the 2-request window.
+    for (0..2) |_| {
+        var ok = try t.get("/hello", .{});
+        defer ok.deinit();
+        try ok.expectStatus(.ok);
     }
+    {
+        var denied = try t.get("/hello", .{});
+        defer denied.deinit();
+        try denied.expectStatus(.too_many_requests);
+        try std.testing.expect(denied.header("retry-after") != null);
+    }
+    // Advance past the 60 s window: full bucket returns without sleeping.
+    clock.advance(.fromSeconds(60));
+    var again = try t.get("/hello", .{});
+    defer again.deinit();
+    try again.expectStatus(.ok);
+    try again.expectBody("hello");
 }
 
 test "Clock: standalone MemoryLimiter using app.io() obeys ServerOptions.clock" {
-    var clock = Clock.fromSeconds(1_700_000_000);
+    var clock: Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
     var app = try anole.App.init(std.testing.allocator, .{
         .executors = .exact(1),
         .clock = &clock,
@@ -1265,35 +1255,38 @@ test "Clock: handler expiry rules (room code and rejoin window) advance without 
         }
     };
 
-    var clock = Clock.fromSeconds(1_700_000_000);
-    var rooms: Rooms = .{};
-    var app = try anole.Server(Rooms).init(std.testing.allocator, .{
-        .executors = .exact(1),
-        .clock = &clock,
-    }, &rooms);
-    defer app.deinit();
-    app.post("/rooms", Rooms.create);
-    app.get("/rooms/ABCD", Rooms.join);
+    // The clock on the server (`Options.clock`) or on the client alone (`clientWith`).
+    inline for (.{ true, false }) |on_server| {
+        var clock: Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
+        var rooms: Rooms = .{};
+        var app = try anole.Server(Rooms).init(std.testing.allocator, .{
+            .executors = .exact(1),
+            .clock = if (on_server) &clock else null,
+        }, &rooms);
+        defer app.deinit();
+        app.post("/rooms", Rooms.create);
+        app.get("/rooms/ABCD", Rooms.join);
 
-    var t = try client(&app);
-    defer t.deinit();
+        var t = if (on_server) try client(&app) else try clientWith(&app, .{ .clock = &clock });
+        defer t.deinit();
 
-    var created = try t.post("/rooms", .{});
-    defer created.deinit();
-    try created.expectStatus(.created);
+        var created = try t.post("/rooms", .{});
+        defer created.deinit();
+        try created.expectStatus(.created);
 
-    // Still valid 9m59s later.
-    clock.advance(.fromSeconds(9 * 60 + 59));
-    var ok = try t.get("/rooms/ABCD", .{});
-    defer ok.deinit();
-    try ok.expectStatus(.ok);
-    try ok.expectBody("joined");
+        // Still valid 9m59s later.
+        clock.advance(.fromSeconds(9 * 60 + 59));
+        var ok = try t.get("/rooms/ABCD", .{});
+        defer ok.deinit();
+        try ok.expectStatus(.ok);
+        try ok.expectBody("joined");
 
-    // 1 s later (10m total): expired.
-    clock.advance(.fromSeconds(1));
-    var expired = try t.get("/rooms/ABCD", .{});
-    defer expired.deinit();
-    try expired.expectStatus(.gone);
+        // 1 s later (10m total): expired.
+        clock.advance(.fromSeconds(1));
+        var expired = try t.get("/rooms/ABCD", .{});
+        defer expired.deinit();
+        try expired.expectStatus(.gone);
+    }
 }
 
 test "Clock: ResponseCache TTL expires deterministically on clock.advance" {
@@ -1305,7 +1298,7 @@ test "Clock: ResponseCache TTL expires deterministically on clock.advance" {
         }
     };
 
-    var clock = Clock.fromSeconds(1_700_000_000);
+    var clock: Clock = .init(.fromNanoseconds(1_700_000_000 * std.time.ns_per_s));
     var counter: Counter = .{};
     var app = try anole.Server(Counter).init(std.testing.allocator, .{
         .executors = .exact(1),

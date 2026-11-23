@@ -291,9 +291,13 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
-    /// Optional fake clock (`anole.testing.Clock`) for deterministic tests of
-    /// expiry, rate limits, sessions and caches without sleeping. Null (the
-    /// default) reads the system clock. Must outlive the server.
+    /// A fake clock (`anole.testing.Clock`) for tests of expiry, rate
+    /// limits, sessions and caches without sleeping, in test builds only.
+    /// It is the clock of `app.io()` (so of the features built on it:
+    /// `rateLimit`, `responseCache`, `webhooks`, sessions and auth stores
+    /// made with `app.io()`) and of `req.io` in `anole.testing` exchanges.
+    /// The server's sockets, their timeouts and the HTTP client stay on
+    /// the runtime's real clock. Must outlive the server.
     clock: ?*http.Clock = null,
     /// The I/O engine. `.auto`: io_uring on Linux, epoll when the kernel
     /// refuses a ring (the startup line says why). `.io_uring`: refuse to
@@ -1272,19 +1276,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false, rt) catch "" else "";
             const rt_io = rt.io();
             var clock_io: ?*http.Clock.IoBinding = null;
-            if (opts.clock) |c| {
-                const binding = try a.create(http.Clock.IoBinding);
-                binding.* = c.io(rt_io);
-                clock_io = binding;
-            }
+            if (comptime builtin.is_test) {
+                if (opts.clock) |c| {
+                    const binding = try a.create(http.Clock.IoBinding);
+                    binding.* = c.io(rt_io);
+                    clock_io = binding;
+                }
+            } else if (opts.clock != null) @panic("ServerOptions.clock is for test builds");
             errdefer if (clock_io) |b| b.deinit();
-            const effective_io = if (clock_io) |b| b.io() else rt_io;
             server_on_thread = true;
             errdefer server_on_thread = false;
 
             const server_config = coreConfig(opts, mode);
             const server = try a.create(http.Server(Ctx));
-            server.* = .init(gpa, effective_io, server_config, ctx);
+            server.* = .init(gpa, rt_io, server_config, ctx);
             errdefer server.deinit();
             const stopped = try a.create(std.Io.Event);
             stopped.* = .unset;
@@ -1298,7 +1303,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer if (pool) |p| p.deinit();
 
             const extras = try a.create(Extras);
-            extras.* = .{ .client = http.Client.init(gpa, effective_io, opts.client), .client_entry = undefined, .client_registered = false };
+            extras.* = .{ .client = http.Client.init(gpa, rt_io, opts.client), .client_entry = undefined, .client_registered = false };
             extras.client_entry = .{ .rt = rt, .client = &extras.client };
             extras.client_registered = client_mod.register(&extras.client_entry);
             errdefer {
