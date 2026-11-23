@@ -86,18 +86,11 @@ pub const Parked = struct {
     vtable: *const VTable,
     /// The readiness poll in the shelf's queue, while parked.
     poll: NetPoll = undefined,
+    /// On `Shelf.timed` or `Shelf.untimed` while `phase` is `parked`.
     node: std.DoublyLinkedList.Node = .{},
-    /// The shelf it is on, while parked.
-    shelf: ?*Shelf = null,
     /// When the driver closes it (awake clock); null for never.
     deadline: ?std.Io.Timestamp = null,
-    /// Its deadline passed, or the server is stopping: its socket is shut
-    /// down, and it closes when its poll comes back.
-    expired: bool = false,
-    /// `VTable.expire` is not done with it yet (it may wait).
-    expiring: bool = false,
-    /// Its poll came back while `expiring`: `expireDone` closes it.
-    back: bool = false,
+    phase: Phase = .running,
     /// When it parked (awake clock).
     parked_at: std.Io.Timestamp = .zero,
     /// It woke after being parked for `Shelf.long_park` or more: the task
@@ -110,9 +103,144 @@ pub const Parked = struct {
     /// it, or closes it now if the poll is back already. On the shelf's
     /// executor.
     pub fn expireDone(self: *Parked) void {
-        self.expiring = false;
-        if (self.back) return self.vtable.close(self);
-        if (comptime supported) zio.os.net.shutdown(self.poll.handle, .both) catch {};
+        self.apply(self.step(.expire_done));
+    }
+
+    /// Where the connection is between its task and its shelf. Owner: the
+    /// shelf's executor (the connection's task parks it there, the driver
+    /// and the tasks it spawns `.local` do the rest), so no lock; tasks
+    /// interleave only where one yields, which is `VTable.expire`'s work
+    /// (a TLS close_notify) while `expiring`. Every transition is a cell of
+    /// `table`, written only by `step`; a new case is a cell or a phase
+    /// there, not a flag beside it.
+    ///
+    /// | phase \ event | park | expire | poll_back | canceled | expire_done | wake_failed |
+    /// |---|---|---|---|---|---|---|
+    /// | running | parked | - (1) | - (2) | - (2) | - (3) | closed, close |
+    /// | parked | - (4) | expiring | running, wake | closed, close | - (3) | - (5) |
+    /// | expiring | - (6) | - (6) | expiring_back | expiring_back | shut, shutdown | - (5) |
+    /// | expiring_back | - (6) | - (6) | - (7) | - (7) | closed, close | - (5) |
+    /// | shut | - (6) | - (6) | closed, close | closed, close | - (8) | - (5) |
+    /// | closed | - (9) | - (9) | - (9) | - (9) | - (9) | - (9) |
+    ///
+    /// "-": ignored, the phase stays and nothing is done. (1) Not on a list:
+    /// sweep and expireAll find only parked entries. (2) No poll is queued.
+    /// (3) `expire` has not begun. (4) `settle` parks once per task end; a
+    /// second park would queue the poll twice. (5) No wake began. (6) Off
+    /// the lists and its poll still queued: only the poll's return or
+    /// `expireDone` reach it. (7) One poll per park, and it is back. (8)
+    /// `VTable.expire` finishes once. (9) Freed, or about to be: `closed`
+    /// is set just before `VTable.close`, so that a repeat cannot close
+    /// twice. The callers unlist a `parked` entry before stepping it out of
+    /// `parked` (`expire`, `pollBack`); `pollBack` sets `woke_from_long`
+    /// before a wake. A connection whose poll is back while `expiring` is
+    /// closed by whichever of `expireDone` and the poll's return comes
+    /// second.
+    pub const Phase = enum {
+        /// A task serves it, or it never parked.
+        running,
+        /// On a list, its poll in the shelf's queue.
+        parked,
+        /// Off the lists, poll queued, `VTable.expire` not done with it
+        /// (it may wait).
+        expiring,
+        /// The poll came back while `expiring`: `expireDone` closes it.
+        expiring_back,
+        /// `VTable.expire` is done and the socket shut down: the poll's
+        /// return closes it.
+        shut,
+        /// Handed to `VTable.close`.
+        closed,
+    };
+
+    const Event = enum {
+        park,
+        /// Its deadline passed (`Shelf.sweep`) or the server stops
+        /// (`Shelf.expireAll`).
+        expire,
+        /// Its poll is back: readable, failed or shut down.
+        poll_back,
+        /// The driver was canceled and zio returned its poll.
+        canceled,
+        /// `VTable.expire` is done with it, or failed at once.
+        expire_done,
+        /// `VTable.wake` failed.
+        wake_failed,
+    };
+
+    /// What follows a transition (list work stays with the shelf).
+    const Act = enum { none, wake, shutdown, close };
+
+    const Step = struct { next: Phase, act: Act = .none };
+
+    /// The doc table on `Phase`, every cell listed.
+    const table = std.EnumArray(Phase, std.EnumArray(Event, Step)).init(.{
+        .running = .init(.{
+            .park = .{ .next = .parked },
+            .expire = .{ .next = .running },
+            .poll_back = .{ .next = .running },
+            .canceled = .{ .next = .running },
+            .expire_done = .{ .next = .running },
+            .wake_failed = .{ .next = .closed, .act = .close },
+        }),
+        .parked = .init(.{
+            .park = .{ .next = .parked },
+            .expire = .{ .next = .expiring },
+            .poll_back = .{ .next = .running, .act = .wake },
+            .canceled = .{ .next = .closed, .act = .close },
+            .expire_done = .{ .next = .parked },
+            .wake_failed = .{ .next = .parked },
+        }),
+        .expiring = .init(.{
+            .park = .{ .next = .expiring },
+            .expire = .{ .next = .expiring },
+            .poll_back = .{ .next = .expiring_back },
+            .canceled = .{ .next = .expiring_back },
+            .expire_done = .{ .next = .shut, .act = .shutdown },
+            .wake_failed = .{ .next = .expiring },
+        }),
+        .expiring_back = .init(.{
+            .park = .{ .next = .expiring_back },
+            .expire = .{ .next = .expiring_back },
+            .poll_back = .{ .next = .expiring_back },
+            .canceled = .{ .next = .expiring_back },
+            .expire_done = .{ .next = .closed, .act = .close },
+            .wake_failed = .{ .next = .expiring_back },
+        }),
+        .shut = .init(.{
+            .park = .{ .next = .shut },
+            .expire = .{ .next = .shut },
+            .poll_back = .{ .next = .closed, .act = .close },
+            .canceled = .{ .next = .closed, .act = .close },
+            .expire_done = .{ .next = .shut },
+            .wake_failed = .{ .next = .shut },
+        }),
+        .closed = .init(.{
+            .park = .{ .next = .closed },
+            .expire = .{ .next = .closed },
+            .poll_back = .{ .next = .closed },
+            .canceled = .{ .next = .closed },
+            .expire_done = .{ .next = .closed },
+            .wake_failed = .{ .next = .closed },
+        }),
+    });
+
+    /// The only writer of `phase`.
+    fn step(self: *Parked, ev: Event) Act {
+        const s = table.get(self.phase).get(ev);
+        self.phase = s.next;
+        return s.act;
+    }
+
+    /// Runs `act`; after `.close`, `self` is freed.
+    fn apply(self: *Parked, act: Act) void {
+        switch (act) {
+            .none => {},
+            // Only `pollBack` gets it, and runs it there (it needs the shelf).
+            .wake => unreachable,
+            .shutdown => if (comptime supported) zio.os.net.shutdown(self.poll.handle, .both) catch {},
+            .close => self.vtable.close(self),
+        }
     }
 };
 
@@ -394,11 +522,9 @@ pub const Shelf = struct {
         if (comptime !supported) return false;
         if (self.closed) return false;
         p.poll = .init(handle, .recv);
-        p.expired = false;
-        p.expiring = false;
-        p.back = false;
         p.parked_at = now(self.io);
         self.cq.submit(&p.poll.c) catch return false;
+        _ = p.step(.park);
         self.insert(p);
         _ = self.count.fetchAdd(1, .monotonic);
         return true;
@@ -432,7 +558,6 @@ pub const Shelf = struct {
     }
 
     fn insert(self: *Shelf, p: *Parked) void {
-        p.shelf = self;
         const deadline = p.deadline orelse return self.untimed.append(&p.node);
         var after = self.timed.last;
         while (after) |n| : (after = n.prev) {
@@ -444,15 +569,13 @@ pub const Shelf = struct {
 
     fn remove(self: *Shelf, p: *Parked) void {
         if (p.deadline != null) self.timed.remove(&p.node) else self.untimed.remove(&p.node);
-        p.shelf = null;
     }
 
     /// Takes `p` off the lists and ends it: it closes when its poll is
-    /// back.
+    /// back. `p` may be freed once `VTable.expire` is called.
     fn expire(self: *Shelf, p: *Parked) void {
         self.remove(p);
-        p.expired = true;
-        p.expiring = true;
+        _ = p.step(.expire);
         p.vtable.expire(p) catch p.expireDone();
     }
 
@@ -486,18 +609,20 @@ pub const Shelf = struct {
         }
     }
 
-    /// `p`'s poll is back: its socket is readable (or failed, which the
-    /// next read reports), or was shut down.
-    fn pollBack(self: *Shelf, p: *Parked) void {
+    /// `p`'s poll is back (`ev` `.poll_back`): its socket is readable (or
+    /// failed, which the next read reports), or was shut down; or zio
+    /// returned it as the driver was canceled (`.canceled`).
+    fn pollBack(self: *Shelf, p: *Parked, ev: Parked.Event) void {
         _ = self.count.fetchSub(1, .monotonic);
-        if (p.expired) {
-            if (p.expiring) p.back = true else p.vtable.close(p);
-            return;
+        if (p.phase == .parked) self.remove(p);
+        switch (p.step(ev)) {
+            .wake => {
+                const parked_for = p.parked_at.durationTo(now(self.io));
+                p.woke_from_long = parked_for.nanoseconds >= self.long_park.nanoseconds;
+                p.vtable.wake(p) catch p.apply(p.step(.wake_failed));
+            },
+            else => |act| p.apply(act),
         }
-        self.remove(p);
-        const parked_for = p.parked_at.durationTo(now(self.io));
-        p.woke_from_long = parked_for.nanoseconds >= self.long_park.nanoseconds;
-        p.vtable.wake(p) catch p.vtable.close(p);
     }
 };
 
@@ -545,12 +670,7 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
                 shelf.closed = true;
                 while (shelf.cq.next()) |back| {
                     if (back == &shelf.bell.c) continue;
-                    const p: *Parked = @alignCast(@fieldParentPtr("poll", back.cast(NetPoll)));
-                    _ = shelf.count.fetchSub(1, .monotonic);
-                    if (!p.expired) {
-                        shelf.remove(p);
-                        p.vtable.close(p);
-                    } else if (p.expiring) p.back = true else p.vtable.close(p);
+                    shelf.pollBack(@alignCast(@fieldParentPtr("poll", back.cast(NetPoll))), .canceled);
                 }
                 return error.Canceled;
             },
@@ -561,7 +681,7 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
             if (shelf.stopping.load(.acquire)) shelf.expireAll() else shelf.cq.submit(&shelf.bell.c) catch {};
             continue;
         }
-        shelf.pollBack(@alignCast(@fieldParentPtr("poll", c.cast(NetPoll))));
+        shelf.pollBack(@alignCast(@fieldParentPtr("poll", c.cast(NetPoll))), .poll_back);
     }
     shelf.cq.close();
 }
@@ -585,4 +705,205 @@ pub fn spawnOn(group: *std.Io.Group, index: usize, func: anytype, args: std.meta
 pub fn usable(io: std.Io) bool {
     if (comptime !supported) return false;
     return zio.Runtime.fromIo(io) != null;
+}
+
+test "Parked.phase: every (phase, event) pair" {
+    const P = Parked.Phase;
+    const Row = struct { from: P, event: Parked.Event, to: P, act: Parked.Act = .none };
+    // Written apart from `Parked.table`, so that the table is not checked
+    // against itself.
+    const rows = [_]Row{
+        .{ .from = .running, .event = .park, .to = .parked },
+        .{ .from = .running, .event = .expire, .to = .running },
+        .{ .from = .running, .event = .poll_back, .to = .running },
+        .{ .from = .running, .event = .canceled, .to = .running },
+        .{ .from = .running, .event = .expire_done, .to = .running },
+        .{ .from = .running, .event = .wake_failed, .to = .closed, .act = .close },
+
+        .{ .from = .parked, .event = .park, .to = .parked },
+        .{ .from = .parked, .event = .expire, .to = .expiring },
+        .{ .from = .parked, .event = .poll_back, .to = .running, .act = .wake },
+        .{ .from = .parked, .event = .canceled, .to = .closed, .act = .close },
+        .{ .from = .parked, .event = .expire_done, .to = .parked },
+        .{ .from = .parked, .event = .wake_failed, .to = .parked },
+
+        .{ .from = .expiring, .event = .park, .to = .expiring },
+        .{ .from = .expiring, .event = .expire, .to = .expiring },
+        .{ .from = .expiring, .event = .poll_back, .to = .expiring_back },
+        .{ .from = .expiring, .event = .canceled, .to = .expiring_back },
+        .{ .from = .expiring, .event = .expire_done, .to = .shut, .act = .shutdown },
+        .{ .from = .expiring, .event = .wake_failed, .to = .expiring },
+
+        .{ .from = .expiring_back, .event = .park, .to = .expiring_back },
+        .{ .from = .expiring_back, .event = .expire, .to = .expiring_back },
+        .{ .from = .expiring_back, .event = .poll_back, .to = .expiring_back },
+        .{ .from = .expiring_back, .event = .canceled, .to = .expiring_back },
+        .{ .from = .expiring_back, .event = .expire_done, .to = .closed, .act = .close },
+        .{ .from = .expiring_back, .event = .wake_failed, .to = .expiring_back },
+
+        .{ .from = .shut, .event = .park, .to = .shut },
+        .{ .from = .shut, .event = .expire, .to = .shut },
+        .{ .from = .shut, .event = .poll_back, .to = .closed, .act = .close },
+        .{ .from = .shut, .event = .canceled, .to = .closed, .act = .close },
+        .{ .from = .shut, .event = .expire_done, .to = .shut },
+        .{ .from = .shut, .event = .wake_failed, .to = .shut },
+
+        .{ .from = .closed, .event = .park, .to = .closed },
+        .{ .from = .closed, .event = .expire, .to = .closed },
+        .{ .from = .closed, .event = .poll_back, .to = .closed },
+        .{ .from = .closed, .event = .canceled, .to = .closed },
+        .{ .from = .closed, .event = .expire_done, .to = .closed },
+        .{ .from = .closed, .event = .wake_failed, .to = .closed },
+    };
+    // A new phase or event needs its rows.
+    comptime std.debug.assert(rows.len == std.enums.values(P).len * std.enums.values(Parked.Event).len);
+    var seen = std.EnumArray(P, std.EnumSet(Parked.Event)).initFill(.empty);
+    for (rows) |r| {
+        try std.testing.expect(!seen.getPtr(r.from).contains(r.event));
+        seen.getPtr(r.from).insert(r.event);
+        var p: Parked = .{ .vtable = undefined, .phase = r.from };
+        errdefer std.debug.print("{t} + {t}\n", .{ r.from, r.event });
+        try std.testing.expectEqual(r.act, p.step(r.event));
+        try std.testing.expectEqual(r.to, p.phase);
+    }
+}
+
+// Runs on the core's zio stub (core-test), where nothing is polled and the
+// shutdown act compiles out; on the real zio it would shut down an unset
+// poll's socket, so it skips there. The real shutdown is covered end to end
+// by park_test.zig's deadline and TLS rows.
+test "Parked.phase: a shelf closes each connection once, in every order" {
+    if (comptime supported) return error.SkipZigTest;
+    const Conn = struct {
+        p: Parked = .{ .vtable = &vtable },
+        expire_mode: enum { deferred, done_inline, fails } = .deferred,
+        wake_fails: bool = false,
+        wakes: u32 = 0,
+        closes: u32 = 0,
+
+        const vtable: VTable = .{ .wake = wake, .expire = expire, .close = close };
+        fn of(p: *Parked) *@This() {
+            return @fieldParentPtr("p", p);
+        }
+        fn wake(p: *Parked) anyerror!void {
+            of(p).wakes += 1;
+            if (of(p).wake_fails) return error.RuntimeShutdown;
+        }
+        fn expire(p: *Parked) anyerror!void {
+            switch (of(p).expire_mode) {
+                .deferred => {},
+                .done_inline => p.expireDone(),
+                .fails => return error.RuntimeShutdown,
+            }
+        }
+        // Counts and does not free, so that the test can look afterwards.
+        fn close(p: *Parked) void {
+            of(p).closes += 1;
+        }
+    };
+    const Op = enum { park, expire, poll_back, canceled, expire_done };
+    // After `op`: the phase and how many closes so far.
+    const Check = struct { op: Op, phase: Parked.Phase, closes: u32 };
+    const Row = struct {
+        name: []const u8,
+        conn: Conn = .{},
+        timed: bool = false,
+        ops: []const Check,
+        wakes: u32 = 0,
+        /// Polls still counted at the end: null where the row returns a
+        /// poll twice, which never happens outside this test.
+        count: ?usize = 0,
+        /// How long it had been parked when its poll came back.
+        parked_for: std.Io.Duration = .zero,
+        woke_from_long: bool = false,
+    };
+    const rows = [_]Row{
+        .{ .name = "poll back while expiring, then expireDone closes once", .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .expiring, .closes = 0 },
+            .{ .op = .poll_back, .phase = .expiring_back, .closes = 0 },
+            .{ .op = .expire_done, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "expireDone first, then the poll back, closes once", .timed = true, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .expiring, .closes = 0 },
+            .{ .op = .expire_done, .phase = .shut, .closes = 0 },
+            .{ .op = .poll_back, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "expire finishing inline, then the poll back", .conn = .{ .expire_mode = .done_inline }, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .shut, .closes = 0 },
+            .{ .op = .poll_back, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "expire failing at once", .conn = .{ .expire_mode = .fails }, .timed = true, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .shut, .closes = 0 },
+            .{ .op = .poll_back, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "the Canceled sweep on a parked one", .timed = true, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .canceled, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "the Canceled sweep on an expiring one", .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .expiring, .closes = 0 },
+            .{ .op = .canceled, .phase = .expiring_back, .closes = 0 },
+            .{ .op = .expire_done, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "the Canceled sweep on a shut one", .conn = .{ .expire_mode = .done_inline }, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .shut, .closes = 0 },
+            .{ .op = .canceled, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "wake fails: closed once, off the lists", .conn = .{ .wake_fails = true }, .timed = true, .wakes = 1, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .poll_back, .phase = .closed, .closes = 1 },
+        } },
+        .{ .name = "wake succeeds after a short park", .wakes = 1, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .poll_back, .phase = .running, .closes = 0 },
+        } },
+        .{ .name = "wake succeeds after a long park", .timed = true, .wakes = 1, .parked_for = .fromSeconds(7200), .woke_from_long = true, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .poll_back, .phase = .running, .closes = 0 },
+        } },
+        .{ .name = "double events do not double close", .count = null, .ops = &.{
+            .{ .op = .park, .phase = .parked, .closes = 0 },
+            .{ .op = .expire, .phase = .expiring, .closes = 0 },
+            .{ .op = .poll_back, .phase = .expiring_back, .closes = 0 },
+            .{ .op = .expire_done, .phase = .closed, .closes = 1 },
+            .{ .op = .expire_done, .phase = .closed, .closes = 1 },
+            .{ .op = .poll_back, .phase = .closed, .closes = 1 },
+            .{ .op = .canceled, .phase = .closed, .closes = 1 },
+        } },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var shelf: Shelf = .{ .io = std.testing.io, .long_park = .fromSeconds(3600) };
+        var c = row.conn;
+        if (row.timed) c.p.deadline = now(shelf.io).addDuration(.fromSeconds(60));
+        for (row.ops) |check| {
+            switch (check.op) {
+                // `Shelf.park` without the queue, which needs a runtime.
+                .park => {
+                    c.p.parked_at = now(shelf.io).subDuration(row.parked_for);
+                    _ = c.p.step(.park);
+                    shelf.insert(&c.p);
+                    _ = shelf.count.fetchAdd(1, .monotonic);
+                    try std.testing.expect((if (row.timed) shelf.timed.first else shelf.untimed.first) != null);
+                },
+                .expire => shelf.expire(&c.p),
+                .poll_back => shelf.pollBack(&c.p, .poll_back),
+                .canceled => shelf.pollBack(&c.p, .canceled),
+                .expire_done => c.p.expireDone(),
+            }
+            errdefer std.debug.print("after {t}\n", .{check.op});
+            try std.testing.expectEqual(check.phase, c.p.phase);
+            try std.testing.expectEqual(check.closes, c.closes);
+        }
+        try std.testing.expectEqual(row.wakes, c.wakes);
+        try std.testing.expectEqual(row.woke_from_long, c.p.woke_from_long);
+        try std.testing.expect(shelf.timed.first == null and shelf.untimed.first == null);
+        if (row.count) |n| try std.testing.expectEqual(n, shelf.count.load(.monotonic));
+    }
 }

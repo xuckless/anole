@@ -3936,7 +3936,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
-                    if (!connection.mode.upgraded() and !response._parked and hasUnreadInput(connection, parser)) {
+                    if (!connection.mode.upgraded() and response._phase != .parked and hasUnreadInput(connection, parser)) {
                         try lp.lingeringClose();
                     }
                     if (connection.mode.adopter() == null) return .close;

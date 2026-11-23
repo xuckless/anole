@@ -316,27 +316,17 @@ pub const Resp = enum(u8) {
 
     pub const Event = enum { head, end, wait, drained };
 
-    /// The table above.
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(Resp, std.EnumArray(Event, Resp)).init(.{
+        .none = .init(.{ .head = .head_sent, .end = .ended, .wait = .none, .drained = .none }),
+        .head_sent = .init(.{ .head = .head_sent, .end = .ended, .wait = .head_sent, .drained = .head_sent }),
+        .ended = .init(.{ .head = .ended, .end = .ended, .wait = .waiting, .drained = .ended }),
+        .waiting = .init(.{ .head = .waiting, .end = .waiting, .wait = .waiting, .drained = .ended }),
+    });
+
     pub fn next(r: Resp, ev: Event) Resp {
-        return switch (r) {
-            .none => switch (ev) {
-                .head => .head_sent,
-                .end => .ended,
-                .wait, .drained => .none,
-            },
-            .head_sent => switch (ev) {
-                .head, .wait, .drained => .head_sent,
-                .end => .ended,
-            },
-            .ended => switch (ev) {
-                .head, .end, .drained => .ended,
-                .wait => .waiting,
-            },
-            .waiting => switch (ev) {
-                .head, .end, .wait => .waiting,
-                .drained => .ended,
-            },
-        };
+        return table.get(r).get(ev);
     }
 
     /// The last frame is submitted (or being submitted).
@@ -385,36 +375,44 @@ pub const ReqBody = enum(u8) {
 
     pub const Event = enum { end, discard, discard_tunnel };
 
-    /// The table above.
-    pub fn next(b: ReqBody, ev: Event) ReqBody {
-        return switch (b) {
-            .receiving => switch (ev) {
-                .end => .complete,
-                .discard => .discarding,
-                .discard_tunnel => .tunnel_closing,
-            },
-            .discarding, .tunnel_closing => switch (ev) {
-                .end => .dropped,
-                .discard, .discard_tunnel => b,
-            },
-            .dropped, .complete => b,
-        };
-    }
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(ReqBody, std.EnumArray(Event, ReqBody)).init(.{
+        .receiving = .init(.{ .end = .complete, .discard = .discarding, .discard_tunnel = .tunnel_closing }),
+        .discarding = .init(.{ .end = .dropped, .discard = .discarding, .discard_tunnel = .discarding }),
+        .tunnel_closing = .init(.{ .end = .dropped, .discard = .tunnel_closing, .discard_tunnel = .tunnel_closing }),
+        .dropped = .init(.{ .end = .dropped, .discard = .dropped, .discard_tunnel = .dropped }),
+        .complete = .init(.{ .end = .complete, .discard = .complete, .discard_tunnel = .complete }),
+    });
 
     /// No more body comes.
-    pub fn done(b: ReqBody) bool {
-        return switch (b) {
-            .dropped, .complete => true,
-            .receiving, .discarding, .tunnel_closing => false,
-        };
-    }
+    const is_done = std.EnumArray(ReqBody, bool).init(.{
+        .receiving = false,
+        .discarding = false,
+        .tunnel_closing = false,
+        .dropped = true,
+        .complete = true,
+    });
 
     /// The handler is done with the body: what comes is dropped.
+    const is_dropping = std.EnumArray(ReqBody, bool).init(.{
+        .receiving = false,
+        .discarding = true,
+        .tunnel_closing = true,
+        .dropped = true,
+        .complete = false,
+    });
+
+    pub fn next(b: ReqBody, ev: Event) ReqBody {
+        return table.get(b).get(ev);
+    }
+
+    pub fn done(b: ReqBody) bool {
+        return is_done.get(b);
+    }
+
     pub fn dropping(b: ReqBody) bool {
-        return switch (b) {
-            .discarding, .tunnel_closing, .dropped => true,
-            .receiving, .complete => false,
-        };
+        return is_dropping.get(b);
     }
 };
 
@@ -458,31 +456,25 @@ pub const Writer = enum {
 
     pub const Event = enum { take, wrote, flushed, release, shut_drained, fail };
 
-    /// The table above.
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(Writer, std.EnumArray(Event, Writer)).init(.{
+        .idle = .init(.{ .take = .flushing, .wrote = .idle, .flushed = .idle, .release = .idle, .shut_drained = .shut, .fail = .shut }),
+        .flushing = .init(.{ .take = .flushing, .wrote = .flushing_unflushed, .flushed = .flushing, .release = .idle, .shut_drained = .flushing, .fail = .shut }),
+        .flushing_unflushed = .init(.{ .take = .flushing_unflushed, .wrote = .flushing_unflushed, .flushed = .flushing, .release = .flushing_unflushed, .shut_drained = .flushing_unflushed, .fail = .shut }),
+        .shut = .init(.{ .take = .shut, .wrote = .shut, .flushed = .shut, .release = .shut, .shut_drained = .shut, .fail = .shut }),
+    });
+
+    /// A task holds the token.
+    const is_held = std.EnumArray(Writer, bool).init(.{
+        .idle = false,
+        .flushing = true,
+        .flushing_unflushed = true,
+        .shut = false,
+    });
+
     pub fn next(w: Writer, ev: Event) Writer {
-        return switch (ev) {
-            .take => switch (w) {
-                .idle => .flushing,
-                .flushing, .flushing_unflushed, .shut => w,
-            },
-            .wrote => switch (w) {
-                .flushing => .flushing_unflushed,
-                .idle, .flushing_unflushed, .shut => w,
-            },
-            .flushed => switch (w) {
-                .flushing_unflushed => .flushing,
-                .idle, .flushing, .shut => w,
-            },
-            .release => switch (w) {
-                .flushing => .idle,
-                .idle, .flushing_unflushed, .shut => w,
-            },
-            .shut_drained => switch (w) {
-                .idle => .shut,
-                .flushing, .flushing_unflushed, .shut => w,
-            },
-            .fail => .shut,
-        };
+        return table.get(w).get(ev);
     }
 
     /// `take`: whether it was granted (the state moved).
@@ -492,12 +484,8 @@ pub const Writer = enum {
         return w.* != was;
     }
 
-    /// A task holds the token.
     pub fn held(w: Writer) bool {
-        return switch (w) {
-            .flushing, .flushing_unflushed => true,
-            .idle, .shut => false,
-        };
+        return is_held.get(w);
     }
 };
 
@@ -1898,7 +1886,7 @@ pub fn Engine(comptime Ctx: type) type {
                     .running_parked, .parked => |p| p.peerGone(),
                     .detached_inline, .detached_tasked => |ex| {
                         // Attached or finished: its task or its end lets go.
-                        const d = ex.response.detached.?;
+                        const d = ex.response._detachment().?;
                         if (d.state != .detached) return;
                         d.abort();
                         ex.request._body_held.release();
@@ -2230,13 +2218,40 @@ pub fn Engine(comptime Ctx: type) type {
             parked: *H2Parked,
             done,
 
-            /// The handler (or the owner it handed the response to) holds
-            /// the stream.
+            const Tag = std.meta.Tag(Dispatch);
+
+            /// What each state is, one row per state (add a state as a row).
+            ///   holds:     the handler (or the owner it handed the response
+            ///              to) holds the stream.
+            ///   on_reader: the response is written on the reader, which
+            ///              never waits for the peer (`StreamSink`). The two
+            ///              `inline_` states write nothing yet; in the set,
+            ///              it stays one mask.
+            ///   parked:    parked from inside the handler or returned parked.
+            ///   owned:     the response has an owner past the handler,
+            ///              whom the teardown lets go.
+            const Traits = struct { holds: bool, on_reader: bool, parked: bool, owned: bool };
+            const traits = std.EnumArray(Tag, Traits).init(.{
+                .head = .{ .holds = false, .on_reader = false, .parked = false, .owned = false },
+                .queued_task = .{ .holds = true, .on_reader = false, .parked = false, .owned = false },
+                .inline_awaiting_body = .{ .holds = true, .on_reader = true, .parked = false, .owned = false },
+                .inline_ready = .{ .holds = true, .on_reader = true, .parked = false, .owned = false },
+                .running_inline = .{ .holds = true, .on_reader = true, .parked = false, .owned = false },
+                .running_tasked = .{ .holds = true, .on_reader = false, .parked = false, .owned = false },
+                .running_parked = .{ .holds = true, .on_reader = false, .parked = true, .owned = true },
+                .running_ended = .{ .holds = true, .on_reader = false, .parked = false, .owned = false },
+                .detached_inline = .{ .holds = true, .on_reader = true, .parked = false, .owned = true },
+                .detached_tasked = .{ .holds = true, .on_reader = false, .parked = false, .owned = true },
+                .parked = .{ .holds = true, .on_reader = false, .parked = true, .owned = true },
+                .done = .{ .holds = false, .on_reader = false, .parked = false, .owned = false },
+            });
+
+            fn row(d: Dispatch) Traits {
+                return traits.get(std.meta.activeTag(d));
+            }
+
             pub fn holdsStream(d: Dispatch) bool {
-                return switch (d) {
-                    .head, .done => false,
-                    .queued_task, .inline_awaiting_body, .inline_ready, .running_inline, .running_tasked, .running_parked, .running_ended, .detached_inline, .detached_tasked, .parked => true,
-                };
+                return row(d).holds;
             }
 
             /// Counted in `Conn.open_streams` (a handler was assigned).
@@ -2244,30 +2259,16 @@ pub fn Engine(comptime Ctx: type) type {
                 return d != .head;
             }
 
-            /// The response is written on the reader, which never waits for
-            /// the peer (`StreamSink`). The two `inline_` states write
-            /// nothing yet; in the set, it stays one mask.
             pub fn onReader(d: Dispatch) bool {
-                return switch (d) {
-                    .inline_awaiting_body, .inline_ready, .running_inline, .detached_inline => true,
-                    .head, .queued_task, .running_tasked, .running_parked, .running_ended, .detached_tasked, .parked, .done => false,
-                };
+                return row(d).on_reader;
             }
 
             pub fn isParked(d: Dispatch) bool {
-                return switch (d) {
-                    .running_parked, .parked => true,
-                    .head, .queued_task, .inline_awaiting_body, .inline_ready, .running_inline, .running_tasked, .running_ended, .detached_inline, .detached_tasked, .done => false,
-                };
+                return row(d).parked;
             }
 
-            /// The response has an owner past the handler, whom the
-            /// teardown lets go.
             pub fn owned(d: Dispatch) bool {
-                return switch (d) {
-                    .running_parked, .parked, .detached_inline, .detached_tasked => true,
-                    .head, .queued_task, .inline_awaiting_body, .inline_ready, .running_inline, .running_tasked, .running_ended, .done => false,
-                };
+                return row(d).owned;
             }
         };
 
@@ -3151,10 +3152,8 @@ pub fn Engine(comptime Ctx: type) type {
             defer if (!detached) response.deinit();
             response._request = request;
             request._response = response;
-            response._detach_engine = &detach_engine;
-            response._detach_ctx = &ex;
             // On its own task the response may detach only to be parked.
-            response._detach_park_only = timer != null;
+            response._offerDetach(&detach_engine, &ex, if (timer != null) .park_only else .full);
 
             request.method = parseMethod(es.method) orelse {
                 response.status = .not_implemented;
@@ -3246,7 +3245,7 @@ pub fn Engine(comptime Ctx: type) type {
             // A detached response is its owner's (or over already, a park
             // that failed having handled the error), whatever the handler
             // returned: the stack copy is not written or freed here.
-            if (response.detached) |d| {
+            if (response._detachment()) |d| {
                 detached = true;
                 conn.lock();
                 defer conn.unlock();
@@ -3298,7 +3297,6 @@ pub fn Engine(comptime Ctx: type) type {
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
-            ex.response._detach_ctx = ex;
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;

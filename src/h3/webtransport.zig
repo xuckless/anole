@@ -880,20 +880,18 @@ const Life = enum(u8) {
 
     const Event = enum { drain, end, detach };
 
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(Life, std.EnumArray(Event, Life)).init(.{
+        .open = .init(.{ .drain = .draining, .end = .closed, .detach = .detached }),
+        .draining = .init(.{ .drain = .draining, .end = .closed_draining, .detach = .detached }),
+        .closed = .init(.{ .drain = .closed_draining, .end = .closed, .detach = .detached }),
+        .closed_draining = .init(.{ .drain = .closed_draining, .end = .closed_draining, .detach = .detached }),
+        .detached = .init(.{ .drain = .detached, .end = .detached, .detach = .detached }),
+    });
+
     fn next(l: Life, e: Event) Life {
-        return switch (e) {
-            .detach => .detached,
-            .drain => switch (l) {
-                .open, .draining => .draining,
-                .closed, .closed_draining => .closed_draining,
-                .detached => .detached,
-            },
-            .end => switch (l) {
-                .open, .closed => .closed,
-                .draining, .closed_draining => .closed_draining,
-                .detached => .detached,
-            },
-        };
+        return table.get(l).get(e);
     }
 
     /// Neither side has closed the session (open or draining).

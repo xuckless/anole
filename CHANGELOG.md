@@ -5,16 +5,94 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
-### Removed
-
-- SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.
+S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247. S3 batch 3 does it for the HTTP/1.x server loop and the C ABI engine, and fixes #220.
 
 ### Changed
 
-- **PostgreSQL calls that skip the statement cache take one round trip after their first run** (`describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Needs the pg.zig fork's description cache. Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.
+- **HTTP/2 and HTTP/3 transport state as explicit enums with declared transition tables** (#215). No behaviour change: wire bytes, frame order, error and reset codes and C ABI results are as before. Each state has one `next` (an exhaustive state x event switch) and a test row per cell; switches that only map a state to a value are comptime `std.EnumArray` tables.
+  - HTTP/2 engine (src/http/core/h2/server.zig): a stream's response side (`Resp`: none, head sent, ended, waiting for its send), its dispatch (`Dispatch`) and its request body (`ReqBody`) are one value each; a connection's output, life and drain are one `Writer`, `Life` and `Drain` value each, with the in-flight holds derived instead of counted beside them. The test seams are one comptime `Probe`, a no-op outside tests.
+  - HTTP/2 core: the inbound parser phase is one `In` union, the server's SETTINGS come from a declared table, and the never-read `Local.max_concurrent_streams` is gone; header names are classified by the core's name tokens in `onField` and the response head.
+  - HTTP/3 request stream: its 17 booleans (#215) became one phase enum covering the head and start of a request and the handler's end, including inline and detached runs.
+  - Holder sets (`std.EnumSet`) replace reference counts and done flags for HTTP/3 server, client and WebTransport streams and for the HTTP/2 client's streams; releasing an HTTP/3 server stream's holder twice now trips an assert in Debug.
+  - Connection state: the HTTP/3 server connection's life and seat, the protocol (handshaking, HTTP/3 or hq-interop) as one union with an hq stream's phase as one enum, the HTTP/2 and HTTP/3 clients' connection phase and a client stream's request and response sides, and a WebTransport session's life and send sides are one value each.
+- **`Detached.attach` takes the task function and its arguments** (`d.attach(func, args)`) and spawns the task itself, instead of returning a group for the caller to spawn into (#225, below). Code using `anole.http`'s detached responses directly needs the one-line change.
+- Performance neutral: fixed-count user-space instructions per request within +0.2% on h2c, unary gRPC, static-h2, h2 TLS, HTTP/3 and HTTP/1.1; RSS flat or lower on every cell of the A/B (bench/results/20261122-s3-batch1-ab, measured before the comptime-table commit).
+- Pins: pg.zig `anole` 8595bef (was 06ccba1).
+- **The HTTP/1 core's state as explicit enums and unions with declared tables** (S3 batch 2). No behaviour change beyond the two fixes below: wire bytes, error results and C ABI results are as before.
+  - Response: the body framing (`_body_mode`: buffered, chunked, streaming, declared length) and the body writer (`_body_writer`) are two enums instead of four booleans; the response's phase (building, head sent, writing, finished, parked) is one `Phase` enum with a comptime table, and its detach offer and detached handle one union.
+  - Request body: `req.body()` and `req.reader()` share one union (unread, reader taken, cached) and each form one optional instead of a map plus a flag; a failed form parse publishes nothing.
+  - Idle park: a shelf entry's lifecycle is one phase enum with a comptime table (the never-read `shelf` back pointer is gone).
+  - Client: a pooled connection's role (HTTP/1, a dialed HTTP/2 session, an origin's HTTP/2 carrier, a view on a shared session) is one `Kind` union and an HTTP/2 origin's list membership one state; the dials in flight and the HTTP/1-only memory are one `Dials` type with its table; a response body is one `BodyState` union (unread, reader taken, cached).
+  - WebSocket: a connection's flush-batch membership and flusher task and the write backstop are explicit states with declared tables; the four send variants go through one `sendFrame`, and the fragmentation state is one optional.
+- **The HTTP/1.x server loop and the C ABI engine as explicit state** (S3 batch 3). No behaviour change beyond the fixes below; include/ (anole.h, anole.abi.json, anole.schema.json) is unchanged.
+  - Server loop: a connection's in-flight count is one `count` on the connection (the `busy: *bool` thread through the loop and the HTTP/2 engine is gone); whether a request took it out of HTTP/1.x is one `Connection.mode` (http, upgraded, adopted, both) with a state x event table, changed only by `finishUpgrade`, `adopt` and `releaseAdopter`; `handleRequests` runs as named phases returning one step, the refusals go through `refuse`/`refuseHead`, and the three fixed replies are one table. `Forwarding` is gone: the proxied and secure facts are computed once per listener.
+  - C ABI engine: a request slot's owner (task, detached, orphan, abandoned) is one executor-local union with one `finish`; its flavour is one enum with comptime tables for the handle kind and record type, an upgrade's accept is one union, `Route.kind` one union. Areas: one record writer, one string dupe, one call error and one table-driven failure mapper for the seven connector areas; generation, liveness and handles once on `SlotTable`; one `Lane(Cmd)` with an explicit running state for the WebSocket and SSE publish lanes; the areas' init, open, close, destroy and drain one comptime declaration; the config checks shared helpers over one declared option list (refusal texts byte for byte as before).
+- **`Response.detached` is gone** (`anole.http` users): ask `res.isDetached()`; the engines read `res._detachment()`. `Response.WriteError` no longer contains `HeaderError` (`write()` can't fail on a full header table any more, #246).
 
-- The startup line now names the real reason io_uring is off (the error zio kept from the ring's setup) instead of guessing from the kernel version; only an EPERM without `kernel.io_uring_disabled` is still "likely a seccomp profile".
-- New `io_engine` option (`.auto` or `.io_uring`, also `"io_engine"` in the C ABI config): `.io_uring` refuses to start on epoll, naming the cause.
+### Fixed
+
+- **A response whose headers fill `response.max_header_count` is answered** (#246), without the Content-Type that has no room, instead of dropping the HTTP/1.1 connection (logged as `Malformed request: TooManyHeaders`) or resetting the HTTP/2 or HTTP/3 stream. The 500 for a handler that tries to add one header past the limit is now sent too.
+- **HTTP/1.x header values lose their trailing spaces and tabs** (#247, RFC 9110 5.5), in requests and in client responses: `X-Trim: spaced   ` reached the handler with its spaces, and `Content-Length: 5 ` read as no length. HTTP/2 and HTTP/3 already refuse or drop such values.
+- **A detached response's task could be spawned into a connection group that was already joined** (#225): `Detached.attach` checked the connection under its lock, let go of the lock, and the caller spawned afterwards, so on `std.Io.Threaded` a teardown could join the group in between and the task outlived the connection. The spawn now happens under the connection's lock in both engines. HTTP/2 refuses an attach once its tasks are over; HTTP/3 never needs to, because its teardown aborts every still-detached response before it joins the group.
+- **Stopping a PostgreSQL watch no longer writes Terminate into a socket another task is writing to** (#221): the watch hub stops a connection with the pg.zig fork's new `Listener.interrupt` (a shutdown without Terminate), so a LISTEN, UNLISTEN or ping in flight can't be interleaved with it or blocked behind it. A listener says goodbye on close only if it was never interrupted.
+- **A drain started by the server (a signal, the console, a hand-off, a failing listener) now reaches the C ABI's own areas** (#220): it went only as far as the DRAINING record, so jobs, Kafka groups, webhooks, S3 and SMTP kept running and cut requests were reported as ABORT_CLIENT. Every drain now goes through one `beginDrain`, as `anole_server_drain` does.
+- **The HTTP/2 engine no longer swallows a cancel after a failed write**: shutting the socket after a failed or canceled write (`writeFailed`, `shutDrained`, `lingeringClose`) waited cancelably with a cancel already delivered, and a still-pending one was dropped by `catch {}` and left the socket open. They and the parked HTTP/1.x close use one uncancelable `Connection.shutdownBoth`.
+- The C ABI test of a WebSocket handshake past its deadline no longer races (#234): it runs on one executor, so a barrier request orders the check after the handshake's record instead of waiting for a delivery that may never come.
+
+### Tests
+
+- An hq-interop round trip on aioquic's H0 ALPN, run by tests/h3/run.sh and CI; an HTTP/3 row for requests past the task cap (rejected unprocessed, stream credit returned); HTTP/2 rows for a response head too large to submit (whole, streamed, bare and on a tunnel: reset with INTERNAL_ERROR, the connection carries on).
+- test-flags builds without WebSocket or HTTP/3 compile again: the C ABI slot-size test reads those slots only with their features.
+
+## 0.6.1 (2026-11-22)
+
+The end of S2 and the first step of S3: zio stream writes gather more slices per send, PostgreSQL one-off queries take one round trip, io_uring's fallback names its cause, and the SAFETY regime is gone on the way to 1.0.0-rc. libanole is now a release asset for the bindings.
+
+### Highlights
+
+On my box (i7-14700F), against 0.6.0. Instructions per request are fixed-count on 1 executor; req/s, CPU and RSS are a rested A/B on 5 executors, one pass.
+
+| Cell | 0.6.0 | 0.6.1 |
+|---|---|---|
+| h2c json `/json/50`: kernel instructions per request | 19,987 | 6,586 (−67%) |
+| h2c json `/json/50`: sendmsg per request | 0.656 | 0.096 |
+| json-h2c, 4096 connections, 120 s: req/s | 230.1k | 259.1k (+12.6%) |
+| json-h2c, 4096 connections: CPU per request | 6.90 µs | 5.94 µs (−13.9%) |
+| json-h2c, 4096 connections: RSS | 2466 MB | 2192 MB |
+
+Everything else (static-h2, unary gRPC, h2c baseline, HTTP/1.1, HTTP/3, the WebSocket relay) is flat within one-pass noise. The S3 step-1 changes keep user-space instructions per request within ±0.2% on HTTP/1.1, h2c, unary gRPC and HTTP/3. Results: bench/results/20261122-s2-finish-ab, 20261122-s3-step1-gate.
+
+### Changed
+
+- **zio stream writes gather up to 64 iovecs (was 8)** when the caller passes 8 or more slices. This is the h2c gain above: an HTTP/2 flush round of up to 64 slices takes one sendmsg instead of up to eight (one sendmsg per 10 responses instead of per 1.5). Small responses already fit one send and don't change; TLS output was already sealed into one buffer.
+- **PostgreSQL calls that skip the statement cache take one round trip after their first run** (#132; `describe_cache_size`, default 64; `databases[].postgres.describe_cache_size` in the C ABI): `.prepare = false` calls and `statement_cache_size = 0` used to take two. A connection now remembers the parameter and column types of such a statement and sends Parse, Bind, Describe, Execute and Sync in one write; nothing stays prepared on the server (pgx's `QueryExecModeCacheDescribe`). Also fixed: a cached statement that returns no columns reported 32 columns. 0 turns it off.
+- **The startup line names the real reason io_uring is off** (#134; the error zio kept from the ring's setup) instead of guessing from the kernel version; only an EPERM without `kernel.io_uring_disabled` is still "likely a seccomp profile". New `io_engine` option (`.auto` or `.io_uring`, also `"io_engine"` in the C ABI config): `.io_uring` refuses to start on epoll, naming the cause.
+- The rate-limit middleware resolves its policy once at init instead of per request (#204).
+- gRPC routes transcoded from JSON for Zig services honour `no_wait`; a route shared by several bindings is `no_wait` only if every binding is (#50).
+- QUIC `SSL`s (server and client) shed their handshake configuration after the handshake, as the TLS listeners already did (#50).
+- WebSocket over HTTP/2 and HTTP/3 sizes its message buffer once from the length the frames declare, instead of growing it piece by piece (A2-7).
+- Pins: zio `anole-diag` d7380db (was 3c863fc), pg.zig `anole` 06ccba1 (was 4abc2ca).
+
+### Fixed
+
+- **HTTP/2: a send from a task on another executor swallowed a cancel** (#236): the engine's cross-executor hop caught `error.Canceled` and turned it into a write failure, so the sender's next cancelable call didn't see it. It now re-raises the cancel (`io.recancel()`).
+- **A plain GET to a `wsCallbacks` route crashed under `anole.testing`** (#237): it read the connection before checking for an upgrade. The upgrade check now runs first and the route answers 426, as it already did over a socket.
+- **libanole failed to link against glibc older than 2.25**: the ngtcp2 build defined `HAVE_EXPLICIT_BZERO` on every Linux target, leaving `__explicit_bzero_chk` undefined. It is now set only for glibc >= 2.25 and musl; older glibc uses ngtcp2's own fallback.
+- Console (part of #128): the `/routes` `cached` flag is filled from the route's middleware chain (it was always false), and Redis, MongoDB, NATS and Kafka report a `consoleInfo` for `/db`. The `/db` call rates and latencies are still open.
+
+### Removed
+
+- SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.
+- **`zig build lint` and `zig build safety-test` no longer exist**; scripts that call them need to drop them.
+
+### Added
+
+- **`zig build capi-dist`**: `libanole-<arch>-<os>.a`, `anole.h`, `anole.abi.json`, `anole.schema.json` and `SHA256SUMS-libanole` for x86_64 and aarch64 `linux-gnu.2.17` and x86_64 and aarch64 macOS, stripped ReleaseSafe, into `zig-out/capi-dist`. The stripped libanole.a is about 24 MB (19 MB with `-Dprofile=web`) and exports only the `anole_*` symbols. These ship as release assets from this release on, next to the `anole` CLI binaries. New `-Dstrip` option for `zig build capi`.
+
+### Known issues
+
+- The QUIC and WebTransport interop CI jobs are red, on 0.6.0's code too (#244, #243).
+- HTTP/3 still costs 2.4x h2c's CPU per request (h3 1.62 against h2c 0.68 µs at one connection, 64 streams).
 
 ## 0.6.0 (2026-11-16)
 

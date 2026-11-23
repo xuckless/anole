@@ -297,11 +297,26 @@ pub fn token(name: []const u8) ?Token {
 /// RFC 9113 §8.2.2: the fields no HTTP/2 message may carry; the request and
 /// response checks above reject exactly these, the engine drops them from a
 /// response head.
+const connection_specific = std.EnumArray(Token, bool).init(.{
+    .status = false,
+    .authority = false,
+    .method = false,
+    .path = false,
+    .scheme = false,
+    .protocol = false,
+    .host = false,
+    .content_length = false,
+    .connection = true,
+    .keep_alive = true,
+    .proxy_connection = true,
+    .transfer_encoding = true,
+    .upgrade = true,
+    .te = false,
+    .priority = false,
+});
+
 pub fn connectionSpecific(t: Token) bool {
-    return switch (t) {
-        .connection, .keep_alive, .proxy_connection, .transfer_encoding, .upgrade => true,
-        else => false,
-    };
+    return connection_specific.get(t);
 }
 
 /// nghttp2's character tables, built at comptime: `bytes` and, with

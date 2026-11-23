@@ -370,9 +370,9 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   takes one round trip after its first run (Parse with the cached types,
   Bind, Describe, Execute and Sync in one write, as pgx's
   `QueryExecModeCacheDescribe`; the fork's `tests/run.sh` covers it).
-  `Listener.interrupt`: shutdown without Terminate, so the watch hub can
-  stop a connection another task is writing to (#221); `deinit` sends
-  Terminate only after no interrupt or stop. The first four are
+  `Listener.interrupt`: shutdown without Terminate; deinit says goodbye
+  only if never interrupted (#221), so the watch hub can stop a connection
+  another task is writing to (pinned at 8595bef). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig

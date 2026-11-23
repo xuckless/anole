@@ -183,13 +183,17 @@ const Seat = enum(u8) {
 
     const Event = enum { handoff, retire, give_up };
 
-    /// The table above.
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(Seat, std.EnumArray(Event, Seat)).init(.{
+        .accepting = .init(.{ .handoff = .driven, .retire = .accepting, .give_up = .given_up }),
+        .given_up = .init(.{ .handoff = .given_up, .retire = .given_up, .give_up = .given_up }),
+        .driven = .init(.{ .handoff = .driven, .retire = .retired, .give_up = .driven }),
+        .retired = .init(.{ .handoff = .retired, .retire = .retired, .give_up = .retired }),
+    });
+
     fn next(from: Seat, ev: Event) Seat {
-        return switch (ev) {
-            .handoff => if (from == .accepting) .driven else from,
-            .retire => if (from == .driven) .retired else from,
-            .give_up => if (from == .accepting) .given_up else from,
-        };
+        return table.get(from).get(ev);
     }
 
     fn handedOver(s: Seat) bool {
@@ -2913,11 +2917,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
 
                 /// The response holds the stream (`.response`).
+                const owns_stream = std.EnumArray(Tag, bool).init(.{
+                    .head = false,
+                    .awaiting_body = false,
+                    .started = false,
+                    .attached = true,
+                    .parked = true,
+                    .ended = false,
+                    .endpoint = false,
+                    .detached = true,
+                });
+
                 fn owns(p: Phase) bool {
-                    return switch (p) {
-                        .detached, .attached, .parked => true,
-                        .head, .awaiting_body, .started, .ended, .endpoint => false,
-                    };
+                    return owns_stream.get(@as(Tag, p));
                 }
 
                 /// On the endpoint task: writes pass the stream's cap.
@@ -3275,14 +3287,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // A detached response is its owner's (or over already, a
                 // park that failed having handled the error), whatever the
                 // handler returned: the stack copy is not freed here.
-                defer if (response.detached == null) response.deinit();
+                defer if (response._detachment() == null) response.deinit();
                 response._request = request;
                 request._response = response;
                 // On the endpoint task the response may detach; on its own
                 // task only to be parked (an event stream, `Response._park`).
-                response._detach_engine = &detach_engine;
-                response._detach_ctx = ex;
-                response._detach_park_only = !inline_mode;
+                response._offerDetach(&detach_engine, ex, if (inline_mode) .full else .park_only);
 
                 if (s.head_too_large) {
                     response.status = .request_header_fields_too_large;
@@ -3420,7 +3430,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
                 const dispatched = server.dispatch(request, response);
                 // Detached: not written here; the caller moves it.
-                if (response.detached) |d| return exchangeOf(d);
+                if (response._detachment()) |d| return exchangeOf(d);
                 dispatched catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
@@ -3526,7 +3536,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex.response._request = &ex.request;
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
-            ex.response._detach_ctx = ex;
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;
@@ -3608,7 +3617,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             switch (s.phase) {
                 .parked => |p| p.peerGone(),
                 .detached => |ex| {
-                    const d = ex.response.detached.?;
+                    const d = ex.response._detachment().?;
                     // Its owner has begun to finish it.
                     if (d.state != .detached) return;
                     d.abort();
