@@ -3433,7 +3433,28 @@ pub fn Server(comptime Ctx: type) type {
                 // Without a shelf to watch the wait, the connection does
                 // not park.
                 .watch_shelf = if (self.parkAfter(null) == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null,
-                .request = undefined,
+                // Here, not assigned after: a safe build would fill an
+                // undefined field with 0xaa first.
+                .request = .{
+                    // The pooled arena, once a request has arrived.
+                    .arena = undefined,
+                    .io = self.io,
+                    ._transport = connection.transport(),
+                    ._parser = undefined,
+                    ._config = self.config.request,
+                    .remote_address = connection.peerAddress(),
+                    .listener = l.config,
+                    .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
+                    .drain = &self.draining,
+                    ._drain_hooks = &self.drain_hooks,
+                    .peer_certificate = connection.peerCertificate(),
+                    ._timeout_context = timer,
+                    ._set_timeout = setRequestTimeout,
+                    ._set_lazy_timeout = setLazyRequestTimeout,
+                    ._claim_timeout = claimRequestTimeout,
+                    // Its entry table is never read past `len`: not zeroed.
+                    .session = undefined,
+                },
             };
             if (lp.watch_shelf) |s| s.watch(&lp.park_watch);
             defer if (lp.watch_shelf) |s| s.unwatch(&lp.park_watch);
@@ -3472,26 +3493,6 @@ pub fn Server(comptime Ctx: type) type {
                 .adopt, .h2c => {},
             };
 
-            lp.request = .{
-                // The pooled arena, once a request has arrived.
-                .arena = undefined,
-                .io = self.io,
-                ._transport = connection.transport(),
-                ._parser = undefined,
-                ._config = self.config.request,
-                .remote_address = connection.peerAddress(),
-                .listener = l.config,
-                .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
-                .drain = &self.draining,
-                ._drain_hooks = &self.drain_hooks,
-                .peer_certificate = connection.peerCertificate(),
-                ._timeout_context = timer,
-                ._set_timeout = setRequestTimeout,
-                ._set_lazy_timeout = setLazyRequestTimeout,
-                ._claim_timeout = claimRequestTimeout,
-                // Its entry table is never read past `len`: not zeroed.
-                .session = undefined,
-            };
             lp.request.session._empty();
 
             try lp.parser.init(&lp.request);

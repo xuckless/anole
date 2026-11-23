@@ -1153,6 +1153,12 @@ const CorkCtx = struct {
     adopter: dusty.Adopter = .{ .serve = adopterServe, .release = adopterRelease },
     adopter_served: u32 = 0,
     adopter_released: u32 = 0,
+    /// What `/adopt-abort` read into, and whether its connection still read
+    /// into it when the adopter was released: its request buffers not yet
+    /// given back.
+    abort_conn: ?*dusty.Connection = null,
+    abort_read_buffer: ?[*]u8 = null,
+    released_holding_buffers: bool = false,
 
     const big_len = 1024;
     const big_body: [big_len]u8 = @splat('b');
@@ -1189,6 +1195,7 @@ const CorkCtx = struct {
 
     fn adopterRelease(ad: *dusty.Adopter) void {
         const ctx: *CorkCtx = @fieldParentPtr("adopter", ad);
+        if (ctx.abort_read_buffer) |b| ctx.released_holding_buffers = ctx.abort_conn.?.read_buffer.ptr == b;
         _ = @atomicRmw(u32, &ctx.adopter_released, .Add, 1, .release);
     }
 
@@ -1206,6 +1213,8 @@ const CorkCtx = struct {
     /// A streamed 200 handed over, then aborted: the request fails before
     /// the adopter's first run.
     fn adoptAbort(ctx: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        ctx.abort_conn = res._conn.?;
+        ctx.abort_read_buffer = res._conn.?.read_buffer.ptr;
         var buf: [64]u8 = undefined;
         var body = try res.stream(&buf);
         try body.interface.writeAll("hello");
@@ -1573,6 +1582,9 @@ test "Server: an adopter whose request fails before its first run is released on
         }
     }.released);
     try std.testing.expectEqual(0, @atomicLoad(u32, &client.ctx.adopter_served, .acquire));
+    // Released by the request loop, before its buffers went back, not by
+    // `closeConn` after.
+    try std.testing.expect(client.ctx.released_holding_buffers);
 }
 
 test "Connection.Mode: every state x event cell" {
