@@ -652,6 +652,9 @@ pub const Client = struct {
                     continue;
                 };
                 ts.context = s;
+                // First seen while the client closes (a monitor's `apply`
+                // after `deinit` retired the others): retired too.
+                if (self.closing.load(.acquire)) s.retire(self.io);
                 changes.start.appendAssumeCapacity(s);
             }
             const s: *Server = @ptrCast(@alignCast(ts.context.?));
@@ -685,8 +688,9 @@ pub const Client = struct {
         for (changes.start.items) |s| {
             if (s.isRetired()) continue;
             // May yield (a busy executor); nothing is locked here. A spawn
-            // into the group while `deinit` cancels it fails, and `deinit`
-            // retired the server already.
+            // into the group while `deinit` cancels it fails, for a server
+            // retired already (by `deinit`, or by `syncServers` once the
+            // client is closing).
             placement.concurrent(&self.group, self.io, .{ .executor = 0 }, monitor, .{s}) catch |err| {
                 log.warn("mongodb {s}: monitor not started: {t}", .{ s.address.text, err });
             };
@@ -1529,4 +1533,52 @@ test "classify: codes to classes" {
         .{ null, "not master", .unavailable },
         .{ null, "something", .other },
     }) |case| try testing.expectEqual(case[2], classify(.{ .code = case[0], .message = case[1], .reply = doc }));
+}
+
+/// The close test's hook: with every server retired by `deinit`, a hello
+/// naming a new member reaches the client, as from a monitor whose check
+/// passed its retired check before `deinit` ran.
+const CloseJoin = struct {
+    var life: ?Server.Life = null;
+
+    fn hold(s: *Server) void {
+        const self = s.client;
+        var b: bson.Builder = .init(testing.allocator);
+        defer b.deinit();
+        const d = hello(&b, s.address.text) catch return;
+        self.apply(d);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const ts = self.topology.find("127.0.0.1:2") orelse return;
+        life = @as(*Server, @ptrCast(@alignCast(ts.context.?))).life.load(.acquire);
+    }
+
+    fn hello(b: *bson.Builder, me: []const u8) !*sdam.Description {
+        try b.begin();
+        try b.append("isWritablePrimary", .{ .boolean = true });
+        try b.append("setName", .{ .string = "rs0" });
+        try b.beginArray("hosts");
+        try b.append("", .{ .string = me });
+        try b.append("", .{ .string = "127.0.0.1:2" });
+        try b.end();
+        try b.append("me", .{ .string = me });
+        try b.append("setVersion", .{ .int32 = 1 });
+        try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+        try b.append("maxWireVersion", .{ .int32 = 21 });
+        try b.append("ok", .{ .double = 1 });
+        try b.end();
+        return sdam.describe(testing.allocator, me, .{ .bytes = b.bytes() }, 0);
+    }
+};
+
+test "mongodb: a member first seen while the client closes is retired, its monitor never starts" {
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const client = try Client.init(testing.allocator, rt.io(), .{ .url = "mongodb://127.0.0.1:1/app?replicaSet=rs0" });
+    CloseJoin.life = null;
+    test_close_hold = CloseJoin.hold;
+    defer test_close_hold = null;
+    client.deinit();
+    try testing.expectEqual(@as(?Server.Life, .retired), CloseJoin.life);
 }
