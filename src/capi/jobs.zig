@@ -80,16 +80,6 @@ pub const ExecState = struct {
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
     }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
-    }
 };
 
 /// The state `txOp` and the handlers reach without an engine argument (one
@@ -244,11 +234,6 @@ pub fn draining(e: *Engine) void {
         w.stopped.store(true, .release);
         maybeEnd(w);
     }
-}
-
-/// The server stops: nothing new starts from here.
-pub fn close(e: *Engine) void {
-    _ = e;
 }
 
 /// `anole_server_destroy`: frees what a stopped server still holds.

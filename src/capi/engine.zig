@@ -47,35 +47,21 @@ const Pipe = pipe_mod.Pipe;
 const Chunk = pipe_mod.Chunk;
 pub const Config = config_mod.Config;
 pub const ws = if (features.websocket) @import("ws.zig") else struct {
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-        pub fn maxGen(_: *const ExecState) u32 {
-            return 0;
-        }
-    };
+    pub const ExecState = struct {};
 };
 /// gRPC services implemented by consumers (`anole_grpc_*`).
 pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
     pub const SlotState = struct {};
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-    };
+    pub const ExecState = struct {};
     pub const EngineState = struct {};
 };
 pub const wt = if (features.http3) @import("wt.zig") else struct {
-    pub const ExecState = struct {
-        pub fn deinit(_: *ExecState) void {}
-        pub fn maxGen(_: *const ExecState) u32 {
-            return 0;
-        }
-    };
+    pub const ExecState = struct {};
 };
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const nats = @import("nats.zig");
 pub const kafka = @import("kafka.zig");
-/// Pass 3's areas (ABI 0.10): each a module with fixed hooks, called from
-/// here in one order (`openAreas`, `closeAreas`, ...).
 pub const net = @import("net.zig");
 pub const jobs = @import("jobs.zig");
 pub const webhooks = @import("webhooks.zig");
@@ -84,6 +70,40 @@ pub const watch = @import("watch.zig");
 pub const s3 = @import("s3.zig");
 pub const smtp = @import("smtp.zig");
 pub const config = config_mod;
+
+/// Pass 3's areas (ABI 0.10) by name, in OPEN order: each is the module
+/// `engine.<name>`, the field `Engine.<name>_state` and the field
+/// `Exec.<name>`. Open runs forward (jobs before webhooks, which hooks into
+/// it; watch last, it needs the databases); close, destroy, cancel and the
+/// State deinit run in reverse; drain runs forward. Every hook is optional
+/// and looked up by `@hasDecl`: module `open close destroy draining`, State
+/// `init maxGen deinit`, ExecState `cancel maxGen deinit`. To add an area:
+/// one name here, plus its three fields.
+const areas = [_][]const u8{ "s3", "smtp", "jobs", "webhooks", "watch", "sse", "net" };
+const areas_rev = reversed(areas);
+/// The names whose `Engine.<name>_state` is built, `maxGen`-read and freed
+/// with the areas (nats and kafka keep hand-called open and close: they
+/// bracket `db`).
+const state_areas = [_][]const u8{ "nats", "kafka" } ++ areas;
+const state_areas_rev = reversed(state_areas);
+/// The names of `Exec`'s per-area fields (the ones with `maxGen`/`deinit`).
+const exec_areas = [_][]const u8{ "ws", "grpc", "wt", "db", "nats", "kafka" } ++ areas;
+const exec_areas_rev = reversed(exec_areas);
+
+fn reversed(comptime a: anytype) [a.len][]const u8 {
+    var out: [a.len][]const u8 = undefined;
+    for (a, 0..) |n, i| out[a.len - 1 - i] = n;
+    return out;
+}
+
+fn mod(comptime name: []const u8) type {
+    return @field(@This(), name);
+}
+
+/// Calls the module hook `hook(e)` of each area in `list` that declares it.
+fn eachArea(comptime list: anytype, comptime hook: []const u8, e: *Engine) void {
+    inline for (list) |n| if (comptime @hasDecl(mod(n), hook)) @field(mod(n), hook)(e);
+}
 
 const log = std.log.scoped(.anole_capi);
 
@@ -351,6 +371,47 @@ pub const Owner = union(enum) {
         return o == .timed_out or o == .abandoned;
     }
 };
+
+test "capi engine: areas are declared once, in open order, with their lifecycle constraints" {
+    try std.testing.expectEqualSlices([]const u8, &.{ "s3", "smtp", "jobs", "webhooks", "watch", "sse", "net" }, &areas);
+    try std.testing.expectEqualSlices([]const u8, &.{ "net", "sse", "watch", "webhooks", "jobs", "smtp", "s3" }, &areas_rev);
+    const index = struct {
+        fn of(comptime name: []const u8) usize {
+            return for (areas, 0..) |n, i| {
+                if (std.mem.eql(u8, n, name)) break i;
+            } else unreachable;
+        }
+    }.of;
+    // webhooks hooks into jobs (open) and clears it (destroy); watch needs the databases.
+    comptime std.debug.assert(index("jobs") < index("webhooks") and index("webhooks") < index("watch"));
+}
+
+test "capi engine: no-op hooks stay deleted" {
+    try std.testing.expect(!@hasDecl(sse, "close"));
+    try std.testing.expect(!@hasDecl(sse, "destroy"));
+    try std.testing.expect(!@hasDecl(webhooks.State, "init"));
+    try std.testing.expect(!@hasDecl(smtp.State, "maxGen"));
+    try std.testing.expect(!@hasDecl(watch, "draining"));
+}
+
+test "capi engine: every _state field and every area's Exec field is declared" {
+    const contains = struct {
+        fn in(comptime list: anytype, comptime name: []const u8) bool {
+            return for (list) |n| {
+                if (std.mem.eql(u8, n, name)) break true;
+            } else false;
+        }
+    }.in;
+    inline for (@typeInfo(Engine).@"struct".field_names) |name| {
+        if (comptime std.mem.endsWith(u8, name, "_state")) {
+            try std.testing.expect(contains(state_areas, name[0 .. name.len - "_state".len]));
+        }
+    }
+    inline for (state_areas) |n| try std.testing.expect(@hasField(Engine, n ++ "_state"));
+    inline for (exec_areas) |n| try std.testing.expect(@hasField(Exec, n));
+    // An area with an Engine state has its Exec field declared too.
+    inline for (areas) |n| try std.testing.expect(contains(exec_areas, n));
+}
 
 test "capi engine: Owner transitions" {
     // SAFETY: only its address is used.
@@ -1450,7 +1511,6 @@ pub const Engine = struct {
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
         e.brokers = try a.alloc(nats.Broker, cfg.brokers.len);
         for (e.brokers, cfg.brokers, 0..) |*b, bc, i| b.* = .{ .engine = e, .config = bc, .index = @intCast(i) };
-        e.nats_state.init(e.first_gen);
         var nkafka: usize = 0;
         for (cfg.brokers) |bc| nkafka += @intFromBool(bc.kafka != null);
         e.kafka_brokers = try a.alloc(kafka.Broker, nkafka);
@@ -1459,15 +1519,10 @@ pub const Engine = struct {
             e.kafka_brokers[ki] = .{ .engine = e, .config = bc, .index = @intCast(i) };
             ki += 1;
         };
-        e.kafka_state.init(e.first_gen);
-        e.net_state.init(e.first_gen);
-        e.jobs_state.init(e.first_gen);
-        e.webhooks_state.init(e.first_gen);
-        e.sse_state.init(e.first_gen);
-        e.watch_state.init(e.first_gen);
-        e.s3_state.init(e.first_gen);
-        e.smtp_state.init(e.first_gen);
-        try sse.create(e, why);
+        inline for (state_areas) |n| {
+            const s = &@field(e, n ++ "_state");
+            if (comptime @hasDecl(@TypeOf(s.*), "init")) s.init(e.first_gen);
+        }
         // The modes (docs/config.md): resolved once, here, so a binding sees
         // $PORT and the filled addresses before it starts.
         var opts = try e.serverOptions(a);
@@ -1593,7 +1648,7 @@ pub const Engine = struct {
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
-        e.openAreas(&app) catch |err| {
+        inline for (areas) |n| if (comptime @hasDecl(mod(n), "open")) mod(n).open(e, &app) catch |err| {
             e.closeAreas();
             return e.failStartDeinit(&app, err);
         };
@@ -1642,7 +1697,9 @@ pub const Engine = struct {
         for (e.execs) |*x| x.db.cancel(app.io());
         for (e.execs) |*x| x.nats.cancel(app.io());
         for (e.execs) |*x| x.kafka.cancel(app.io());
-        for (e.execs) |*x| cancelAreas(x, app.io());
+        for (e.execs) |*x| inline for (areas_rev) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(x, n)), "cancel")) @field(x, n).cancel(app.io());
+        };
         e.closeAreas();
         db.close(e);
         nats.close(e);
@@ -2137,7 +2194,7 @@ pub const Engine = struct {
         const app = e.enter() orelse return;
         defer e.leave();
         e.beginDrain();
-        watch.draining(e);
+        watch.stop(e);
         app.stop();
     }
 
@@ -2164,10 +2221,7 @@ pub const Engine = struct {
         e.notifyDraining();
         if (!first) return;
         kafka.draining(e);
-        jobs.draining(e);
-        webhooks.draining(e);
-        s3.draining(e);
-        smtp.draining(e);
+        eachArea(areas, "draining", e);
     }
 
     /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once
@@ -2307,14 +2361,13 @@ pub const Engine = struct {
         var last = e.first_gen;
         for (e.execs) |*x| {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
-            last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
-            last = @max(last, x.net.maxGen(), x.jobs.maxGen(), x.webhooks.maxGen(), x.sse.maxGen());
-            last = @max(last, x.watch.maxGen(), x.s3.maxGen(), x.smtp.maxGen());
+            inline for (exec_areas) |n| {
+                if (comptime @hasDecl(@TypeOf(@field(x, n)), "maxGen")) last = @max(last, @field(x, n).maxGen());
+            }
         }
-        last = @max(last, e.nats_state.maxGen());
-        last = @max(last, e.kafka_state.maxGen());
-        last = @max(last, e.net_state.maxGen(), e.jobs_state.maxGen(), e.webhooks_state.maxGen(), e.sse_state.maxGen());
-        last = @max(last, e.watch_state.maxGen(), e.s3_state.maxGen(), e.smtp_state.maxGen());
+        inline for (state_areas) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(e, n ++ "_state")), "maxGen")) last = @max(last, @field(e, n ++ "_state").maxGen());
+        }
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -2338,24 +2391,15 @@ pub const Engine = struct {
                 c.next = null;
                 c.run(c, x);
             }
-            x.ws.deinit();
-            x.grpc.deinit();
-            x.wt.deinit();
-            x.db.deinit();
-            x.nats.deinit();
-            x.kafka.deinit();
-            x.net.deinit();
-            x.jobs.deinit();
-            x.webhooks.deinit();
-            x.sse.deinit();
-            x.watch.deinit();
-            x.s3.deinit();
-            x.smtp.deinit();
+            inline for (exec_areas_rev) |n| {
+                if (comptime @hasDecl(@TypeOf(@field(x, n)), "deinit")) @field(x, n).deinit();
+            }
         }
-        e.destroyAreas();
-        e.nats_state.deinit();
+        eachArea(areas_rev, "destroy", e);
         kafka.destroy(e);
-        e.kafka_state.deinit();
+        inline for (state_areas_rev) |n| {
+            if (comptime @hasDecl(@TypeOf(@field(e, n ++ "_state")), "deinit")) @field(e, n ++ "_state").deinit();
+        }
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
@@ -2395,41 +2439,9 @@ pub const Engine = struct {
         return out;
     }
 
-    /// Pass 3's `open` hooks (R42's order), after `db`, `nats` and `kafka`.
-    fn openAreas(e: *Engine, app: *anole.App) !void {
-        try s3.open(e, app);
-        try smtp.open(e, app);
-        try jobs.open(e, app);
-        try webhooks.open(e, app);
-        try watch.open(e, app);
-    }
-
-    /// Their `close` hooks, in the reverse order.
+    /// The areas' `close` hooks, in reverse open order.
     fn closeAreas(e: *Engine) void {
-        net.close(e);
-        watch.close(e);
-        webhooks.close(e);
-        jobs.close(e);
-        smtp.close(e);
-        s3.close(e);
-        sse.close(e);
-    }
-
-    /// Their `destroy` hooks, in the reverse order, then their states.
-    fn destroyAreas(e: *Engine) void {
-        watch.destroy(e);
-        webhooks.destroy(e);
-        jobs.destroy(e);
-        smtp.destroy(e);
-        s3.destroy(e);
-        sse.destroy(e);
-        e.smtp_state.deinit();
-        e.s3_state.deinit();
-        e.watch_state.deinit();
-        e.sse_state.deinit();
-        e.webhooks_state.deinit();
-        e.jobs_state.deinit();
-        e.net_state.deinit();
+        eachArea(areas_rev, "close", e);
     }
 
     /// `anole_server_set_ready`.
@@ -4178,17 +4190,6 @@ pub fn sseAccept(e: *Engine, hv: u64, topics: []const []const u8, headers: []con
     const handle = sse.openReserved(x, s.ws_slot);
     handBack(x, s, h, .done);
     return handle;
-}
-
-/// Pass 3's per-executor tasks, canceled at the stop.
-fn cancelAreas(x: *Exec, io: std.Io) void {
-    x.net.cancel(io);
-    x.jobs.cancel(io);
-    x.webhooks.cancel(io);
-    x.sse.cancel(io);
-    x.watch.cancel(io);
-    x.s3.cancel(io);
-    x.smtp.cancel(io);
 }
 
 /// `anole_handle_release`: ends whatever the handle is, the way the

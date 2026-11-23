@@ -92,8 +92,6 @@ pub const ExecState = struct {
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
     }
-
-    pub fn deinit(_: *ExecState) void {}
 };
 
 pub const CallError = error{ Invalid, State, Again, OutOfMemory, Unsupported, Gone };

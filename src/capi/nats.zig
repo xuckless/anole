@@ -180,8 +180,6 @@ pub const ExecState = struct {
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
     }
-
-    pub fn deinit(_: *ExecState) void {}
 };
 
 pub fn handleOf(kind: Handle.Kind, index: u32, gen: u32, exec: u8) u64 {

@@ -108,12 +108,6 @@ pub const State = struct {
         s.first_gen = first_gen;
     }
 
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
-    }
-
     pub fn deinit(s: *State) void {
         // The topics are the app's (`app.sseTopics`).
         s.topics = null;
@@ -200,15 +194,8 @@ pub fn openReserved(x: *Exec, i: u32) u64 {
 // ---------------------------------------------------------------------------
 // The configuration's topics
 
-/// `anole_server_create`, after the configuration is parsed. The topics
-/// themselves are made when the server opens (`openTopics`): they are the
-/// app's, freed with it.
-pub fn create(e: *Engine, why: *std.Io.Writer) !void {
-    _ = e;
-    _ = why;
-}
-
-/// The configuration's topics, made on `app` (called by `watch.open`).
+/// The configuration's topics, made when the server opens, on `app` (called
+/// by `watch.open`): they are the app's, freed with it.
 pub fn openTopics(e: *Engine, app: *anole.App) !void {
     const c = e.config.sse;
     const options: sse.Topics.Options = .{
@@ -235,16 +222,6 @@ pub fn openTopics(e: *Engine, app: *anole.App) !void {
     const t = try app.sseTopics(options);
     t.written_hook = onWritten;
     e.sse_state.topics = t;
-}
-
-/// The server stops: nothing new starts from here.
-pub fn close(e: *Engine) void {
-    _ = e;
-}
-
-/// `anole_server_destroy`: frees what a stopped server still holds.
-pub fn destroy(e: *Engine) void {
-    _ = e;
 }
 
 /// `anole_handle_release` for the kind `sse` (a cleanup call: a handle that

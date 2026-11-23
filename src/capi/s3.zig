@@ -78,13 +78,7 @@ pub const State = struct {
     first_gen: u32 = 1,
 
     pub fn init(s: *State, first_gen: u32) void {
-        s.* = .{ .first_gen = first_gen };
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
+        s.first_gen = first_gen;
     }
 
     pub fn deinit(s: *State) void {
