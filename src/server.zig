@@ -972,17 +972,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// `serveOpenApi` could not build the document; `run` fails with it.
             openapi_failed: if (features.openapi) ?anyerror else void = if (features.openapi) null else {},
 
-            /// Removes the entry of a connector its constructor is about to
-            /// free (its start failed), so the teardown never reaches it.
-            fn dropConnector(self: *Extras, context: *anyopaque) void {
-                var i = self.connectors.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (self.connectors.items[i].context == context) {
-                        _ = self.connectors.orderedRemove(i);
-                        return;
-                    }
-                }
+            /// Hands one connector what the app observes with: the one start
+            /// call, for `startConnectors` and for a connector made later.
+            fn startOne(self: *const Extras, c: Connector) !void {
+                return c.start(c.context, self.metrics, self.exporter, self.health);
             }
         };
 
@@ -2343,8 +2336,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     pages.invalidate(.{ .path = "/about" });
         pub fn responseCache(self: *Self, settings: ResponseCache.Options) *ResponseCache {
             const cache = ResponseCache.init(self.gpa, self.io(), settings) catch @panic("OOM");
-            self.extras.connectors.append(self.arena.allocator(), .of(ResponseCache, cache)) catch @panic("OOM");
-            if (self.extras.connectors_started) cache.start(self.extras.metrics, self.extras.exporter, self.extras.health) catch {};
+            // Its start only registers metrics (families exist or are made): OOM is its one error.
+            self.addConnector(ResponseCache, cache) catch |err| @panic(@errorName(err));
             return cache;
         }
 
@@ -2816,13 +2809,50 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return out;
         }
 
+        /// Takes `value` over: registered, and started now when `startConnectors`
+        /// ran (a connector made later would otherwise never start). A start
+        /// that fails is the caller's error; the connector stays registered and
+        /// is closed with the server, so what its start handed out (a health
+        /// check, a pointer) never dangles. If it cannot be registered it is
+        /// freed. The app is single-owner until `run`: no lock.
+        fn addConnector(self: *Self, comptime T: type, value: *T) !void {
+            const extras = self.extras;
+            const c = Connector.of(T, value);
+            extras.connectors.append(self.arena.allocator(), c) catch |err| {
+                value.deinit();
+                return err;
+            };
+            if (extras.connectors_started) try extras.startOne(c);
+        }
+
+        /// The constructor prologue of the database and service connectors:
+        /// the app's `environ` when the options name none, SMTP's
+        /// `environment` default, `T.init` on the runtime's io, the lambda
+        /// deployment's `suppress_consumers` (NATS, Kafka), then `addConnector`.
+        /// Each quirk is the type's own field, read with `@hasField`.
+        fn makeConnector(self: *Self, comptime T: type, config: anytype) !*T {
+            var opts = config;
+            if (comptime @hasField(@TypeOf(opts), "environ")) {
+                if (opts.environ == null) if (self.process) |p| {
+                    opts.environ = p.environ;
+                };
+            }
+            if (comptime @hasField(@TypeOf(opts), "environment")) {
+                if (opts.environment == null) opts.environment = self.environment();
+            }
+            const created = try T.init(self.gpa, self.rt.io(), opts);
+            if (comptime @hasField(T, "suppress_consumers")) created.suppress_consumers = self.mode.deployment == .lambda;
+            try self.addConnector(T, created);
+            return created;
+        }
+
         /// Hands the databases what the app observes with, once (`run` does
         /// it too): the C ABI opens them before anything listens.
         pub fn startConnectors(self: *Self) !void {
             const extras = self.extras;
             if (extras.connectors_started) return;
             extras.connectors_started = true;
-            for (extras.connectors.items) |c| c.start(c.context, extras.metrics, extras.exporter, extras.health) catch |err| {
+            for (extras.connectors.items) |c| extras.startOne(c) catch |err| {
                 extras.failed_system = c.name;
                 extras.failed_cause = @errorName(err);
                 return err;
@@ -3069,16 +3099,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.health` (a ping behind `/readyz`) when the app has them,
         /// and it is closed with the server, after the drain. See
         /// `anole.pg`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Client {
             if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const d = try pg_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Client, d));
-            return d;
+            return self.makeConnector(pg_mod.Client, config);
         }
 
         /// Opens a SQLite database (`anole.sqlite`), closed with the server:
@@ -3091,6 +3116,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     state.db = try app.sqlite("app.db");
         ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout = .fromSeconds(10) });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
@@ -3102,10 +3129,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try p.init(self.rt, .{});
                 self.blocking_pool = p;
             }
-            const d = try sqlite_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Client, d));
-            return d;
+            return self.makeConnector(sqlite_mod.Client, opts);
         }
 
         /// A MongoDB client for the handlers, owned by the server:
@@ -3116,16 +3140,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.tracing` and `app.health` (a ping behind `/readyz`) when the
         /// app has them, and it is closed with the server, after the drain.
         /// See `anole.mongodb`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error. With `connect_at_start`, that includes opening a connection.
         pub fn mongodb(self: *Self, config: mongodb_mod.Options) !*mongodb_mod.Client {
             if (comptime !features.mongodb) @compileError("app.mongodb needs MongoDB (-Dmongodb, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const mongo = try mongodb_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer mongo.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
-            return mongo;
+            return self.makeConnector(mongodb_mod.Client, config);
         }
 
         /// A Redis or Valkey client for the handlers, owned by the server:
@@ -3136,16 +3155,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.tracing` and `app.health` (a PING behind `/readyz`) when
         /// the app has them, and it is closed with the server, after the
         /// drain. See `anole.redis`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn redis(self: *Self, config: redis_mod.Options) !*redis_mod.Client {
             if (comptime !features.redis) @compileError("app.redis needs Redis (-Dredis, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const r = try redis_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer r.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(redis_mod.Client, r));
-            return r;
+            return self.makeConnector(redis_mod.Client, config);
         }
 
         /// A NATS client for the handlers, owned by the server: `NATS_URL`
@@ -3155,17 +3169,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// is drained and closed with the server. Register handlers with
         /// `nc.handle(&app, subject, opts, fn)` before `run`. See
         /// `anole.nats`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error. That includes connecting (the first connection).
         pub fn nats(self: *Self, config: nats_mod.Options) !*nats_mod.Client {
             if (comptime !features.nats) @compileError("app.nats needs NATS (-Dnats, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const n = try nats_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer n.deinit();
-            n.suppress_consumers = self.mode.deployment == .lambda;
-            try self.extras.connectors.append(self.arena.allocator(), .of(nats_mod.Client, n));
-            return n;
+            return self.makeConnector(nats_mod.Client, config);
         }
 
         /// A Kafka client for the handlers, owned by the server:
@@ -3176,18 +3184,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// the app has them, joins the groups registered with `consume`,
         /// and at shutdown drains: records in flight finish, offsets are
         /// committed, the producer flushes. See `anole.kafka`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn kafka(self: *Self, config: kafka_mod.Options) !*kafka_mod.Client {
             if (comptime !features.kafka) @compileError("app.kafka needs Kafka (-Dkafka, on in the full profile)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const k = try kafka_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer k.deinit();
-            k.suppress_consumers = self.mode.deployment == .lambda;
-            try self.extras.connectors.append(self.arena.allocator(), .of(kafka_mod.Client, k));
-            if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return k;
+            return self.makeConnector(kafka_mod.Client, config);
         }
 
         /// Serves `handler` (callbacks or `fn (*Conn) !void`) on raw TCP at
@@ -3282,6 +3283,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// with serving, after its store, and is drained and closed with the
         /// server. Register handlers with `jobs.handle(&app, Args, .{}, fn)`
         /// before `run`. Under `deployment = lambda` it only enqueues.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn jobs(self: *Self, config: jobs_mod.Options) !*jobs_mod.Client {
             if (comptime !features.jobs) @compileError("app.jobs needs jobs (-Djobs, on in the web and full profiles)");
             switch (config.store) {
@@ -3298,13 +3301,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 },
             }
             const j = try jobs_mod.Client.init(self.gpa, self.rt.io(), config);
-            errdefer j.deinit();
             j.suppress_workers = self.mode.deployment == .lambda;
             j.drain_event = &self.server.draining;
-            try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(j);
-            if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            try self.addConnector(jobs_mod.Client, j);
             return j;
         }
 
@@ -3314,16 +3313,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     const hooks = try app.webhooks(.{ .jobs = jobs });
         ///     _ = try hooks.publish(req, .{ .owner = "acme", .type = "invoice.paid" }, .{ .id = 7 });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
             if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
             const w = try wh.Client.init(self.gpa, self.io(), config);
-            errdefer w.deinit();
-            try w.register(self);
-            try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
-            // Before the errdefer above frees it: no entry outlives its client.
-            errdefer self.extras.dropConnector(w);
-            if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            {
+                errdefer w.deinit();
+                try w.register(self);
+            }
+            try self.addConnector(wh.Client, w);
             return w;
         }
 
@@ -3337,7 +3337,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
             const wh = @import("webhooks/root.zig");
             const v = wh.Verify.init(self.gpa, self.io(), config) catch |err| @panic(@errorName(err));
-            self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
+            self.addConnector(wh.Verify, v) catch |err| @panic(@errorName(err));
             return v;
         }
 
@@ -3349,12 +3349,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     const live = try app.sseTopics(.{});
         ///     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn sseTopics(self: *Self, topic_options: sse_mod.Topics.Options) !*sse_mod.Topics {
             const topics = try sse_mod.Topics.create(self.gpa, topic_options);
-            errdefer topics.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(sse_mod.Topics, topics));
+            try self.addConnector(sse_mod.Topics, topics);
             topics._registerDrain(self.rt.io(), &self.server.drain_hooks);
-            if (self.extras.connectors_started) try topics.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return topics;
         }
 
@@ -3393,16 +3393,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     _ = try app.watch(.{ .postgres = .{ .client = db, .channels = &.{"orders"} } }, .{
         ///         .to = &.{.{ .sse = .{ .topics = live, .topic = "orders" } }},
         ///     });
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn watch(self: *Self, source: watch_mod.Source, watch_options: watch_mod.Options) !*watch_mod.Watch {
             const w = try watch_mod.Watch.init(self.gpa, self.rt.io(), source, watch_options);
-            errdefer w.deinit();
             if (self.mode.deployment == .lambda) {
                 w.disabled = true;
                 std.log.scoped(.anole).info("watch \"{s}\": not started under the lambda deployment (a function holds no long-lived connection to a database)", .{w.name});
             }
-            try self.extras.connectors.append(self.arena.allocator(), .of(watch_mod.Watch, w));
+            try self.addConnector(watch_mod.Watch, w);
             w._registerDrain(&self.server.drain_hooks);
-            if (self.extras.connectors_started) try w.start(self.extras.metrics, null, null);
             return w;
         }
 
@@ -3420,17 +3420,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// source it tried). Once serving it reports to `app.metrics`,
         /// `app.tracing` and, with `readiness`, `app.health`, and it is
         /// drained and closed with the server. See `anole.s3`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn s3(self: *Self, config: s3_mod.Options) !*s3_mod.Client {
             if (comptime !features.s3) @compileError("app.s3 needs the S3 client (-Ds3, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            const c = try s3_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer c.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(s3_mod.Client, c));
-            if (self.extras.connectors_started) try c.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return c;
+            return self.makeConnector(s3_mod.Client, config);
         }
 
         const smtp_mod = if (features.smtp) @import("smtp/root.zig") else struct {
@@ -3447,18 +3441,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Once serving, it reports to `app.metrics`, `app.tracing` and
         /// `app.health` when the app has them, and is drained and closed with
         /// the server. See `anole.smtp`.
+        ///
+        /// Made after serving has started, it starts at once, in this call, and a start that fails is this call's error.
         pub fn smtp(self: *Self, config: smtp_mod.Options) !*smtp_mod.Client {
             if (comptime !features.smtp) @compileError("app.smtp needs SMTP (-Dsmtp, on in the web and full profiles)");
-            var opts = config;
-            if (opts.environ == null) if (self.process) |p| {
-                opts.environ = p.environ;
-            };
-            if (opts.environment == null) opts.environment = self.environment();
-            const m = try smtp_mod.Client.init(self.gpa, self.rt.io(), opts);
-            errdefer m.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(smtp_mod.Client, m));
-            if (self.extras.connectors_started) try m.start(self.extras.metrics, self.extras.exporter, self.extras.health);
-            return m;
+            return self.makeConnector(smtp_mod.Client, config);
         }
 
         /// For the Lambda adapter: what `run` does before serving (the
@@ -5493,4 +5480,76 @@ test "console: each database and service connector keeps its /db system name" {
     if (features.kafka) try std.testing.expectEqualStrings("kafka", Name.of(kafka_mod.Client));
     if (features.s3) try std.testing.expectEqualStrings("s3", Name.of(@import("s3/root.zig").Client));
     if (features.smtp) try std.testing.expectEqualStrings("smtp", Name.of(@import("smtp/root.zig").Client));
+}
+
+test "Server: a late connector gets the app's metrics and health, as one made before" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    const registry = app.metrics(.{});
+    const health = app.health(.{});
+    try app.startConnectors();
+    // Rows: constructor made after startConnectors; its system label must show in the pool series.
+    const rows = .{
+        .{ features.sqlite, "sqlite" },
+        .{ features.postgres, "postgresql" },
+        .{ features.redis, "redis" },
+    };
+    inline for (rows) |row| if (comptime row[0]) {
+        const before = health.len;
+        if (comptime std.mem.eql(u8, row[1], "sqlite")) _ = try app.sqlite(":memory:");
+        if (comptime std.mem.eql(u8, row[1], "postgresql")) _ = try app.postgres(.{ .url = "postgres://u@127.0.0.1:1/d", .environ = .empty });
+        if (comptime std.mem.eql(u8, row[1], "redis")) _ = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
+        var buf: [64 * 1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try registry.render(&w);
+        const want = "anole_db_pool_connections{system=\"" ++ row[1] ++ "\"";
+        try std.testing.expect(std.mem.find(u8, w.buffered(), want) != null);
+        try std.testing.expectEqual(before + 1, health.len);
+    };
+}
+
+test "Server: a connector's late start runs through addConnector (stub rows)" {
+    const Stub = struct {
+        fail: bool,
+        starts: u32 = 0,
+        deinits: u32 = 0,
+        saw_args: bool = false,
+        fn start(self: *@This(), metrics_: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, health_: ?*observe.Health) !void {
+            self.starts += 1;
+            self.saw_args = metrics_ != null and health_ != null;
+            if (self.fail) return error.ServiceUnavailable;
+        }
+        fn deinit(self: *@This()) void {
+            self.deinits += 1;
+        }
+    };
+    const rows = [_]struct { name: []const u8, started_first: bool, fail: bool, want_err: bool, want_starts: u32 }{
+        .{ .name = "before startConnectors: registered, not started", .started_first = false, .fail = false, .want_err = false, .want_starts = 0 },
+        .{ .name = "after startConnectors: started once with the app's metrics and health", .started_first = true, .fail = false, .want_err = false, .want_starts = 1 },
+        .{ .name = "after, start fails: error returned, entry stays, nothing freed", .started_first = true, .fail = true, .want_err = true, .want_starts = 1 },
+    };
+    for (rows) |row| {
+        var app = try Server(void).init(std.testing.allocator, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+        _ = app.metrics(.{});
+        _ = app.health(.{});
+        var stub: Stub = .{ .fail = row.fail };
+        if (row.started_first) try app.startConnectors();
+        const result = app.addConnector(Stub, &stub);
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        try std.testing.expectEqual(row.want_err, std.meta.isError(result));
+        if (row.want_err) try std.testing.expectError(error.ServiceUnavailable, result);
+        try std.testing.expectEqual(row.want_starts, stub.starts);
+        try std.testing.expect(row.want_starts == 0 or stub.saw_args);
+        try std.testing.expectEqual(@as(usize, 1), app.extras.connectors.items.len);
+        try std.testing.expectEqual(@as(u32, 0), stub.deinits);
+        try std.testing.expect(app.extras.failed_system == null);
+        if (!row.started_first) {
+            try app.startConnectors();
+            try app.startConnectors();
+            try std.testing.expectEqual(@as(u32, 1), stub.starts);
+        }
+        app.deinit();
+        try std.testing.expectEqual(@as(u32, 1), stub.deinits);
+    }
 }
