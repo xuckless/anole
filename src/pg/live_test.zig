@@ -313,6 +313,24 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
         try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "rolled back") != null);
     }
     try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, balance, .{@as(i32, 2)}));
+    {
+        // Rows left early inside a transaction: drained, the transaction
+        // goes on; an error in the middle of the rows breaks it.
+        var tx = try d.begin(&c, .{});
+        defer tx.deinit();
+        {
+            var rows = try tx.iterate(i64, &c, "SELECT x::int8 FROM generate_series(1, 3) x", .{});
+            defer rows.deinit();
+            try testing.expectEqual(@as(i64, 1), (try rows.next()).?);
+        }
+        try testing.expectEqual(@as(i64, 7), try tx.one(i64, &c, "SELECT 7::int8", .{}));
+        var rows = try tx.iterate(i64, &c, "SELECT (10 / (x - 2))::int8 FROM generate_series(1, 3) x", .{});
+        defer rows.deinit();
+        try testing.expectEqual(@as(i64, -10), (try rows.next()).?);
+        try testing.expectError(error.Database, rows.next());
+        try testing.expect(try rows.next() == null);
+        try testing.expectError(error.Database, tx.commit(&c));
+    }
 
     // `transaction`: the first attempt loses a serialization race (raised
     // here), the second commits.
@@ -972,6 +990,25 @@ test "pg: a connection released inside a transaction is rolled back" {
         conn.release();
     }
     try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_guard", .{}));
+
+    // Released twice, also through a copy: given back once, each extra
+    // release logged; two holders then get two connections (#160).
+    const d2 = try open(io, .{ .max_connections = 2 });
+    defer d2.deinit();
+    const before = expected_log.count();
+    const a = try d2.acquire(&c);
+    const b = a;
+    a.release();
+    b.release();
+    a.release();
+    try testing.expectEqual(before + 2, expected_log.count());
+    const x = try d2.acquire(&c);
+    defer x.release();
+    const y = try d2.acquire(&c);
+    defer y.release();
+    try testing.expect(x.raw != y.raw);
+    _ = try x.raw.exec("SELECT 1", .{});
+    _ = try y.raw.exec("SELECT 1", .{});
 }
 
 /// What `test_after_take` does to the next connection handed out, once.
