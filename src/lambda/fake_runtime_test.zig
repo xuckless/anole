@@ -397,6 +397,51 @@ test "lambda: streaming Function URL" {
     try std.testing.expectEqualStrings("streamed", p.body[delim + 8 ..]);
 }
 
+var fail_after_head = false;
+
+fn fails(_: *anole.Request, res: *anole.Response) !void {
+    if (fail_after_head) {
+        res.body = "part";
+        try res.write();
+    }
+    return error.Boom;
+}
+
+// The deterministic cells of the post-run outcome: `.failed` before and after
+// the head. `.timed_out` and `.canceled` need a deadline or a cancel (a clock); the
+// abort trailers of a streamed answer are dropped by the fake's server, so the
+// streaming row only shows the head (200) went out and no 500 replaced it.
+test "lambda: a handler that fails answers 500 before the head, 504 (buffered) or the sent head stands (streaming) after it" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const Case = struct {
+        name: []const u8,
+        event: []const u8,
+        after_head: bool,
+        mode: anole.ServerOptions.Lambda.InvokeMode,
+        body_has: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .name = "buffered, before the head", .event = http_api_get, .after_head = false, .mode = .buffered, .body_has = "\"statusCode\":500" },
+        .{ .name = "buffered, after the head", .event = http_api_get, .after_head = true, .mode = .buffered, .body_has = "\"statusCode\":504" },
+        .{ .name = "streaming, before the head", .event = function_url_get, .after_head = false, .mode = .response_stream, .body_has = "\"statusCode\":500" },
+        .{ .name = "streaming, after the head", .event = function_url_get, .after_head = true, .mode = .response_stream, .body_has = "\"statusCode\":200" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c.name});
+        var f: Fake = undefined;
+        try f.start(&.{.{ .request_id = "req-f", .event = c.event }});
+        defer f.stop();
+        var app = try lambdaApp(&f, .{ .sigterm = false, .invoke_mode = c.mode });
+        defer app.deinit();
+        fail_after_head = c.after_head;
+        app.get("/hello", fails);
+        try serveUntil(&app, &f, 1);
+        try std.testing.expect(std.mem.endsWith(u8, f.post(0).path, "/response"));
+        try std.testing.expect(has(f.post(0).body, c.body_has));
+    }
+}
+
 test "lambda: init errors go to /runtime/init/error" {
     var f: Fake = undefined;
     try f.start(&.{});

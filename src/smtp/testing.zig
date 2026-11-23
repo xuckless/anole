@@ -89,6 +89,10 @@ pub const FakeServer = struct {
     /// Connections to close right after the final "." arrives, with no
     /// reply.
     drop_after_dot: std.atomic.Value(u32) = .init(0),
+    /// Connections to close right after MAIL FROM is answered 250.
+    drop_after_mail: std.atomic.Value(u32) = .init(0),
+    /// Recipients to answer 421 (and close) instead of 250.
+    close_at_rcpt: std.atomic.Value(u32) = .init(0),
     /// The login of the last successful AUTH.
     last_user: ?[]u8 = null,
     last_password: ?[]u8 = null,
@@ -373,6 +377,10 @@ pub const FakeServer = struct {
                 st.from = try gpa.dupe(u8, rest[lt + 1 .. gt]);
                 st.declared_size = declared;
                 try reply(w, "250 2.1.0 Ok", .{});
+                if (self.drop_after_mail.load(.acquire) > 0) {
+                    _ = self.drop_after_mail.fetchSub(1, .acq_rel);
+                    return .done;
+                }
             } else if (std.ascii.eqlIgnoreCase(verb, "RCPT")) {
                 if (st.from == null) {
                     try reply(w, "503 5.5.1 need MAIL first", .{});
@@ -387,6 +395,11 @@ pub const FakeServer = struct {
                     continue;
                 };
                 const addr = rest[lt + 1 .. gt];
+                if (self.close_at_rcpt.load(.acquire) > 0) {
+                    _ = self.close_at_rcpt.fetchSub(1, .acq_rel);
+                    try reply(w, "421 4.3.2 shutting down", .{});
+                    return .done;
+                }
                 if (listed(o.reject_recipients, addr)) {
                     try reply(w, "550 5.1.1 <{s}>: Recipient address rejected: User unknown", .{addr});
                 } else if (listed(o.defer_recipients, addr)) {
