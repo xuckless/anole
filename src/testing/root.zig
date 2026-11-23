@@ -1060,6 +1060,22 @@ test "client: a route conflict makes client() fail with RouteConflict" {
     app.get("/a/:name", Routes.hello);
     try std.testing.expect(app.routeConflict() != null);
     try std.testing.expectError(error.RouteConflict, client(&app));
+    try std.testing.expectError(error.RouteConflict, client(&app));
+}
+
+test "client: a second client on the same app prepares once" {
+    var app = try testApp();
+    defer app.deinit();
+    _ = app.metrics(.{});
+    var first = try client(&app);
+    first.deinit();
+    // A second helper /metrics route would be a conflict here.
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/metrics", .{});
+    defer res.deinit();
+    try res.expectStatus(.ok);
+    try std.testing.expect(app.phase == .staged);
 }
 
 test "open: SSE events in order, then null after the handler returns" {

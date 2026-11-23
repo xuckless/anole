@@ -807,6 +807,62 @@ pub const OnlyOn = struct {
     }
 };
 
+/// Where a server is in its life, owned by the thread that called `init`
+/// (a plain enum: `stop` only sets an Event). Why a table: every lifecycle
+/// move is a cell of `next`; add a state or a cell, never a flag beside it.
+///
+/// | from \ event | configure  | prepare             | serve   | end     |
+/// |--------------|------------|---------------------|---------|---------|
+/// | building     | configured | staged (one-shots)  | -       | -       |
+/// | configured   | refuse     | prepared (one-shots)| -       | -       |
+/// | staged       | prepared   | same                | -       | -       |
+/// | prepared     | refuse     | same                | serving | -       |
+/// | serving      | refuse     | same                | serving | stopped |
+/// | stopped      | refuse     | same                | serving | -       |
+///
+/// configure: `listen`, `listenTls`, `run` apply the listener options
+/// (`addRawListener` asks it too); refuse is `error.ListenersAlreadySet`.
+/// prepare: `run`, Lambda INIT, `testing.client`; the one-shots (the helper
+/// routes) run on the move out of building or configured, `same` re-runs
+/// only the repeatable checks (OpenAPI, conflicts, `prepareStatic`).
+/// serve and end: `run` around its loop; a second `run` is unguarded, as
+/// it always was. `-` cannot happen (null, asserted). A failed prepare
+/// stays prepared; Lambda INIT stays prepared; the OpenAPI tool only
+/// configures. The connectors keep their own fact (`startConnectors`):
+/// the C ABI starts them while building.
+const Phase = enum {
+    /// `init` named no listener: `pending` holds the options.
+    building,
+    /// The listeners are set.
+    configured,
+    /// Prepared before the listeners were set (`testing.client`);
+    /// `pending` still holds the options.
+    staged,
+    /// Listeners set and the helper routes added.
+    prepared,
+    /// `run` is in its loop.
+    serving,
+    /// That run ended.
+    stopped,
+
+    const Event = enum { configure, prepare, serve, end };
+
+    const Row = std.EnumArray(Event, ?Phase);
+    const table = std.EnumArray(Phase, Row).init(.{
+        .building = .init(.{ .configure = .configured, .prepare = .staged, .serve = null, .end = null }),
+        .configured = .init(.{ .configure = null, .prepare = .prepared, .serve = null, .end = null }),
+        .staged = .init(.{ .configure = .prepared, .prepare = .staged, .serve = null, .end = null }),
+        .prepared = .init(.{ .configure = null, .prepare = .prepared, .serve = .serving, .end = null }),
+        .serving = .init(.{ .configure = null, .prepare = .serving, .serve = .serving, .end = .stopped }),
+        .stopped = .init(.{ .configure = null, .prepare = .stopped, .serve = .serving, .end = null }),
+    });
+
+    /// The table above; null for refuse and for `-`.
+    fn next(p: Phase, ev: Event) ?Phase {
+        return table.get(p).get(ev);
+    }
+};
+
 /// A server whose handlers share the state `Ctx`: `init(gpa, options,
 /// &state)`, and handlers `fn (state: *Ctx, req, res) !void` (or plain
 /// `(req, res)`). For no state, `App`.
@@ -912,8 +968,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         owned_middleware: std.ArrayList(http.Middleware(Ctx)) = .empty,
         /// What `init` was given when it named no listener (neither
         /// `http` nor `https`): `listen`, `listenTls` or `run` sets them up
-        /// from it. Null once they are.
-        pending: ?Options = null,
+        /// from it. Meaningful while `phase` allows `configure`.
+        pending: Options = .{},
+        /// The lifecycle (`Phase`): every move is a cell of `Phase.next`.
+        phase: Phase = .building,
         /// The `Alt-Svc` middleware, once there is one.
         alt_svc: ?*AltSvc = null,
         /// For tests: stands for ANOLE_OPENAPI_OUT / ANOLE_OPENAPI_CHECK.
@@ -938,9 +996,6 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// The admission gate's collector is on `metrics`.
             admission_metrics: bool = false,
             health: ?*observe.Health = null,
-            /// `metrics` and `health` register their routes when serving
-            /// starts, so `use` can still follow them.
-            routes_added: bool = false,
             grpc_health: ?*grpc_mod.Health = null,
             exporter: ?*observe.trace.Exporter = null,
             /// The breaker and retry series of the outbound client, when it has a policy.
@@ -954,6 +1009,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
             /// in order.
             connectors: std.ArrayList(Connector) = .empty,
+            /// `startConnectors` ran (its one writer): connectors made
+            /// later start at once. Not a `Phase`: the C ABI starts them
+            /// while building.
             connectors_started: bool = false,
             /// The connector whose start failed, and why (for the startup error's text).
             failed_system: ?[]const u8 = null,
@@ -1353,6 +1411,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (h3_possible) self.alt_svc = self.addAltSvc();
             } else {
                 try self.listenOn(opts);
+                self.phase = .configured;
             }
             return self;
         }
@@ -2076,17 +2135,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn takePending(self: *Self, comptime what: []const u8) !Options {
-            return self.pending orelse {
+            if (Phase.next(self.phase, .configure) == null) {
                 // Not the end of the server: `run` still serves those.
                 errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
                 return error.ListenersAlreadySet;
-            };
+            }
+            return self.pending;
         }
 
         /// The listeners `init` left for later; a failure also ends
-        /// `waitReady`.
+        /// `waitReady`. The phase moves first: a failed configure still
+        /// counts as the one.
         fn configure(self: *Self, opts: Options) !void {
-            self.pending = null;
+            self.phase = Phase.next(self.phase, .configure).?;
             if (self.mode.lambda) |l| {
                 // Lambda accepts no connections: what the options named is
                 // set aside (one startup line says what).
@@ -2846,8 +2907,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return created;
         }
 
-        /// Hands the databases what the app observes with, once (`run` does
-        /// it too): the C ABI opens them before anything listens.
+        /// Hands the databases what the app observes with, once (`prepare`
+        /// does it too): the C ABI opens them before anything listens, in
+        /// any phase. The one writer of `connectors_started`.
         pub fn startConnectors(self: *Self) !void {
             const extras = self.extras;
             if (extras.connectors_started) return;
@@ -2869,14 +2931,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
-        /// The routes `metrics` and `health` left for when serving starts.
-        fn addHelperRoutes(self: *Self) void {
-            const extras = self.extras;
-            if (extras.routes_added) return;
-            extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
-            if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
-            if (comptime features.openapi) self.serveOpenApi();
+        /// What `run`, Lambda INIT and `testing.client` each do before
+        /// serving, in this order: the helper routes (on the first prepare,
+        /// by the phase: `metrics` and `health` register theirs only now,
+        /// so `use` can still follow them), the OpenAPI document (`strict`
+        /// only: the test client serves without it), the conflict check,
+        /// `prepareStatic`, the connectors. Raw errors; each caller maps
+        /// them its way.
+        fn prepare(self: *Self, comptime strict: bool) !void {
+            const to = Phase.next(self.phase, .prepare).?;
+            const first = to != self.phase;
+            self.phase = to;
+            if (first) {
+                const extras = self.extras;
+                if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
+                if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
+                if (comptime features.openapi) self.serveOpenApi();
+            }
+            if (comptime strict and features.openapi) if (self.extras.openapi_failed) |err| return err;
+            // Only with `router.record_conflicts` (the C ABI, test builds): a
+            // route that conflicted with another, or that the helper routes
+            // collided with.
+            if (self.router.conflict != null) return error.RouteConflict;
+            // Before the HTTP/3 endpoint and the core `serve` start as tasks on
+            // other executors: it writes what their requests read.
+            try self.server.prepareStatic();
+            self.startConnectors() catch return error.DatabaseUnavailable;
         }
 
         /// Serves the OpenAPI document of this server's routes at
@@ -3235,10 +3315,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn addRawListener(self: *Self, comptime what: []const u8, l: Options.Listener) errors.ServerError!void {
             if (comptime !features.net) @compileError("app." ++ what ++ " needs raw TCP and UDP servers (-Dnet, on in the web and full profiles)");
-            const opts = &(self.pending orelse {
+            if (Phase.next(self.phase, .configure) == null) {
                 errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); add it to .listeners, or leave both out of init", .{});
                 return error.ListenersAlreadySet;
-            });
+            }
+            const opts = &self.pending;
             const a = self.arena.allocator();
             const list = a.alloc(Options.Listener, opts.listeners.len + 1) catch return error.OutOfMemory;
             @memcpy(list[0..opts.listeners.len], opts.listeners);
@@ -3453,11 +3534,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// connectors), returning the error rather than logging it, so the
         /// adapter can report it to Lambda first.
         pub fn _lambdaPrepare(self: *Self) !void {
-            self.addHelperRoutes();
-            if (comptime features.openapi) if (self.extras.openapi_failed) |err| return err;
-            if (self.router.conflict != null) return error.RouteConflict;
-            try self.server.prepareStatic();
-            self.startConnectors() catch return error.DatabaseUnavailable;
+            return self.prepare(true);
         }
 
         /// Closes the idle connections of the outbound client and of every
@@ -3761,16 +3838,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn prepareInMemoryInner(self: *Self) !void {
-            self.addHelperRoutes();
-            if (self.router.conflict) |msg| {
-                // Printed, not logged: a test that provokes it must not fail on the log.
-                std.debug.print("anole: {s}\n", .{msg});
-                return self.failStart(error.RouteConflict);
-            }
-            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
-            self.startConnectors() catch |err| {
-                errors.log.err("a database connector could not start: {t}", .{err});
-                return self.failStart(error.DatabaseUnavailable);
+            self.prepare(false) catch |err| {
+                switch (err) {
+                    // Printed, not logged: a test that provokes it must not fail on the log.
+                    error.RouteConflict => if (self.router.conflict) |msg| std.debug.print("anole: {s}\n", .{msg}),
+                    error.DatabaseUnavailable => errors.log.err("a database connector could not start: {s}", .{self.extras.failed_cause orelse "unknown"}),
+                    else => {},
+                }
+                return self.failStart(errors.toServerError(err));
             };
         }
 
@@ -3785,7 +3860,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         fn runInner(self: *Self) !void {
-            if (self.pending) |opts| try self.configure(opts);
+            if (Phase.next(self.phase, .configure) != null) try self.configure(self.pending);
             // `zig build openapi` and `openapi-check`: before the banner, the
             // helper routes, any listener or connector.
             {
@@ -3809,19 +3884,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.sseNote();
             logBuildMode(self.mode.debug_production);
             self.logIoEngine();
-            self.addHelperRoutes();
-            if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
-                errors.log.err("openapi: the document can't be built: {t}", .{err});
+            self.prepare(true) catch |err| {
+                if (comptime features.openapi) if (self.extras.openapi_failed) |why| {
+                    errors.log.err("openapi: the document can't be built: {t}", .{why});
+                };
                 return self.failStart(errors.toServerError(err));
             };
-            // Only with `router.record_conflicts` (the C ABI, test builds): a
-            // route that conflicted with another, or that the helper routes
-            // collided with.
-            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
-            // Before the HTTP/3 endpoint and the core `serve` start as tasks on
-            // other executors: it writes what their requests read.
-            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
-            self.startConnectors() catch return self.failStart(error.DatabaseUnavailable);
+            self.phase = Phase.next(self.phase, .serve).?;
+            defer self.phase = Phase.next(self.phase, .end).?;
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
@@ -4671,13 +4741,37 @@ test "anole.Server: a second server on the same thread is refused, and one after
     second.deinit();
 }
 
+test "Phase.next: every state x event cell" {
+    const cells = [_]struct { Phase, Phase.Event, ?Phase }{
+        .{ .building, .configure, .configured }, .{ .building, .prepare, .staged },
+        .{ .building, .serve, null },            .{ .building, .end, null },
+        .{ .configured, .configure, null },      .{ .configured, .prepare, .prepared },
+        .{ .configured, .serve, null },          .{ .configured, .end, null },
+        .{ .staged, .configure, .prepared },     .{ .staged, .prepare, .staged },
+        .{ .staged, .serve, null },              .{ .staged, .end, null },
+        .{ .prepared, .configure, null },        .{ .prepared, .prepare, .prepared },
+        .{ .prepared, .serve, .serving },        .{ .prepared, .end, null },
+        .{ .serving, .configure, null },         .{ .serving, .prepare, .serving },
+        .{ .serving, .serve, .serving },         .{ .serving, .end, .stopped },
+        .{ .stopped, .configure, null },         .{ .stopped, .prepare, .stopped },
+        .{ .stopped, .serve, .serving },         .{ .stopped, .end, null },
+    };
+    comptime std.debug.assert(cells.len == std.enums.values(Phase).len * std.enums.values(Phase.Event).len);
+    for (cells) |c| {
+        errdefer std.debug.print("{t} x {t}\n", .{ c[0], c[1] });
+        try std.testing.expectEqual(c[2], Phase.next(c[0], c[1]));
+    }
+}
+
 test "anole.Server: http listens on 127.0.0.1:8080 when nothing is set, from run on" {
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{ .executors = .exact(1) }, {});
     defer app.deinit();
     // Left for `listen`, `listenTls` or `run`.
     try std.testing.expectEqual(@as(usize, 0), app.server.config.listeners.len);
-    try app.configure(app.pending.?);
+    try std.testing.expect(app.phase == .building);
+    try app.configure(app.pending);
+    try std.testing.expect(app.phase == .configured);
     const listeners = app.server.config.listeners;
     try std.testing.expectEqual(@as(usize, 1), listeners.len);
     const ip = listeners[0].address.ip;

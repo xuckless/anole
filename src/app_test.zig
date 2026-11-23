@@ -503,6 +503,7 @@ test "anole.Server(State): listen after init's listeners is ListenersAlreadySet,
     var app = try Server(State).init(alloc, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, &state);
     defer app.deinit();
     // The listeners came from init's options...
+    try std.testing.expect(app.phase == .configured);
     try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
     // ...and `run` still serves them.
     const Check = struct {
@@ -516,6 +517,7 @@ test "anole.Server(State): listen after init's listeners is ListenersAlreadySet,
     defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
+    try std.testing.expect(app.phase == .stopped);
 }
 
 test "anole.Server(State): (req, res) and (state, req, res) handlers, state middleware and gRPC methods on a value are served" {
@@ -988,6 +990,10 @@ test "route conflicts in a test build: run fails with RouteConflict and routeCon
     const message = app.routeConflict() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, message, ":name conflicts with :id") != null);
     try std.testing.expectError(error.RouteConflict, app.run());
+    // The failed run configured and prepared: listeners are set, a retry reports again.
+    try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
+    try std.testing.expectError(error.RouteConflict, app.run());
+    try std.testing.expect(app.phase == .prepared);
 }
 
 test "addRoute takes a run-time path and checks it at registration" {
