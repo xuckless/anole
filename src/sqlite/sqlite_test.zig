@@ -874,6 +874,9 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
             if (note.done) done += 1;
         }
         rows.deinit();
+        // Closed: a second deinit gives nothing back again (one reader).
+        rows.deinit();
+        try testing.expectEqual(@as(?Note, null), try rows.next());
         try testing.expectEqual(@as(usize, 300), n);
         try testing.expectEqual(@as(usize, 150), done);
 
@@ -890,6 +893,7 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
             var ids = try tx.iterate(i64, ctx, "SELECT id FROM notes WHERE id <= 3 ORDER BY id", .{});
             var sum: i64 = 0;
             while (try ids.next()) |id| sum += id;
+            ids.deinit();
             ids.deinit();
             try testing.expectEqual(@as(i64, 6), sum);
             try tx.commit(ctx);
@@ -1138,219 +1142,6 @@ test "sqlite: a writer released twice leaves the next holder's transaction alone
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
-/// A writer client on a file with one reader, its schema made, for the
-/// tests of a checkout ended twice.
-fn twiceSetup(io: std.Io, tmp: *TmpFile, s: *Scratch) !*sqlite.Client {
-    s.init(io);
-    errdefer s.deinit();
-    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
-    errdefer db.deinit();
-    _ = try db.exec(&s.ctx, schema, .{});
-    return db;
-}
-
-test "sqlite: a transaction ended through a copy leaves the next holder's transaction alone" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var tx = try db.begin(ctx, .{});
-    // A copy commits; `tx` itself never learns that it ended.
-    var copy = tx;
-    try copy.commit(ctx);
-    var next = try db.begin(ctx, .{});
-    defer next.deinit();
-    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
-    // The first transaction's deinit, while `next` holds the writer:
-    // nothing happens to `next`'s transaction.
-    tx.deinit();
-    try next.commit(ctx);
-    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-}
-
-test "sqlite: exec and commit through a copy of a Tx that ended are refused, and leave the next holder's transaction alone (#160)" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var tx = try db.begin(ctx, .{});
-    // A copy commits; `tx` itself never learns that it ended.
-    var copy = tx;
-    try copy.commit(ctx);
-    var next = try db.begin(ctx, .{});
-    defer next.deinit();
-    // The stale `tx`, while `next` holds the writer: refused, nothing run.
-    try testing.expectError(error.Database, tx.exec(ctx, "INSERT INTO notes (title) VALUES ('stray')", .{}));
-    try testing.expectError(error.Database, tx.commit(ctx));
-    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "the transaction is over") != null);
-    tx.deinit();
-    // `next`'s transaction is still its own: its rollback undoes it all.
-    try next.rollback(ctx);
-    try testing.expectEqual(@as(i64, 0), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-}
-
-test "sqlite: rows on the writer ended through a copy leave the next holder's transaction alone" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var rows = try db.with(.{ .write = true }).iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
-    var copy = rows;
-    copy.deinit();
-    var next = try db.begin(ctx, .{});
-    defer next.deinit();
-    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
-    // The first rows' deinit, while `next` holds the writer: nothing
-    // happens to `next`'s transaction.
-    rows.deinit();
-    try next.commit(ctx);
-    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-}
-
-test "sqlite: a read-only transaction ended through a copy leaves the next reader's snapshot alone" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var tx = try db.begin(ctx, .{ .read_only = true });
-    // A copy commits; `tx` itself never learns that it ended.
-    var copy = tx;
-    try copy.commit(ctx);
-    // The one reader, now the next holder's; its snapshot starts at its
-    // first read.
-    var next = try db.begin(ctx, .{ .read_only = true });
-    defer next.deinit();
-    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
-    // The first transaction's deinit, while `next` holds the reader: `next`
-    // keeps its snapshot.
-    tx.deinit();
-    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-    try next.commit(ctx);
-}
-
-test "sqlite: rows on a reader ended through a copy leave the next reader's snapshot alone" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var rows = try db.iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
-    var copy = rows;
-    copy.deinit();
-    var next = try db.begin(ctx, .{ .read_only = true });
-    defer next.deinit();
-    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
-    // The first rows' deinit, while `next` holds the reader: `next` keeps
-    // its snapshot.
-    rows.deinit();
-    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-    try next.commit(ctx);
-}
-
-test "sqlite: rows of a transaction a copy ended leave the next holder's statement alone" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try twiceSetup(io, &tmp, &s);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-    // More rows than one batch (64), so the next holder steps its statement
-    // again after the stale rows end.
-    _ = try db.exec(ctx, "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 100) INSERT INTO notes (title) SELECT 'n' || x FROM k", .{});
-    const sql = "SELECT id, title, done FROM notes ORDER BY id";
-
-    var tx = try db.begin(ctx, .{ .read_only = true });
-    var rows = try tx.iterate(Note, ctx, sql, .{});
-    while (try rows.next()) |_| {}
-    // A copy commits; `tx` and its rows never learn that it ended.
-    var copy = tx;
-    try copy.commit(ctx);
-    // The same reader and the same cached statement, the next holder's.
-    var next = try db.iterate(Note, ctx, sql, .{});
-    defer next.deinit();
-    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
-    // The stale rows' deinit, while `next` steps the statement: `next`
-    // goes on where it was.
-    rows.deinit();
-    var last: i64 = 1;
-    while (try next.next()) |note| {
-        last += 1;
-        try testing.expectEqual(last, note.id);
-    }
-    try testing.expectEqual(@as(i64, 100), last);
-    tx.deinit();
-}
-
 /// One reader, 100 notes (more than one batch of 64), and the statement
 /// cache of `cache_size`.
 fn openRowsSetup(io: std.Io, tmp: *TmpFile, s: *Scratch, cache_size: u16) !*sqlite.Client {
@@ -1364,37 +1155,6 @@ fn openRowsSetup(io: std.Io, tmp: *TmpFile, s: *Scratch, cache_size: u16) !*sqli
 }
 
 const open_rows_sql = "SELECT id, title, done FROM notes ORDER BY id";
-
-test "sqlite: rows a reader transaction left mid-result when a copy committed it: the next holder's rows of the same SQL start at the first row" {
-    const expected_log = @import("../errors.zig").expectLog();
-    defer expected_log.deinit();
-    var r: Runtime = undefined;
-    try r.init(1, 2);
-    defer r.deinit();
-    const io = r.io();
-    var tmp: TmpFile = .init();
-    defer tmp.deinit();
-    var s: Scratch = undefined;
-    const db = try openRowsSetup(io, &tmp, &s, 64);
-    defer db.deinit();
-    defer s.deinit();
-    const ctx = &s.ctx;
-    const level = quiet();
-    defer testing.log_level = level;
-
-    var tx = try db.begin(ctx, .{ .read_only = true });
-    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
-    // One batch stepped, the statement mid-result.
-    try testing.expectEqual(@as(i64, 1), (try rows.next()).?.id);
-    var copy = tx;
-    try copy.commit(ctx);
-    // The same reader and the same cached statement, the next holder's.
-    var next = try db.iterate(Note, ctx, open_rows_sql, .{});
-    defer next.deinit();
-    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
-    rows.deinit();
-    tx.deinit();
-}
 
 /// A reader transaction's rows stepped one batch, the transaction
 /// committed with the rows still open (their deinit deferred past the
@@ -1457,6 +1217,7 @@ test "sqlite: rows of a transaction that is over fail at their next batch instea
     while (id < 64) : (id += 1) try testing.expectEqual(id + 1, (try rows.next()).?.id);
     try tx.commit(ctx);
     try testing.expectError(error.Database, rows.next());
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "their transaction ended") != null);
 }
 
 /// The canceled begin's hook, on the writer thread after a job ran: holds the job
@@ -1803,14 +1564,42 @@ test "sqlite: commit after commit is an error, not an assert" {
     s.init(testing.io);
     defer s.deinit();
     const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const Over = struct {
+        fn check(cx: *anole_db.Ctx, result: anytype) !void {
+            try testing.expectError(error.Database, result);
+            try testing.expect(std.mem.indexOf(u8, anole_db.lastError(cx).?.message, "the transaction is over") != null);
+        }
+    };
     var tx = try db.begin(ctx, .{});
     defer tx.deinit();
     try tx.commit(ctx);
     const level = quiet();
     defer testing.log_level = level;
-    try testing.expectError(error.Database, tx.commit(ctx));
-    try testing.expectError(error.Database, tx.rollback(ctx));
-    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "the transaction is over") != null);
+    // The next holder's transaction: a done Tx's calls and deinit leave it alone.
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    try Over.check(ctx, tx.commit(ctx));
+    try Over.check(ctx, tx.rollback(ctx));
+    try Over.check(ctx, tx.exec(ctx, "SELECT 1", .{}));
+    try Over.check(ctx, tx.one(i64, ctx, "SELECT 1", .{}));
+    try Over.check(ctx, tx.iterate(i64, ctx, "SELECT 1", .{}));
+    try Over.check(ctx, tx.table(ctx, "SELECT 1", &.{}));
+    try Over.check(ctx, tx.execValues(ctx, "SELECT 1", &.{}));
+    tx.deinit();
+    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('a')", .{});
+    try next.commit(ctx);
+    // Rolled back: the same, and deinit after it does nothing.
+    var back = try db.begin(ctx, .{});
+    defer back.deinit();
+    try back.rollback(ctx);
+    try Over.check(ctx, back.commit(ctx));
+    try Over.check(ctx, back.rollback(ctx));
+    try Over.check(ctx, back.exec(ctx, "SELECT 1", .{}));
+    back.deinit();
+    // The writer is free: a Client write is not "this task already holds the writer".
+    try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('b')", .{}));
+    try testing.expectEqual(@as(i64, 2), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
 test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
