@@ -221,6 +221,7 @@ fn heapRemove(x: *Exec, i: u32) void {
 
 /// From `Exec.release`: the call's slot is free again.
 pub fn onRelease(x: *Exec, i: u32) void {
+    dusty.gauges.addAt(x.index, .grpc_calls, -1);
     heapRemove(x, i);
     const g = &x.slots[i].grpc;
     g.message = "";
@@ -597,6 +598,8 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     };
     g.credit.store(m.service.cfg.read_ahead, .monotonic);
     s.word.store(pack(gen, .queued), .release);
+    // In flight on the console's `/conns` until `onRelease`.
+    dusty.gauges.addAt(x.index, .grpc_calls, 1);
     if (d != null and g.deadline != null) heapPush(x, si);
 
     var canceled = false;

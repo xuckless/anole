@@ -655,14 +655,28 @@ fn checkDeadline(x: *Ctx) anyerror!void {
 
 /// A call the client cancels: ABORT at the consumer, and the handle is gone.
 fn checkCancel(x: *Ctx) anyerror!void {
+    const base = grpcCalls();
     var s = try x.echo().stream("Unary", x.arena, .{});
     try s.send(.{ .message = "hold" });
     try s.closeSend();
     const held = try waitUntil(x.io, &x.a.held, null);
+    // In flight on /conns while the consumer holds it; not once released.
+    try std.testing.expect(grpcCalls() >= base + 1);
     s.cancel();
     s.deinit();
     _ = try waitUntil(x.io, &x.a.last_abort, held);
     try std.testing.expectError(error.Gone, grpc_capi.send(x.a.e, held, "", false, true));
+    try wait.waitUntil(x.io, "the call released off /conns", base, grpcCallsAtMost);
+}
+
+fn grpcCalls() i64 {
+    var n: i64 = 0;
+    for (0..dusty.gauges.max_executors) |i| n += dusty.gauges.get(.grpc_calls, i);
+    return n;
+}
+
+fn grpcCallsAtMost(base: i64) bool {
+    return grpcCalls() <= base;
 }
 
 fn checkConnectJson(x: *Ctx) anyerror!void {

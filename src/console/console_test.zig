@@ -10,6 +10,7 @@ const service = @import("service.zig");
 const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const os = @import("os.zig");
+const dusty = @import("dusty");
 
 const sys = ui.sys;
 const protocol = ui.protocol;
@@ -287,6 +288,48 @@ test "service: a stats subscription carries the requests counted so far" {
     try std.testing.expectEqual(@as(u32, 2), f.db[1].i);
     try std.testing.expectEqual(@as(u32, 1), f.db[1].n);
     try std.testing.expectEqual(@as(u32, 0), f.db[1].e);
+}
+
+test "service: /conns streams come from the gauges" {
+    if (!os.supported) return error.SkipZigTest;
+    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
+    defer h.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const a = arena_s.allocator();
+    const Delta = struct { kind: dusty.gauges.Kind, by: i64 };
+    const rows = [_]struct { deltas: []const Delta, column: []const u8, want: i64 }{
+        .{ .deltas = &.{.{ .kind = .ws_h1, .by = 1 }}, .column = "ws", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .ws_h2, .by = 1 }}, .column = "ws", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .ws_h3, .by = 1 }}, .column = "ws", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .wt_sessions, .by = 1 }}, .column = "wt", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .h2_streams, .by = 1 }}, .column = "h2", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .h3_streams, .by = 1 }}, .column = "h3", .want = 1 },
+        .{ .deltas = &.{.{ .kind = .grpc_calls, .by = 1 }}, .column = "grpc", .want = 1 },
+        .{ .deltas = &.{ .{ .kind = .connections, .by = 2 }, .{ .kind = .h2_conns, .by = 1 } }, .column = "h1", .want = 1 },
+        // More HTTP/2 connections than connections on this executor: clamped at 0.
+        .{ .deltas = &.{.{ .kind = .h2_conns, .by = 1 }}, .column = "h1", .want = 0 },
+    };
+    // Executor 0's gauges from 0 for the test (earlier tests may leave a
+    // row negative), restored after.
+    var kept: std.EnumArray(dusty.gauges.Kind, i64) = .initFill(0);
+    for (std.enums.values(dusty.gauges.Kind)) |k| {
+        kept.set(k, dusty.gauges.get(k, 0));
+        dusty.gauges.addAt(0, k, -kept.get(k));
+    }
+    defer for (std.enums.values(dusty.gauges.Kind)) |k| dusty.gauges.addAt(0, k, kept.get(k));
+    for (rows) |r| {
+        errdefer std.debug.print("row: {s} {any}\n", .{ r.column, r.deltas });
+        for (r.deltas) |d| dusty.gauges.addAt(0, d.kind, d.by);
+        defer for (r.deltas) |d| dusty.gauges.addAt(0, d.kind, -d.by);
+        try std.testing.expectEqual(r.want, try streamOn0(&h, a, r.column));
+    }
+}
+
+/// Column `name` of executor 0's streams in a `/conns` snapshot.
+fn streamOn0(h: *Harness, a: std.mem.Allocator, name: []const u8) !i64 {
+    const v = try h.svc.snapshot(a, .conns);
+    return v.object.get("executors").?.array.items[0].object.get("streams").?.object.get(name).?.integer;
 }
 
 test "service: 5xx entries stream to a subscriber" {

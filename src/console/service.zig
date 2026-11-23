@@ -917,6 +917,19 @@ pub const Service = struct {
 
     // ---------------------------------------------------------- snapshots
 
+    /// The `/conns` streams columns, each a sum of gauges on one
+    /// executor, clamped at 0 (a connection closed on another executor
+    /// than it opened on leaves one row negative). A new column is a row.
+    const stream_columns = [_]struct { name: []const u8, plus: []const dusty.gauges.Kind, minus: []const dusty.gauges.Kind = &.{} }{
+        // HTTP/1.x: the TCP connections the HTTP/2 engine does not serve.
+        .{ .name = "h1", .plus = &.{.connections}, .minus = &.{.h2_conns} },
+        .{ .name = "h2", .plus = &.{.h2_streams} },
+        .{ .name = "h3", .plus = &.{.h3_streams} },
+        .{ .name = "ws", .plus = &.{ .ws_h1, .ws_h2, .ws_h3 } },
+        .{ .name = "wt", .plus = &.{.wt_sessions} },
+        .{ .name = "grpc", .plus = &.{.grpc_calls} },
+    };
+
     pub const SnapshotError = error{ Unavailable, OutOfMemory, WriteFailed, InvalidJson };
 
     fn parse(a: std.mem.Allocator, text: []const u8) SnapshotError!std.json.Value {
@@ -977,8 +990,12 @@ pub const Service = struct {
                         }
                     }
                     var streams: std.json.ObjectMap = .empty;
-                    try streams.put(a, "h2", .{ .integer = dusty.gauges.get(.h2_streams, i) });
-                    try streams.put(a, "h3", .{ .integer = dusty.gauges.get(.h3_streams, i) });
+                    inline for (stream_columns) |col| {
+                        var v: i64 = 0;
+                        inline for (col.plus) |k| v += dusty.gauges.get(k, i);
+                        inline for (col.minus) |k| v -= dusty.gauges.get(k, i);
+                        try streams.put(a, col.name, .{ .integer = @max(0, v) });
+                    }
                     try o.put(a, "streams", .{ .object = streams });
                     try execs.append(.{ .object = o });
                 }

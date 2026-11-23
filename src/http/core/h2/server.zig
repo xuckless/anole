@@ -2510,6 +2510,8 @@ pub fn Engine(comptime Ctx: type) type {
             try conn.proto.initAt(server.allocator, conn, opts);
             if (comptime registered()) @field(server, Registry.field).add(conn);
             connection.adopt(&conn.adopter);
+            // Paired with `teardown`, which the adopter's release runs once.
+            gauges.add(io, .h2_conns, 1);
         }
 
         /// `start`, then the connection served on the calling task as a
@@ -2583,6 +2585,7 @@ pub fn Engine(comptime Ctx: type) type {
         noinline fn teardown(conn: *Conn) void {
             const io = conn.io;
             const server = conn.server;
+            gauges.add(io, .h2_conns, -1);
             // Out of the drain's reach, and no task joins the group from
             // here (`spawnFlusher`), before the group is canceled: a
             // flusher started after that would outlive the connection.

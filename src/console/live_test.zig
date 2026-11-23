@@ -409,6 +409,15 @@ const Check = struct {
         var url_buf: [64]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{self.port}), cd.listeners[0].url);
         try std.testing.expectEqualStrings("h1", cd.listeners[0].protocols[0]);
+        // The lobby WebSocket under WS, no gRPC call.
+        var ws_open: u64 = 0;
+        var grpc_calls: u64 = 0;
+        for (cd.executors) |e| if (e.streams) |counts| {
+            ws_open += counts.ws;
+            grpc_calls += counts.grpc;
+        };
+        try std.testing.expect(ws_open >= 1);
+        try std.testing.expectEqual(@as(u64, 0), grpc_calls);
 
         // /db: the SQLite database alone (no other connector is a
         // database), its file, and its pool: the writer and one reader

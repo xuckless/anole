@@ -22,7 +22,22 @@ const Sleeper = struct {
     var done: std.atomic.Value(bool) = .init(false);
 };
 
+/// The gauges' sums over executors.
+fn gaugeSum(kind: dusty.gauges.Kind) i64 {
+    var n: i64 = 0;
+    for (0..dusty.gauges.max_executors) |i| n += dusty.gauges.get(kind, i);
+    return n;
+}
+
+/// What a "gauges" call saw while it ran.
+var seen_in_call: struct { grpc_calls: i64 = 0, h2_conns: i64 = 0 } = .{};
+
+fn gaugesAtMost(base: [2]i64) bool {
+    return gaugeSum(.grpc_calls) <= base[0] and gaugeSum(.h2_conns) <= base[1];
+}
+
 fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+    if (std.mem.eql(u8, req.message, "gauges")) seen_in_call = .{ .grpc_calls = gaugeSum(.grpc_calls), .h2_conns = gaugeSum(.h2_conns) };
     if (std.mem.eql(u8, req.message, "fail")) return call.fail(.not_found, "no such thing: fail");
     // "slow" runs until the call's deadline cancels it (the wait helper's
     // deadline is only a hang guard): a 100 ms deadline never races it.
@@ -442,6 +457,17 @@ test "gRPC: a unary call over h2 is answered whole, never through a streaming bo
                 try std.testing.expectEqual(@as(?u32, @backingInt(grpc.Code.not_found)), cl.grpc_status);
             }
             try std.testing.expectEqual(bodies, dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic));
+            // The call and its HTTP/2 connection count on /conns while open, not
+            // after. The calls above may still be ending (their counts fall after
+            // the client has its answer), so the base is an upper bound.
+            {
+                const base: [2]i64 = .{ gaugeSum(.grpc_calls), gaugeSum(.h2_conns) };
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = "gauges" }}, &.{});
+                cl.deinit();
+                try std.testing.expect(seen_in_call.grpc_calls >= 1);
+                try std.testing.expect(seen_in_call.h2_conns >= 1);
+                try wait.waitUntil(env.io, "the gRPC call and its connection uncounted", base, gaugesAtMost);
+            }
             // A server stream still streams.
             const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/ServerStream", &.{.{ .message = "tick", .repeat = 2 }}, &.{});
             defer cl.deinit();
