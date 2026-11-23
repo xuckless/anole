@@ -7,18 +7,10 @@ const json = @import("json.zig");
 
 const Component = json.Component;
 
-fn m(comptime key: []const u8, comptime value: json.Node) json.Member {
-    return .{ .key = key, .value = value };
-}
-fn obj(comptime members: []const json.Member) json.Node {
-    return .{ .object = members };
-}
-fn str(comptime s: []const u8) json.Node {
-    return .{ .string = s };
-}
-fn typ(comptime t: []const u8) json.Node {
-    return obj(&.{m("type", str(t))});
-}
+const m = json.m;
+const obj = json.obj;
+const str = json.str;
+const typeOnly = json.typeOnly;
 
 pub const error_body: Component = .{
     .name = "Error",
@@ -26,7 +18,7 @@ pub const error_body: Component = .{
     .schema = obj(&.{
         m("type", str("object")),
         m("required", .{ .array = &.{str("error")} }),
-        m("properties", obj(&.{m("error", typ("string"))})),
+        m("properties", obj(&.{m("error", typeOnly("string"))})),
     }),
     .deps = &.{},
 };
@@ -39,11 +31,11 @@ pub const problem: Component = .{
         m("description", str("An RFC 9457 problem document: what was wrong with the request.")),
         m("required", .{ .array = &.{ str("type"), str("title"), str("status") } }),
         m("properties", obj(&.{
-            m("type", typ("string")),
-            m("title", typ("string")),
-            m("status", typ("integer")),
-            m("detail", typ("string")),
-            m("instance", typ("string")),
+            m("type", typeOnly("string")),
+            m("title", typeOnly("string")),
+            m("status", typeOnly("integer")),
+            m("detail", typeOnly("string")),
+            m("instance", typeOnly("string")),
             m("errors", obj(&.{
                 m("type", str("array")),
                 m("items", obj(&.{
@@ -51,13 +43,13 @@ pub const problem: Component = .{
                     m("required", .{ .array = &.{ str("in"), str("code"), str("message") } }),
                     m("properties", obj(&.{
                         m("in", obj(&.{ m("type", str("string")), m("enum", .{ .array = &.{ str("body"), str("query"), str("header") } }) })),
-                        m("field", typ("string")),
-                        m("code", typ("string")),
-                        m("message", typ("string")),
+                        m("field", typeOnly("string")),
+                        m("code", typeOnly("string")),
+                        m("message", typeOnly("string")),
                     })),
                 })),
             })),
-            m("truncated", typ("boolean")),
+            m("truncated", typeOnly("boolean")),
         })),
     }),
     .deps = &.{},
