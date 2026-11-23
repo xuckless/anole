@@ -2284,7 +2284,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Rate limiting for every route after it, with an in-memory limiter
         /// the server owns: `app.rateLimit(.{ .limit = 100 })` is 100
         /// requests a minute per client address, over the limit 429 with
-        /// `Retry-After`. Call it with `use`, before the routes.
+        /// `Retry-After`. It installs itself as middleware, so call it before the routes it should cover.
         pub fn rateLimit(self: *Self, opts: RateLimitOptions) void {
             const a = self.arena.allocator();
             const limiter = self.gpa.create(ratelimit.MemoryLimiter) catch @panic("OOM");
