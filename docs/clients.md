@@ -47,7 +47,10 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
 ```
 
 - `fetch(url, options)` takes `method`, `headers` (inline pairs, up to 32),
-  `body`, `timeout`, `max_redirects` and `decompress`.
+  `body`, `timeout`, `max_redirects`, `decompress`, `retry` (`.inherit`, the
+  client's `ServerOptions.client.retry`; `.off`; or `.on` with a policy of
+  its own) and `idempotent` (null: by method, GET, HEAD, OPTIONS, TRACE and
+  QUERY, or an Idempotency-Key header).
 - The response has `status()`, `header(name)`, `body()` (the whole body,
   `""` when there is none) and `json(T, allocator)`, which parses the body
   into `T`, skipping fields `T` does not have, with memory from `allocator`
@@ -146,8 +149,8 @@ var response = try client.fetch(url, .{ .method = .post, .headers = &headers, .b
 defer response.deinit();
 ```
 
-Other `FetchOptions`: `max_redirects`, `timeout`, `decompress`, `stream`, and
-`unix_socket_path` (for a server on a Unix socket, such as Docker's).
+Other `FetchOptions`: `max_redirects`, `timeout`, `decompress`, `retry`,
+`idempotent`, `stream`, and `unix_socket_path` (for a server on a Unix socket, such as Docker's).
 
 The URL's path and query go into the request as they are, so they must be
 percent-encoded: a space, a control character (CR and LF among them) or a

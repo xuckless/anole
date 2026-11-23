@@ -443,7 +443,8 @@ fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
 - `broadcast(room, msg_type, data, except)` queues the message for every
   member except `except` (pass `&ws` to skip the sender, or null for
   everyone) and returns for how many members it was queued. It never waits
-  for a member to be sent to.
+  for a member to be sent to. When it cannot allocate the message it
+  returns 0, without a log.
 - `count(room)` returns the number of members.
 
 Rooms work across HTTP versions, tasks and threads: sockets on HTTP/1.1,

@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         // shows both, so it turns it on.
         .http2 = .{ .enable_connect_protocol = true },
         // Open sockets hold a graceful shutdown until they close or this
-        // runs out (30 s by default); then they are cut.
+        // runs out (10 s by default); then they are cut.
         .timeouts = .{ .shutdown = .fromSeconds(5) },
     }, &state);
     defer {
