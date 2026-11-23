@@ -185,7 +185,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
                 while (conn.nextFrame(frame_arena.allocator()) catch null) |f| app.frame(f);
                 if (!alive) {
                     app.connectionClosed();
-                    if (opts.mode == .in_process and exit == null) exit = if (app.restarting != null) .restarted else .server_gone;
+                    if (opts.mode == .in_process and exit == null) exit = if (app.isRestarting()) .restarted else .server_gone;
                 }
                 dirty = true;
             }
@@ -228,7 +228,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
         }
         conn.flush() catch {};
 
-        if (app.restarting != null and exit == null) exit = .restarted;
+        if (app.isRestarting() and exit == null) exit = .restarted;
 
         // Resize: polled, no SIGWINCH handler (D17).
         if (now - last_size_check >= 250) {
@@ -242,7 +242,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
             }
         }
         // Keep the link alive and notice a silent server.
-        if (now - last_ping >= 1000 and !app.server_gone) {
+        if (now - last_ping >= 1000 and app.peer != .gone) {
             last_ping = now;
             _ = conn.ping() catch {};
         }

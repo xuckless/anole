@@ -789,7 +789,7 @@ fn drawFooter(app: *App, scr: *Screen) void {
         return;
     }
     if (app.link() == .exited) {
-        const why = if (app.restarting != null) "the app is restarting" else "the app has stopped";
+        const why = if (app.isRestarting()) "the app is restarting" else "the app has stopped";
         _ = scr.print(1, y, scr.cols, fmt(app, "{s}; Ctrl-C leaves the console", .{why}), s_red);
         return;
     }

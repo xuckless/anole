@@ -14,6 +14,14 @@ const sys = ui.sys;
 
 pub const CloseReason = enum(u32) { quit = 0, interrupt = 1, restarting = 2 };
 
+const close_reason = std.EnumArray(ui.run.Exit, CloseReason).init(.{
+    .quit = .quit,
+    .back_to_logs = .quit,
+    .interrupt = .interrupt,
+    .restarted = .restarting,
+    .server_gone = .quit,
+});
+
 pub const OpenError = error{ AlreadyOpen, NotRunning, Busy, SystemResources, OutOfMemory } || ui.term.OpenError;
 
 pub const Closed = *const fn (ctx: ?*anyopaque, reason: CloseReason) void;
@@ -41,9 +49,8 @@ pub const InProcess = struct {
     client_fd: sys.fd_t = -1,
     capture: Capture = .{},
     finished: std.atomic.Value(bool) = .init(false),
-    interrupted: bool = false,
-    reason: CloseReason = .quit,
-    server_gone: bool = false,
+    /// How the TUI ended; null when the handshake failed. Written and read on the TUI thread.
+    exit: ?ui.run.Exit = null,
 };
 
 pub fn isOpen() bool {
@@ -119,30 +126,14 @@ fn run(self: *InProcess) void {
     var conn = ui.client.Conn.init(gpa, self.client_fd, self.client_fd);
     defer conn.deinit();
     conn.handshake("anole in-process", 5000, sys.monotonicMs) catch return;
-    const exit = ui.run.run(gpa, .{
+    self.exit = ui.run.run(gpa, .{
         .mode = .in_process,
         .term = &self.term,
         .conn = &conn,
         .wake_fd = self.wake[0],
-        .on_interrupt = onInterrupt,
-        .ctx = self,
     }) catch .server_gone;
-    switch (exit) {
-        .quit, .back_to_logs => self.reason = .quit,
-        .interrupt => {
-            self.interrupted = true;
-            self.reason = .interrupt;
-        },
-        .restarted => self.reason = .restarting,
-        .server_gone => self.server_gone = true,
-    }
     conn.close();
     self.client_fd = -1;
-}
-
-fn onInterrupt(ctx: ?*anyopaque) void {
-    const self: *InProcess = @ptrCast(@alignCast(ctx.?));
-    self.interrupted = true;
 }
 
 fn cleanup(self: *InProcess) void {
@@ -154,8 +145,8 @@ fn cleanup(self: *InProcess) void {
     sys.close(self.wake[1]);
     const cb = self.on_closed;
     const ctx = self.ctx;
-    const reason = self.reason;
-    const interrupted = self.interrupted;
+    const reason = if (self.exit) |e| close_reason.get(e) else .quit;
+    const interrupted = self.exit == .interrupt;
     active.store(null, .release);
     if (cb) |f| f(ctx, reason);
     if (interrupted) _ = sys.kill(sys.getpid(), sys.Sig.int);
