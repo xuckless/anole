@@ -1029,14 +1029,19 @@ test "In path fields under a group prefix are checked at registration" {
 test "Server verbs: app.<verb> and with(.{}).<verb> register the same routes, once" {
     var app = try App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
+    app.use(AppRoutes.stamp);
     const verbs = .{ "get", "head", "post", "put", "patch", "delete", "options", "query", "any" };
     inline for (verbs) |v| {
         @field(App, v)(&app, "/a" ++ v, AppRoutes.hello);
         @field(App.Group, v)(app.with(.{}), "/b" ++ v, AppRoutes.hello);
     }
+    app.get("/acached", handlers.cached(.{}, AppRoutes.hello));
+    app.with(.{}).get("/bcached", handlers.cached(.{}, AppRoutes.hello));
     if (features.websocket) {
         app.wsCallbacks("/acb", AppRoutes.EchoCallbacks);
         app.with(.{}).wsCallbacks("/bcb", AppRoutes.EchoCallbacks);
+        app.ws("/aws", AppRoutes.echo);
+        app.with(.{}).ws("/bws", AppRoutes.echo);
     }
     const routes = app.router.routes.items;
     var i: usize = 0;
@@ -1047,8 +1052,10 @@ test "Server verbs: app.<verb> and with(.{}).<verb> register the same routes, on
         try std.testing.expectEqual(x.no_wait, y.no_wait);
         try std.testing.expectEqualStrings(x.info.path[2..], y.info.path[2..]);
         try std.testing.expectEqual(x.middlewares.len, y.middlewares.len);
+        try std.testing.expect(x.middlewares.len >= 1); // app.use(stamp) is kept; cached adds its group
+        if (x.kind == .ws) try std.testing.expect(x.info.data != null and y.info.data != null);
     }
-    if (features.openapi) try std.testing.expectEqual(@as(usize, 14), app.extras.doc_entries.items.len);
+    if (features.openapi) try std.testing.expectEqual(@as(usize, 16), app.extras.doc_entries.items.len);
     try std.testing.expect(app.routeConflict() == null);
     // A group's own path is its prefix, and groups nest.
     app.group("/v1", .{}).post("", AppRoutes.hello);

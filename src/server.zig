@@ -2608,6 +2608,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Routes registered under a prefix and behind middleware; see
         /// `Server.group`. Groups nest: a nested group's prefix and
+        /// middleware come after its parent's.
         pub const Group = GroupOf(false);
 
         /// The router as a group with no prefix and no middleware: what
@@ -2674,6 +2675,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 pub fn any(g: G, comptime path: []const u8, comptime handler: anytype) void {
                     g.verb(null, path, handler);
                 }
+                /// A group's own path is "" (its prefix); the root has no prefix to stand for, so it checks every pattern.
+                fn checkOwnPath(comptime path: []const u8) void {
+                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path);
+                }
                 fn verb(g: G, comptime method: ?http.Method, comptime path: []const u8, comptime handler: anytype) void {
                     comptime typed.checkRoute(method, path, handler, is_root);
                     g.server.register(g.inner, method, path, handler);
@@ -2685,7 +2690,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 /// `Server.wsWith` under this group.
                 pub fn wsWith(g: G, comptime path: []const u8, comptime handler: anytype, upgrade: websocket.UpgradeOptions) void {
                     if (comptime !features.websocket) @compileError(app ++ "ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    checkOwnPath(path);
                     g.inner.addRouteWith(.get, path, websocket.routeFromData(Ctx, handler), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
                 }
                 /// `Server.wsCallbacks` under this group.
@@ -2695,7 +2700,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 /// `Server.wsCallbacksWith` under this group.
                 pub fn wsCallbacksWith(g: G, comptime path: []const u8, comptime Handlers: type, upgrade: websocket.UpgradeOptions) void {
                     if (comptime !features.websocket) @compileError(app ++ "wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    checkOwnPath(path);
                     g.inner.addRouteWith(.get, path, websocket.callbacksFromData(Ctx, Handlers), .{ .kind = .ws, .data = g.server.storeWsOptions(upgrade) });
                 }
                 /// `Server.webtransport` under this group.
@@ -2705,13 +2710,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 /// `Server.webtransportWith` under this group.
                 pub fn webtransportWith(g: G, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                     if (comptime !features.http3) @compileError(app ++ "webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
+                    checkOwnPath(path);
                     g.server.enableWebTransport();
                     g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
                 }
                 /// `Server.sse` under this group (the group's prefix goes before `path`).
                 pub fn sse(g: G, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
-                    if (comptime is_root or path.len > 0) comptime checkPattern("GET", path);
+                    checkOwnPath(path);
                     // A group's prefix may hold the {name}s, and its routes never went into the OpenAPI document (kept as it was).
                     comptime if (is_root and !sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
                     const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
