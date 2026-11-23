@@ -18,21 +18,19 @@ const declarations = @import("openapi/declarations.zig");
 /// already has that shape, or wrapped when it is a `(req, res)` handler on a
 /// server with state (which it then ignores).
 pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Handler {
-    const F = @TypeOf(handler);
-    if (comptime isNoWait(F)) return adapt(Ctx, F.no_wait_handler);
-    if (comptime isCached(F)) return adapt(Ctx, F.cached_handler);
-    if (comptime isDoc(F)) return adapt(Ctx, F.doc_handler);
+    const bare = comptime Peel(handler).bare;
+    const F = @TypeOf(bare);
     const info = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
         else => @compileError("a handler is a function taking (*anole.Request, *anole.Response), not " ++ @typeName(F)),
     };
     // Typed inputs or output (anole.In, a result type): see typed.zig.
-    if (comptime typed.shapeOf(F).typed) return typed.adapt(Ctx, handler);
+    if (comptime typed.shapeOf(F).typed) return typed.adapt(Ctx, bare);
     const want = if (Ctx == void) 2 else 3;
-    if (info.param_types.len == want) return handler;
+    if (info.param_types.len == want) return bare;
     if (Ctx != void and info.param_types.len == 2) return struct {
         fn h(_: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-            return handler(req, res);
+            return bare(req, res);
         }
     }.h;
     @compileError("a handler takes (*anole.Request, *anole.Response)" ++
@@ -124,60 +122,74 @@ pub fn isDoc(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "doc_handler");
 }
 
+/// What the markers around a handler say, outermost first where a marker can
+/// repeat (`doc(a, doc(b, h))` is `a`).
+const Marks = struct {
+    no_wait: bool = false,
+    cached: ?ResponseCache.Options = null,
+    doc: ?declarations.RouteDoc = null,
+};
+
+/// The one walk through the handler markers: `.bare` is the function inside
+/// them and `.marks` what they say. Every reader below reads this and
+/// never names a marker. A new marker is one arm here and its constructor.
+fn Peel(comptime handler: anytype) type {
+    const F = @TypeOf(handler);
+    if (isNoWait(F)) return Under(.{ .no_wait = true }, F.no_wait_handler);
+    if (isCached(F)) return Under(.{ .cached = F.cache_options }, F.cached_handler);
+    if (isDoc(F)) return Under(.{ .doc = F.route_doc }, F.doc_handler);
+    return struct {
+        pub const bare = handler;
+        pub const marks: Marks = .{};
+    };
+}
+
+/// `Peel(inner)` with one more marker, `own`, around it.
+fn Under(comptime own: Marks, comptime inner: anytype) type {
+    const in = Peel(inner);
+    return struct {
+        pub const bare = in.bare;
+        pub const marks: Marks = .{
+            .no_wait = own.no_wait or in.marks.no_wait,
+            .cached = own.cached orelse in.marks.cached,
+            .doc = own.doc orelse in.marks.doc,
+        };
+    };
+}
+
 /// The `RouteDoc` given to `doc` anywhere in the markers around `handler`
 /// (all defaults when none).
 pub fn routeDoc(comptime handler: anytype) declarations.RouteDoc {
-    const F = @TypeOf(handler);
-    if (comptime isDoc(F)) return F.route_doc;
-    if (comptime isNoWait(F)) return routeDoc(F.no_wait_handler);
-    if (comptime isCached(F)) return routeDoc(F.cached_handler);
-    return .{};
+    return Peel(handler).marks.doc orelse .{};
 }
 
 /// Whether any marker around `handler` is `noWait`.
 pub fn anyNoWait(comptime handler: anytype) bool {
-    const F = @TypeOf(handler);
-    if (comptime isNoWait(F)) return true;
-    if (comptime isCached(F)) return anyNoWait(F.cached_handler);
-    if (comptime isDoc(F)) return anyNoWait(F.doc_handler);
-    return false;
+    return Peel(handler).marks.no_wait;
 }
 
 /// Whether any marker around `handler` is `cached`.
 pub fn anyCached(comptime handler: anytype) bool {
-    const F = @TypeOf(handler);
-    if (comptime isCached(F)) return true;
-    if (comptime isNoWait(F)) return anyCached(F.no_wait_handler);
-    if (comptime isDoc(F)) return anyCached(F.doc_handler);
-    return false;
+    return Peel(handler).marks.cached != null;
 }
 
 /// The router options a handler as `Server` takes it implies.
 pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
-    const F = @TypeOf(handler);
-    if (comptime isCached(F)) return routeOptions(F.cached_handler);
-    if (comptime isDoc(F)) return routeOptions(F.doc_handler);
-    return .{ .no_wait = comptime isNoWait(F), .required_params = comptime typed.requiredParams(handler) };
+    return .{ .no_wait = comptime anyNoWait(handler), .required_params = comptime typed.requiredParams(handler) };
 }
 
 /// The function type inside `noWait` and `cached` markers (`F` itself for
 /// a bare function).
 pub fn Unwrapped(comptime F: type) type {
-    if (isNoWait(F)) return Unwrapped(@TypeOf(F.no_wait_handler));
-    if (isCached(F)) return Unwrapped(@TypeOf(F.cached_handler));
-    if (isDoc(F)) return Unwrapped(@TypeOf(F.doc_handler));
-    return F;
+    if (@typeInfo(F) != .@"struct") return F;
+    return @TypeOf(Peel(@as(F, undefined)).bare);
 }
 
 /// The handler function inside `noWait` / `cached` markers, as a pointer
 /// to it: what tools that read a handler's signature (`anole.routeInfo`,
 /// OpenAPI) start from.
 pub fn unwrap(comptime handler: anytype) *const Unwrapped(@TypeOf(handler)) {
-    const F = @TypeOf(handler);
-    if (comptime isNoWait(F)) return unwrap(F.no_wait_handler);
-    if (comptime isCached(F)) return unwrap(F.cached_handler);
-    if (comptime isDoc(F)) return unwrap(F.doc_handler);
-    return &handler;
+    return &Peel(handler).bare;
 }
 
 /// What a function middleware calls to run the rest of the chain (the
@@ -277,4 +289,41 @@ test "noWait: the handler adapts as it is, and marks its route" {
     _ = a;
     try std.testing.expect(routeOptions(noWait(H.plain)).no_wait);
     try std.testing.expect(!routeOptions(H.plain).no_wait);
+}
+
+test "peel: every nesting of the handler markers answers as before" {
+    const H = struct {
+        fn h(_: *dusty.Request, in: typed.In(.{ .path = struct { id: u64 } })) ![]const u8 {
+            _ = in;
+            return "x";
+        }
+    };
+    const h = H.h;
+    const N = noWait(h);
+    // Row: marked handler, no_wait, outermost cache max_entries (0: none), outermost doc summary ("": none).
+    const rows = .{
+        .{ h, false, 0, "" },
+        .{ N, true, 0, "" },
+        .{ cached(.{ .max_entries = 1 }, h), false, 1, "" },
+        .{ doc(.{ .summary = "d1" }, h), false, 0, "d1" },
+        .{ cached(.{ .max_entries = 1 }, N), true, 1, "" },
+        .{ doc(.{ .summary = "d1" }, N), true, 0, "d1" },
+        .{ cached(.{ .max_entries = 1 }, doc(.{ .summary = "d1" }, h)), false, 1, "d1" },
+        .{ doc(.{ .summary = "d1" }, cached(.{ .max_entries = 1 }, h)), false, 1, "d1" },
+        .{ cached(.{ .max_entries = 1 }, doc(.{ .summary = "d1" }, N)), true, 1, "d1" },
+        .{ doc(.{ .summary = "d1" }, cached(.{ .max_entries = 1 }, N)), true, 1, "d1" },
+        .{ doc(.{ .summary = "d1" }, doc(.{ .summary = "d2" }, h)), false, 0, "d1" },
+        .{ cached(.{ .max_entries = 1 }, cached(.{ .max_entries = 2 }, h)), false, 1, "" },
+    };
+    inline for (rows) |row| {
+        const m = comptime Peel(row[0]).marks;
+        try std.testing.expectEqual(row[1], anyNoWait(row[0]));
+        try std.testing.expectEqual(row[1], routeOptions(row[0]).no_wait);
+        try std.testing.expectEqual(row[2] != 0, anyCached(row[0]));
+        try std.testing.expectEqual(row[2], if (m.cached) |c| c.max_entries else 0);
+        try std.testing.expectEqualStrings(row[3], routeDoc(row[0]).summary orelse "");
+        try std.testing.expectEqualStrings("id", routeOptions(row[0]).required_params[0]);
+        try std.testing.expect(@TypeOf(unwrap(row[0])) == *const @TypeOf(h));
+        try std.testing.expect(Unwrapped(@TypeOf(row[0])) == @TypeOf(h));
+    }
 }
