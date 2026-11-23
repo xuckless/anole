@@ -568,6 +568,12 @@ test "grpc channel .h3: prior knowledge over a channel that owns its connection"
             const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "pk" }, .{});
             try std.testing.expectEqual(grpc.Code.ok, r.status.code);
             try std.testing.expectEqual(grpc.Transport.h3, r.transport);
+            // The connection goes: the next call redials it on the same port.
+            channel.h3.?.testGoaway();
+            const again = try client.unary("Unary", arena_state.allocator(), .{ .message = "pk" }, .{});
+            try std.testing.expectEqual(grpc.Code.ok, again.status.code);
+            try std.testing.expectEqual(grpc.Transport.h3, again.transport);
+            try std.testing.expectEqual(@as(u32, 2), channel.h3DialCount());
         }
     }.run);
 }

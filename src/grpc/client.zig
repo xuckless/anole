@@ -137,28 +137,26 @@ pub const Channel = struct {
         http3: Http3,
         /// Guards the fields below; never held across a dial.
         mutex: std.Io.Mutex = .init,
-        /// `activeH2`/`activeH3` are dialing (single flight: a channel uses
-        /// one of them; `.auto`'s HTTP/3 dial is `h3_dialing`, which never
-        /// makes a call wait). Calls that need the dial wait on `dialed`.
+        /// `redial` is dialing: one at a time (a channel redials one
+        /// transport; `.auto`'s HTTP/3 dial is `h3.gate`, which never makes a
+        /// call wait). Calls that need the dial wait on `dialed`.
         redialing: bool = false,
         dialed: std.Io.Condition = .init,
         /// Connections replaced by a redial: they may still carry calls,
         /// so they close with the channel.
         retired: std.ArrayList(*h2.ClientConnection) = .empty,
         retired3: std.ArrayList(*H3Connection) = .empty,
-        /// `.auto`: what Alt-Svc advertised, whether a dial is running, when
-        /// HTTP/3 may be tried again, and whether a call ever completed on
-        /// it (then a lost connection is redialed rather than given up on).
-        alt: ?struct { port: u16, until: std.Io.Clock.Timestamp } = null,
-        h3_dialing: bool = false,
-        h3_broken_until: ?std.Io.Clock.Timestamp = null,
-        h3_succeeded: bool = false,
-        h3_port: u16 = 0,
+        /// `.auto`: what is known about HTTP/3; every change is `H3State.next`.
+        h3: if (features.http3) H3State else void = if (features.http3) .{} else {},
         /// HTTP/3 dials made (tests).
         h3_dials: u32 = 0,
-        /// Tickets for resuming QUIC sessions on a redial.
-        cache: if (features.http3) wire.h3.SessionCache else void = undefined,
-        has_cache: bool = false,
+        /// Tickets for resuming QUIC sessions on a redial; null on `.h2`.
+        cache: if (features.http3) ?wire.h3.SessionCache else void = if (features.http3) null else {},
+
+        /// When HTTP/3 may be tried again after a failure now.
+        fn retryAt(owned: *const Owned, io: std.Io) std.Io.Timestamp {
+            return std.Io.Timestamp.now(io, .awake).addDuration(owned.http3.retry_after);
+        }
     };
 
     /// What `connect` takes besides the connection's options.
@@ -193,9 +191,8 @@ pub const Channel = struct {
         owned.* = .{ .gpa = gpa, .options = options, .http = channel.http, .http3 = channel.http3 };
         if (comptime features.http3) if (channel.http != .h2) {
             owned.cache = wire.h3.SessionCache.init(gpa, io);
-            owned.has_cache = true;
         };
-        errdefer if (comptime features.http3) if (owned.has_cache) owned.cache.deinit();
+        errdefer if (comptime features.http3) if (owned.cache) |*c| c.deinit();
         const authority = channel.authority orelse if (h2.unixTarget(options.host) != null)
             "localhost"
         else
@@ -216,7 +213,6 @@ pub const Channel = struct {
         if (channel.http == .h3) {
             self.h3 = try dialH3(owned, io, channel.http3.port orelse options.port);
             owned.h3_dials += 1;
-            owned.h3_port = channel.http3.port orelse options.port;
         } else {
             self.conn = try h2.ClientConnection.connect(gpa, io, options);
         }
@@ -232,7 +228,7 @@ pub const Channel = struct {
             if (self.h3) |c| c.close();
             for (owned.retired3.items) |c| c.close();
             owned.retired3.deinit(gpa);
-            if (owned.has_cache) owned.cache.deinit();
+            if (owned.cache) |*c| c.deinit();
         }
         for (owned.retired.items) |c| c.close();
         owned.retired.deinit(gpa);
@@ -272,26 +268,30 @@ pub const Channel = struct {
             return .{ .h2 = self.conn.? };
         };
         switch (owned.http) {
-            .h2 => return .{ .h2 = try self.activeH2() },
-            .h3 => return .{ .h3 = try self.activeH3() },
+            .h2 => return .{ .h2 = try self.redial(.h2) },
+            .h3 => return .{ .h3 = try self.redial(.h3) },
             .auto => {
-                if (comptime !features.http3) return .{ .h2 = try self.activeH2() };
+                if (comptime !features.http3) return .{ .h2 = try self.redial(.h2) };
                 if (!prefer_h2) if (try self.autoH3()) |c| return .{ .h3 = c };
-                return .{ .h2 = try self.activeH2() };
+                return .{ .h2 = try self.redial(.h2) };
             },
         }
     }
 
-    /// The HTTP/2 connection of an owned channel: a fresh one when the
-    /// current has gone. One dial at a time, with no lock held across it:
-    /// the calls that find it running wait for it, then
-    /// look again; a failed dial fails only its own call. `isOpen` takes
-    /// the connection's own lock, so it is asked with the channel's let go.
-    fn activeH2(self: *Channel) !*h2.ClientConnection {
-        const owned = self._owned orelse return self.conn.?;
+    /// The connection of an owned channel on transport `t` (`.h2`, or
+    /// `.h3` by prior knowledge): a fresh one when the current has gone.
+    /// One dial at a time, with no lock held across it: the calls that find
+    /// it running wait for it, then look again; a failed dial fails only its
+    /// own call. `isOpen` takes the connection's own lock, so it is asked
+    /// with the channel's let go.
+    fn redial(self: *Channel, comptime t: Transport) !@FieldType(wire.Conn, @tagName(t)) {
+        if (comptime t == .h3 and !features.http3) unreachable;
+        const owned = self._owned.?;
+        const slot = if (comptime t == .h2) &self.conn else &self.h3;
+        const retired = if (comptime t == .h2) &owned.retired else &owned.retired3;
         const io_ = self.runtime();
         while (true) {
-            const current = self.conn;
+            const current = slot.*;
             if (current) |c| if (c.isOpen()) return c;
             owned.mutex.lockUncancelable(io_);
             defer owned.mutex.unlock(io_);
@@ -301,12 +301,15 @@ pub const Channel = struct {
                 owned.dialed.waitUncancelable(io_, &owned.mutex);
                 continue;
             }
-            // The defer unlocks on `continue` and `break` alike; `self.conn`'s plain reads are D2's race.
-            if (self.conn != current) continue;
+            // The defer unlocks on `continue` and `break` alike; `slot`'s plain reads are D2's race.
+            if (slot.* != current) continue;
             owned.redialing = true;
             break;
         }
-        const dial = h2.ClientConnection.connect(owned.gpa, io_, owned.options);
+        const dial = if (comptime t == .h2)
+            h2.ClientConnection.connect(owned.gpa, io_, owned.options)
+        else
+            dialH3(owned, io_, owned.http3.port orelse owned.options.port);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
         // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
@@ -314,41 +317,9 @@ pub const Channel = struct {
         owned.dialed.broadcast(io_);
         const fresh = try dial;
         errdefer fresh.close();
-        if (self.conn) |old| try owned.retired.append(owned.gpa, old);
-        self.conn = fresh;
-        return fresh;
-    }
-
-    /// The HTTP/3 connection of a `.h3` channel, redialed when it has gone,
-    /// as `activeH2` does.
-    fn activeH3(self: *Channel) !*H3Connection {
-        if (comptime !features.http3) unreachable;
-        const owned = self._owned.?;
-        const io_ = self.runtime();
-        while (true) {
-            const current = self.h3;
-            if (current) |c| if (c.isOpen()) return c;
-            owned.mutex.lockUncancelable(io_);
-            defer owned.mutex.unlock(io_);
-            if (owned.redialing) {
-                owned.dialed.waitUncancelable(io_, &owned.mutex);
-                continue;
-            }
-            if (self.h3 != current) continue;
-            owned.redialing = true;
-            break;
-        }
-        const dial = dialH3(owned, io_, owned.h3_port);
-        owned.mutex.lockUncancelable(io_);
-        defer owned.mutex.unlock(io_);
-        // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
-        owned.redialing = false;
-        owned.dialed.broadcast(io_);
-        const fresh = try dial;
-        errdefer fresh.close();
-        owned.h3_dials += 1;
-        if (self.h3) |old| try owned.retired3.append(owned.gpa, old);
-        self.h3 = fresh;
+        if (comptime t == .h3) owned.h3_dials += 1;
+        if (slot.*) |old| try retired.append(owned.gpa, old);
+        slot.* = fresh;
         return fresh;
     }
 
@@ -370,38 +341,29 @@ pub const Channel = struct {
             owned.mutex.unlock(io_);
         }
         // Held from here: the connection is the one found gone, or none.
-        const now = std.Io.Clock.Timestamp.now(io_, .awake);
-        const port: u16 = blk: {
-            if (owned.alt) |a| if (now.compare(.lt, a.until)) break :blk a.port;
-            // Lost a connection that had worked: back to the same port.
-            if (self.h3 != null and owned.h3_succeeded and owned.h3_port != 0) break :blk owned.h3_port;
+        // The decision and `dial_start` share this critical section, so
+        // two calls never both dial.
+        const port = owned.h3.dialPort(std.Io.Timestamp.now(io_, .awake)) orelse {
             owned.mutex.unlock(io_);
             return null;
         };
-        const broken = if (owned.h3_broken_until) |b| now.compare(.lt, b) else false;
-        if (broken or owned.h3_dialing) {
-            owned.mutex.unlock(io_);
-            return null;
-        }
-        owned.h3_dialing = true;
+        owned.h3 = owned.h3.next(.dial_start);
         owned.h3_dials += 1;
         owned.mutex.unlock(io_);
 
         const dialed = dialH3(owned, io_, port);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        owned.h3_dialing = false;
-        const fresh = dialed catch {
-            owned.h3_broken_until = std.Io.Clock.Timestamp.now(io_, .awake).addDuration(.{ .raw = owned.http3.retry_after, .clock = .awake });
-            return null;
-        };
-        owned.h3_port = port;
-        owned.h3_succeeded = false;
-        if (self.h3) |old| owned.retired3.append(owned.gpa, old) catch {
-            fresh.close();
-            return null;
-        };
-        self.h3 = fresh;
+        // A connection that cannot be retired (out of memory) counts as a failed dial.
+        const fresh: ?*H3Connection = if (dialed) |c| retire: {
+            if (self.h3) |old| owned.retired3.append(owned.gpa, old) catch {
+                c.close();
+                break :retire null;
+            };
+            break :retire c;
+        } else |_| null;
+        owned.h3 = owned.h3.next(if (fresh != null) .{ .dial_ok = port } else .{ .dial_failed = owned.retryAt(io_) });
+        self.h3 = fresh orelse return null;
         return fresh;
     }
 
@@ -423,39 +385,139 @@ pub const Channel = struct {
         const owned = self._owned orelse return;
         if (owned.http != .auto) return;
         const io_ = self.runtime();
-        const found = alt_svc.parse(value, owned.options.host);
+        const ev: H3State.Event = switch (alt_svc.parse(value, owned.options.host)) {
+            .none => return,
+            .clear => .alt_clear,
+            .h3 => |a| .{ .alt_set = .{
+                .port = a.port,
+                .until = std.Io.Timestamp.now(io_, .awake).addDuration(.fromSeconds(a.max_age_s)),
+            } },
+        };
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        switch (found) {
-            .none => {},
-            .clear => owned.alt = null,
-            .h3 => |a| owned.alt = .{
-                .port = a.port,
-                .until = std.Io.Clock.Timestamp.now(io_, .awake).addDuration(.{ .raw = .fromSeconds(a.max_age_s), .clock = .awake }),
-            },
-        }
+        owned.h3 = owned.h3.next(ev);
     }
 
     /// A call completed on the HTTP/3 connection (`.auto`).
     fn h3Worked(self: *Channel) void {
+        if (comptime !features.http3) return;
         const owned = self._owned orelse return;
         if (owned.http != .auto) return;
         const io_ = self.runtime();
         owned.mutex.lockUncancelable(io_);
-        owned.h3_succeeded = true;
-        owned.mutex.unlock(io_);
+        defer owned.mutex.unlock(io_);
+        owned.h3 = owned.h3.next(.call_worked);
     }
 
     /// An HTTP/3 call could not be carried (`.auto`): until a call has
     /// worked on it, give HTTP/3 up for `retry_after`.
     fn h3Failed(self: *Channel) void {
+        if (comptime !features.http3) return;
         const owned = self._owned orelse return;
         if (owned.http != .auto) return;
         const io_ = self.runtime();
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        if (owned.h3_succeeded) return;
-        owned.h3_broken_until = std.Io.Clock.Timestamp.now(io_, .awake).addDuration(.{ .raw = owned.http3.retry_after, .clock = .awake });
+        owned.h3 = owned.h3.next(.{ .call_failed = owned.retryAt(io_) });
+    }
+};
+
+/// What an `.auto` channel knows about HTTP/3: Alt-Svc advice, the last
+/// connection dialed, and whether a dial may start. Every change is `next`,
+/// under the channel's lock. `alt` moves only by `alt_set`/`alt_clear`;
+/// `link` by `dial_ok` (set to `{port, worked = false}`) and `call_worked`
+/// (`worked = true` when there is a link); `gate`, by this table (`t`: the
+/// event's retry deadline; "worked": `link.worked`):
+///
+/// | gate \ event | dial_start    | dial_ok                | dial_failed(t) | call_worked | call_failed(t)                |
+/// |--------------|---------------|------------------------|----------------|-------------|-------------------------------|
+/// | idle         | dialing(null) | idle                   | broken(t)      | idle        | worked: idle; else broken(t)  |
+/// | dialing(p)   | dialing(p)    | p: broken(p); else idle | broken(t)     | dialing(p)  | worked: dialing(p); else dialing(t) |
+/// | broken(u)    | dialing(null) | broken(u)              | broken(t)      | broken(u)   | worked: broken(u); else broken(t) |
+///
+/// `dialing(p)`: a call failure while the dial runs is kept as `p` and
+/// applies once the dial lands. dial_start while dialing and dial_ok while
+/// not dialing cannot happen (`dialPort` guards `dial_start`). A lost
+/// connection is not an event: `autoH3` finds it with `isOpen` and asks
+/// `dialPort`, which redials a worked link on its port. Add behaviour as a
+/// cell here, not as a branch in `autoH3`.
+const H3State = struct {
+    /// Alt-Svc advice (RFC 7838) and when it lapses.
+    alt: ?Alt = null,
+    /// The last HTTP/3 connection dialed: its UDP port, and whether a call
+    /// completed on it. Null until a dial succeeds.
+    link: ?Link = null,
+    gate: Gate = .idle,
+
+    /// On the awake clock.
+    const Timestamp = std.Io.Timestamp;
+    const Alt = struct { port: u16, until: Timestamp };
+    const Link = struct { port: u16, worked: bool };
+    const Gate = union(enum) {
+        /// May dial when `dialPort` says so.
+        idle,
+        /// A dial is in flight (never waited for); the payload is a penalty
+        /// a call failure recorded meanwhile.
+        dialing: ?Timestamp,
+        /// HTTP/2 only until then.
+        broken: Timestamp,
+    };
+    const Event = union(enum) {
+        alt_set: Alt,
+        alt_clear,
+        dial_start,
+        /// The UDP port dialed.
+        dial_ok: u16,
+        /// No dial until then.
+        dial_failed: Timestamp,
+        call_worked,
+        /// No dial until then, unless the link worked.
+        call_failed: Timestamp,
+    };
+
+    /// The table above.
+    fn next(s: H3State, ev: Event) H3State {
+        var n = s;
+        switch (ev) {
+            .alt_set => |a| n.alt = a,
+            .alt_clear => n.alt = null,
+            .dial_start => n.gate = switch (s.gate) {
+                .idle, .broken => .{ .dialing = null },
+                .dialing => s.gate,
+            },
+            .dial_ok => |port| {
+                n.link = .{ .port = port, .worked = false };
+                n.gate = switch (s.gate) {
+                    .dialing => |p| if (p) |u| .{ .broken = u } else .idle,
+                    .idle, .broken => s.gate,
+                };
+            },
+            .dial_failed => |t| n.gate = .{ .broken = t },
+            .call_worked => if (s.link) |l| {
+                n.link = .{ .port = l.port, .worked = true };
+            },
+            .call_failed => |t| {
+                if (s.link) |l| if (l.worked) return s;
+                n.gate = switch (s.gate) {
+                    .idle, .broken => .{ .broken = t },
+                    .dialing => .{ .dialing = t },
+                };
+            },
+        }
+        return n;
+    }
+
+    /// The port to dial at `now`, or null: none while dialing or broken;
+    /// else fresh advice's port; else a worked link's (lost, redialed).
+    fn dialPort(s: H3State, now: Timestamp) ?u16 {
+        switch (s.gate) {
+            .idle => {},
+            .dialing => return null,
+            .broken => |u| if (now.compare(.lt, u)) return null,
+        }
+        if (s.alt) |a| if (now.compare(.lt, a.until)) return a.port;
+        const l = s.link orelse return null;
+        return if (l.worked) l.port else null;
     }
 };
 
@@ -482,7 +544,7 @@ fn dialH3(owned: *Channel.Owned, io: std.Io, port: u16) !*H3Connection {
         .connect_timeout = timeout,
         .timeout = o.timeout,
         .max_header_list_size = o.max_header_list_size,
-        .session_cache = if (owned.has_cache) &owned.cache else null,
+        .session_cache = if (owned.cache) |*c| c else null,
     });
 }
 
@@ -970,4 +1032,62 @@ test "resetStatus maps HTTP/2 and HTTP/3 codes (G2, PROTOCOL-HTTP2)" {
     };
     for (rows) |r| try std.testing.expectEqual(r.want, resetStatus(a, r.code).code);
     try std.testing.expectEqualStrings("stream reset by the server (code 0x52e4a40fa8db)", resetStatus(a, 0x52e4a40fa8db).message);
+}
+
+test "grpc channel .auto: h3 state, every gate x event cell, and dialPort" {
+    const at = struct {
+        fn at(n: i96) H3State.Timestamp {
+            return .fromNanoseconds(n);
+        }
+    }.at;
+    const p = at(5);
+    const u = at(6);
+    const t = at(9);
+    const events = [_]H3State.Event{ .dial_start, .{ .dial_ok = 443 }, .{ .dial_failed = t }, .call_worked, .{ .call_failed = t } };
+    const unproven: H3State.Link = .{ .port = 80, .worked = false };
+    const worked: H3State.Link = .{ .port = 80, .worked = true };
+    // From each gate with an unproven link: the gate per the doc table, and the link each event leaves.
+    const links = [events.len]H3State.Link{ unproven, .{ .port = 443, .worked = false }, unproven, worked, unproven };
+    const rows = [_]struct { from: H3State.Gate, want: [5]H3State.Gate }{
+        .{ .from = .idle, .want = .{ .{ .dialing = null }, .idle, .{ .broken = t }, .idle, .{ .broken = t } } },
+        .{ .from = .{ .dialing = null }, .want = .{ .{ .dialing = null }, .idle, .{ .broken = t }, .{ .dialing = null }, .{ .dialing = t } } },
+        .{ .from = .{ .dialing = p }, .want = .{ .{ .dialing = p }, .{ .broken = p }, .{ .broken = t }, .{ .dialing = p }, .{ .dialing = t } } },
+        .{ .from = .{ .broken = u }, .want = .{ .{ .dialing = null }, .{ .broken = u }, .{ .broken = t }, .{ .broken = u }, .{ .broken = t } } },
+    };
+    try std.testing.expectEqual(std.enums.values(std.meta.Tag(H3State.Gate)).len + 1, rows.len);
+    const alt: H3State.Alt = .{ .port = 443, .until = t };
+    for (rows) |r| {
+        errdefer std.debug.print("gate: {any}\n", .{r.from});
+        for (events, r.want, links) |ev, want, link| {
+            errdefer std.debug.print("event: {s}\n", .{@tagName(ev)});
+            const from: H3State = .{ .link = unproven, .gate = r.from };
+            try std.testing.expectEqual(H3State{ .link = link, .gate = want }, from.next(ev));
+        }
+        // A worked link: a call failure is a no-op and a dial resets it;
+        // no link: call_worked is a no-op; Alt-Svc moves only `alt`.
+        const w: H3State = .{ .link = worked, .gate = r.from };
+        try std.testing.expectEqual(w, w.next(.{ .call_failed = t }));
+        try std.testing.expectEqual(@as(?H3State.Link, .{ .port = 443, .worked = false }), w.next(.{ .dial_ok = 443 }).link);
+        const none: H3State = .{ .gate = r.from };
+        try std.testing.expectEqual(none, none.next(.call_worked));
+        try std.testing.expectEqual(H3State{ .alt = alt, .link = worked, .gate = r.from }, w.next(.{ .alt_set = alt }));
+        try std.testing.expectEqual(w, w.next(.{ .alt_set = alt }).next(.alt_clear));
+    }
+
+    const ports = [_]struct { s: H3State, now: i96, want: ?u16 }{
+        .{ .s = .{}, .now = 1, .want = null },
+        .{ .s = .{ .alt = alt }, .now = 1, .want = 443 },
+        .{ .s = .{ .alt = alt }, .now = 9, .want = null }, // advice lapses at `until`
+        .{ .s = .{ .alt = alt, .link = worked }, .now = 10, .want = 80 }, // lost, worked: same port
+        .{ .s = .{ .alt = alt, .link = unproven }, .now = 10, .want = null },
+        .{ .s = .{ .alt = alt, .link = worked }, .now = 1, .want = 443 },
+        .{ .s = .{ .alt = alt, .gate = .{ .dialing = null } }, .now = 1, .want = null },
+        .{ .s = .{ .alt = alt, .gate = .{ .broken = u } }, .now = 1, .want = null },
+        .{ .s = .{ .alt = alt, .gate = .{ .broken = u } }, .now = 6, .want = 443 }, // penalty passed
+        .{ .s = .{ .link = worked, .gate = .{ .broken = u } }, .now = 7, .want = 80 },
+    };
+    for (ports, 0..) |r, i| {
+        errdefer std.debug.print("dialPort row {d}\n", .{i});
+        try std.testing.expectEqual(r.want, r.s.dialPort(at(r.now)));
+    }
 }
