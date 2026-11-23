@@ -5473,10 +5473,12 @@ test "Response: a stream refused at the headers leaves nothing for the error res
 test "Response: a Content-Type with no room is left out, not an error" {
     const Source = enum { default, content_type, header_first };
     const max = 4;
-    const rows = [_]struct { name: []const u8, source: Source, fillers: usize, has_type: bool }{
-        .{ .name = "default, fits", .source = .default, .fillers = max - 1, .has_type = true },
-        .{ .name = "content_type, fits", .source = .content_type, .fillers = max - 1, .has_type = true },
-        .{ .name = "explicit header first, full table", .source = .header_first, .fillers = max - 1, .has_type = true },
+    // `head` is the whole wire form when the table has room: what the
+    // response sent before the Content-Type had a way to be left out.
+    const rows = [_]struct { name: []const u8, source: Source, fillers: usize, has_type: bool, head: ?[]const u8 = null }{
+        .{ .name = "default, fits", .source = .default, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: 2\r\n\r\nhi" },
+        .{ .name = "content_type, fits", .source = .content_type, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nhi" },
+        .{ .name = "explicit header first, full table", .source = .header_first, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Length: 2\r\n\r\nhi" },
         .{ .name = "default, full", .source = .default, .fillers = max, .has_type = false },
         .{ .name = "content_type, full", .source = .content_type, .fillers = max, .has_type = false },
     };
@@ -5504,6 +5506,7 @@ test "Response: a Content-Type with no room is left out, not an error" {
         try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expectEqual(row.has_type, std.mem.indexOf(u8, written, "Content-Type: ") != null);
         try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhi"));
+        if (row.head) |head| try std.testing.expectEqualStrings(head, written);
     }
 }
 

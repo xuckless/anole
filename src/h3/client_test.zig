@@ -1218,9 +1218,7 @@ test "h3 server: a response with as many headers as the limit allows is answered
     const conn = try f.connect(gpa, io);
     defer conn.close();
     for ([_][]const u8{ "/full-table", "/hello" }) |path| {
-        const body = try get(conn, path, gpa);
-        defer gpa.free(body);
-        try std.testing.expect(body.len > 0);
+        try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, path, &.{}));
     }
 }
 
