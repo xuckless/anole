@@ -26,13 +26,8 @@ pub const Info = struct {
     responses: []const operation.Operation.Response = &.{},
 };
 
-fn s(comptime v: []const u8) json.Node {
-    return .{ .string = v };
-}
-
-fn m(comptime k: []const u8, comptime v: json.Node) json.Member {
-    return .{ .key = k, .value = v };
-}
+const s = json.str;
+const m = json.m;
 
 fn flowNode(comptime f: MiddlewareDoc.Flow) json.Node {
     var members: []const json.Member = &.{};

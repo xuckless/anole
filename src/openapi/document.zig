@@ -140,45 +140,61 @@ fn pathParams(a: Allocator, path: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-const NameClash = struct { a: []const u8, b: []const u8, name: []const u8 };
+const yes: Node = .{ .boolean = true };
 
-/// Builds the document of `entries` in `gpa`'s memory; the caller frees it.
-pub fn build(gpa: Allocator, entries_in: []const Entry, opts: Options, error_format: root.ErrorFormat, log: anytype) root.BuildError![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const b: Builder = .{ .a = a };
+fn strOrNull(v: ?[]const u8) ?Node {
+    return if (v) |s| str(s) else null;
+}
 
-    // 1. The entries that stay, in document order.
+/// The members of a JSON object, in the order listed; an optional value that
+/// is null leaves its key out. `items` is a tuple of `.{ "key", Node-or-?Node }`.
+fn members(a: Allocator, items: anytype) Allocator.Error![]Member {
+    var out: std.ArrayList(Member) = .empty;
+    inline for (items) |kv| {
+        if (@typeInfo(@TypeOf(kv[1])) == .optional) {
+            if (kv[1]) |v| try out.append(a, .{ .key = kv[0], .value = v });
+        } else try out.append(a, .{ .key = kv[0], .value = kv[1] });
+    }
+    return out.items;
+}
+
+fn obj(a: Allocator, items: anytype) Allocator.Error!Node {
+    return .{ .object = try members(a, items) };
+}
+
+/// The entries that stay, in document order.
+fn keptEntries(a: Allocator, entries_in: []const Entry, opts: Options) Allocator.Error![]Entry {
     var kept: std.ArrayList(Entry) = .empty;
     for (entries_in) |e| if (keep(e, opts)) try kept.append(a, e);
     std.mem.sort(Entry, kept.items, {}, lessEntry);
+    return kept.items;
+}
 
-    // 2. Components.
-    var comps: Components = .{};
-    for (kept.items) |e| try walkOp(&comps, a, e.op, e.middleware);
-
-    // 3. Their names: renames first, then a check that no two share one.
-    const names = try a.alloc([]const u8, comps.items.items.len);
-    for (comps.items.items, names) |c, *n| {
+/// The names of `comps`: renames first, then a check that no two share one.
+fn componentNames(a: Allocator, comps: *const Components, opts: Options, log: anytype) root.BuildError![]const []const u8 {
+    const items = comps.items.items;
+    const names = try a.alloc([]const u8, items.len);
+    for (items, names) |c, *n| {
         n.* = c.name;
         for (opts.rename) |r| if (std.mem.eql(u8, r.type_name, c.type_name)) {
             n.* = r.name;
         };
     }
-    for (comps.items.items, 0..) |c, i| {
-        for (comps.items.items[0..i], 0..) |d, j| {
+    for (items, 0..) |c, i| {
+        for (items[0..i], 0..) |d, j| {
             if (std.mem.eql(u8, names[i], names[j])) {
                 log.err("openapi: two types are named \"{s}\": {s} and {s}; name one with pub const openapi: anole.openapi.Doc(@This()) = .{{ .name = \"...\" }}, or with app.openapi(.{{ .rename = &.{{.{{ .type_name = \"{s}\", .name = \"...\" }}}} }})", .{ names[i], d.type_name, c.type_name, c.type_name });
                 return error.OpenApiNameClash;
             }
         }
     }
-    const table: json.NameTable = .{ .components = comps.items.items, .names = names };
+    return names;
+}
 
-    // 4. Security schemes.
+/// The security schemes the routes' middleware declare, sorted by name.
+fn securitySchemes(a: Allocator, kept: []const Entry, log: anytype) root.BuildError![]mw.Scheme {
     var schemes: std.ArrayList(mw.Scheme) = .empty;
-    for (kept.items) |e| for (e.middleware) |info| for (info.schemes) |sc| {
+    for (kept) |e| for (e.middleware) |info| for (info.schemes) |sc| {
         var found = false;
         for (schemes.items) |have| {
             if (!std.mem.eql(u8, have.name, sc.name)) continue;
@@ -195,67 +211,71 @@ pub fn build(gpa: Allocator, entries_in: []const Entry, opts: Options, error_for
             return std.mem.order(u8, x.name, y.name) == .lt;
         }
     }.less);
+    return schemes.items;
+}
 
-    // 5. Paths.
+/// `paths`: one object per path, one operation per verb (the first wins).
+fn pathsNode(b: Builder, kept: []const Entry, opts: Options, error_format: root.ErrorFormat, table: json.NameTable, used_tags: *std.StringHashMapUnmanaged(?[]const u8)) !Node {
+    const a = b.a;
     var used_ids: std.StringHashMapUnmanaged(u32) = .empty;
-    var used_tags: std.StringHashMapUnmanaged(?[]const u8) = .empty;
     var path_members: std.ArrayList(Member) = .empty;
     var i: usize = 0;
-    while (i < kept.items.len) {
-        const path = kept.items[i].path;
+    while (i < kept.len) {
+        const path = kept[i].path;
         var verbs: std.ArrayList(Member) = .empty;
         var seen_verbs: [verb_order.len]bool = @splat(false);
-        while (i < kept.items.len and std.mem.eql(u8, kept.items[i].path, path)) : (i += 1) {
-            const e = kept.items[i];
+        while (i < kept.len and std.mem.eql(u8, kept[i].path, path)) : (i += 1) {
+            const e = kept[i];
             const rank = verbRank(e.verb);
             if (seen_verbs[rank]) continue;
             seen_verbs[rank] = true;
-            try verbs.append(a, .{ .key = @tagName(e.verb), .value = try operationNode(b, e, opts, error_format, table, &used_ids, &used_tags) });
+            try verbs.append(a, .{ .key = @tagName(e.verb), .value = try operationNode(b, e, opts, error_format, table, &used_ids, used_tags) });
         }
         try path_members.append(a, .{ .key = path, .value = .{ .object = verbs.items } });
     }
+    return .{ .object = path_members.items };
+}
 
-    // 6. Top level.
-    var info_members: std.ArrayList(Member) = .empty;
-    try info_members.append(a, .{ .key = "title", .value = str(opts.info.title) });
-    if (opts.info.summary) |t| try info_members.append(a, .{ .key = "summary", .value = str(t) });
-    if (opts.info.description) |t| try info_members.append(a, .{ .key = "description", .value = str(t) });
-    try info_members.append(a, .{ .key = "version", .value = str(opts.info.version) });
+fn infoNode(a: Allocator, opts: Options) !Node {
+    return obj(a, .{
+        .{ "title", str(opts.info.title) },
+        .{ "summary", strOrNull(opts.info.summary) },
+        .{ "description", strOrNull(opts.info.description) },
+        .{ "version", str(opts.info.version) },
+    });
+}
 
-    var top: std.ArrayList(Member) = .empty;
-    try top.append(a, .{ .key = "openapi", .value = str("3.1.0") });
-    try top.append(a, .{ .key = "info", .value = .{ .object = info_members.items } });
-    if (opts.servers.len > 0) {
-        var servers: std.ArrayList(Node) = .empty;
-        for (opts.servers) |sv| {
-            var ms: std.ArrayList(Member) = .empty;
-            try ms.append(a, .{ .key = "url", .value = str(sv.url) });
-            if (sv.description) |d| try ms.append(a, .{ .key = "description", .value = str(d) });
-            try servers.append(a, .{ .object = ms.items });
-        }
-        try top.append(a, .{ .key = "servers", .value = .{ .array = servers.items } });
+fn serversNode(a: Allocator, opts: Options) !?Node {
+    if (opts.servers.len == 0) return null;
+    const servers = try a.alloc(Node, opts.servers.len);
+    for (opts.servers, servers) |sv, *n| n.* = try obj(a, .{
+        .{ "url", str(sv.url) },
+        .{ "description", strOrNull(sv.description) },
+    });
+    return .{ .array = servers };
+}
+
+/// The tags some operation uses, sorted; a description from `opts.tags` wins
+/// over the one found on the route.
+fn tagsNode(a: Allocator, used_tags: *const std.StringHashMapUnmanaged(?[]const u8), opts: Options) !?Node {
+    if (used_tags.count() == 0) return null;
+    var tag_names: std.ArrayList([]const u8) = .empty;
+    var it = used_tags.iterator();
+    while (it.next()) |kv| try tag_names.append(a, kv.key_ptr.*);
+    std.mem.sort([]const u8, tag_names.items, {}, lessStr);
+    const tags = try a.alloc(Node, tag_names.items.len);
+    for (tag_names.items, tags) |t, *n| {
+        var desc: ?[]const u8 = used_tags.get(t).?;
+        for (opts.tags) |te| if (std.mem.eql(u8, te.name, t)) {
+            desc = te.description;
+        };
+        n.* = try obj(a, .{ .{ "name", str(t) }, .{ "description", strOrNull(desc) } });
     }
-    if (used_tags.count() > 0) {
-        var tag_names: std.ArrayList([]const u8) = .empty;
-        var it = used_tags.iterator();
-        while (it.next()) |kv| try tag_names.append(a, kv.key_ptr.*);
-        std.mem.sort([]const u8, tag_names.items, {}, lessStr);
-        var tags: std.ArrayList(Node) = .empty;
-        for (tag_names.items) |t| {
-            var ms: std.ArrayList(Member) = .empty;
-            try ms.append(a, .{ .key = "name", .value = str(t) });
-            var desc: ?[]const u8 = used_tags.get(t).?;
-            for (opts.tags) |te| if (std.mem.eql(u8, te.name, t)) {
-                desc = te.description;
-            };
-            if (desc) |d| try ms.append(a, .{ .key = "description", .value = str(d) });
-            try tags.append(a, .{ .object = ms.items });
-        }
-        try top.append(a, .{ .key = "tags", .value = .{ .array = tags.items } });
-    }
-    try top.append(a, .{ .key = "paths", .value = .{ .object = path_members.items } });
+    return .{ .array = tags };
+}
 
-    var comp_members: std.ArrayList(Member) = .empty;
+fn componentsNode(a: Allocator, comps: *const Components, names: []const []const u8, schemes: []const mw.Scheme) !?Node {
+    var schemas: ?Node = null;
     if (comps.items.items.len > 0) {
         const order = try a.alloc(usize, comps.items.items.len);
         for (order, 0..) |*o, k| o.* = k;
@@ -264,20 +284,49 @@ pub fn build(gpa: Allocator, entries_in: []const Entry, opts: Options, error_for
                 return std.mem.order(u8, n[x], n[y]) == .lt;
             }
         }.less);
-        var ms: std.ArrayList(Member) = .empty;
-        for (order) |k| try ms.append(a, .{ .key = names[k], .value = comps.items.items[k].schema });
-        try comp_members.append(a, .{ .key = "schemas", .value = .{ .object = ms.items } });
+        const ms = try a.alloc(Member, order.len);
+        for (order, ms) |k, *m| m.* = .{ .key = names[k], .value = comps.items.items[k].schema };
+        schemas = .{ .object = ms };
     }
-    if (schemes.items.len > 0) {
-        var ms: std.ArrayList(Member) = .empty;
-        for (schemes.items) |sc| try ms.append(a, .{ .key = sc.name, .value = sc.definition });
-        try comp_members.append(a, .{ .key = "securitySchemes", .value = .{ .object = ms.items } });
+    var security: ?Node = null;
+    if (schemes.len > 0) {
+        const ms = try a.alloc(Member, schemes.len);
+        for (schemes, ms) |sc, *m| m.* = .{ .key = sc.name, .value = sc.definition };
+        security = .{ .object = ms };
     }
-    if (comp_members.items.len > 0) try top.append(a, .{ .key = "components", .value = .{ .object = comp_members.items } });
+    const ms = try members(a, .{ .{ "schemas", schemas }, .{ "securitySchemes", security } });
+    return if (ms.len > 0) .{ .object = ms } else null;
+}
+
+/// Builds the document of `entries` in `gpa`'s memory; the caller frees it.
+pub fn build(gpa: Allocator, entries_in: []const Entry, opts: Options, error_format: root.ErrorFormat, log: anytype) root.BuildError![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const b: Builder = .{ .a = a };
+
+    const kept = try keptEntries(a, entries_in, opts);
+    var comps: Components = .{};
+    for (kept) |e| try walkOp(&comps, a, e.op, e.middleware);
+    const names = try componentNames(a, &comps, opts, log);
+    const table: json.NameTable = .{ .components = comps.items.items, .names = names };
+    const schemes = try securitySchemes(a, kept, log);
+
+    var used_tags: std.StringHashMapUnmanaged(?[]const u8) = .empty;
+    const paths = try pathsNode(b, kept, opts, error_format, table, &used_tags);
+
+    const top = try obj(a, .{
+        .{ "openapi", str("3.1.0") },
+        .{ "info", try infoNode(a, opts) },
+        .{ "servers", try serversNode(a, opts) },
+        .{ "tags", try tagsNode(a, &used_tags, opts) },
+        .{ "paths", paths },
+        .{ "components", try componentsNode(a, &comps, names, schemes) },
+    });
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    json.writeNamed(.{ .object = top.items }, &out.writer, table) catch return error.OutOfMemory;
+    json.writeNamed(top, &out.writer, table) catch return error.OutOfMemory;
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
@@ -286,53 +335,39 @@ fn responseCode(a: Allocator, status: u16) ![]const u8 {
     return std.fmt.allocPrint(a, "{d}", .{status});
 }
 
-fn operationNode(
-    b: Builder,
-    e: Entry,
-    opts: Options,
-    error_format: root.ErrorFormat,
-    table: json.NameTable,
-    used_ids: *std.StringHashMapUnmanaged(u32),
-    used_tags: *std.StringHashMapUnmanaged(?[]const u8),
-) !Node {
-    _ = table;
-    const a = b.a;
+/// `tags`: the operation's own, else its gRPC service or path tag; records
+/// every tag used.
+fn tagsMember(a: Allocator, e: Entry, opts: Options, used_tags: *std.StringHashMapUnmanaged(?[]const u8)) !?Node {
     const op = e.op;
-    var members: std.ArrayList(Member) = .empty;
-
-    // Tags.
-    var tag: ?[]const u8 = null;
     if (op.tags.len > 0) {
-        var ts: std.ArrayList(Node) = .empty;
-        for (op.tags) |t| {
-            try ts.append(a, str(t));
+        const ts = try a.alloc(Node, op.tags.len);
+        for (op.tags, ts) |t, *n| {
+            n.* = str(t);
             if (!used_tags.contains(t)) try used_tags.put(a, t, null);
         }
-        try members.append(a, .{ .key = "tags", .value = .{ .array = ts.items } });
-    } else {
-        tag = op.grpc_service orelse if (opts.tags_from_path) operation.tagFromPath(e.path) else null;
-        if (tag) |t| {
-            try members.append(a, .{ .key = "tags", .value = .{ .array = try a.dupe(Node, &.{str(t)}) } });
-            if (!used_tags.contains(t)) try used_tags.put(a, t, e.tag_doc) else if (e.tag_doc != null and used_tags.get(t).? == null) try used_tags.put(a, t, e.tag_doc);
-        }
+        return .{ .array = ts };
     }
-    if (op.summary) |t| try members.append(a, .{ .key = "summary", .value = str(t) });
-    if (op.description) |t| try members.append(a, .{ .key = "description", .value = str(t) });
+    const t = op.grpc_service orelse if (opts.tags_from_path) operation.tagFromPath(e.path) else null;
+    const tag = t orelse return null;
+    if (!used_tags.contains(tag)) try used_tags.put(a, tag, e.tag_doc) else if (e.tag_doc != null and used_tags.get(tag).? == null) try used_tags.put(a, tag, e.tag_doc);
+    return .{ .array = try a.dupe(Node, &.{str(tag)}) };
+}
 
-    // operationId, unique within the document.
-    const base = op.operation_id orelse try defaultId(a, e.verb, e.path);
-    var id = base;
+/// The operationId, unique within the document.
+fn uniqueId(a: Allocator, e: Entry, used_ids: *std.StringHashMapUnmanaged(u32)) ![]const u8 {
+    const base = e.op.operation_id orelse try defaultId(a, e.verb, e.path);
     if (used_ids.get(base)) |n| {
-        id = try std.fmt.allocPrint(a, "{s}_{d}", .{ base, n + 1 });
         try used_ids.put(a, base, n + 1);
-    } else try used_ids.put(a, base, 1);
-    try members.append(a, .{ .key = "operationId", .value = str(id) });
-    if (op.deprecated) try members.append(a, .{ .key = "deprecated", .value = .{ .boolean = true } });
+        return std.fmt.allocPrint(a, "{s}_{d}", .{ base, n + 1 });
+    }
+    try used_ids.put(a, base, 1);
+    return base;
+}
 
-    // Parameters: the operation's, the path's that it leaves out, the middleware's.
-    var params: std.ArrayList(Node) = .empty;
+/// `parameters`: the operation's, the path's that it leaves out, the middleware's.
+fn parametersNode(a: Allocator, e: Entry) !?Node {
     var have: std.ArrayList(Operation.Param) = .empty;
-    for (op.params) |p| try have.append(a, p);
+    for (e.op.params) |p| try have.append(a, p);
     for (try pathParams(a, e.path)) |name| {
         var present = false;
         for (have.items) |p| if (p.in == .path and std.mem.eql(u8, p.name, name)) {
@@ -347,20 +382,23 @@ fn operationNode(
         };
         if (!present) try have.append(a, p);
     };
-    for (have.items) |p| try params.append(a, try paramNode(a, p));
-    if (params.items.len > 0) try members.append(a, .{ .key = "parameters", .value = .{ .array = params.items } });
+    if (have.items.len == 0) return null;
+    const params = try a.alloc(Node, have.items.len);
+    for (have.items, params) |p, *n| n.* = try paramNode(a, p);
+    return .{ .array = params };
+}
 
-    if (op.body) |body| {
-        var ms: std.ArrayList(Member) = .empty;
-        if (body.required) try ms.append(a, .{ .key = "required", .value = .{ .boolean = true } });
-        const content = try a.dupe(Member, &.{.{ .key = body.content_type, .value = .{ .object = try a.dupe(Member, &.{.{ .key = "schema", .value = body.schema }}) } }});
-        try ms.append(a, .{ .key = "content", .value = .{ .object = content } });
-        try members.append(a, .{ .key = "requestBody", .value = .{ .object = ms.items } });
-    }
+fn requestBodyNode(a: Allocator, body: Operation.Body) !Node {
+    return obj(a, .{
+        .{ "required", if (body.required) yes else null },
+        .{ "content", try obj(a, .{.{ body.content_type, try obj(a, .{.{ "schema", body.schema }}) }}) },
+    });
+}
 
-    // Responses: the operation's, then the middleware's for statuses it lacks.
+/// `responses`: the operation's, then the middleware's for statuses it lacks.
+fn responsesNode(a: Allocator, e: Entry, error_format: root.ErrorFormat) !Node {
     var resp: std.ArrayList(Operation.Response) = .empty;
-    for (op.responses) |r| try resp.append(a, r);
+    for (e.op.responses) |r| try resp.append(a, r);
     for (e.middleware) |info| for (info.responses) |r| {
         var present = false;
         for (resp.items) |q| if (q.status == r.status) {
@@ -375,30 +413,48 @@ fn operationNode(
             return xs < ys;
         }
     }.less);
-    var rms: std.ArrayList(Member) = .empty;
-    for (resp.items) |r| try rms.append(a, .{ .key = try responseCode(a, r.status), .value = try responseNode(a, r, error_format) });
-    try members.append(a, .{ .key = "responses", .value = .{ .object = rms.items } });
+    const rms = try a.alloc(Member, resp.items.len);
+    for (resp.items, rms) |r, *m| m.* = .{ .key = try responseCode(a, r.status), .value = try responseNode(a, r, error_format) };
+    return .{ .object = rms };
+}
 
-    // Security.
-    if (try securityNode(a, e)) |sec| try members.append(a, .{ .key = "security", .value = sec });
-
-    return .{ .object = members.items };
+fn operationNode(
+    b: Builder,
+    e: Entry,
+    opts: Options,
+    error_format: root.ErrorFormat,
+    table: json.NameTable,
+    used_ids: *std.StringHashMapUnmanaged(u32),
+    used_tags: *std.StringHashMapUnmanaged(?[]const u8),
+) !Node {
+    _ = table;
+    const a = b.a;
+    const op = e.op;
+    return obj(a, .{
+        .{ "tags", try tagsMember(a, e, opts, used_tags) },
+        .{ "summary", strOrNull(op.summary) },
+        .{ "description", strOrNull(op.description) },
+        .{ "operationId", str(try uniqueId(a, e, used_ids)) },
+        .{ "deprecated", if (op.deprecated) yes else null },
+        .{ "parameters", try parametersNode(a, e) },
+        .{ "requestBody", if (op.body) |body| try requestBodyNode(a, body) else null },
+        .{ "responses", try responsesNode(a, e, error_format) },
+        .{ "security", try securityNode(a, e) },
+    });
 }
 
 fn paramNode(a: Allocator, p: Operation.Param) !Node {
-    var ms: std.ArrayList(Member) = .empty;
-    try ms.append(a, .{ .key = "name", .value = str(p.name) });
-    try ms.append(a, .{ .key = "in", .value = str(@tagName(p.in)) });
-    if (p.description) |d| try ms.append(a, .{ .key = "description", .value = str(d) });
-    if (p.required) try ms.append(a, .{ .key = "required", .value = .{ .boolean = true } });
-    if (p.deprecated) try ms.append(a, .{ .key = "deprecated", .value = .{ .boolean = true } });
-    if (p.explode) {
-        try ms.append(a, .{ .key = "style", .value = str("form") });
-        try ms.append(a, .{ .key = "explode", .value = .{ .boolean = true } });
-    }
-    try ms.append(a, .{ .key = "schema", .value = p.schema });
-    if (p.rest_of_path) try ms.append(a, .{ .key = "x-anole-rest-of-path", .value = .{ .boolean = true } });
-    return .{ .object = ms.items };
+    return obj(a, .{
+        .{ "name", str(p.name) },
+        .{ "in", str(@tagName(p.in)) },
+        .{ "description", strOrNull(p.description) },
+        .{ "required", if (p.required) yes else null },
+        .{ "deprecated", if (p.deprecated) yes else null },
+        .{ "style", if (p.explode) str("form") else null },
+        .{ "explode", if (p.explode) yes else null },
+        .{ "schema", p.schema },
+        .{ "x-anole-rest-of-path", if (p.rest_of_path) yes else null },
+    });
 }
 
 fn schemaMember(a: Allocator, ct: []const u8, schema: Node) !Member {
@@ -406,24 +462,26 @@ fn schemaMember(a: Allocator, ct: []const u8, schema: Node) !Member {
 }
 
 fn responseNode(a: Allocator, r: Operation.Response, error_format: root.ErrorFormat) !Node {
-    var ms: std.ArrayList(Member) = .empty;
-    try ms.append(a, .{ .key = "description", .value = str(r.description) });
+    var headers: ?Node = null;
     if (r.headers.len > 0) {
-        var hs: std.ArrayList(Member) = .empty;
-        for (r.headers) |h| try hs.append(a, .{ .key = h.name, .value = .{ .object = try a.dupe(Member, &.{
-            .{ .key = "description", .value = str(h.description) },
-            .{ .key = "schema", .value = h.schema },
-        }) } });
-        try ms.append(a, .{ .key = "headers", .value = .{ .object = hs.items } });
+        const hs = try a.alloc(Member, r.headers.len);
+        for (r.headers, hs) |h, *m| m.* = .{ .key = h.name, .value = try obj(a, .{
+            .{ "description", str(h.description) },
+            .{ "schema", h.schema },
+        }) };
+        headers = .{ .object = hs };
     }
     var contents: std.ArrayList(Member) = .empty;
     if (r.error_body) {
         if (error_format != .text) try contents.append(a, try schemaMember(a, "application/json", fixed.error_ref));
-        if (error_format != .json) try contents.append(a, try schemaMember(a, "text/plain", .{ .object = try a.dupe(Member, &.{.{ .key = "type", .value = str("string") }}) }));
+        if (error_format != .json) try contents.append(a, try schemaMember(a, "text/plain", string_schema));
     }
     for (r.contents) |c| try contents.append(a, try schemaMember(a, c.content_type, c.schema));
-    if (contents.items.len > 0) try ms.append(a, .{ .key = "content", .value = .{ .object = contents.items } });
-    return .{ .object = ms.items };
+    return obj(a, .{
+        .{ "description", str(r.description) },
+        .{ "headers", headers },
+        .{ "content", if (contents.items.len > 0) Node{ .object = contents.items } else null },
+    });
 }
 
 /// The `security` of a route: the schemes its middleware requires.

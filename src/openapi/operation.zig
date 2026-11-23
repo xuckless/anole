@@ -73,9 +73,7 @@ pub const Operation = struct {
 
 // ------------------------------------------------------------------ handlers
 
-fn typeOnly(comptime t: []const u8) json.Node {
-    return .{ .object = &.{.{ .key = "type", .value = .{ .string = t } }} };
-}
+const typeOnly = json.typeOnly;
 
 fn phrase(comptime code: u16) []const u8 {
     const status: std.http.Status = @fromBackingInt(@intCast(code));

@@ -3,11 +3,10 @@
 //! Where configuration comes from.
 
 /// One configuration source. Create it with `.json(path)`, `.ini(path)`,
-/// `.env(path)` or `.osEnv()`.
+/// `.dotenvFiles()` or `.osEnv()`.
 pub const ConfigSource = union(enum) {
     json_file: []const u8,
     ini_file: []const u8,
-    dotenv: []const u8,
     os_env,
     /// The `.env` entries Anole read (`SourceOptions.overlay`).
     dotenv_files,
@@ -20,12 +19,6 @@ pub const ConfigSource = union(enum) {
     /// An INI file. It must exist.
     pub fn ini(path: []const u8) ConfigSource {
         return .{ .ini_file = path };
-    }
-
-    /// A `.env` file. It is skipped when it doesn't exist, so optional files
-    /// such as `.env.local` can always be listed.
-    pub fn env(path: []const u8) ConfigSource {
-        return .{ .dotenv = path };
     }
 
     pub fn dotenvFiles() ConfigSource {
