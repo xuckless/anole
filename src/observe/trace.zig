@@ -293,9 +293,6 @@ pub const Exporter = struct {
     buffer: []Span,
     /// The batching task: only `start` and `close` (the owner) touch it.
     task: ?std.Io.Future(void) = null,
-    /// Set by `start` (release) once the task runs, read by `flush`
-    /// (acquire) in place of `task`.
-    started: std.atomic.Value(bool) = .init(false),
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
     /// Set by `flush` and `deinit`: cuts the task's pause short. Only the
@@ -319,11 +316,18 @@ pub const Exporter = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
-    /// The teardown state: alive, then closed (`close`), then dead
-    /// (`deinit`).
-    state: std.atomic.Value(State) = .init(.alive),
+    /// Read by `flush` (acquire) in place of `task`.
+    state: std.atomic.Value(State) = .init(.created),
 
-    pub const State = enum(u8) { alive, closed, dead };
+    /// | state   | start         | close                 | submit  | flush      |
+    /// |---------|---------------|-----------------------|---------|------------|
+    /// | created | running       | closed, drain queue   | queued  | returns    |
+    /// | running | (unsupported) | closed, stop + drain  | queued  | waits      |
+    /// | closed  | (unsupported) | no-op                 | dropped | returns    |
+    pub const State = enum(u8) { created, running, closed };
+
+    /// Whether `submit`, `job` and `child` take a span in each state.
+    const takes = std.EnumArray(State, bool).init(.{ .created = true, .running = true, .closed = false });
 
     /// An exporter with its queue allocated, sending through `client` (the
     /// server's, `app.client()`). Nothing is sent until `start`. `client`'s
@@ -333,23 +337,20 @@ pub const Exporter = struct {
         return .{ .gpa = gpa, .io = io, .client = client, .options = options, .queue = .init(buffer), .buffer = buffer };
     }
 
-    /// Starts the batching task.
+    /// Starts the batching task. Once, before `close`; a spawn error
+    /// leaves the exporter created.
     pub fn start(self: *Exporter) !void {
         self.task = try self.io.concurrent(run, .{self});
-        self.started.store(true, .release);
+        self.state.store(.running, .release);
     }
 
     /// Sends what is queued and stops the task, then takes no more spans:
     /// from here on `submit`, `job` and `child` drop theirs (counted in
     /// `dropped`) and allocate nothing, and `flush` returns at once. The
-    /// memory stays until `deinit`. Once only (a second close panics in
-    /// debug builds).
+    /// memory stays until `deinit`. A second close does nothing.
     pub fn close(self: *Exporter) void {
-        if (self.state.cmpxchgStrong(.alive, .closed, .acq_rel, .acquire)) |was| {
-            if (builtin.mode == .debug) std.debug.panic("trace.Exporter.close on an exporter already {t}", .{was});
-            return;
-        }
-        // A flusher that saw the exporter alive returns now, not once the
+        if (self.state.swap(.closed, .acq_rel) == .closed) return;
+        // A flusher that saw the exporter running returns now, not once the
         // last batch is answered.
         self.notifyProgress();
         self.closing.set(self.io);
@@ -372,26 +373,17 @@ pub const Exporter = struct {
         self.notifyProgress();
     }
 
-    /// `close`, when not done yet, then frees the queue. Nothing may use
-    /// the exporter afterwards (a use panics in debug builds).
+    /// `close` (a no-op when done), then frees the queue. Nothing may use
+    /// the exporter afterwards.
     pub fn deinit(self: *Exporter) void {
-        if (self.state.load(.acquire) == .alive) self.close();
-        const was = self.state.swap(.dead, .acq_rel);
-        if (was == .dead) {
-            if (builtin.mode == .debug) @panic("trace.Exporter.deinit twice");
-            return;
-        }
+        self.close();
         self.gpa.free(self.buffer);
     }
 
     /// Whether spans are still taken; past `close`, the span is counted as
-    /// dropped. A use after `deinit` panics in debug builds.
+    /// dropped.
     fn taking(self: *Exporter) bool {
-        switch (self.state.load(.acquire)) {
-            .alive => return true,
-            .closed => {},
-            .dead => if (builtin.mode == .debug) @panic("trace.Exporter used after deinit"),
-        }
+        if (takes.get(self.state.load(.acquire))) return true;
         _ = self.dropped.fetchAdd(1, .monotonic);
         return false;
     }
@@ -404,7 +396,7 @@ pub const Exporter = struct {
     /// returns at once and stays canceled. Does nothing before `start`, and
     /// returns at once after `close`.
     pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
-        if (self.state.load(.acquire) != .alive or !self.started.load(.acquire)) return;
+        if (self.state.load(.acquire) != .running) return;
         const target = self.queued.load(.acquire);
         if (self.finished.load(.acquire) >= target) return;
         const deadline = std.Io.Timeout{ .deadline = .{ .raw = std.Io.Clock.awake.now(self.io).addDuration(timeout), .clock = .awake } };
@@ -413,7 +405,7 @@ pub const Exporter = struct {
         // `finished` and `state` change before `notifyProgress`, which
         // takes the lock to broadcast: a change after this check wakes the
         // wait below.
-        while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .alive) {
+        while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .running) {
             // A wake under the leaf lock, not a wait.
             self.kick.set(self.io);
             if (comptime builtin.is_test) _ = self.test_flush_waits.fetchAdd(1, .release);

@@ -817,12 +817,31 @@ test "trace: spans close finds unsent are counted finished and dropped" {
     defer client.deinit();
     // Never started: nothing sends what is queued.
     var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "unsent" });
+    // deinit after close: close is a no-op there.
     defer exporter.deinit();
     for ("ghi") |id| exporter.submit(testSpan(id));
-    exporter.close();
-    try std.testing.expectEqual(@as(u64, 3), exporter.queued.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 3), exporter.finished.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 3), exporter.dropped.load(.acquire));
+    // Before start: returns at once (an hour's timeout would hang the test).
+    exporter.flush(.fromSeconds(3600));
+    // Each step, then the counters it leaves: queued, finished, dropped.
+    const Step = enum { close, close_again, submit_closed, flush_closed };
+    const rows = [_]struct { Step, [3]u64 }{
+        .{ .close, .{ 3, 3, 3 } },
+        .{ .close_again, .{ 3, 3, 3 } },
+        .{ .submit_closed, .{ 3, 3, 4 } },
+        .{ .flush_closed, .{ 3, 3, 4 } },
+    };
+    for (rows) |row| {
+        switch (row[0]) {
+            .close, .close_again => exporter.close(),
+            .submit_closed => exporter.submit(testSpan('j')),
+            .flush_closed => exporter.flush(.fromSeconds(3600)),
+        }
+        const got = [3]u64{ exporter.queued.load(.acquire), exporter.finished.load(.acquire), exporter.dropped.load(.acquire) };
+        std.testing.expectEqualSlices(u64, &row[1], &got) catch |err| {
+            std.debug.print("step {t}\n", .{row[0]});
+            return err;
+        };
+    }
     try std.testing.expectEqual(@as(u64, 0), exporter.exported.load(.acquire));
 }
 
