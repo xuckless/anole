@@ -67,7 +67,7 @@ pub const max_file_bytes = 1024 * 1024;
 /// Strings and lists in the result are allocated with `gpa`; release them with
 /// `free`, or pass an arena such as `init.arena.allocator()`. On error,
 /// `config` is left untouched and nothing is leaked.
-fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Error!void {
+pub fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Error!void {
     const T = ConfigType(@TypeOf(config));
     const leaves = comptime naming.leaves(T);
 
@@ -90,13 +90,21 @@ fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Error!vo
     for (options.sources) |source| switch (source) {
         .json_file => |path| {
             has_file_source = true;
-            const text = try readFile(arena, options, path, .required, diag) orelse continue;
+            const text = try readFile(arena, options, path, diag) orelse continue;
             if (try json.parse(arena, text, path, diag)) |object| try tree.merge(object);
         },
         .ini_file => |path| {
             has_file_source = true;
-            const text = try readFile(arena, options, path, .required, diag) orelse continue;
+            const text = try readFile(arena, options, path, diag) orelse continue;
             try tree.merge(try ini.parse(arena, text, path, diag));
+        },
+        .dotenv => |path| {
+            has_env_source = true;
+            const files = env_mod.Files.load(arena, options.io, options.dir, &.{path}, diag) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidEnvFile => continue, // the problems are in `diag`
+            };
+            try env.placeOverlay(&tree, leaves, &env_names, &files);
         },
         .dotenv_files => {
             has_env_source = true;
@@ -120,6 +128,23 @@ fn loadSources(gpa: Allocator, config: anytype, options: SourceOptions) Error!vo
     if (diag.problems.items.len != problems_before) return error.InvalidConfig;
 
     config.* = try copy.dupe(T, gpa, value);
+}
+
+/// Like `loadSources`, but on failure logs every problem and exits with status 1.
+pub fn loadSourcesOrExit(gpa: Allocator, config: anytype, options: SourceOptions) void {
+    var own_diagnostics: Diagnostics = .init(gpa);
+    defer own_diagnostics.deinit();
+    var with_diagnostics = options;
+    const diag = options.diagnostics orelse &own_diagnostics;
+    with_diagnostics.diagnostics = diag;
+
+    loadSources(gpa, config, with_diagnostics) catch |err| {
+        switch (err) {
+            error.InvalidConfig => log.err("{f}", .{diag}),
+            error.OutOfMemory => log.err("out of memory while loading configuration", .{}),
+        }
+        std.process.exit(1);
+    };
 }
 
 /// Frees the strings and lists that `load` allocated in `config` (the struct, not a pointer).
@@ -244,16 +269,14 @@ fn ConfigType(comptime CfgPtr: type) type {
     return info.pointer.child;
 }
 
-const Presence = enum { required, optional };
-
-/// The file's contents, or null when it can't be read (reported unless an optional file is missing).
-fn readFile(arena: Allocator, options: SourceOptions, path: []const u8, presence: Presence, diag: *Diagnostics) Allocator.Error!?[]const u8 {
+/// The file's contents, or null when it can't be read (reported).
+fn readFile(arena: Allocator, options: SourceOptions, path: []const u8, diag: *Diagnostics) Allocator.Error!?[]const u8 {
     const dir = options.dir orelse std.Io.Dir.cwd();
     // readFileAlloc fails as soon as it has read `limit` bytes, so allow one more.
     return dir.readFileAlloc(options.io, path, arena, .limited(max_file_bytes + 1)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FileNotFound => {
-            if (presence == .required) try diag.add(.{ .kind = .unreadable, .origin = .{ .file = path }, .detail = "file not found" });
+            try diag.add(.{ .kind = .unreadable, .origin = .{ .file = path }, .detail = "file not found" });
             return null;
         },
         error.StreamTooLong => {
@@ -575,6 +598,34 @@ fn expectProblems(comptime T: type, options: SourceOptions, expected: []const u8
     const text = try std.fmt.allocPrint(testing.allocator, "{f}", .{&diag});
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(expected, text);
+}
+
+test "loadSourcesOrExit fills config when it is valid" {
+    var environ: std.process.Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("NAME", "anole");
+    try environ.put("DB_HOST", "localhost");
+
+    var config: TestConfig = undefined;
+    loadSourcesOrExit(testing.allocator, &config, .{ .io = testing.io, .environ = &environ, .sources = &.{.osEnv()} });
+    defer free(testing.allocator, config);
+
+    try testing.expectEqualStrings("anole", config.name);
+}
+
+test "variables from a .env(path) file keep their file and line; a missing one is skipped" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "app.env", .data = "# settings\nPORT=eighty\n" });
+
+    try expectProblems(struct { port: u16 }, .{
+        .io = testing.io,
+        .dir = tmp.dir,
+        .sources = &.{ .env("missing.env"), .env("app.env") },
+    },
+        \\1 configuration problem:
+        \\  app.env:2: PORT: invalid (expected an integer 0..65535)
+    );
 }
 
 test "a later source overrides an earlier one of any kind" {
