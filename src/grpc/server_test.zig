@@ -77,7 +77,7 @@ fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.Ech
             fn started(cl: *grpc.Call) !bool {
                 try cl.impl.write_lock.lock(cl.io);
                 defer cl.impl.write_lock.unlock(cl.io);
-                return cl.impl.out != null;
+                return cl.impl.sink == .stream;
             }
         }.started);
         const late: []const u8 = if (call.addHeader("x-late", "yes")) |_| "added" else |err| @errorName(err);

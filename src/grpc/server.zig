@@ -165,20 +165,11 @@ pub const Call = struct {
         /// How the response messages are compressed
         /// (`RegisterOptions.response_compression`).
         response_compression: Compression = .identity,
-        /// The response body, started by the first message (so initial
-        /// metadata can be added until then), through `out_buf` (the
-        /// caller's: on the stack of the task that writes).
-        out: ?dusty.StreamingBodyWriter = null,
-        out_buf: []u8 = &.{},
-        /// Instead of streaming, the response body is collected here and
-        /// `finish` sets it as the body: for a response written all at once
-        /// with no task (the C ABI's detached calls).
-        buffer: ?*std.ArrayList(u8) = null,
-        /// Some of the response body was written (streamed or collected).
-        started: bool = false,
-        /// A transcoded server stream: its messages are the elements of
-        /// one JSON array.
-        json_array: bool = false,
+        /// Where the response body goes (`Sink`).
+        sink: Sink = .unset,
+        /// How the response messages reach the body: the protocol's
+        /// `deliveries` row, set with it by `begin`/`beginTranscoded`.
+        delivery: Delivery = .framed,
         /// The call's response stream: one writer at a time, across the
         /// stream's write and flush; also orders `addHeader` against the
         /// head the first write sends. An I/O lock
@@ -189,9 +180,11 @@ pub const Call = struct {
         /// content type.
         protocol: Protocol = .grpc,
         codec: Codec = .proto,
-        /// Connect unary: the request was read; the response waits here for
-        /// `finish`.
+        /// Connect unary: the request was read.
         unary_read: bool = false,
+        /// A `.kept` delivery's message, set as the body by `finish`. Plain
+        /// data, not part of the sink: `finish` reads it with a per-protocol
+        /// default ("" for Connect, "[]" for JSON).
         unary_response: ?[]const u8 = null,
         /// gRPC-Web text: the request body, base64-decoded.
         text_input: ?std.Io.Reader = null,
@@ -199,6 +192,44 @@ pub const Call = struct {
         /// query, read by `getMessage`), and the message.
         get: bool = false,
         get_message: ?[]const u8 = null,
+    };
+
+    /// Where the response body goes. Every change is a cell here: the
+    /// setters are `serve*` and the C ABI (before the first write), the
+    /// write transitions are `writeBytesWith`'s.
+    ///
+    ///   state    set (armed/collect/unset)  write                               addHeader    endBody
+    ///   unset    the new state              collect (new list), append          ok           body ""
+    ///   armed    the new state (a)          stream (open; error: stays), write  ok           body ""
+    ///   collect  the new state (a)          append                              ok           body = items
+    ///   stream   never (b)                  write + flush                       HeadersSent  end()
+    ///
+    /// unset: nothing was set up (a call refused or failed before it could
+    /// be, as `begin` leaves it; a C ABI whole answer cleared). (a) a call
+    /// is armed by its streaming task or collected by a whole answer, never
+    /// both, so these follow `unset` only. (b) the setters run before the
+    /// first write; a stream is never replaced.
+    const Sink = union(enum) {
+        unset,
+        /// A stream's buffer (the caller's: on the stack of the task that
+        /// writes). The stream opens with the first write, so initial
+        /// metadata can be added until then.
+        armed: []u8,
+        /// The body is collected here and `finish` sets it: a unary
+        /// response, or one written all at once with no task (the C ABI's
+        /// detached calls).
+        collect: *std.ArrayList(u8),
+        stream: dusty.StreamingBodyWriter,
+
+        /// Some of the body was written (every write is non-empty). A
+        /// stream that failed to open stays `armed`: not started.
+        fn started(s: *const Sink) bool {
+            return switch (s.*) {
+                .unset, .armed => false,
+                .collect => |b| b.items.len > 0,
+                .stream => true,
+            };
+        }
     };
 
     /// What `fail` returns: the status is on the call.
@@ -241,7 +272,7 @@ pub const Call = struct {
         // The writer starts the head under the same lock (`writeBytes`).
         try self.impl.write_lock.lock(self.io);
         defer self.impl.write_lock.unlock(self.io);
-        if (self.impl.out != null) return error.HeadersSent;
+        if (self.impl.sink == .stream) return error.HeadersSent;
         if (!metadata_mod.isSendableKey(name, .header) or !metadata_mod.isSendableValue(name, value)) return error.InvalidMetadata;
         try self.res.addHeader(try self.arena.dupe(u8, name), try self.arena.dupe(u8, value));
     }
@@ -448,7 +479,7 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
     // streaming queue or writer between (#99). The streaming kinds stream.
     var out_buf: [16 * 1024]u8 = undefined;
     var collected: std.ArrayList(u8) = .empty;
-    if (M.kind == .unary) call.impl.buffer = &collected else call.impl.out_buf = &out_buf;
+    call.impl.sink = if (M.kind == .unary) .{ .collect = &collected } else .{ .armed = &out_buf };
     // A call can outlive the server's request timeout: the client's own
     // deadline bounds it, and `max_call_duration`; reading the request
     // messages is bounded by `read_timeout`.
@@ -477,8 +508,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
 /// set none), or `error.Answered` when the call was refused and its
 /// response is set (a plain HTTP status, or `finish` with a gRPC status):
 /// the route has nothing more to do. A JSON codec is refused (415) unless
-/// `accept_json`. `call` is set up whole; give it `impl.out_buf` (or
-/// `impl.buffer`) before it writes.
+/// `accept_json`. `call` is set up whole; give it `impl.sink` (`.armed`
+/// or `.collect`) before it writes.
 pub fn begin(
     call: *Call,
     ctx: ?*anyopaque,
@@ -520,6 +551,7 @@ pub fn begin(
             .max_received_bytes = options.max_received_bytes,
             .read_timeout = options.read_timeout,
             .protocol = kind.protocol,
+            .delivery = deliveries.get(kind.protocol),
             .codec = kind.codec,
             .get = is_get,
         },
@@ -794,7 +826,7 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
             }
         },
         .http_json => {
-            if (call.impl.out != null or (call.impl.started and call.status == .ok)) {
+            if (call.impl.sink == .stream or (call.impl.sink.started() and call.status == .ok)) {
                 // A server stream's array has started, under a 200: an error
                 // now can only cut it short, which the client sees as a
                 // reset stream (HTTP/2) or a body without its last chunk
@@ -810,7 +842,7 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
                 endBody(call);
             } else {
                 // Nothing has gone out (an error ends a stream collected in
-                // `buffer` as any other call: its elements are dropped).
+                // a `.collect` sink as any other call: its elements are dropped).
                 // Trailing metadata as headers, as grpc-gateway sends it.
                 for (call.impl.trailers.items) |t| {
                     try call.res.header(try std.fmt.allocPrint(call.arena, "grpc-trailer-{s}", .{t.key}), t.value);
@@ -830,11 +862,11 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
 /// Ends the response body: the stream, or the collected body (an empty
 /// one when nothing was written).
 fn endBody(call: *Call) void {
-    if (call.impl.out) |*o| {
-        o.end() catch {};
-    } else if (call.impl.buffer) |b| {
-        call.res.body = b.items;
-    } else call.res.body = "";
+    switch (call.impl.sink) {
+        .stream => |*o| o.end() catch {},
+        .collect => |b| call.res.body = b.items,
+        .unset, .armed => call.res.body = "",
+    }
 }
 
 /// A request a `google.api.http` binding matched (transcode.zig): the
@@ -859,7 +891,7 @@ pub fn serveTranscoded(
         else => |e| return e,
     };
     var out_buf: [16 * 1024]u8 = undefined;
-    call.impl.out_buf = &out_buf;
+    call.impl.sink = .{ .armed = &out_buf };
     // The body is read under the server's request timeout, as on any
     // route; the call's own deadline starts once the request is in.
     defer boundTheRest(&call);
@@ -891,7 +923,8 @@ pub fn beginTranscoded(call: *Call, ctx: ?*anyopaque, req: *dusty.Request, res: 
             .read_timeout = options.read_timeout,
             .protocol = .http_json,
             .codec = .json,
-            .json_array = method_kind == .server_streaming,
+            // A server stream's messages are the elements of one JSON array.
+            .delivery = if (method_kind == .server_streaming) .array else deliveries.get(.http_json),
         },
     };
     res.status = .ok;
@@ -1264,7 +1297,7 @@ fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
     // the body, behind room kept for the frame's 5-byte prefix, which is
     // filled in once the length is known (nilo's `prefixed`): the body is
     // the encoded message itself, never copied.
-    if (call.impl.buffer) |b| if (b.items.len == 0 and call.impl.codec == .proto and
+    if (call.impl.sink == .collect and call.impl.sink.collect.items.len == 0 and call.impl.codec == .proto and
         call.impl.response_compression == .identity and
         (call.impl.protocol == .grpc or call.impl.protocol == .grpc_web))
     {
@@ -1273,10 +1306,9 @@ fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
         try message.encode(&encoded.writer, call.arena);
         var list = encoded.toArrayList();
         std.mem.writeInt(u32, list.items[1..5], @intCast(list.items.len - frame.header_size), .big);
-        b.* = list;
-        call.impl.started = true;
+        call.impl.sink.collect.* = list;
         return;
-    };
+    }
     return writePayload(call, try encodeMessage(Resp, call, message));
 }
 
@@ -1285,26 +1317,22 @@ fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
 /// transcoded call), or written as the next element of a JSON array (a
 /// server stream transcoded). `payload` must live as long as the call.
 pub fn writePayload(call: *Call, payload: []const u8) !void {
-    switch (call.impl.protocol) {
-        .connect => call.impl.unary_response = payload,
-        .http_json => if (call.impl.json_array) {
-            try writeBytes(call, try std.mem.concat(call.arena, u8, &.{ if (call.impl.started) "," else "[", payload }));
-        } else {
-            call.impl.unary_response = payload;
-        },
-        else => {
+    switch (call.impl.delivery) {
+        .kept => call.impl.unary_response = payload,
+        .array => try writeBytes(call, try std.mem.concat(call.arena, u8, &.{ if (call.impl.sink.started()) "," else "[", payload })),
+        .framed => {
             // Collected and not compressed: the frame goes straight into
             // the body, one copy.
-            if (call.impl.buffer) |b| if (call.impl.response_compression == .identity and call.impl.protocol != .grpc_web_text) {
+            if (call.impl.sink == .collect and call.impl.response_compression == .identity and call.impl.protocol != .grpc_web_text) {
+                const b = call.impl.sink.collect;
                 var head: [frame.header_size]u8 = undefined;
                 head[0] = 0;
                 std.mem.writeInt(u32, head[1..5], @intCast(payload.len), .big);
                 try b.ensureUnusedCapacity(call.arena, head.len + payload.len);
                 b.appendSliceAssumeCapacity(&head);
                 b.appendSliceAssumeCapacity(payload);
-                call.impl.started = true;
                 return;
-            };
+            }
             try writeBytes(call, try frame.encodeWithCompression(call.arena, payload, call.impl.response_compression));
         },
     }
@@ -1323,6 +1351,23 @@ fn statusText(code: status_mod.Code) []const u8 {
     return texts[@backingInt(code)];
 }
 
+/// How a protocol's response messages reach the body: each framed (and
+/// written), the last one kept for `finish` to send whole, or each an
+/// element of one JSON array (a transcoded server stream, which
+/// `beginTranscoded` picks per method).
+const Delivery = enum { framed, kept, array };
+
+/// Each protocol's `Delivery`, stored on the call by `begin`. Add a
+/// protocol by adding its row (the compiler checks every one is here).
+const deliveries: std.EnumArray(Protocol, Delivery) = .init(.{
+    .grpc = .framed,
+    .grpc_web = .framed,
+    .grpc_web_text = .framed,
+    .connect = .kept,
+    .connect_stream = .framed,
+    .http_json = .kept,
+});
+
 /// One frame with these flags (gRPC-Web's trailers, Connect's end of
 /// stream).
 fn writeFrame(call: *Call, flags: u8, payload: []const u8) !void {
@@ -1336,21 +1381,21 @@ fn writeFrame(call: *Call, flags: u8, payload: []const u8) !void {
 /// One response message of a stream of any length, in the call's codec:
 /// `writePayload`, but framed (compressed, base64 for gRPC-Web text) in
 /// `scratch` and freed once written, so that a long stream does not grow
-/// the call's arena. Collected calls (`impl.buffer`) and the protocols
-/// that keep the message for `finish` go through `writePayload`.
+/// the call's arena. Collected calls (a `.collect` sink) and the
+/// protocols that keep the message for `finish` go through `writePayload`.
 pub fn writeStreamed(call: *Call, payload: []const u8) !void {
-    if (call.impl.buffer != null) return writePayload(call, payload);
-    switch (call.impl.protocol) {
-        .grpc, .grpc_web, .grpc_web_text, .connect_stream => {
+    if (call.impl.sink == .collect) return writePayload(call, payload);
+    switch (call.impl.delivery) {
+        .framed => {
             const framed = try frame.encodeWithCompression(scratch, payload, call.impl.response_compression);
             defer scratch.free(framed);
             return writeBytesWith(call, framed, scratch);
         },
-        .http_json => if (call.impl.json_array) {
-            try writeBytesWith(call, if (call.impl.started) "," else "[", scratch);
+        .array => {
+            try writeBytesWith(call, if (call.impl.sink.started()) "," else "[", scratch);
             return writeBytesWith(call, payload, scratch);
-        } else return writePayload(call, payload),
-        .connect => return writePayload(call, payload),
+        },
+        .kept => return writePayload(call, payload),
     }
 }
 
@@ -1371,19 +1416,30 @@ fn writeBytesWith(call: *Call, bytes: []const u8, allocator: std.mem.Allocator) 
     const data = if (encoded) |enc| std.base64.standard.Encoder.encode(enc, bytes) else bytes;
     try call.impl.write_lock.lock(call.io);
     defer call.impl.write_lock.unlock(call.io);
-    call.impl.started = true;
-    if (call.impl.buffer == null and call.impl.out == null and call.impl.out_buf.len == 0) {
+    // On the tag, so the writer is not copied out of the sink.
+    const sink = &call.impl.sink;
+    sw: switch (std.meta.activeTag(sink.*)) {
         // No stream was set up (a call refused or failed before it could
-        // be, as `begin` does): the body is collected and sent whole.
-        const b = try call.arena.create(std.ArrayList(u8));
-        b.* = .empty;
-        call.impl.buffer = b;
+        // be, as `begin` leaves it): the body is collected and sent whole.
+        .unset => {
+            const b = try call.arena.create(std.ArrayList(u8));
+            b.* = .empty;
+            sink.* = .{ .collect = b };
+            continue :sw .collect;
+        },
+        .armed => {
+            // Opened before the store: a failed open leaves the sink armed.
+            const out = try call.res.stream(sink.armed);
+            sink.* = .{ .stream = out };
+            continue :sw .stream;
+        },
+        .collect => return sink.collect.appendSlice(call.arena, data),
+        .stream => {
+            const out = &sink.stream;
+            out.interface.writeAll(data) catch return out.err orelse error.WriteFailed;
+            out.interface.flush() catch return out.err orelse error.WriteFailed;
+        },
     }
-    if (call.impl.buffer) |b| return b.appendSlice(call.arena, data);
-    if (call.impl.out == null) call.impl.out = try call.res.stream(call.impl.out_buf);
-    const out = &call.impl.out.?;
-    out.interface.writeAll(data) catch return out.err orelse error.WriteFailed;
-    out.interface.flush() catch return out.err orelse error.WriteFailed;
 }
 
 fn runUnary(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
@@ -1578,4 +1634,67 @@ test "percentEncode leaves printable ASCII and escapes the rest" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualStrings("not found: %25x%0A%C3%A9", try percentEncode(arena.allocator(), "not found: %x\né"));
+}
+
+test "grpc: writePayload and writeStreamed per protocol and sink" {
+    const Row = struct {
+        name: []const u8,
+        protocol: Protocol,
+        array: bool = false, // a transcoded server stream
+        unset: bool = false, // no sink set up (a refused call)
+        streamed: bool = false, // writeStreamed instead of writePayload
+        gzip: bool = false, // body: the reference encoder's frame of each message
+        messages: []const []const u8 = &.{"hi"},
+        body: []const u8 = "",
+        kept: ?[]const u8 = null,
+    };
+    const hi = "\x00\x00\x00\x00\x02hi";
+    for ([_]Row{
+        .{ .name = "grpc unary", .protocol = .grpc, .body = hi },
+        .{ .name = "grpc_web unary", .protocol = .grpc_web, .body = hi },
+        .{ .name = "connect_stream unary", .protocol = .connect_stream, .body = hi },
+        .{ .name = "grpc_web_text: base64, no fast path", .protocol = .grpc_web_text, .body = "AAAAAAJoaQ==" },
+        .{ .name = "grpc gzip", .protocol = .grpc, .gzip = true },
+        .{ .name = "connect keeps the last", .protocol = .connect, .messages = &.{ "a", "hi" }, .kept = "hi" },
+        .{ .name = "http_json unary keeps the last", .protocol = .http_json, .messages = &.{ "a", "hi" }, .kept = "hi" },
+        .{ .name = "http_json array", .protocol = .http_json, .array = true, .messages = &.{ "{\"a\":1}", "{\"a\":2}" }, .body = "[{\"a\":1},{\"a\":2}" },
+        .{ .name = "grpc server stream, collected", .protocol = .grpc, .streamed = true, .messages = &.{ "hi", "hi" }, .body = hi ++ hi },
+        .{ .name = "grpc_web on unset collects", .protocol = .grpc_web, .unset = true, .body = hi },
+        .{ .name = "grpc_web streamed on unset collects", .protocol = .grpc_web, .unset = true, .streamed = true, .body = hi },
+        .{ .name = "array on unset", .protocol = .http_json, .array = true, .unset = true, .messages = &.{ "1", "2" }, .body = "[1,2" },
+        .{ .name = "array streamed", .protocol = .http_json, .array = true, .streamed = true, .messages = &.{ "1", "2" }, .body = "[1,2" },
+    }) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        if (row.gzip and !features.compression) continue;
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var list: std.ArrayList(u8) = .empty;
+        var call: Call = .{ .req = undefined, .res = undefined, .arena = arena, .io = std.testing.io, .ctx = null, .impl = .{
+            .max_message_size = 0,
+            .protocol = row.protocol,
+            .delivery = if (row.array) .array else deliveries.get(row.protocol),
+            .response_compression = if (row.gzip) .gzip else .identity,
+            .sink = if (row.unset) .unset else .{ .collect = &list },
+        } };
+        var expected: std.ArrayList(u8) = .empty;
+        try expected.appendSlice(arena, row.body);
+        for (row.messages) |m| {
+            try if (row.streamed) writeStreamed(&call, m) else writePayload(&call, m);
+            if (row.gzip) try expected.appendSlice(arena, try frame.encodeWithCompression(arena, m, .gzip));
+        }
+        const body: []const u8 = switch (call.impl.sink) {
+            .collect => |b| b.items,
+            .unset, .armed, .stream => "",
+        };
+        try std.testing.expectEqualStrings(expected.items, body);
+        try std.testing.expectEqual(row.kept, call.impl.unary_response);
+        try std.testing.expectEqual(body.len > 0, call.impl.sink.started());
+    }
+    // Sink.started's cells without a write (the stream cell: the end-to-end tests).
+    var empty: std.ArrayList(u8) = .empty;
+    var x = "x".*;
+    var one: std.ArrayList(u8) = .fromOwnedSlice(&x);
+    for ([_]struct { Call.Sink, bool }{ .{ .unset, false }, .{ .{ .armed = &.{} }, false }, .{ .{ .collect = &empty }, false }, .{ .{ .collect = &one }, true } }) |c|
+        try std.testing.expectEqual(c[1], c[0].started());
 }
