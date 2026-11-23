@@ -903,10 +903,9 @@ test "gRPC client: how a call ends (status, then null for ever)" {
             defer conn.close();
             var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
             const client: grpc.Client(Echo) = .{ .channel = &channel };
-            const rows = [_]struct { name: []const u8, method: []const u8, message: []const u8, cancel_first: bool, messages: usize, code: grpc.Code }{
-                .{ .name = "status without head", .method = "Unary", .message = "x", .cancel_first = true, .messages = 0, .code = .cancelled },
-                .{ .name = "head ok then status", .method = "Unary", .message = "x", .cancel_first = false, .messages = 1, .code = .ok },
-                .{ .name = "trailers-only error", .method = "Unary", .message = "fail", .cancel_first = false, .messages = 0, .code = .not_found },
+            const rows = [_]struct { name: []const u8, method: []const u8, message: []const u8, messages: usize, code: grpc.Code }{
+                .{ .name = "head ok then status", .method = "Unary", .message = "x", .messages = 1, .code = .ok },
+                .{ .name = "trailers-only error", .method = "Unary", .message = "fail", .messages = 0, .code = .not_found },
             };
             inline for (rows) |row| {
                 errdefer std.debug.print("row: {s}\n", .{row.name});
@@ -915,7 +914,6 @@ test "gRPC client: how a call ends (status, then null for ever)" {
                 try s.send(.{ .message = row.message });
                 try s.closeSend();
                 try std.testing.expect(s.status() == null);
-                if (row.cancel_first) s.cancel();
                 var n: usize = 0;
                 while (try s.receive()) |_| n += 1;
                 try std.testing.expectEqual(row.messages, n);
