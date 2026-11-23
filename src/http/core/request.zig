@@ -2679,6 +2679,8 @@ test "Request._body_state: every (state, event) cell" {
         outcomes: []const Outcome,
         end: Tag,
         end_bytes: ?[]const u8 = null,
+        /// Bytes the reader from the last `.reader` event yields, when checked.
+        reads: ?usize = null,
     };
     const rows = [_]Row{
         .{ .name = "unread/reader", .start = .unread, .events = &.{.reader}, .outcomes = &.{.ok}, .end = .reader_taken },
@@ -2686,7 +2688,7 @@ test "Request._body_state: every (state, event) cell" {
         .{ .name = "reader_taken/body", .start = .reader_taken, .events = &.{.body}, .outcomes = &.{.taken}, .end = .reader_taken },
         .{ .name = "unread/reader twice", .start = .unread, .events = &.{ .reader, .reader }, .outcomes = &.{ .ok, .taken }, .end = .reader_taken },
         .{ .name = "cached/reader, repeatable", .start = .{ .cached = "xy" }, .events = &.{ .reader, .reader }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "xy" },
-        .{ .name = "cached null/reader", .start = .{ .cached = null }, .events = &.{.reader}, .outcomes = &.{.ok}, .end = .cached },
+        .{ .name = "cached null/reader", .start = .{ .cached = null }, .events = &.{.reader}, .outcomes = &.{.ok}, .end = .cached, .reads = 0 },
         .{ .name = "cached/body twice", .start = .{ .cached = "xy" }, .events = &.{ .body, .body }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "xy" },
         .{ .name = "unread/body", .start = .unread, .events = &.{ .body, .body }, .outcomes = &.{ .ok, .ok }, .end = .cached, .end_bytes = "abc" },
         .{ .name = "unread/body, empty body is cached null", .start = .unread, .bytes = "", .events = &.{.body}, .outcomes = &.{.ok}, .end = .cached },
@@ -2702,7 +2704,14 @@ test "Request._body_state: every (state, event) cell" {
         req._body_state = row.start;
         for (row.events, row.outcomes) |event, outcome| {
             const got: Outcome = switch (event) {
-                .reader => if (req.reader(&.{})) |_| .ok else |err| switch (err) {
+                .reader => if (req.reader(&.{})) |rd| ok: {
+                    var r = rd;
+                    if (row.reads) |want| {
+                        var buf: [8]u8 = undefined;
+                        try std.testing.expectEqual(want, try r.interface.readSliceShort(&buf));
+                    }
+                    break :ok .ok;
+                } else |err| switch (err) {
                     error.BodyReaderTaken => .taken,
                     else => return err,
                 },
@@ -2797,4 +2806,25 @@ test "Request.formData: a body over the limit propagates and caches nothing" {
     try std.testing.expectError(error.BodyTooBig, req.formData());
     try std.testing.expect(req._form == .unparsed);
     try std.testing.expect(req._body_state == .reader_taken);
+}
+
+test "Request.formData: a shed body propagates, caches nothing and leaves the form unparsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rows = [_]admission.Row{.{}};
+    var state: admission.State = .{ .rows = &rows, .buffer_budget = 10 };
+    // Another holder has most of it, so this body is refused.
+    var other: admission.Held = .{};
+    try std.testing.expect(other.growTo(&state, std.testing.io, 8));
+    defer other.release();
+    var source: BindBody = .{};
+    var req = source.request(arena.allocator(), "a=1&b=2");
+    req.io = std.testing.io;
+    req.content_type = .form;
+    req.content_length = 7;
+    req._config._admission = &state;
+    try std.testing.expectError(error.ServiceUnavailable, req.formData());
+    try std.testing.expect(req._form == .unparsed);
+    try std.testing.expect(req._body_state == .reader_taken);
+    try std.testing.expect(req._shed);
 }
