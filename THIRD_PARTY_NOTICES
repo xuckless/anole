@@ -243,6 +243,12 @@ tests only, not linked, not vendored)
 B. Code adapted into this repository
 ------------------------------------
 
+tests/interop/sim-run.sh (the interop runner's network-simulator entrypoint,
+with its signal handlers changed to wait for the capture processes)
+  Licence:  Apache-2.0. Copyright 2019 Jana Iyengar, Marten Seemann
+  Source:   https://github.com/quic-interop/quic-network-simulator, sim/run.sh
+  Linked:   never (CI only, mounted into the simulator container)
+
 src/http/core/ (the HTTP core: HTTP/1.1 server, router, middleware,
 client, WebSocket, the HTTP/2 server engine, static files, assets)
   Adapted from dusty, through Anole's fork, whose changes (the HTTP/2
