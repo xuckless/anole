@@ -987,7 +987,8 @@ pub const Conn = struct {
 
     /// Gives the writer back, for the next call or transaction; a second
     /// call does nothing (it logs) while the ctx's arena that holds the
-    /// checkout record lives. Don't call anything on it after.
+    /// checkout record lives. Don't call anything on it after. Call it
+    /// before that arena is reset or freed: the checkout record lives there.
     pub fn release(self: *const Conn) void {
         if (!self.checkout.once()) {
             log.err("sqlite \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.db.name});

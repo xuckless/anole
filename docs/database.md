@@ -677,7 +677,9 @@ has, whatever the order of the calls: `anole_db_*` metrics with
 zig-sqlite (user functions, blobs, backups): `conn.run(func, args)` runs
 `func(driver_db, args...)` on the writer thread; `conn.release()` gives it
 back once (a second call does nothing; don't call anything on it after
-`release()`). `anole.sqlite.c` is the C API.
+`release()`). Release it before the arena of the request or `Ctx` given to
+`acquire` is reset or freed: the checkout record lives there.
+`anole.sqlite.c` is the C API.
 
 ## MongoDB
 
