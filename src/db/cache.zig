@@ -316,14 +316,14 @@ const Flight = struct {
     ctx: db.Ctx,
     /// Callers waiting, or copying the result.
     waiters: u32 = 0,
-    state: enum { queued, running, done } = .queued,
-    /// In `local.flights`, where identical calls join it.
+    /// Changed only by `leave` and `Typed.task`. `running` holds the task
+    /// to cancel (null when the Io cannot cancel one task alone);
+    /// `abandoned`: no caller waits and nothing keeps the result, so the
+    /// task does not start the statement, or is canceled in it.
+    state: union(enum) { queued, running: ?placement.Task, done, abandoned } = .queued,
+    /// Membership of `local.flights`, where identical calls join it; an
+    /// invalidation clears it in any state, so it is not derived from `state`.
     listed: bool = true,
-    /// No caller waits any more and nothing keeps the result: the task
-    /// does not start the statement, or is canceled in it.
-    abandoned: bool = false,
-    /// The task, while it runs the statement.
-    task: ?placement.Task = null,
     done: std.Io.Event = .unset,
     /// Kept this long once done; null: not kept.
     ttl: ?std.Io.Duration,
@@ -348,11 +348,18 @@ const Flight = struct {
         if (f.waiters > 0) return;
         switch (f.state) {
             .done => f.destroy(f),
-            .queued, .running => if (f.ttl == null) {
+            // A ttl keeps it going for the cache.
+            .queued => if (f.ttl == null) {
                 f.unlist();
-                f.abandoned = true;
-                if (f.task) |t| placement.cancelTask(t);
+                f.state = .abandoned;
             },
+            .running => |task| if (f.ttl == null) {
+                f.unlist();
+                f.state = .abandoned;
+                if (task) |t| placement.cancelTask(t);
+            },
+            // Set by the last leave() alone, and an unlisted flight is never joined.
+            .abandoned => unreachable,
         }
     }
 };
@@ -369,11 +376,14 @@ fn Typed(comptime Out: type, comptime Args: type, comptime Runner: type) type {
 
         fn task(self: *Self) void {
             const f = &self.base;
-            if (!f.abandoned) {
-                f.task = placement.currentTask(f.io);
-                f.state = .running;
-                self.result = self.runner.run(&f.ctx, self.sql, self.args);
-                f.task = null;
+            switch (f.state) {
+                .queued => {
+                    f.state = .{ .running = placement.currentTask(f.io) };
+                    self.result = self.runner.run(&f.ctx, self.sql, self.args);
+                },
+                .abandoned => {},
+                // This task alone leaves `queued`, once.
+                .running, .done => unreachable,
             }
             f.state = .done;
             f.unlist();
@@ -768,6 +778,21 @@ test "db cache: kept within its ttl; invalidation by tag, by query, of all and d
     try testing.expectEqual(@as(u32, 1), ok.load(.monotonic));
     try once(&cache, io, h.fake(1), opts, 4);
     try testing.expectEqual(@as(u32, 6), h.calls.load(.monotonic));
+
+    // Its last caller canceled while it runs: a ttl keeps it going, and its result is kept.
+    var gate2: std.Io.Event = .unset;
+    defer gate2.set(io);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate2), opts, 5, &ok, &errors });
+    try h.waitCalls(io, 7);
+    group.cancel(io);
+    gate2.set(io);
+    // Joins the flight or hits its result; done either way, so the next one hits.
+    try once(&cache, io, h.fake(1), opts, 5);
+    const hits = cache.stats().hits;
+    try once(&cache, io, h.fake(1), opts, 5);
+    try testing.expectEqual(hits + 1, cache.stats().hits);
+    try testing.expectEqual(@as(u32, 7), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), h.canceled.load(.monotonic));
 }
 
 /// One call on executor 0 with a context of its own: how many rows came
