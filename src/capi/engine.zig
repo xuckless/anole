@@ -1520,8 +1520,9 @@ pub const Engine = struct {
     watch_state: watch.State = .{},
     s3_state: s3.State = .{},
     smtp_state: smtp.State = .{},
-    /// WebSocket topics, shared by every executor.
-    rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
+    /// WebSocket topics, shared by every executor. Built in `mainThread` on
+    /// the runtime's io and freed beside `app.deinit()`; `phase` says when it is live.
+    rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) undefined else {},
     /// gRPC services, methods, descriptors and health.
     grpc: grpc.EngineState = .{},
 
@@ -1547,10 +1548,6 @@ pub const Engine = struct {
         e.inline_body_max = cfg.limits.inline_body_max;
         e.stream_high_water = cfg.limits.stream_high_water;
         e.record_budget = @max(16 * @as(usize, cfg.limits.ws_high_water), 2 * @as(usize, cfg.limits.ws_max_message));
-        // A topic's subscriber gets as much queued as `anole_ws_send` lets
-        // wait for a socket; past it, publishes skip it, and one stuck that
-        // way is closed.
-        if (comptime features.websocket) e.rooms.options.max_queued_bytes = cfg.limits.ws_high_water;
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
         e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
@@ -1671,6 +1668,10 @@ pub const Engine = struct {
         var app = anole.App.init(gpa, init_opts) catch |err| return e.failStart(err);
         e.app = &app;
         e.io = app.io();
+        // A topic's subscriber gets as much queued as `anole_ws_send` lets
+        // wait for a socket; past it, publishes skip it, and one stuck that
+        // way is closed.
+        if (comptime features.websocket) e.rooms = .init(gpa, e.io, .{ .max_queued_bytes = e.config.limits.ws_high_water });
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
         // Executor e feeds consumer e mod M: one past the executors would
@@ -2127,6 +2128,7 @@ pub const Engine = struct {
         e.app = null;
         e.closeIo();
         app.deinit();
+        if (comptime features.websocket) e.rooms.deinit();
         e.failStart(err);
     }
 

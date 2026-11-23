@@ -3350,10 +3350,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///     const live = try app.sseTopics(.{});
         ///     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
         pub fn sseTopics(self: *Self, topic_options: sse_mod.Topics.Options) !*sse_mod.Topics {
-            const topics = try sse_mod.Topics.create(self.gpa, topic_options);
+            const topics = try sse_mod.Topics.create(self.gpa, self.io(), topic_options);
             errdefer topics.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(sse_mod.Topics, topics));
-            topics._registerDrain(self.rt.io(), &self.server.drain_hooks);
+            topics._registerDrain(self.io(), &self.server.drain_hooks);
             if (self.extras.connectors_started) try topics.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return topics;
         }

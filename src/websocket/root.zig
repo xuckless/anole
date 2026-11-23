@@ -76,6 +76,7 @@ const codec = @import("anole_websocket_codec").server;
 /// `receive` hands over messages still compressed; `Socket` inflates.
 const H2Socket = @import("h2_socket.zig").H2Socket;
 const origin = @import("../origin.zig");
+const fanout = @import("../fanout.zig");
 /// Which pages may open a socket (`UpgradeOptions.allowed_origins`).
 pub const Origins = origin.Origins;
 
@@ -264,7 +265,7 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
 };
 
 /// The HTTP version a `Socket` runs over.
-pub const HttpVersion = enum { http1, http2, http3 };
+pub const HttpVersion = fanout.HttpVersion;
 
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
@@ -531,7 +532,7 @@ pub const Socket = struct {
         Rooms.leaveEvery(self);
         if (self._gauged) {
             self._gauged = false;
-            dusty.gauges.add(self.io, gaugeOf(self._http_version), -1);
+            dusty.gauges.add(self.io, ws_gauge.get(self._http_version), -1);
         }
         if (self._admission) |a| {
             self._admission = null;
@@ -832,7 +833,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         socket._close_watch = watch;
     }
     socket._gauged = true;
-    dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
+    dusty.gauges.add(req.io, ws_gauge.get(socket._http_version), 1);
     if (req._ws_admission == .held) {
         socket._admission = adm;
         req._ws_admission = .moved;
@@ -855,13 +856,7 @@ pub noinline fn overloaded(req: *dusty.Request, res: *dusty.Response, a: *dusty.
     return error.ServiceUnavailable;
 }
 
-fn gaugeOf(v: HttpVersion) dusty.gauges.Kind {
-    return switch (v) {
-        .http1 => .ws_h1,
-        .http2 => .ws_h2,
-        .http3 => .ws_h3,
-    };
-}
+const ws_gauge: std.EnumArray(HttpVersion, dusty.gauges.Kind) = .init(.{ .http1 = .ws_h1, .http2 = .ws_h2, .http3 = .ws_h3 });
 
 /// Deinitializes `socket` and frees what `openSocket` took from `owner`.
 fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
@@ -1526,11 +1521,8 @@ pub fn _readBlocksHeld() usize {
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
     options: Options = .{},
-    /// The runtime's `std.Io`, taken from the first socket to join, so
-    /// `init` needs none (the rooms can be made before the server).
-    io: std.Io = undefined,
-    io_set: std.atomic.Value(bool) = .init(false),
-    io_lock: std.atomic.Mutex = .unlocked,
+    /// The runtime's `std.Io` (`app.io()`) the sockets run on; set at `init`.
+    io: std.Io,
     /// Over `rooms` and every member's queue and flags; never held across
     /// I/O.
     mutex: std.Io.Mutex = .init,
@@ -1581,27 +1573,18 @@ pub const Rooms = struct {
         type: MessageType,
         len: usize,
 
+        const shared = fanout.Shared(Payload);
+        pub const bytes = shared.bytes;
+        pub const retain = shared.retain;
+        pub const release = shared.release;
+
         pub fn create(allocator: std.mem.Allocator, msg_type: MessageType, message: []const u8) !*Payload {
-            const block = try allocator.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + message.len);
-            const p: *Payload = @ptrCast(block.ptr);
-            p.* = .{ .refs = .init(1), .type = msg_type, .len = message.len };
-            @memcpy(block[@sizeOf(Payload)..], message);
-            return p;
+            return shared.alloc(allocator, .{ .refs = .init(1), .type = msg_type, .len = message.len }, message);
         }
 
-        pub fn bytes(p: *const Payload) []const u8 {
-            const base: [*]const u8 = @ptrCast(p);
-            return base[@sizeOf(Payload)..][0..p.len];
-        }
-
-        fn cost(p: *const Payload) usize {
-            return p.len + 64;
-        }
-
-        pub fn release(p: *Payload, allocator: std.mem.Allocator) void {
-            if (p.refs.fetchSub(1, .acq_rel) != 1) return;
-            const base: [*]align(@alignOf(Payload)) u8 = @ptrCast(p);
-            allocator.free(base[0 .. @sizeOf(Payload) + p.len]);
+        /// What it counts against a member's queue.
+        pub fn cost(p: *const Payload) usize {
+            return p.len + fanout.item_overhead;
         }
     };
 
@@ -1620,10 +1603,7 @@ pub const Rooms = struct {
         /// Closed for not keeping up (`Options.on_full = .close`): its
         /// sender ends the connection as it stops.
         overflowed: bool = false,
-        /// Messages waiting, from `head` on.
-        queue: std.ArrayList(*Payload) = .empty,
-        head: usize = 0,
-        queued_bytes: usize = 0,
+        queue: fanout.Queue(Payload) = .{},
         /// A sender task is started or running; it alone takes from the
         /// queue.
         running: bool = false,
@@ -1638,73 +1618,23 @@ pub const Rooms = struct {
         left: bool = false,
         sender: std.Io.Group = .init,
 
-        fn pop(m: *Member) ?*Payload {
-            if (m.head == m.queue.items.len) return null;
-            const p = m.queue.items[m.head];
-            m.head += 1;
-            m.queued_bytes -= p.cost();
-            if (m.head == m.queue.items.len) {
-                m.queue.clearRetainingCapacity();
-                m.head = 0;
-            } else if (m.head >= 64 and m.head * 2 >= m.queue.items.len) {
-                const rest = m.queue.items[m.head..];
-                std.mem.copyForwards(*Payload, m.queue.items[0..rest.len], rest);
-                m.queue.items.len = rest.len;
-                m.head = 0;
-            }
-            return p;
-        }
-
-        fn dropQueue(m: *Member, allocator: std.mem.Allocator) void {
-            for (m.queue.items[m.head..]) |p| p.release(allocator);
-            m.queue.clearRetainingCapacity();
-            m.head = 0;
-            m.queued_bytes = 0;
-        }
-
         /// Gets nothing more, and the send under way is canceled. Under
         /// the mutex.
         fn close(m: *Member, allocator: std.mem.Allocator) void {
             m.broken = true;
             m.overflowed = true;
-            m.dropQueue(allocator);
+            m.queue.drop(allocator);
             if (m.running) if (m.task) |t| placement.cancelTask(t);
         }
     };
 
-    /// The most queued messages a member's sender writes before one flush.
-    const send_round = 64;
-
-    /// Members a broadcast notes on the stack for starting their senders;
-    /// the 65th one needing a start borrows from the allocator (a room whose
-    /// members are running, the usual case, never does).
-    const stack_snapshot = 64;
-
     /// No rooms yet. `allocator` holds the room names, members and queued
     /// messages; it must be thread-safe when sockets on several executors
     /// join.
-    /// `Rooms.init(gpa, .{})` takes the defaults.
-    pub fn init(allocator: std.mem.Allocator, options: Options) Rooms {
-        return .{ .allocator = allocator, .options = options };
-    }
-
-    /// The `std.Io` to lock with: `io` (a joining or leaving socket's)
-    /// unless an earlier one was taken.
-    fn bind(self: *Rooms, io: std.Io) std.Io {
-        if (!self.io_set.load(.acquire)) {
-            while (!self.io_lock.tryLock()) std.atomic.spinLoopHint();
-            defer self.io_lock.unlock();
-            if (!self.io_set.load(.monotonic)) {
-                self.io = io;
-                self.io_set.store(true, .release);
-            }
-        }
-        return self.io;
-    }
-
-    /// Null until a socket has joined: until then every room is empty.
-    fn bound(self: *Rooms) ?std.Io {
-        return if (self.io_set.load(.acquire)) self.io else null;
+    /// `io` is the runtime's (`app.io()`, never `init.io`): the sockets lock
+    /// with it. `Rooms.init(gpa, app.io(), .{})` takes the defaults.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) Rooms {
+        return .{ .allocator = allocator, .io = io, .options = options };
     }
 
     /// Frees every room. Call it once no broadcast is under way; a socket
@@ -1742,13 +1672,13 @@ pub const Rooms = struct {
         while (!registry_lock.tryLock()) std.atomic.spinLoopHint();
         defer registry_lock.unlock();
         for (registry.items) |r| {
-            const io = r.bound() orelse continue;
+            const io = r.io;
             if (!r.mutex.tryLock()) continue;
             defer r.mutex.unlock(io);
             var it = r.rooms.iterator();
             while (it.next()) |entry| {
                 var queued: u64 = 0;
-                for (entry.value_ptr.items) |m| queued += m.queued_bytes;
+                for (entry.value_ptr.items) |m| queued += m.queue.queued_bytes;
                 if (!first.*) try w.writeByte(',');
                 first.* = false;
                 try w.print("{{\"name\":{f},\"members\":{d},\"queued_bytes\":{d},\"closed_slow\":{d}}}", .{
@@ -1804,7 +1734,7 @@ pub const Rooms = struct {
 
     /// Takes `socket` out of every room of these rooms.
     fn leaveAllOf(self: *Rooms, socket: *Socket) void {
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         // The socket's memberships here, out of its list into `mine`.
         var mine: ?*Member = null;
@@ -1845,7 +1775,7 @@ pub const Rooms = struct {
         }
         m.room = "";
         m.left = true;
-        m.dropQueue(self.allocator);
+        m.queue.drop(self.allocator);
     }
 
     /// Waits for the senders of `members` (detached, chained through
@@ -1855,8 +1785,7 @@ pub const Rooms = struct {
     /// canceled meanwhile.
     fn awaitSenders(self: *Rooms, io: std.Io, members: ?*Member) bool {
         var canceled = false;
-        const grace: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.options.leave_grace_ms), .clock = .awake } };
-        const deadline = grace.toDeadline(io);
+        const deadline = placement.graceDeadline(io, .fromMilliseconds(self.options.leave_grace_ms));
         var it = members;
         wait: while (it) |m| : (it = m.next_of_socket) {
             while (m.running) {
@@ -1889,7 +1818,6 @@ pub const Rooms = struct {
     }
 
     fn freeMember(self: *Rooms, m: *Member) void {
-        m.dropQueue(self.allocator);
         m.queue.deinit(self.allocator);
         self.allocator.destroy(m);
     }
@@ -1902,7 +1830,7 @@ pub const Rooms = struct {
         var used = false;
         defer if (!used) self.allocator.destroy(member);
         member.* = .{ .socket = socket, .rooms = self };
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (!self.registered) {
@@ -1939,7 +1867,7 @@ pub const Rooms = struct {
     /// dropped; a send under way is given `Options.leave_grace_ms` to finish
     /// and then canceled, so a socket is never sent to once `leave` returns.
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
-        const io = self.bind(socket.io);
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         // The socket's own memberships, not the room's members: as many as
         // the rooms it is in.
@@ -1974,9 +1902,9 @@ pub const Rooms = struct {
     /// `Payload.create`, one reference of the caller's, which it keeps):
     /// each queue takes a reference of its own. Internal.
     pub fn broadcastPayload(self: *Rooms, room: []const u8, payload: *Payload, except: ?*Socket) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
 
-        var stack: [stack_snapshot]*Member = undefined;
+        var stack: [fanout.stack_snapshot]*Member = undefined;
         var buf: []*Member = &stack;
         var heap: []*Member = &.{};
         defer self.allocator.free(heap);
@@ -1996,16 +1924,15 @@ pub const Rooms = struct {
             var n: usize = 0;
             for (members) |m| {
                 if (m.socket == except or m.broken or m.left) continue;
-                if (m.queued_bytes > 0 and m.queued_bytes + payload.cost() > self.options.max_queued_bytes) {
+                if (!m.queue.admits(payload, self.options.max_queued_bytes)) {
                     if (self.options.on_full == .close) if (m.sending_since) |since| {
                         const stuck = since.untilNow(io).raw.toMilliseconds();
                         if (stuck >= self.options.close_after_ms) m.close(self.allocator);
                     };
                     continue;
                 }
-                m.queue.append(self.allocator, payload) catch continue;
-                _ = payload.refs.fetchAdd(1, .monotonic);
-                m.queued_bytes += payload.cost();
+                m.queue.push(self.allocator, payload) catch continue;
+                payload.retain();
                 reached += 1;
                 if (m.running) continue;
                 m.running = true;
@@ -2050,12 +1977,8 @@ pub const Rooms = struct {
             // Everything queued, up to a round's worth, goes out in one
             // flush: the member's socket gets one write for a run of
             // messages, not one each.
-            var round: [send_round]*Payload = undefined;
-            var n: usize = 0;
-            while (n < round.len) {
-                round[n] = m.pop() orelse break;
-                n += 1;
-            }
+            var round: [fanout.send_round]*Payload = undefined;
+            const n = m.queue.popRound(&round);
             if (n == 0) break;
             m.sending_since = .now(io, .awake);
             self.mutex.unlock(io);
@@ -2078,7 +2001,7 @@ pub const Rooms = struct {
             m.sending_since = null;
             if (!sent) {
                 m.broken = true;
-                m.dropQueue(self.allocator);
+                m.queue.drop(self.allocator);
             }
         }
         // Closed for not keeping up while still in its room: its
@@ -2106,7 +2029,7 @@ pub const Rooms = struct {
 
     /// How many sockets are in `room`.
     pub fn count(self: *Rooms, room: []const u8) usize {
-        const io = self.bound() orelse return 0;
+        const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return if (self.rooms.get(room)) |m| m.items.len else 0;

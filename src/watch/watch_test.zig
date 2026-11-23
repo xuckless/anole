@@ -51,7 +51,7 @@ const Closed = struct {
 };
 
 test "watch: a templated SSE topic gets only matching events; an event without the field is skipped" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true, .replay = null });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true, .replay = null });
     defer topics.deinit();
     var fake: sse.out_mod.Fake = .init(gpa, io);
     defer fake.deinit();
@@ -84,7 +84,7 @@ test "watch: a templated SSE topic gets only matching events; an event without t
 }
 
 test "watch: a gap reaches a fixed topic, a templated one by prefix" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     var fixed: sse.out_mod.Fake = .init(gpa, io);
     defer fixed.deinit();
@@ -114,7 +114,7 @@ const Ctx = struct {
 };
 
 test "watch: a listener reads events in order; past max_events the oldest drop and one gap takes their place" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
     defer w.deinit();
@@ -157,7 +157,7 @@ const Seen = struct {
 };
 
 test "watch: a handler runs events in order; after a failing one the next still runs" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
     defer w.deinit();
@@ -180,7 +180,7 @@ test "watch: a handler runs events in order; after a failing one the next still 
 test "watch: init refuses what cannot work" {
     const g = @import("../errors.zig").expectLog();
     defer g.deinit();
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     try std.testing.expectError(error.InvalidWatch, Watch.init(gpa, io, .{ .postgres = .{ .client = stubClient(), .channels = &.{} } }, .{}));
     const long: [64]u8 = @splat('c');
@@ -213,7 +213,7 @@ test "watch mongo: history lost -> a gap, then the stream reopens from now" {
     const client = try mongodb.Client.init(gpa, rio, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
     defer client.deinit();
 
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true, .replay = null });
+    var topics = try sse.Topics.init(gpa, rio, .{ ._manual_ticks = true, .replay = null });
     defer topics.deinit();
     var out: sse.out_mod.Fake = .init(gpa, rio);
     defer out.deinit();
@@ -289,7 +289,7 @@ fn entry(data: []const u8, id: []const u8) root.Raw {
 }
 
 test "watch: auto-ack: after the handler succeeded, never after it failed (handler on the reader, and on its own tasks)" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
     defer w.deinit();
@@ -325,7 +325,7 @@ test "watch: auto-ack: after the handler succeeded, never after it failed (handl
 }
 
 test "watch: a manual ack goes through the manual hook only; with the reader gone it is refused (Unsupported)" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
     defer w.deinit();
@@ -356,7 +356,7 @@ const Gate = struct {
 };
 
 test "watch: stop: a running handler finishes, a listener ends after what it has queued" {
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
     defer w.deinit();
@@ -430,7 +430,7 @@ test "watch: phase table" {
         .{ .name = "idle askStop then stop", .idle = true, .ops = &.{ .ask_stop, .stop }, .status = .stopped, .ended_ok = 1 },
         .{ .name = "fail out of memory: still failed", .idle = true, .ops = &.{ .fail_oom, .stop }, .status = .failed, .ended_failed = 1 },
     };
-    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    var topics = try sse.Topics.init(gpa, io, .{ ._manual_ticks = true });
     defer topics.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();

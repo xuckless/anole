@@ -653,7 +653,7 @@ const PublishCmd = struct {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
         _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.payload.len, .monotonic);
         gpa.free(p.topic);
-        p.payload.release(p.engine.rooms.allocator);
+        p.payload.release(gpa);
         gpa.destroy(p);
     }
 };
@@ -698,7 +698,7 @@ pub fn publish(e: *Engine, topic: []const u8, typ: u32, data: []const u8, except
     errdefer gpa.destroy(p);
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
-    const payload = try websocket.Rooms.Payload.create(e.rooms.allocator, mt, data);
+    const payload = try websocket.Rooms.Payload.create(gpa, mt, data);
     p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .payload = payload, .after = e.topic_changes.load(.acquire) };
     // One executor per topic, so publishes to a topic fan out in the order
     // they were taken; topics spread over the executors.

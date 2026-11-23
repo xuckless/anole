@@ -32,7 +32,7 @@ test "Rooms: a message to the room reaches every member" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    rooms = .init(gpa, .{});
+    rooms = .init(gpa, io, .{});
     defer rooms.deinit();
 
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
@@ -112,7 +112,7 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
 
     var stalled: Stalled = undefined;
@@ -123,7 +123,7 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
     defer other.ws.deinit();
     other.release.set(io); // never stalls
 
-    // Made without an Io: before the first join, every room is empty.
+    // Before the first join, every room is empty.
     try std.testing.expectEqual(@as(usize, 0), r.broadcast("slow", .text, "nobody here", null));
     try std.testing.expectEqual(@as(usize, 0), r.count("slow"));
 
@@ -183,8 +183,15 @@ test "Rooms: joining twice is one membership, and one leave ends it" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
+
+    var rows: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&rows);
+    var first = true;
+    try std.testing.expect(!r.registered);
+    try websocket.Rooms._consoleRows(&w, &first);
+    try std.testing.expectEqualStrings("", w.buffered());
 
     var a: Stalled = undefined;
     a.init(gpa, io);
@@ -192,6 +199,8 @@ test "Rooms: joining twice is one membership, and one leave ends it" {
     try r.join("lobby", &a.socket);
     try r.join("lobby", &a.socket);
     try std.testing.expectEqual(@as(usize, 1), r.count("lobby"));
+    try websocket.Rooms._consoleRows(&w, &first);
+    try std.testing.expectEqualStrings("{\"name\":\"lobby\",\"members\":1,\"queued_bytes\":0,\"closed_slow\":0}", w.buffered());
     r.leave("lobby", &a.socket);
     try std.testing.expectEqual(@as(usize, 0), r.count("lobby"));
     a.ws.deinit();
@@ -208,7 +217,7 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{ .max_queued_bytes = 1024, .close_after_ms = 50 });
+    var r: websocket.Rooms = .init(gpa, io, .{ .max_queued_bytes = 1024, .close_after_ms = 50 });
     defer r.deinit();
 
     var stalled: Stalled = undefined;
@@ -278,7 +287,7 @@ test "Rooms: with on_full = drop, a full member skips messages and stays" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{ .max_queued_bytes = 600, .on_full = .drop });
+    var r: websocket.Rooms = .init(gpa, io, .{ .max_queued_bytes = 600, .on_full = .drop });
     defer r.deinit();
 
     var slow: Stalled = undefined;
@@ -304,9 +313,9 @@ test "Rooms: a socket released without leave is out of every room, so no broadca
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
-    var other_rooms: websocket.Rooms = .init(gpa, .{});
+    var other_rooms: websocket.Rooms = .init(gpa, io, .{});
     defer other_rooms.deinit();
 
     // On the heap, as a request's arena or a callback socket holds it: once
@@ -382,7 +391,7 @@ test "Rooms: a socket whose handler ends without leave leaves its rooms" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    auto_rooms = .init(gpa, .{});
+    auto_rooms = .init(gpa, io, .{});
     defer auto_rooms.deinit();
 
     var server: dusty.Server(void) = undefined;
@@ -419,7 +428,7 @@ test "Rooms: a member closed for not keeping up is shut down, so its handler end
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    auto_rooms = .init(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    auto_rooms = .init(gpa, io, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
     defer auto_rooms.deinit();
 
     var server: dusty.Server(void) = undefined;
@@ -488,7 +497,7 @@ test "Rooms: a member with ten queued messages gets them in one write" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
 
     var member: Counting = undefined;
@@ -510,7 +519,7 @@ test "Rooms: a member that leaves mid-drain gets nothing after leave returns and
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
 
     var member: Counting = undefined;
@@ -615,13 +624,19 @@ test "Rooms: a broadcast to a room of running members allocates nothing" {
         defer rt.deinit();
         const io = rt.io();
         var probe: Probe = .{ .child = gpa };
-        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        var r: websocket.Rooms = .init(probe.allocator(), io, .{});
         defer r.deinit();
-        const crowd = try Crowd.create(gpa, io, &r, n);
-        defer crowd.destroy(gpa, io, &r);
 
         const payload = try websocket.Rooms.Payload.create(gpa, .text, "hello");
         defer payload.release(gpa);
+        // A room nobody joined: 0 members, nothing allocated, not registered.
+        const none = probe.calls.load(.monotonic);
+        try std.testing.expectEqual(@as(usize, 0), r.broadcastPayload("none", payload, null));
+        try std.testing.expectEqual(@as(usize, 0), r.count("none"));
+        try std.testing.expectEqual(none, probe.calls.load(.monotonic));
+        try std.testing.expect(!r.registered);
+        const crowd = try Crowd.create(gpa, io, &r, n);
+        defer crowd.destroy(gpa, io, &r);
         // The first one starts every sender; each pops its message, so its
         // queue keeps the room it needs for the next.
         try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
@@ -640,7 +655,7 @@ test "Rooms: a broadcast to idle members takes a snapshot only above 64" {
         defer rt.deinit();
         const io = rt.io();
         var probe: Probe = .{ .child = gpa, .watch = n * @sizeOf(*anyopaque) };
-        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        var r: websocket.Rooms = .init(probe.allocator(), io, .{});
         defer r.deinit();
         const crowd = try Crowd.create(gpa, io, &r, n);
         defer crowd.destroy(gpa, io, &r);
@@ -661,7 +676,7 @@ test "Rooms: when the snapshot cannot be had, the members after the 64th wait fo
         defer rt.deinit();
         const io = rt.io();
         var probe: Probe = .{ .child = gpa, .watch = n * @sizeOf(*anyopaque), .fail_watched = true };
-        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        var r: websocket.Rooms = .init(probe.allocator(), io, .{});
         defer r.deinit();
         const crowd = try Crowd.create(gpa, io, &r, n);
         defer crowd.destroy(gpa, io, &r);
@@ -689,7 +704,7 @@ test "Rooms: a member that left and one that joined between broadcasts of a big 
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
     const crowd = try Crowd.create(gpa, io, &r, 100);
     defer crowd.destroy(gpa, io, &r);
@@ -731,7 +746,7 @@ test "Rooms: leaving from the front, middle and end keeps every member's index" 
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, .{});
+    var r: websocket.Rooms = .init(gpa, io, .{});
     defer r.deinit();
 
     var s: [6]Stalled = undefined;

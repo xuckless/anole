@@ -3,13 +3,12 @@
 
 const std = @import("std");
 const root = @import("root.zig");
-const out_mod = @import("out.zig");
 const wait = @import("anole_test_wait");
 const replay = @import("replay.zig");
 
 const Topics = root.Topics;
 const Subscriber = root.Subscriber;
-const Fake = out_mod.Fake;
+const Fake = @import("out_fake.zig").Fake;
 
 const gpa = std.testing.allocator;
 const io = std.testing.io;
@@ -31,7 +30,7 @@ const Harness = struct {
         const h = try gpa.create(Harness);
         var o = options;
         o._manual_ticks = true;
-        h.* = .{ .hub = try Topics.init(gpa, o) };
+        h.* = .{ .hub = try Topics.init(gpa, io, o) };
         h.hub.fake_now_ms.store(1000, .monotonic);
         return h;
     }
@@ -112,7 +111,7 @@ const Harness = struct {
             fn settled(c: @This()) bool {
                 c.h.hub.mutex.lockUncancelable(io);
                 defer c.h.hub.mutex.unlock(io);
-                return c.sub.armed and !c.sub.running;
+                return c.sub.life != .opening and c.sub.life.sender() != .running;
             }
         };
         try wait.waitUntil(io, "the subscriber armed and its sender finished", C{ .h = h, .sub = h.subAt(i) }, C.settled);
@@ -533,13 +532,25 @@ test "sse: the drain gives each subscriber a retry from the spread, then ends th
 test "sse: publish to an unknown topic is 0 and allocates nothing; bad input is an error" {
     const h = try Harness.init(.{});
     defer h.deinit();
+    // Set up at init: one exec list on a Threaded io, nothing counted yet.
+    try std.testing.expectEqual(@as(usize, 1), h.hub.execs.len);
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.stats().topics);
     _ = try h.add(&.{"t"}, null);
     try std.testing.expectEqual(@as(usize, 0), try h.hub.publish("nobody", .{ .data = "x" }));
     try std.testing.expectError(error.InvalidTopic, h.hub.publish("", .{ .data = "x" }));
     const long: [256]u8 = @splat('x');
     try std.testing.expectError(error.InvalidTopic, h.hub.publish(&long, .{ .data = "x" }));
     try std.testing.expectError(error.InvalidEventField, h.hub.publish("t", .{ .data = "x", .event = "a\nb" }));
-    try std.testing.expectError(error.InvalidEventField, Topics.init(gpa, .{ .gap_event = "g\n" }));
+    try std.testing.expectError(error.InvalidEventField, Topics.init(gpa, io, .{ .gap_event = "g\n" }));
+}
+
+test "sse: Topics sizes one exec list per executor of the runtime at init" {
+    const rt = try @import("zio").Runtime.init(gpa, .{ .executors = .exact(3) });
+    defer rt.deinit();
+    var hub = try Topics.init(gpa, rt.io(), .{});
+    defer hub.deinit();
+    try std.testing.expectEqual(@as(usize, 3), hub.execs.len);
 }
 
 test "sse: Subscriber.join and leave: events after the call" {
@@ -579,7 +590,8 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     // Its sender runs here, by hand, as the fallback's own task runs it
     // (S3): between the failed write and the end there is a window.
     h.hub.mutex.lockUncancelable(io);
-    sub.fallback = true;
+    const out = sub.mode.hub_sender;
+    sub.mode = .{ .fallback = out };
     h.hub.mutex.unlock(io);
     f.fail_with = error.Gone;
     _ = try h.hub.publish("t", .{ .data = "x" });
@@ -590,8 +602,8 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     // Before #211 this claimed a sender nothing would run (the fallback
     // had stopped), so the end waited for it forever, and the reason
     // became `closed`.
-    const running = sub.running;
-    const queued = sub.queue.items.len - sub.head;
+    const running = sub.life.sender() == .running;
+    const queued = sub.queue.len();
     const reason = sub.close_reason;
     h.hub.mutex.unlock(io);
     try std.testing.expect(!running);
@@ -630,7 +642,7 @@ const ZioCase = struct {
         const rio = c.rt.io();
         var o = options;
         o._manual_ticks = true;
-        c.hub = try Topics.init(gpa, o);
+        c.hub = try Topics.init(gpa, rio, o);
         c.hub.fake_now_ms.store(1000, .monotonic);
         c.f = .init(gpa, rio);
         c.f.hold = true;
@@ -787,4 +799,112 @@ test "sse: the peer leaving while on_open runs: the end waits for the open, then
     try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
     try std.testing.expectEqual(@as(usize, 0), h.hub.stats().subscribers);
     try std.testing.expect(f.released);
+}
+
+test "sse: the subscriber's state tables: every decided cell" {
+    const Life = Subscriber.Life;
+    const op = struct {
+        fn ending(e: Life.End, s: Subscriber.Sender) Life {
+            return .{ .ending = .{ .end = e, .sender = s } };
+        }
+        fn left(e: ?Life.End, s: Subscriber.Sender) Life {
+            return .{ .left = .{ .end = e, .sender = s } };
+        }
+    };
+    const life_rows = [_]struct { from: Life, ev: Subscriber.LifeEvent, to: ?Life }{
+        .{ .from = .{ .opening = null }, .ev = .armed, .to = .{ .open = .idle } },
+        .{ .from = .{ .opening = .graceful }, .ev = .armed, .to = op.ending(.graceful, .idle) },
+        .{ .from = .{ .opening = .abort }, .ev = .armed, .to = op.ending(.abort, .idle) },
+        .{ .from = .{ .opening = null }, .ev = .end_queued, .to = .{ .opening = .graceful } },
+        .{ .from = .{ .opening = .graceful }, .ev = .end_queued, .to = null },
+        .{ .from = .{ .opening = .graceful }, .ev = .abort_end, .to = .{ .opening = .abort } },
+        .{ .from = .{ .opening = null }, .ev = .abort_end, .to = null },
+        .{ .from = .{ .opening = null }, .ev = .claim, .to = null },
+        .{ .from = .{ .open = .idle }, .ev = .end_queued, .to = op.ending(.graceful, .idle) },
+        .{ .from = .{ .open = .running }, .ev = .end_queued, .to = op.ending(.graceful, .running) },
+        .{ .from = .{ .open = .idle }, .ev = .abort_end, .to = null },
+        .{ .from = .{ .open = .idle }, .ev = .claim, .to = .{ .open = .running } },
+        .{ .from = .{ .open = .running }, .ev = .claim, .to = null },
+        .{ .from = .{ .open = .running }, .ev = .write_failed, .to = .{ .broken = .running } },
+        .{ .from = .{ .open = .running }, .ev = .sender_idle, .to = .{ .open = .idle } },
+        .{ .from = .{ .open = .idle }, .ev = .finish, .to = op.left(null, .idle) },
+        .{ .from = .{ .open = .running }, .ev = .finish, .to = op.left(null, .running) },
+        .{ .from = op.ending(.graceful, .idle), .ev = .abort_end, .to = op.ending(.abort, .idle) },
+        .{ .from = op.ending(.graceful, .running), .ev = .abort_end, .to = op.ending(.abort, .running) },
+        .{ .from = op.ending(.graceful, .idle), .ev = .end_queued, .to = null },
+        .{ .from = op.ending(.graceful, .idle), .ev = .claim, .to = op.ending(.graceful, .running) },
+        .{ .from = op.ending(.graceful, .running), .ev = .claim, .to = null },
+        .{ .from = op.ending(.abort, .running), .ev = .write_failed, .to = .{ .broken = .running } },
+        .{ .from = op.ending(.abort, .running), .ev = .sender_idle, .to = op.ending(.abort, .idle) },
+        .{ .from = op.ending(.graceful, .running), .ev = .sender_over, .to = .over },
+        .{ .from = op.ending(.abort, .running), .ev = .finish, .to = op.left(.abort, .running) },
+        .{ .from = .over, .ev = .end_queued, .to = null },
+        .{ .from = .over, .ev = .abort_end, .to = null },
+        .{ .from = .over, .ev = .claim, .to = null },
+        .{ .from = .over, .ev = .finish, .to = op.left(null, .idle) },
+        .{ .from = .{ .broken = .running }, .ev = .end_queued, .to = null },
+        .{ .from = .{ .broken = .idle }, .ev = .claim, .to = null },
+        .{ .from = .{ .broken = .running }, .ev = .sender_idle, .to = .{ .broken = .idle } },
+        .{ .from = .{ .broken = .running }, .ev = .sender_over, .to = .over },
+        .{ .from = .{ .broken = .running }, .ev = .finish, .to = op.left(null, .running) },
+        .{ .from = op.left(null, .idle), .ev = .claim, .to = null },
+        .{ .from = op.left(.abort, .running), .ev = .write_failed, .to = op.left(.abort, .running) },
+        .{ .from = op.left(.abort, .running), .ev = .sender_idle, .to = op.left(.abort, .idle) },
+        .{ .from = op.left(.graceful, .running), .ev = .sender_over, .to = op.left(.graceful, .idle) },
+        .{ .from = op.left(null, .running), .ev = .end_queued, .to = null },
+        .{ .from = op.left(null, .running), .ev = .abort_end, .to = null },
+    };
+    for (life_rows, 0..) |row, i| {
+        errdefer std.debug.print("life row {d}\n", .{i});
+        try std.testing.expectEqual(row.to, Life.step(row.from, row.ev));
+    }
+    const EndTask = Subscriber.EndTask;
+    const end_rows = [_]struct { from: EndTask, ev: Subscriber.EndEvent, to: ?EndTask }{
+        .{ .from = .opening, .ev = .ask, .to = .asked },
+        .{ .from = .opening, .ev = .opened, .to = .none },
+        .{ .from = .opening, .ev = .tick, .to = null },
+        .{ .from = .asked, .ev = .ask, .to = null },
+        .{ .from = .asked, .ev = .opened, .to = .started },
+        .{ .from = .asked, .ev = .tick, .to = null },
+        .{ .from = .none, .ev = .ask, .to = .started },
+        .{ .from = .none, .ev = .tick, .to = .started },
+        .{ .from = .started, .ev = .ask, .to = null },
+        .{ .from = .started, .ev = .tick, .to = null },
+        .{ .from = .started, .ev = .start_failed, .to = .none },
+    };
+    for (end_rows) |row| try std.testing.expectEqual(row.to, EndTask.table.get(row.from).get(row.ev));
+}
+
+test "sse: on_open closing, or publishing past the cap, ends the stream after what it queued" {
+    const Open = struct {
+        var taken: usize = 0;
+        fn close(sub: *Subscriber) void {
+            sub.close();
+        }
+        fn flood(sub: *Subscriber) void {
+            for (0..8) |_| taken += sub.hub.publish("t", .{ .data = "0123456789" }) catch unreachable;
+        }
+    };
+    const Row = struct { on_open: *const fn (*Subscriber) void, reason: root.CloseReason, slow: u64 };
+    for ([_]Row{
+        .{ .on_open = Open.close, .reason = .closed, .slow = 0 },
+        .{ .on_open = Open.flood, .reason = .slow, .slow = 1 },
+    }) |row| {
+        Open.taken = 0;
+        const h = try Harness.init(.{ .max_queued_bytes = 400, .replay = null });
+        defer h.deinit();
+        const f = try gpa.create(Fake);
+        f.* = .init(gpa, io);
+        try h.fakes.append(gpa, f);
+        const rec = try gpa.create(Rec);
+        rec.* = .{ .h = h };
+        try h.recs.append(gpa, rec);
+        rec.sub = try h.hub._attach(io, f.out(), .{ .topics = &.{"t"}, .context = rec, .on_open = row.on_open, .on_close = Harness.onClose }, null);
+        try h.waitClosed(1);
+        try std.testing.expectEqual(@as(u32, @backingInt(row.reason)), h.last_reason.load(.acquire));
+        try std.testing.expectEqual(row.slow, h.hub.stats().closed_slow);
+        try std.testing.expect(f.ended and f.released);
+        try std.testing.expectEqual(Open.taken, std.mem.count(u8, Harness.text(f), "data: "));
+        if (row.slow > 0) try std.testing.expect(Open.taken > 0 and Open.taken < 8);
+    }
 }
