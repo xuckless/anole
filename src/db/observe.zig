@@ -184,6 +184,13 @@ comptime {
     std.debug.assert(@sizeOf(Observer) == 120);
 }
 
+/// The console's share of `Call.endWith`, out of line: it runs only while a
+/// console collects, so every `endWith` instantiation stays small.
+noinline fn countCall(slot: u32, io: std.Io, took: std.Io.Duration, failed: bool) void {
+    @branchHint(.cold);
+    if (console_call) |f| f(slot, dusty.placement.currentExecutor(io), @intCast(@max(0, took.nanoseconds)), failed);
+}
+
 /// One call in progress, from `Observer.start`.
 pub const Call = struct {
     observer: *const Observer,
@@ -223,10 +230,7 @@ pub const Call = struct {
                 m.query.observeDuration(took);
                 if (err) |e| m.errors.with(&.{ m.system, m.name, @errorName(e) }).inc();
             }
-            if (counted) {
-                @branchHint(.unlikely);
-                if (console_call) |f| f(o.console_slot, dusty.placement.currentExecutor(c.io), @intCast(@max(0, took.nanoseconds)), err != null);
-            }
+            if (counted) countCall(o.console_slot, c.io, took, err != null);
         }
         const exporter = o.tracer orelse return;
         const req = internal.requestOf(c) orelse return;

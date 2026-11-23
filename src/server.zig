@@ -975,8 +975,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Adds a connector with an `observer` (a database or service)
             /// and gives it its console slot, its index plus one: the `i`
             /// of its `/db` entry and of its `Stats.db` row. Entries leave
-            /// only from the tail (`dropConnector` of a failed start), so
-            /// an index never shifts.
+            /// only from the tail (the caller's `dropConnector` when a late
+            /// start fails), so an index never shifts.
             fn addObserved(self: *Extras, gpa: std.mem.Allocator, comptime T: type, value: *T) !void {
                 try self.connectors.append(gpa, .of(T, value));
                 value.observer.console_slot = @intCast(self.connectors.items.len);
@@ -3196,6 +3196,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer k.deinit();
             k.suppress_consumers = self.mode.deployment == .lambda;
             try self.extras.addObserved(self.arena.allocator(), kafka_mod.Client, k);
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(k);
             if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return k;
         }
@@ -3439,6 +3441,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const c = try s3_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer c.deinit();
             try self.extras.addObserved(self.arena.allocator(), s3_mod.Client, c);
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(c);
             if (self.extras.connectors_started) try c.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return c;
         }
@@ -3467,6 +3471,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const m = try smtp_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer m.deinit();
             try self.extras.addObserved(self.arena.allocator(), smtp_mod.Client, m);
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(m);
             if (self.extras.connectors_started) try m.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return m;
         }
@@ -5525,6 +5531,20 @@ test "console: addObserved gives a connector slot index + 1 and start keeps it" 
     try extras.connectors.items[2].start(extras.connectors.items[2].context, null, null, null);
     try std.testing.expectEqual(@as(u32, 3), second.observer.console_slot);
     try std.testing.expect(second.observer.metrics == null);
+}
+
+test "anole.Server: a connector added after the start whose start fails leaves no entry behind" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    try app.startConnectors();
+    const before = app.extras.connectors.items.len;
+    // A non-AWS endpoint and an empty environment: no credentials, the start fails.
+    try std.testing.expectError(error.DatabaseUnavailable, app.s3(.{ .endpoint = "http://127.0.0.1:9", .bucket = "b", .environ = .empty }));
+    try std.testing.expectEqual(before, app.extras.connectors.items.len);
 }
 
 test "console: each database and service connector keeps its /db system name" {

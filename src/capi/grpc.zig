@@ -115,6 +115,13 @@ pub const EngineState = struct {
 // ---------------------------------------------------------------------------
 // Per slot and per executor
 
+/// How a call came in: by a gRPC route, or by a `google.api.http` binding.
+const Via = enum { grpc, transcoded };
+
+/// What a call adds to the console's `/conns` `grpc` while in flight: a
+/// transcoded call is REST JSON there, as it is in a Zig app.
+const grpc_calls_of = std.EnumArray(Via, i64).init(.{ .grpc = 1, .transcoded = 0 });
+
 pub const SlotState = struct {
     // Set by the executor before the hand-off; read by `poll`.
     method: *const Method = undefined,
@@ -128,6 +135,7 @@ pub const SlotState = struct {
     deadline: ?i96 = null,
     /// A transcoded call's `response_body`.
     response_body: []const u8 = "",
+    via: Via = .grpc,
 
     // Written by the consumer (while `responding`, or under `out`'s lock
     // once streaming); read by the executor once `done`/`streaming`.
@@ -221,7 +229,7 @@ fn heapRemove(x: *Exec, i: u32) void {
 
 /// From `Exec.release`: the call's slot is free again.
 pub fn onRelease(x: *Exec, i: u32) void {
-    dusty.gauges.addAt(x.index, .grpc_calls, -1);
+    dusty.gauges.addAt(x.index, .grpc_calls, -grpc_calls_of.get(x.slots[i].grpc.via));
     heapRemove(x, i);
     const g = &x.slots[i].grpc;
     g.message = "";
@@ -436,7 +444,7 @@ fn handler(req: *http.Request, res: *http.Response) anyerror!void {
     if (m.kind == .unary or m.kind == .server_streaming) {
         message = readUnary(call, m, detach) catch |err| return serving.finish(call, err);
     }
-    return start(x, m, call, message, timeout_ns, detach, "");
+    return start(x, m, call, message, timeout_ns, detach, .grpc, "");
 }
 
 /// A transcoded call (a `google.api.http` binding matched): the request
@@ -471,7 +479,7 @@ fn serveTranscoded(_: ?*anyopaque, req: *dusty.Request, res: *dusty.Response, ca
         error.DecodeFailed => return serving.finish(call, call.fail(.invalid_argument, why)),
         error.OutOfMemory => return error.OutOfMemory,
     };
-    return start(x, m, call, message, timeout_ns, detach, b.rule.response_body);
+    return start(x, m, call, message, timeout_ns, detach, .transcoded, b.rule.response_body);
 }
 
 /// The one request message of a unary or server-streaming call, as
@@ -534,7 +542,7 @@ fn toBinary(call: *Call, m: *const Method, json: []const u8) ![]const u8 {
 
 /// Hands the call to the consumer; then, unless it detached, waits for its
 /// answer on this task.
-fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_ns: ?u64, detach_wanted: bool, response_body: []const u8) anyerror!void {
+fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_ns: ?u64, detach_wanted: bool, via: Via, response_body: []const u8) anyerror!void {
     const e = x.engine;
     const req = call.req;
     const res = call.res;
@@ -595,11 +603,12 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
         .flags = flags,
         .deadline = if (call.deadline) |dl| dl.raw.nanoseconds else null,
         .response_body = response_body,
+        .via = via,
     };
     g.credit.store(m.service.cfg.read_ahead, .monotonic);
     s.word.store(pack(gen, .queued), .release);
     // In flight on the console's `/conns` until `onRelease`.
-    dusty.gauges.addAt(x.index, .grpc_calls, 1);
+    dusty.gauges.addAt(x.index, .grpc_calls, grpc_calls_of.get(via));
     if (d != null and g.deadline != null) heapPush(x, si);
 
     var canceled = false;

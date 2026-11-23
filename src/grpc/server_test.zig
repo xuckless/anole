@@ -440,6 +440,8 @@ test "gRPC: the four call modes and trailing metadata over h2 (raw core client)"
 test "gRPC: a unary call over h2 is answered whole, never through a streaming body writer" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
+            // Before any call of this test: the gauges' settled sums.
+            const settled: [2]i64 = .{ gaugeSum(.grpc_calls), gaugeSum(.h2_conns) };
             const bodies = dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic);
             for ([_][]const u8{ "hello", "", "bin-trailer" }) |message| {
                 const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = message }}, &.{});
@@ -459,13 +461,14 @@ test "gRPC: a unary call over h2 is answered whole, never through a streaming bo
             try std.testing.expectEqual(bodies, dusty.h2_engine_for_tests.probe.at(.sink_bodies).load(.monotonic));
             // The call and its HTTP/2 connection count on /conns while open, not
             // after. The calls above may still be ending (their counts fall after
-            // the client has its answer), so the base is an upper bound.
+            // the client has its answer): settle them first, so the base is exact.
             {
+                try wait.waitUntil(env.io, "the earlier calls and connections uncounted", settled, gaugesAtMost);
                 const base: [2]i64 = .{ gaugeSum(.grpc_calls), gaugeSum(.h2_conns) };
                 const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = "gauges" }}, &.{});
                 cl.deinit();
-                try std.testing.expect(seen_in_call.grpc_calls >= 1);
-                try std.testing.expect(seen_in_call.h2_conns >= 1);
+                try std.testing.expect(seen_in_call.grpc_calls >= base[0] + 1);
+                try std.testing.expect(seen_in_call.h2_conns >= base[1] + 1);
                 try wait.waitUntil(env.io, "the gRPC call and its connection uncounted", base, gaugesAtMost);
             }
             // A server stream still streams.
