@@ -1834,8 +1834,7 @@ pub const Rooms = struct {
     /// canceled meanwhile.
     fn awaitSenders(self: *Rooms, io: std.Io, members: ?*Member) bool {
         var canceled = false;
-        const grace: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.options.leave_grace_ms), .clock = .awake } };
-        const deadline = grace.toDeadline(io);
+        const deadline = placement.graceDeadline(io, .fromMilliseconds(self.options.leave_grace_ms));
         var it = members;
         wait: while (it) |m| : (it = m.next_of_socket) {
             while (m.running) {

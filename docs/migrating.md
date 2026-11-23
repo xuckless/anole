@@ -4,7 +4,7 @@
 
 | 0.6 | 1.0 |
 | --- | --- |
-| `Rooms.init(allocator, options)`, made before the server (it took the runtime's `std.Io` from the first socket that joined) | `Rooms.init(allocator, app.io(), options)`, set after `Server.init` (`state.rooms = .init(gpa, app.io(), .{})`, then `defer state.rooms.deinit()`); never `init.io` |
+| `Rooms.init(allocator, options)`, made before the server (it took the runtime's `std.Io` from the first socket that joined) | `Rooms.init(allocator, app.io(), options)`, set after `Server.init` (`state.rooms = .init(gpa, app.io(), .{})`, freed right after `app.deinit()`: `defer { app.deinit(); state.rooms.deinit(); }`); never `init.io` |
 | `sse.Topics.init(gpa, options)`, `Topics.create(gpa, options)`, `Topics.bind(io)` | `Topics.init(gpa, io, options)`, `Topics.create(gpa, io, options)` with `app.io()`; `bind` is gone (`app.sseTopics` already passes it) |
 
 ## 0.4 to 0.5

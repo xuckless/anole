@@ -122,9 +122,11 @@ pub fn main(init: std.process.Init) !void {
         // runs out (30 s by default); then they are cut.
         .timeouts = .{ .shutdown = .fromSeconds(5) },
     }, &state);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        state.rooms.deinit();
+    }
     state.rooms = .init(init.gpa, app.io(), .{});
-    defer state.rooms.deinit();
 
     app.use(anole.middleware.Logger.init(.{}));
     app.get("/", page);

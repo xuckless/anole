@@ -73,9 +73,11 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock = try std.fmt.bufPrint(&path_buf, "{s}/c.sock", .{dir_buf[0..dir_len]});
     var app = try App.init(alloc, .{ .executors = .exact(2), .console = .{ .enabled = true, .socket = sock } });
-    defer app.deinit();
+    defer {
+        app.deinit();
+        rooms.deinit();
+    }
     rooms = .init(alloc, app.io(), .{});
-    defer rooms.deinit();
     const live = try app.sseTopics(.{ .heartbeat = null });
     app.sse("/live", live, .{ .topics = &.{"news"} });
     app.ws("/lobby", lobby);

@@ -1149,8 +1149,7 @@ pub const Topics = struct {
     /// meanwhile.
     fn awaitSender(self: *Topics, io: std.Io, sub: *Subscriber) bool {
         var canceled = false;
-        const grace: std.Io.Timeout = .{ .duration = .{ .raw = self.options.leave_grace, .clock = .awake } };
-        const deadline = grace.toDeadline(io);
+        const deadline = placement.graceDeadline(io, self.options.leave_grace);
         while (sub.running) {
             self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
                 if (err == error.Canceled) canceled = true;

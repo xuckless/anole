@@ -8,9 +8,11 @@ const Server = anole.Server(app_main.App);
 test "a message reaches every client in the room" {
     var state: app_main.App = .{ .rooms = undefined };
     var app = try Server.init(alloc, .{ .executors = .exact(2) }, &state);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        state.rooms.deinit();
+    }
     state.rooms = .init(alloc, app.io(), .{});
-    defer state.rooms.deinit();
     app_main.routes(&app);
 
     const Check = struct {
@@ -47,9 +49,11 @@ test "a message reaches every client in the room" {
 test "GET /rooms lists the rooms and who is in them" {
     var state: app_main.App = .{ .rooms = undefined };
     var app = try Server.init(alloc, .{ .executors = .exact(1) }, &state);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        state.rooms.deinit();
+    }
     state.rooms = .init(alloc, app.io(), .{});
-    defer state.rooms.deinit();
     app_main.routes(&app);
     var t = try anole.testing.client(&app);
     defer t.deinit();

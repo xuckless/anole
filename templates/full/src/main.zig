@@ -286,10 +286,12 @@ pub fn main(init: std.process.Init) !void {
         // The outbound client: retries on idempotent requests, a breaker per host.
         .client = .{ .retry = .{}, .breaker = .{} },
     }, &state);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        state.rooms.deinit();
+    }
     const io = app.io();
     state.rooms = .init(init.gpa, io, .{});
-    defer state.rooms.deinit();
 
     state.session_key = if (cfg.session_key) |k| try anole.session.keyFromBase64(k.expose()) else anole.session.devKey(io);
     const key = try auth.apikey.generate(arena, io);

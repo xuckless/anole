@@ -79,6 +79,13 @@ pub fn runtime(io: std.Io) ?*zio.Runtime {
     return zio.Runtime.fromIo(clock.unwrapIo(io));
 }
 
+/// A deadline `d` from now on the real awake clock, even when `io` is wrapped
+/// by `Clock.io`: timed waits run on real time, so their deadlines must too.
+pub fn graceDeadline(io: std.Io, d: std.Io.Duration) std.Io.Timeout {
+    const grace: std.Io.Timeout = .{ .duration = .{ .raw = d, .clock = .awake } };
+    return grace.toDeadline(clock.unwrapIo(io));
+}
+
 /// `group.concurrent(io, func, args)`, placed as `where` says when the `Io`
 /// is zio's and placement applies.
 pub fn concurrent(
@@ -206,6 +213,14 @@ pub fn taskId(io: std.Io) usize {
     // Thread IDs are small numbers on both Linux and macOS, and task
     // addresses are not; the top bit keeps the two apart regardless.
     return @as(usize, @intCast(std.Thread.getCurrentId())) | (@as(usize, 1) << (@bitSizeOf(usize) - 1));
+}
+
+test "graceDeadline: a wrapped Io still gets a deadline on the real clock" {
+    var fake: clock.Clock = .init(.fromNanoseconds(1_700_000_000_000_000_000));
+    var bound = fake.io(std.testing.io);
+    defer bound.deinit();
+    const d = graceDeadline(bound.io(), .fromMilliseconds(1000));
+    try std.testing.expect(d.deadline.raw.nanoseconds < fake.now().nanoseconds);
 }
 
 test "taskId: the same task gets the same answer, another task another" {

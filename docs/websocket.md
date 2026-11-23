@@ -404,8 +404,7 @@ compressor. The server declines an 8-bit server window.
 and reach it from your handlers through the server's context type.
 `Rooms.init(allocator, io, options)` takes an allocator, the runtime's
 `std.Io` (`app.io()`, not `init.io`: the sockets run on the runtime) and
-options, so set it once the server exists, and free it after the server has
-stopped:
+options, so set it once the server exists, and free it after `app.deinit()` (jobs and watches may still use it until then):
 
 ```zig
 const App = struct {
@@ -414,9 +413,11 @@ const App = struct {
 
 var state: App = .{ .rooms = undefined };
 var app = try anole.Server(App).init(init.gpa, .{}, &state);
-defer app.deinit();
+defer {
+    app.deinit();
+    state.rooms.deinit();
+}
 state.rooms = .init(init.gpa, app.io(), .{});
-defer state.rooms.deinit();
 app.ws("/chat/:room", chat);
 try app.listen(":8082");
 ```

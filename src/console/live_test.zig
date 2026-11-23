@@ -490,9 +490,11 @@ test "console live: an attached console gets each panel's data from a real app (
         .executors = .exact(2),
         .console = .{ .enabled = true, .name = "live", .socket = sock },
     });
-    defer app.deinit();
+    defer {
+        app.deinit();
+        rooms.deinit();
+    }
     rooms = .init(alloc, app.io(), .{});
-    defer rooms.deinit();
     notes_db = try app.sqlite(db_path);
     app.use(anole.middleware.RequestId.init(.{ .trust_incoming = true }));
     app.use(anole.observe.AccessLog.init(.{ .format = .text }));
