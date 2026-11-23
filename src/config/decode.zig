@@ -23,6 +23,7 @@ const tree = @import("tree.zig");
 const Node = tree.Node;
 const Object = tree.Object;
 const naming = @import("naming.zig");
+const validate = @import("validate");
 const Secret = @import("Secret.zig");
 const Environment = @import("../modes.zig").Environment;
 
@@ -229,7 +230,7 @@ fn reportUnknownKeys(comptime T: type, ctx: Context, path: []const u8, object: *
     for (object.fields.keys(), object.fields.values()) |key, node| {
         if (isOneOf(key, names)) continue;
         const key_path = try joinPath(ctx.arena, path, key);
-        if (closest(key, names)) |name| {
+        if (validate.closest(names, key)) |name| {
             try ctx.diag.addFmt(.unknown_key, key_path, node.origin, "did you mean \"{s}\"?", .{name});
         } else {
             try ctx.diag.add(.{ .kind = .unknown_key, .path = key_path, .origin = node.origin });
@@ -295,37 +296,6 @@ fn isOneOf(key: []const u8, names: []const []const u8) bool {
         if (std.mem.eql(u8, key, name)) return true;
     }
     return false;
-}
-
-/// The name closest to `key`, if it is close enough to be a likely typo.
-fn closest(key: []const u8, names: []const []const u8) ?[]const u8 {
-    var best: ?[]const u8 = null;
-    var best_distance: usize = 3;
-    for (names) |name| {
-        const distance = editDistance(key, name) orelse continue;
-        if (distance < best_distance and distance < key.len) {
-            best = name;
-            best_distance = distance;
-        }
-    }
-    return best;
-}
-
-/// Levenshtein distance ignoring case; null for strings longer than 64 bytes.
-fn editDistance(a: []const u8, b: []const u8) ?usize {
-    if (a.len > 64 or b.len > 64) return null;
-    var previous: [65]usize = undefined;
-    var current: [65]usize = undefined;
-    for (previous[0 .. b.len + 1], 0..) |*cell, j| cell.* = j;
-    for (a, 0..) |char_a, i| {
-        current[0] = i + 1;
-        for (b, 0..) |char_b, j| {
-            const cost: usize = if (std.ascii.toLower(char_a) == std.ascii.toLower(char_b)) 0 else 1;
-            current[j + 1] = @min(previous[j + 1] + 1, current[j] + 1, previous[j] + cost);
-        }
-        @memcpy(previous[0 .. b.len + 1], current[0 .. b.len + 1]);
-    }
-    return previous[b.len];
 }
 
 test "bools in every spelling" {

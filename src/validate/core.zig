@@ -3557,13 +3557,10 @@ pub fn suggestion(comptime T: type, comptime key: []const u8) []const u8 {
 /// The name among `names` that `key` is most likely a typo of, or null. The
 /// rule is confy's: the closest name by edit distance, ignoring ASCII case,
 /// when that distance is below 3 and below the key's length; on a tie the
-/// first name wins. Runs at compile time.
-pub fn closest(comptime names: []const []const u8, comptime key: []const u8) ?[]const u8 {
-    return comptime closestName(names, key);
-}
-
-fn closestName(comptime names: []const []const u8, comptime key: []const u8) ?[]const u8 {
-    @setEvalBranchQuota(eval_quota);
+/// first name wins. Works at compile time (validators, `suggestion`) and at
+/// runtime (config's unknown-key hint), with the same answers.
+pub fn closest(names: []const []const u8, key: []const u8) ?[]const u8 {
+    if (@inComptime()) @setEvalBranchQuota(eval_quota);
     var best: ?[]const u8 = null;
     var best_distance: usize = 3;
     for (names) |name| {
@@ -3578,8 +3575,8 @@ fn closestName(comptime names: []const []const u8, comptime key: []const u8) ?[]
 
 /// Levenshtein distance ignoring ASCII case; null when a name is longer than
 /// 64 bytes (no suggestion for such names).
-fn editDistance(comptime a: []const u8, comptime b: []const u8) ?usize {
-    @setEvalBranchQuota(eval_quota);
+fn editDistance(a: []const u8, b: []const u8) ?usize {
+    if (@inComptime()) @setEvalBranchQuota(eval_quota);
     if (a.len > 64 or b.len > 64) return null;
     var previous: [65]usize = undefined;
     var current: [65]usize = undefined;
@@ -3619,6 +3616,10 @@ test "closest names the nearest name within 2 edits, ignoring ASCII case" {
     try std.testing.expectEqualStrings("ab", root.closest(&.{"ab"}, "abc").?);
     // On a tie the first name wins.
     try std.testing.expectEqualStrings("cat", root.closest(&.{ "cat", "car" }, "cax").?);
+    // The same answers at compile time (validators and `suggestion` use it there).
+    try std.testing.expectEqualStrings("name", comptime root.closest(names, "NAME").?);
+    try std.testing.expectEqual(null, comptime root.closest(names, "a"));
+    try std.testing.expectEqualStrings("cat", comptime root.closest(&.{ "cat", "car" }, "cax").?);
 }
 
 test "editDistance counts edits ignoring ASCII case and gives up over 64 bytes" {
@@ -3626,6 +3627,10 @@ test "editDistance counts edits ignoring ASCII case and gives up over 64 bytes" 
     try std.testing.expectEqual(@as(?usize, 0), comptime editDistance("Email", "eMAIL"));
     try std.testing.expectEqual(@as(?usize, 1), comptime editDistance(&@as([64]u8, @splat('a')), &@as([63]u8, @splat('a'))));
     try std.testing.expectEqual(@as(?usize, null), comptime editDistance(&@as([65]u8, @splat('a')), "a"));
+    // The same at runtime, as config's unknown-key hint calls it.
+    const long = @as([65]u8, @splat('a'));
+    try std.testing.expectEqual(@as(?usize, 3), editDistance("kitten", "sitting"));
+    try std.testing.expectEqual(@as(?usize, null), editDistance(&long, "a"));
 }
 
 /// The first problem of the public names of `ns` (`root.zig` in the library)
