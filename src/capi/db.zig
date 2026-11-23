@@ -133,14 +133,14 @@ pub fn endTied(x: *Exec, i: u32, cut: bool) void {
 }
 
 /// Whether the request or call `h` is still there to serve. On `h`'s
-/// executor only: an orphaned slot (`Slot.orphan`, executor-local) is not,
+/// executor only: an orphaned slot (`Slot.owner`, executor-local) is not,
 /// though a consumer call that failed may have handed it back to `out`:
 /// its request's memory went with its stream.
 pub fn slotLive(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
-    if (sl.orphan) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
+    if (sl.owner == .orphan) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {
@@ -162,7 +162,7 @@ pub fn slotLive(x: *Exec, h: Handle) bool {
 fn stillOwed(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
-    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
+    if (sl.handleKind(.acquire) != h.kind) return false;
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {
@@ -180,7 +180,7 @@ fn stillOwed(x: *Exec, h: Handle) bool {
 
 /// The executor of the request or gRPC call `hv`, which must still be owed
 /// its answer (`stillOwed`); `c`, when given, must be its consumer.
-pub fn resolveReq(e: *Engine, hv: u64, c: ?*Consumer) QueryError!*Exec {
+pub fn resolveReq(e: *Engine, hv: u64, c: ?*Consumer) CallError!*Exec {
     const h = Handle.decode(hv);
     if (h.gen == 0 or (h.kind != .request and h.kind != .grpc_call)) return error.Invalid;
     if (h.exec >= e.execs.len) return error.Gone;
@@ -386,13 +386,12 @@ pub fn close(e: *Engine) void {
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Db {
-    for (e.dbs) |*d| if (std.mem.eql(u8, d.config.name, name)) return d;
-    return null;
+    return engine.findByName(Db, e.dbs, name);
 }
 
 pub const Verb = enum { query, exec };
 
-pub const QueryError = error{ Invalid, State, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 /// A query in flight: one allocation holding the command, the copied SQL,
 /// parameters and cache tag.
@@ -456,7 +455,7 @@ fn postGone(x: *Exec, user_data: u64, handle: u64, message: []const u8) void {
 }
 
 /// Queues `sql` for `c` (`anole_db_query`, `anole_db_exec`).
-pub fn submit(d: *Db, c: ?*Consumer, verb: Verb, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) QueryError!void {
+pub fn submit(d: *Db, c: ?*Consumer, verb: Verb, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) CallError!void {
     if (comptime !features.sqlite and !features.postgres and !features.redis and !features.mongodb) return error.Unsupported;
     const e = d.engine;
     if (c) |cc| if (cc.engine != e) return error.Invalid;
@@ -696,7 +695,7 @@ pub const Answer = struct {
         if (total > max) return error.TooBig;
         const rec = engine.newRecord(total, .db_result, handle) catch return error.OutOfMemory;
         const ev: *Ev = @ptrCast(rec.ptr);
-        var w: Writer = .{ .rec = rec, .at = bytes_off };
+        var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
         ev.user_data = a.user_data;
         ev.status = a.status;
         ev.http_status = a.http_status;
@@ -769,7 +768,7 @@ fn replyCells(r: redis.Reply, bytes: *usize) usize {
 }
 
 /// `r` and its items in preorder from `cells[k.*]`.
-fn putReply(r: redis.Reply, cells: [*]abi.DbCell, k: *usize, w: *Writer) void {
+fn putReply(r: redis.Reply, cells: [*]abi.DbCell, k: *usize, w: *engine.Writer) void {
     const at = k.*;
     k.* += 1;
     cells[at] = switch (r) {
@@ -839,18 +838,6 @@ fn redisArgs(a: std.mem.Allocator, sql: []const u8, params: []const db.Value) er
     });
     return args.items;
 }
-
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
 
 // ---------------------------------------------------------------------------
 // Transactions (`anole_db_begin` and `anole_db_tx_*`)
@@ -944,14 +931,6 @@ pub const TxSlot = struct {
     req_slot: u32 = 0,
     has_req: bool = false,
 
-    fn gen(t: *const TxSlot) u32 {
-        return @intCast(t.word.load(.acquire) >> 32);
-    }
-
-    fn handle(t: *const TxSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(g), .kind = .db_tx, .slot = @intCast(t.index), .exec = t.exec.index });
-    }
-
     fn setEnd(t: *TxSlot, how: TxEnd) void {
         _ = t.end.cmpxchgStrong(0, @backingInt(how), .acq_rel, .acquire);
     }
@@ -978,7 +957,7 @@ fn txFreeWord(gen: u32) u64 {
     return packTx(gen, .free);
 }
 
-pub const TxTable = SlotTable(TxSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransactions }, txFreeWord);
+pub const TxTable = SlotTable(TxSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransactions, .kind = .db_tx, .open = @backingInt(TxState.open) }, txFreeWord);
 
 /// Any thread, at the stop: every open transaction ends without answering.
 fn markTxStopped(s: *TxSlot) void {
@@ -1040,7 +1019,7 @@ const TxStart = struct {
 };
 
 /// `anole_db_begin` (any thread).
-pub fn begin(d: *Db, c: ?*Consumer, opts: abi.DbTxOptions, user_data: u64) QueryError!void {
+pub fn begin(d: *Db, c: ?*Consumer, opts: abi.DbTxOptions, user_data: u64) CallError!void {
     if (comptime !features.sqlite and !features.postgres) return error.Unsupported;
     if (d.config.sqlite == null and d.config.postgres == null) return error.Unsupported;
     const e = d.engine;
@@ -1082,7 +1061,7 @@ const BeginCmd = struct {
             const a: Answer = .{ .user_data = b.start.user_data, .status = abi.E_NOMEM, .http_status = 500, .error_class = .other, .message = "too many open transactions" };
             return postAnswerNoWait(x, &a);
         };
-        const g = t.gen();
+        const g = TxTable.gen(t);
         t.d = b.d;
         t.head = null;
         t.tail = null;
@@ -1173,8 +1152,8 @@ fn endAnswer(t: *const TxSlot, user_data: u64) ?Answer {
 /// On the transaction's executor, for its whole life.
 fn txTask(x: *Exec, t: *TxSlot, st: TxStart) std.Io.Cancelable!void {
     const io = x.engine.io;
-    const g = t.gen();
-    const handle = t.handle(g);
+    const g = TxTable.gen(t);
+    const handle = TxTable.handle(t, g);
     t.task = placement.currentTask(io);
     var begin_arena: std.heap.ArenaAllocator = .init(gpa);
     defer begin_arena.deinit();
@@ -1259,7 +1238,7 @@ fn txSlotOf(e: *Engine, h: Handle) ?*TxSlot {
 }
 
 /// A call on the open transaction `hv`: `anole_db_tx_query` and `_exec`.
-pub fn txSubmit(e: *Engine, hv: u64, what: TxWhat, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) QueryError!void {
+pub fn txSubmit(e: *Engine, hv: u64, what: TxWhat, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) CallError!void {
     const h = Handle.decode(hv);
     for (params) |p| if (p.type > abi.DB_TYPE_BOOL or p.reserved != 0) return error.Invalid;
     if (opts.cache_ttl_ms != 0 or opts.cache_tag.len != 0 or opts.req != 0 or opts.flags & ~abi.DB_F_NO_PREPARE != 0) return error.Invalid;
@@ -1302,7 +1281,7 @@ pub fn txSubmit(e: *Engine, hv: u64, what: TxWhat, sql: []const u8, params: []co
 
 /// `anole_db_tx_commit` and `_rollback`: from here the handle takes no more
 /// calls.
-pub fn txFinish(e: *Engine, hv: u64, what: TxWhat, user_data: u64) QueryError!void {
+pub fn txFinish(e: *Engine, hv: u64, what: TxWhat, user_data: u64) CallError!void {
     const h = Handle.decode(hv);
     const t = txSlotOf(e, h) orelse return error.Gone;
     var w = t.word.load(.acquire);

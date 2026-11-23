@@ -1367,6 +1367,74 @@ fn fail(why: *std.Io.Writer, comptime fmt: []const u8, args: anytype) Problem {
     return error.Config;
 }
 
+/// The number of true flags in a tuple of bools.
+fn count(flags: anytype) u8 {
+    var n: u8 = 0;
+    inline for (flags) |f| n += @intFromBool(f);
+    return n;
+}
+
+fn exactlyOne(why: *std.Io.Writer, flags: anytype, comptime fmt: []const u8, args: anytype) Problem!void {
+    if (count(flags) != 1) return fail(why, fmt, args);
+}
+
+fn notBoth(why: *std.Io.Writer, a: bool, b: bool, comptime fmt: []const u8, args: anytype) Problem!void {
+    if (a and b) return fail(why, fmt, args);
+}
+
+/// The name of a list item: the item itself (bare or optional) or its `name`.
+fn nameOf(item: anytype) ?[]const u8 {
+    return switch (@typeInfo(@TypeOf(item))) {
+        .@"struct" => nameOf(item.name),
+        else => item,
+    };
+}
+
+/// Refuses item `at` when an earlier one has its name (an item without a
+/// name never collides). `dup_fmt` takes `shown` and the name.
+fn uniqueName(why: *std.Io.Writer, list: anytype, at: usize, shown: usize, comptime dup_fmt: []const u8) Problem!void {
+    const name = nameOf(list[at]) orelse return;
+    for (list[0..at]) |other| if (nameOf(other)) |o| if (std.mem.eql(u8, o, name)) return fail(why, dup_fmt, .{ shown, name });
+}
+
+/// `root[i].name`: 1-255 bytes and unique.
+fn checkName(why: *std.Io.Writer, list: anytype, i: usize, comptime root: []const u8) Problem!void {
+    const name = list[i].name;
+    if (name.len == 0 or name.len > 255) return fail(why, root ++ "[{d}].name: 1-255 bytes", .{i});
+    try uniqueName(why, list, i, i, root ++ "[{d}].name \"{s}\" is taken");
+}
+
+/// The string options, each set once: `checkOneOf` words its refusal from it.
+const options = struct {
+    const s3_provider: []const []const u8 = &.{ "auto", "aws", "r2", "b2", "supabase", "minio", "generic" };
+    const s3_addressing: []const []const u8 = &.{ "auto", "path", "virtual_host" };
+    const s3_payload_signing: []const []const u8 = &.{ "auto", "signed", "unsigned" };
+    const kafka_mechanism: []const []const u8 = &.{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" };
+    const kafka_acks: []const []const u8 = &.{ "none", "leader", "all" };
+    const kafka_compression: []const []const u8 = &.{ "none", "gzip", "zstd", "lz4" };
+    const nats_retention: []const []const u8 = &.{ "limits", "interest", "workqueue" };
+    const nats_storage: []const []const u8 = &.{ "file", "memory" };
+    const nats_deliver_policy: []const []const u8 = &.{ "all", "last", "new", "last_per_subject" };
+    const smtp_tls_mode: []const []const u8 = &.{ "auto", "starttls", "implicit", "none" };
+    const redis_ack: []const []const u8 = &.{ "auto", "manual" };
+    const mongo_full_document: []const []const u8 = &.{ "default", "update_lookup", "when_available", "required" };
+    const mongo_before_change: []const []const u8 = &.{ "off", "when_available", "required" };
+    const ws_type: []const []const u8 = &.{ "text", "binary" };
+};
+
+/// "a, b or c" ("a or b" for two).
+fn joinOr(comptime list: []const []const u8) []const u8 {
+    comptime var text: []const u8 = list[0];
+    inline for (list[1..], 1..) |word, k| text = text ++ (if (k == list.len - 1) " or " else ", ") ++ word;
+    return text;
+}
+
+/// `value` is one of `list`, else "path: a, b or c".
+fn checkOneOf(why: *std.Io.Writer, value: []const u8, comptime list: []const []const u8, comptime path: []const u8, args: anytype) Problem!void {
+    inline for (list) |word| if (std.mem.eql(u8, value, word)) return;
+    return fail(why, path ++ ": " ++ comptime joinOr(list), args);
+}
+
 /// What the types cannot say.
 fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.listeners.len == 0) return fail(why, "listeners: at least one", .{});
@@ -1389,13 +1457,11 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (comptime features.tls != .boringssl) return fail(why, "listeners[{d}].tls: TLS is not built in (-Dtls=boringssl)", .{i});
             const files = t.cert_file != null or t.key_file != null;
             const pem = t.cert_pem != null or t.key_pem != null;
-            const n = @as(u8, @intFromBool(files)) + @intFromBool(pem) + @intFromBool(t.self_signed);
-            if (n != 1) return fail(why, "listeners[{d}].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed", .{i});
+            try exactlyOne(why, .{ files, pem, t.self_signed }, "listeners[{d}].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed", .{i});
             if (files and (t.cert_file == null or t.key_file == null)) return fail(why, "listeners[{d}].tls: cert_file and key_file go together", .{i});
             if (pem and (t.cert_pem == null or t.key_pem == null)) return fail(why, "listeners[{d}].tls: cert_pem and key_pem go together", .{i});
             const mode = clientAuth(t.client_auth) orelse return fail(why, "listeners[{d}].tls.client_auth: \"none\", \"request\" or \"require\"", .{i});
-            const cas = @as(u8, @intFromBool(t.client_ca_file != null)) + @intFromBool(t.client_ca_pem != null) +
-                @intFromBool(t.client_ca_dir != null) + @intFromBool(t.client_ca_system);
+            const cas = count(.{ t.client_ca_file != null, t.client_ca_pem != null, t.client_ca_dir != null, t.client_ca_system });
             if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system", .{ i, t.client_auth });
             if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: the client_ca_* settings go with client_auth \"request\" or \"require\"", .{i});
         }
@@ -1408,37 +1474,31 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (l.tcp != null or l.udp != null) try checkNet(l, i, why);
         if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
             return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
-        for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
-            return fail(why, "listeners[{d}].name \"{s}\" is taken", .{ i, l.name.? });
+        try uniqueName(why, cfg.listeners, i, i, "listeners[{d}].name \"{s}\" is taken");
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
     if (cfg.grpc) |g| try checkGrpc(g, why);
     for (cfg.storage, 0..) |st, i| {
-        if (st.name.len == 0 or st.name.len > 255) return fail(why, "storage[{d}].name: 1-255 bytes", .{i});
-        for (cfg.storage[0..i]) |other| if (std.mem.eql(u8, st.name, other.name))
-            return fail(why, "storage[{d}].name \"{s}\" is taken", .{ i, st.name });
+        try checkName(why, cfg.storage, i, "storage");
         if (comptime !features.s3) return fail(why, "storage[{d}]: S3 is not built in (-Ds3)", .{i});
         const c = st.s3;
         if ((c.access_key_id == null) != (c.secret_access_key == null)) return fail(why, "storage[{d}].s3: access_key_id, secret_access_key: both or neither", .{i});
         if (c.session_token != null and c.access_key_id == null) return fail(why, "storage[{d}].s3: session_token goes with access_key_id and secret_access_key", .{i});
-        if (c.anonymous and c.access_key_id != null) return fail(why, "storage[{d}].s3: anonymous or keys, not both", .{i});
-        if (!oneOf(c.provider, &.{ "auto", "aws", "r2", "b2", "supabase", "minio", "generic" })) return fail(why, "storage[{d}].s3.provider: auto, aws, r2, b2, supabase, minio or generic", .{i});
-        if (!oneOf(c.addressing, &.{ "auto", "path", "virtual_host" })) return fail(why, "storage[{d}].s3.addressing: auto, path or virtual_host", .{i});
-        if (!oneOf(c.payload_signing, &.{ "auto", "signed", "unsigned" })) return fail(why, "storage[{d}].s3.payload_signing: auto, signed or unsigned", .{i});
+        try notBoth(why, c.anonymous, c.access_key_id != null, "storage[{d}].s3: anonymous or keys, not both", .{i});
+        try checkOneOf(why, c.provider, options.s3_provider, "storage[{d}].s3.provider", .{i});
+        try checkOneOf(why, c.addressing, options.s3_addressing, "storage[{d}].s3.addressing", .{i});
+        try checkOneOf(why, c.payload_signing, options.s3_payload_signing, "storage[{d}].s3.payload_signing", .{i});
         if (c.part_size < 5 * 1024 * 1024 or c.part_size > 5 * 1024 * 1024 * 1024) return fail(why, "storage[{d}].s3: part_size: 5 MiB .. 5 GiB", .{i});
         if (c.concurrency < 1 or c.concurrency > 16) return fail(why, "storage[{d}].s3.concurrency: 1 .. 16", .{i});
         if (c.upload_memory < c.part_size) return fail(why, "storage[{d}].s3.upload_memory: at least one part", .{i});
-        if (c.ca_file != null and c.ca_pem != null) return fail(why, "storage[{d}].s3: ca_file or ca_pem, not both", .{i});
+        try notBoth(why, c.ca_file != null, c.ca_pem != null, "storage[{d}].s3: ca_file or ca_pem, not both", .{i});
         try checkClientCert(c, "storage", "s3", i, why);
         if (c.endpoint) |e| if (!(std.mem.startsWith(u8, e, "http://") or std.mem.startsWith(u8, e, "https://")))
             return fail(why, "storage[{d}].s3.endpoint: an http:// or https:// URL", .{i});
     }
     for (cfg.databases, 0..) |d, i| {
-        if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
-        for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
-            return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
-        const kinds = @as(u8, @intFromBool(d.sqlite != null)) + @intFromBool(d.postgres != null) + @intFromBool(d.redis != null) + @intFromBool(d.mongodb != null);
-        if (kinds != 1) return fail(why, "databases[{d}]: exactly one of sqlite, postgres, redis and mongodb", .{i});
+        try checkName(why, cfg.databases, i, "databases");
+        try exactlyOne(why, .{ d.sqlite != null, d.postgres != null, d.redis != null, d.mongodb != null }, "databases[{d}]: exactly one of sqlite, postgres, redis and mongodb", .{i});
         if (d.sqlite) |sq| {
             if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
             if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
@@ -1451,77 +1511,69 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
                 if (p.url) |u| if (std.mem.indexOf(u8, u, "sslmode=") != null)
                     return fail(why, "databases[{d}].postgres: sslmode is given twice, in the url and beside it", .{i});
             }
-            if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
+            try notBoth(why, p.ca_file != null, p.ca_pem != null, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
             try checkClientCert(p, "databases", "postgres", i, why);
             if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
         }
         if (d.redis) |r| {
             if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
-            if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
+            try notBoth(why, r.ca_file != null, r.ca_pem != null, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
             try checkClientCert(r, "databases", "redis", i, why);
             if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
         }
         if (d.mongodb) |m| {
             if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
-            if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
+            try notBoth(why, m.ca_file != null, m.ca_pem != null, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
             try checkClientCert(m, "databases", "mongodb", i, why);
             if (m.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].mongodb.max_connections: at least 1", .{i});
         }
     }
     for (cfg.brokers, 0..) |b, i| {
-        if (b.name.len == 0 or b.name.len > 255) return fail(why, "brokers[{d}].name: 1-255 bytes", .{i});
-        for (cfg.brokers[0..i]) |other| if (std.mem.eql(u8, b.name, other.name))
-            return fail(why, "brokers[{d}].name \"{s}\" is taken", .{ i, b.name });
-        if ((b.nats == null) == (b.kafka == null)) return fail(why, "brokers[{d}]: exactly one of nats or kafka", .{i});
+        try checkName(why, cfg.brokers, i, "brokers");
+        try exactlyOne(why, .{ b.nats != null, b.kafka != null }, "brokers[{d}]: exactly one of nats or kafka", .{i});
         if (b.kafka) |k| {
             if (comptime !features.kafka) return fail(why, "brokers[{d}].kafka: Kafka is not built in (-Dkafka)", .{i});
-            if (k.ca_file != null and k.ca_pem != null) return fail(why, "brokers[{d}].kafka: ca_file or ca_pem, not both", .{i});
+            try notBoth(why, k.ca_file != null, k.ca_pem != null, "brokers[{d}].kafka: ca_file or ca_pem, not both", .{i});
             try checkClientCert(k, "brokers", "kafka", i, why);
             if (k.brokers) |list| {
                 if (list.len == 0) return fail(why, "brokers[{d}].kafka.brokers: at least one host:port", .{i});
                 for (list) |h| if (h.len == 0) return fail(why, "brokers[{d}].kafka.brokers: empty entry", .{i});
             }
-            if (k.sasl) |sa| {
-                if (!oneOf(sa.mechanism, &.{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" }))
-                    return fail(why, "brokers[{d}].kafka.sasl.mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512", .{i});
-            }
+            if (k.sasl) |sa| try checkOneOf(why, sa.mechanism, options.kafka_mechanism, "brokers[{d}].kafka.sasl.mechanism", .{i});
             const p = k.producer;
-            if (!oneOf(p.acks, &.{ "none", "leader", "all" })) return fail(why, "brokers[{d}].kafka.producer.acks: none, leader or all", .{i});
-            if (!oneOf(p.compression, &.{ "none", "gzip", "zstd", "lz4" })) return fail(why, "brokers[{d}].kafka.producer.compression: none, gzip, zstd or lz4", .{i});
+            try checkOneOf(why, p.acks, options.kafka_acks, "brokers[{d}].kafka.producer.acks", .{i});
+            try checkOneOf(why, p.compression, options.kafka_compression, "brokers[{d}].kafka.producer.compression", .{i});
             if (p.idempotent and !std.mem.eql(u8, p.acks, "all")) return fail(why, "brokers[{d}].kafka.producer.idempotent: needs acks \"all\"", .{i});
             if (p.batch_bytes == 0 or p.buffer_bytes < p.batch_bytes or p.max_request_bytes < 1024)
                 return fail(why, "brokers[{d}].kafka.producer: batch_bytes, buffer_bytes or max_request_bytes", .{i});
         }
         if (b.nats) |n| {
             if (comptime !features.nats) return fail(why, "brokers[{d}].nats: NATS is not built in (-Dnats)", .{i});
-            const logins = @as(u8, @intFromBool(n.token != null)) + @intFromBool(n.user != null or n.password != null) +
-                @intFromBool(n.nkey_seed != null or n.nkey_seed_file != null) + @intFromBool(n.creds != null or n.creds_file != null);
+            const logins = count(.{ n.token != null, n.user != null or n.password != null, n.nkey_seed != null or n.nkey_seed_file != null, n.creds != null or n.creds_file != null });
             if (logins > 1) return fail(why, "brokers[{d}].nats: exactly one of token, user/password, nkey_seed(_file), creds(_file)", .{i});
             if ((n.user == null) != (n.password == null)) return fail(why, "brokers[{d}].nats: user and password go together", .{i});
-            if (n.nkey_seed != null and n.nkey_seed_file != null) return fail(why, "brokers[{d}].nats: nkey_seed or nkey_seed_file, not both", .{i});
-            if (n.creds != null and n.creds_file != null) return fail(why, "brokers[{d}].nats: creds or creds_file, not both", .{i});
-            if (n.ca_file != null and n.ca_pem != null) return fail(why, "brokers[{d}].nats: ca_file or ca_pem, not both", .{i});
+            try notBoth(why, n.nkey_seed != null, n.nkey_seed_file != null, "brokers[{d}].nats: nkey_seed or nkey_seed_file, not both", .{i});
+            try notBoth(why, n.creds != null, n.creds_file != null, "brokers[{d}].nats: creds or creds_file, not both", .{i});
+            try notBoth(why, n.ca_file != null, n.ca_pem != null, "brokers[{d}].nats: ca_file or ca_pem, not both", .{i});
             try checkClientCert(n, "brokers", "nats", i, why);
             if (!std.mem.eql(u8, n.connections, "one") and !std.mem.eql(u8, n.connections, "per_executor"))
                 return fail(why, "brokers[{d}].nats.connections: \"one\" or \"per_executor\"", .{i});
             for (n.jetstream.streams, 0..) |s, j| {
                 if (s.name.len == 0) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].name: required", .{ i, j });
-                if (!oneOf(s.retention, &.{ "limits", "interest", "workqueue" })) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].retention: limits, interest or workqueue", .{ i, j });
-                if (!oneOf(s.storage, &.{ "file", "memory" })) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].storage: file or memory", .{ i, j });
+                try checkOneOf(why, s.retention, options.nats_retention, "brokers[{d}].nats.jetstream.streams[{d}].retention", .{ i, j });
+                try checkOneOf(why, s.storage, options.nats_storage, "brokers[{d}].nats.jetstream.streams[{d}].storage", .{ i, j });
             }
             for (n.jetstream.consumers, 0..) |k, j| {
                 if (k.stream.len == 0 or k.durable.len == 0) return fail(why, "brokers[{d}].nats.jetstream.consumers[{d}]: stream and durable are required", .{ i, j });
-                if (!oneOf(k.deliver_policy, &.{ "all", "last", "new", "last_per_subject" })) return fail(why, "brokers[{d}].nats.jetstream.consumers[{d}].deliver_policy: all, last, new or last_per_subject", .{ i, j });
+                try checkOneOf(why, k.deliver_policy, options.nats_deliver_policy, "brokers[{d}].nats.jetstream.consumers[{d}].deliver_policy", .{ i, j });
             }
         }
     }
     for (cfg.mail, 0..) |m, i| {
         if (comptime !features.smtp) return fail(why, "mail[{d}]: SMTP is not built in (-Dsmtp)", .{i});
-        if (m.name.len == 0 or m.name.len > 255) return fail(why, "mail[{d}].name: 1-255 bytes", .{i});
-        for (cfg.mail[0..i]) |other| if (std.mem.eql(u8, m.name, other.name))
-            return fail(why, "mail[{d}].name \"{s}\" is taken", .{ i, m.name });
+        try checkName(why, cfg.mail, i, "mail");
         const sm = m.smtp;
-        if (!oneOf(sm.tls_mode, &.{ "auto", "starttls", "implicit", "none" })) return fail(why, "mail[{d}].smtp.tls_mode: auto, starttls, implicit or none", .{i});
+        try checkOneOf(why, sm.tls_mode, options.smtp_tls_mode, "mail[{d}].smtp.tls_mode", .{i});
         try checkClientCert(sm, "mail", "smtp", i, why);
         if (sm.max_connections) |n| if (n == 0) return fail(why, "mail[{d}].smtp.max_connections: at least 1", .{i});
         if (sm.max_messages_per_connection == 0) return fail(why, "mail[{d}].smtp.max_messages_per_connection: at least 1", .{i});
@@ -1542,8 +1594,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
         for (h.checks, 0..) |name, i| {
             if (name.len == 0 or name.len > 64) return fail(why, "observe.health.checks[{d}]: 1-64 bytes", .{i});
-            for (h.checks[0..i]) |other| if (std.mem.eql(u8, other, name))
-                return fail(why, "observe.health.checks[{d}] \"{s}\" is listed twice", .{ i, name });
+            try uniqueName(why, h.checks, i, i, "observe.health.checks[{d}] \"{s}\" is listed twice");
         }
         if (h.listener) |ln| {
             var found = false;
@@ -1556,8 +1607,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     var ntimeouts: usize = 1;
     timeouts[0] = cfg.timeouts.request_ms orelse std.math.maxInt(u32);
     for (cfg.routes, 0..) |r, i| {
-        const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
-            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null) + @intFromBool(r.sse != null);
+        const kinds = count(.{ r.handler != null, r.respond != null, r.static != null, r.websocket != null, r.webtransport != null, r.sse != null });
         const combined = r.handler != null and r.websocket != null and r.websocket.?.accept == .consumer and kinds == 2;
         if (kinds != 1 and !combined) {
             if (r.handler != null and r.websocket != null and kinds == 2)
@@ -1637,11 +1687,8 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
         }
     }
     for (cfg.watches, 0..) |w, i| {
-        if (w.name.len == 0 or w.name.len > 255) return fail(why, "watches[{d}].name: 1-255 bytes", .{i});
-        for (cfg.watches[0..i]) |other| if (std.mem.eql(u8, other.name, w.name))
-            return fail(why, "watches[{d}].name \"{s}\" is taken", .{ i, w.name });
-        const kinds = @as(u8, @intFromBool(w.postgres != null)) + @intFromBool(w.redis != null) + @intFromBool(w.redis_stream != null) + @intFromBool(w.mongodb != null);
-        if (kinds != 1) return fail(why, "watches[{d}]: exactly one of postgres, redis, redis_stream, mongodb", .{i});
+        try checkName(why, cfg.watches, i, "watches");
+        try exactlyOne(why, .{ w.postgres != null, w.redis != null, w.redis_stream != null, w.mongodb != null }, "watches[{d}]: exactly one of postgres, redis, redis_stream, mongodb", .{i});
         var found: ?Config.Database = null;
         for (cfg.databases) |d| if (std.mem.eql(u8, d.name, w.database)) {
             found = d;
@@ -1659,17 +1706,17 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (w.redis_stream) |r| {
             if (r.keys.len == 0 or r.keys.len > 16) return fail(why, "watches[{d}].redis_stream.keys: 1 to 16", .{i});
             if (r.count == 0) return fail(why, "watches[{d}].redis_stream.count: at least 1", .{i});
-            if (r.group) |g| if (!oneOf(g.ack, &.{ "auto", "manual" })) return fail(why, "watches[{d}].redis_stream.group.ack: auto or manual", .{i});
+            if (r.group) |g| try checkOneOf(why, g.ack, options.redis_ack, "watches[{d}].redis_stream.group.ack", .{i});
         }
         if (w.mongodb) |m| {
             if (m.collection != null and m.database == null) {}
-            if (!oneOf(m.full_document, &.{ "default", "update_lookup", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document: default, update_lookup, when_available or required", .{i});
-            if (!oneOf(m.full_document_before_change, &.{ "off", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document_before_change: off, when_available or required", .{i});
+            try checkOneOf(why, m.full_document, options.mongo_full_document, "watches[{d}].mongodb.full_document", .{i});
+            try checkOneOf(why, m.full_document_before_change, options.mongo_before_change, "watches[{d}].mongodb.full_document_before_change", .{i});
             if (m.pipeline) |p| if (p != .array) return fail(why, "watches[{d}].mongodb.pipeline: an array of stage documents", .{i});
         }
         for (w.to, 0..) |t, k| {
-            if ((t.sse == null) == (t.ws == null)) return fail(why, "watches[{d}].to[{d}]: exactly one of sse and ws", .{ i, k });
-            if (t.ws != null and !oneOf(t.type, &.{ "text", "binary" })) return fail(why, "watches[{d}].to[{d}].type: text or binary", .{ i, k });
+            try exactlyOne(why, .{ t.sse != null, t.ws != null }, "watches[{d}].to[{d}]: exactly one of sse and ws", .{ i, k });
+            if (t.ws != null) try checkOneOf(why, t.type, options.ws_type, "watches[{d}].to[{d}].type", .{ i, k });
             const text = t.sse orelse t.ws.?;
             if (text.len == 0 or text.len > 255) return fail(why, "watches[{d}].to[{d}]: the topic or room is 1-255 bytes", .{ i, k });
             var scratch: [8192]u8 = undefined;
@@ -1705,8 +1752,7 @@ fn checkNet(l: Config.Listener, i: usize, why: *std.Io.Writer) Problem!void {
         if (t.read_ahead == 0) return fail(why, "listeners[{d}].tcp.read_ahead: at least 1", .{i});
         if (t.max_connections) |n| if (n == 0) return fail(why, "listeners[{d}].tcp.max_connections: at least 1", .{i});
         if (t.framing) |f| {
-            const n = @as(u8, @intFromBool(f.lines != null)) + @intFromBool(f.length != null) + @intFromBool(f.varint != null);
-            if (n != 1) return fail(why, "listeners[{d}].tcp.framing: exactly one of lines, length, varint", .{i});
+            try exactlyOne(why, .{ f.lines != null, f.length != null, f.varint != null }, "listeners[{d}].tcp.framing: exactly one of lines, length, varint", .{i});
             if (f.length) |len| {
                 if (len.bytes != 1 and len.bytes != 2 and len.bytes != 4) return fail(why, "listeners[{d}].tcp.framing.length.bytes: 1, 2 or 4", .{i});
                 if (!std.mem.eql(u8, len.endian, "big") and !std.mem.eql(u8, len.endian, "little")) return fail(why, "listeners[{d}].tcp.framing.length.endian: \"big\" or \"little\"", .{i});
@@ -1745,11 +1791,6 @@ fn checkClientCert(c: anytype, comptime root: []const u8, comptime kind: []const
     if (c.insecure_skip_verify and (c.ca_file != null or c.ca_pem != null)) return fail(why, root ++ "[{d}]." ++ kind ++ ": insecure_skip_verify cannot be set with a CA", .{i});
 }
 
-fn oneOf(value: []const u8, comptime options: []const []const u8) bool {
-    inline for (options) |o| if (std.mem.eql(u8, value, o)) return true;
-    return false;
-}
-
 fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
     if (comptime !features.grpc) return fail(why, "grpc: gRPC is not built in (-Dgrpc)", .{});
     if (g.descriptor_set != null and g.descriptor_set_file != null) return fail(why, "grpc: one of descriptor_set and descriptor_set_file", .{});
@@ -1757,7 +1798,7 @@ fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
     if (g.services.len == 0) return fail(why, "grpc.services: at least one", .{});
     for (g.services, 0..) |svc, i| {
         if (svc.name.len == 0 or svc.name.len > 255) return fail(why, "grpc.services[{d}].name: 1-255 bytes", .{i});
-        for (g.services[0..i]) |other| if (std.mem.eql(u8, other.name, svc.name)) return fail(why, "grpc.services[{d}]: {s} twice", .{ i, svc.name });
+        try uniqueName(why, g.services, i, i, "grpc.services[{d}]: {s} twice");
         if (svc.max_message_size == 0 or svc.max_message_size > max_record_payload) return fail(why, "grpc.services[{d}].max_message_size: 1 to {d}", .{ i, max_record_payload });
         var mw_buf: [48]u8 = undefined;
         try checkMiddleware(svc.middleware, std.fmt.bufPrint(&mw_buf, "grpc.services[{d}].middleware", .{i}) catch "grpc.services[].middleware", why);
@@ -1767,7 +1808,7 @@ fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
         for (methods, 0..) |m, j| {
             if (m.name.len == 0 or std.mem.indexOfAny(u8, m.name, "/?# ") != null) return fail(why, "grpc.services[{d}].methods[{d}].name: a method name", .{ i, j });
             if (m.kind == null and !descriptors) return fail(why, "grpc.services[{d}].methods[{d}].kind: needed without descriptors", .{ i, j });
-            for (methods[0..j]) |other| if (std.mem.eql(u8, other.name, m.name)) return fail(why, "grpc.services[{d}].methods: {s} twice", .{ i, m.name });
+            try uniqueName(why, methods, j, i, "grpc.services[{d}].methods: {s} twice");
         }
     }
 }
@@ -1776,7 +1817,7 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
     for (list, 0..) |m, i| switch (m) {
         .jwt => |j| {
             if (comptime !features.auth) return fail(why, "{s}[{d}].jwt: auth is not built in (-Dauth)", .{ where, i });
-            if ((j.jwks_url == null) == (j.jwks == null)) return fail(why, "{s}[{d}].jwt: exactly one of jwks_url and jwks", .{ where, i });
+            try exactlyOne(why, .{ j.jwks_url != null, j.jwks != null }, "{s}[{d}].jwt: exactly one of jwks_url and jwks", .{ where, i });
             if (j.jwks_url != null and j.audience == null and !j.allow_any_audience)
                 return fail(why, "{s}[{d}].jwt: jwks_url needs audience (this API's identifier at the provider), or allow_any_audience: true when the keys sign for this application alone", .{ where, i });
         },
@@ -2046,6 +2087,132 @@ test "parse: each refused document is error.Config with a reason" {
         };
         std.testing.expect(why.buffered().len > 0) catch |err| {
             std.debug.print("refused without a reason: {s}\n", .{doc});
+            return err;
+        };
+    }
+}
+
+const refusal_rows = [_]struct { name: []const u8, on: bool = true, doc: []const u8, expect: []const u8 }{
+    // Names: length, then unique.
+    .{ .name = "listener name empty", .doc = "{\"listeners\": [{\"name\": \"\"}]}", .expect = "config: listeners[0].name: 1-255 bytes, no ':'" },
+    .{ .name = "listener name colon", .doc = "{\"listeners\": [{\"name\": \"a:b\"}]}", .expect = "config: listeners[0].name: 1-255 bytes, no ':'" },
+    .{ .name = "listener name dup", .doc = "{\"listeners\": [{\"name\": \"a\"}, {\"name\": \"a\"}]}", .expect = "config: listeners[1].name \"a\" is taken" },
+    .{ .name = "storage name empty", .doc = "{\"storage\": [{\"name\": \"\", \"s3\": {}}]}", .expect = "config: storage[0].name: 1-255 bytes" },
+    .{ .name = "storage name dup", .on = features.s3, .doc = "{\"storage\": [{\"name\": \"a\", \"s3\": {}}, {\"name\": \"a\", \"s3\": {}}]}", .expect = "config: storage[1].name \"a\" is taken" },
+    .{ .name = "database name empty", .doc = "{\"databases\": [{\"name\": \"\"}]}", .expect = "config: databases[0].name: 1-255 bytes" },
+    .{ .name = "database name dup", .on = features.sqlite, .doc = "{\"databases\": [{\"name\": \"a\", \"sqlite\": {\"path\": \"x\"}}, {\"name\": \"a\", \"sqlite\": {\"path\": \"x\"}}]}", .expect = "config: databases[1].name \"a\" is taken" },
+    .{ .name = "broker name empty", .doc = "{\"brokers\": [{\"name\": \"\"}]}", .expect = "config: brokers[0].name: 1-255 bytes" },
+    .{ .name = "broker name dup", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"a\", \"nats\": {}}, {\"name\": \"a\", \"nats\": {}}]}", .expect = "config: brokers[1].name \"a\" is taken" },
+    .{ .name = "mail name empty", .on = features.smtp, .doc = "{\"mail\": [{\"name\": \"\", \"smtp\": {}}]}", .expect = "config: mail[0].name: 1-255 bytes" },
+    .{ .name = "mail name dup", .on = features.smtp, .doc = "{\"mail\": [{\"name\": \"a\", \"smtp\": {}}, {\"name\": \"a\", \"smtp\": {}}]}", .expect = "config: mail[1].name \"a\" is taken" },
+    .{ .name = "watch name empty", .doc = "{\"watches\": [{\"name\": \"\", \"database\": \"d\"}]}", .expect = "config: watches[0].name: 1-255 bytes" },
+    .{ .name = "watch name dup", .on = features.postgres, .doc = "{\"databases\": [{\"name\": \"d\", \"postgres\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": [\"c\"]}}, {\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": [\"c\"]}}]}", .expect = "config: watches[1].name \"w\" is taken" },
+    .{ .name = "grpc service name empty", .on = features.grpc, .doc = "{\"grpc\": {\"services\": [{\"name\": \"\", \"handler\": 1}]}}", .expect = "config: grpc.services[0].name: 1-255 bytes" },
+    .{ .name = "grpc service dup", .on = features.grpc, .doc = "{\"grpc\": {\"services\": [{\"name\": \"a\", \"handler\": 1, \"methods\": []}, {\"name\": \"a\", \"handler\": 1, \"methods\": []}]}}", .expect = "config: grpc.services[1]: a twice" },
+    .{ .name = "grpc method dup", .on = features.grpc, .doc = "{\"grpc\": {\"services\": [{\"name\": \"a\", \"handler\": 1, \"methods\": [{\"name\": \"m\", \"kind\": \"unary\"}, {\"name\": \"m\", \"kind\": \"unary\"}]}]}}", .expect = "config: grpc.services[0].methods: m twice" },
+    .{ .name = "health check empty", .doc = "{\"observe\": {\"health\": {\"checks\": [\"\"]}}}", .expect = "config: observe.health.checks[0]: 1-64 bytes" },
+    .{ .name = "health check dup", .doc = "{\"observe\": {\"health\": {\"checks\": [\"a\", \"a\"]}}}", .expect = "config: observe.health.checks[1] \"a\" is listed twice" },
+    // Not both.
+    .{ .name = "s3 ca both", .on = features.s3, .doc = "{\"storage\": [{\"name\": \"a\", \"s3\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: storage[0].s3: ca_file or ca_pem, not both" },
+    .{ .name = "s3 anonymous and keys", .on = features.s3, .doc = "{\"storage\": [{\"name\": \"a\", \"s3\": {\"anonymous\": true, \"access_key_id\": \"a\", \"secret_access_key\": \"b\"}}]}", .expect = "config: storage[0].s3: anonymous or keys, not both" },
+    .{ .name = "postgres ca both", .on = features.postgres, .doc = "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: databases[0].postgres: ca_file or ca_pem, not both" },
+    .{ .name = "redis ca both", .on = features.redis, .doc = "{\"databases\": [{\"name\": \"d\", \"redis\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: databases[0].redis: ca_file or ca_pem, not both" },
+    .{ .name = "mongodb ca both", .on = features.mongodb, .doc = "{\"databases\": [{\"name\": \"d\", \"mongodb\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: databases[0].mongodb: ca_file or ca_pem, not both" },
+    .{ .name = "kafka ca both", .on = features.kafka, .doc = "{\"brokers\": [{\"name\": \"b\", \"kafka\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: brokers[0].kafka: ca_file or ca_pem, not both" },
+    .{ .name = "nats ca both", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}", .expect = "config: brokers[0].nats: ca_file or ca_pem, not both" },
+    .{ .name = "nats nkey_seed both", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"nkey_seed\": \"a\", \"nkey_seed_file\": \"b\"}}]}", .expect = "config: brokers[0].nats: nkey_seed or nkey_seed_file, not both" },
+    .{ .name = "nats creds both", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"creds\": \"a\", \"creds_file\": \"b\"}}]}", .expect = "config: brokers[0].nats: creds or creds_file, not both" },
+    // Exactly one.
+    .{ .name = "tls two sources", .on = features.tls == .boringssl, .doc = "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"cert_pem\": \"a\", \"key_pem\": \"b\"}}]}", .expect = "config: listeners[0].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed" },
+    .{ .name = "tls no source", .on = features.tls == .boringssl, .doc = "{\"listeners\": [{\"tls\": {}}]}", .expect = "config: listeners[0].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed" },
+    .{ .name = "client_ca missing", .on = features.tls == .boringssl, .doc = "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}", .expect = "config: listeners[0].tls: client_auth \"require\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system" },
+    .{ .name = "client_ca two", .on = features.tls == .boringssl, .doc = "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}", .expect = "config: listeners[0].tls: client_auth \"request\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system" },
+    .{ .name = "client_ca without auth", .on = features.tls == .boringssl, .doc = "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_pem\": \"b\"}}]}", .expect = "config: listeners[0].tls: the client_ca_* settings go with client_auth \"request\" or \"require\"" },
+    .{ .name = "database two kinds", .doc = "{\"databases\": [{\"name\": \"d\", \"redis\": {}, \"postgres\": {}}]}", .expect = "config: databases[0]: exactly one of sqlite, postgres, redis and mongodb" },
+    .{ .name = "database no kind", .doc = "{\"databases\": [{\"name\": \"d\"}]}", .expect = "config: databases[0]: exactly one of sqlite, postgres, redis and mongodb" },
+    .{ .name = "broker both kinds", .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {}, \"kafka\": {}}]}", .expect = "config: brokers[0]: exactly one of nats or kafka" },
+    .{ .name = "broker no kind", .doc = "{\"brokers\": [{\"name\": \"b\"}]}", .expect = "config: brokers[0]: exactly one of nats or kafka" },
+    .{ .name = "nats two logins", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"token\": \"t\", \"user\": \"u\", \"password\": \"p\"}}]}", .expect = "config: brokers[0].nats: exactly one of token, user/password, nkey_seed(_file), creds(_file)" },
+    .{ .name = "watch two sources", .doc = "{\"watches\": [{\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": []}, \"redis\": {}}]}", .expect = "config: watches[0]: exactly one of postgres, redis, redis_stream, mongodb" },
+    .{ .name = "watch no source", .doc = "{\"watches\": [{\"name\": \"w\", \"database\": \"d\"}]}", .expect = "config: watches[0]: exactly one of postgres, redis, redis_stream, mongodb" },
+    .{ .name = "watch to both", .on = features.postgres, .doc = "{\"databases\": [{\"name\": \"d\", \"postgres\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": [\"c\"]}, \"to\": [{\"sse\": \"a\", \"ws\": \"b\"}]}]}", .expect = "config: watches[0].to[0]: exactly one of sse and ws" },
+    .{ .name = "watch to neither", .on = features.postgres, .doc = "{\"databases\": [{\"name\": \"d\", \"postgres\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": [\"c\"]}, \"to\": [{}]}]}", .expect = "config: watches[0].to[0]: exactly one of sse and ws" },
+    .{ .name = "framing two", .on = features.net, .doc = "{\"listeners\": [{\"port\": 0, \"tcp\": {\"handler\": 1, \"framing\": {\"lines\": {}, \"varint\": {}}}}]}", .expect = "config: listeners[0].tcp.framing: exactly one of lines, length, varint" },
+    .{ .name = "framing none", .on = features.net, .doc = "{\"listeners\": [{\"port\": 0, \"tcp\": {\"handler\": 1, \"framing\": {}}}]}", .expect = "config: listeners[0].tcp.framing: exactly one of lines, length, varint" },
+    .{ .name = "jwt both", .on = features.auth, .doc = "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"u\", \"jwks\": {}}}]}", .expect = "config: middleware[0].jwt: exactly one of jwks_url and jwks" },
+    .{ .name = "jwt neither", .on = features.auth, .doc = "{\"middleware\": [{\"jwt\": {}}]}", .expect = "config: middleware[0].jwt: exactly one of jwks_url and jwks" },
+    .{ .name = "route two kinds", .doc = "{\"routes\": [{\"path\": \"/x\", \"handler\": 1, \"respond\": {}}]}", .expect = "config: routes[0]: exactly one of handler, respond, static, websocket, webtransport, sse" },
+    .{ .name = "route no kind", .doc = "{\"routes\": [{\"path\": \"/x\"}]}", .expect = "config: routes[0]: exactly one of handler, respond, static, websocket, webtransport, sse" },
+    .{ .name = "route handler and websocket", .doc = "{\"routes\": [{\"path\": \"/x\", \"handler\": 1, \"websocket\": {\"handler\": 2}}]}", .expect = "config: routes[0]: handler and websocket go together only with \"accept\": \"consumer\"" },
+};
+
+/// Every string option set: a bad value, the text it is refused with, and
+/// the first option, which must parse.
+const option_rows = [_]struct { name: []const u8, on: bool = true, pre: []const u8, post: []const u8, first: []const u8, expect: []const u8 }{
+    .{ .name = "s3 provider", .on = features.s3, .pre = "{\"storage\": [{\"name\": \"a\", \"s3\": {\"provider\": \"", .post = "\"}}]}", .first = "auto", .expect = "config: storage[0].s3.provider: auto, aws, r2, b2, supabase, minio or generic" },
+    .{ .name = "s3 addressing", .on = features.s3, .pre = "{\"storage\": [{\"name\": \"a\", \"s3\": {\"addressing\": \"", .post = "\"}}]}", .first = "auto", .expect = "config: storage[0].s3.addressing: auto, path or virtual_host" },
+    .{ .name = "s3 payload_signing", .on = features.s3, .pre = "{\"storage\": [{\"name\": \"a\", \"s3\": {\"payload_signing\": \"", .post = "\"}}]}", .first = "auto", .expect = "config: storage[0].s3.payload_signing: auto, signed or unsigned" },
+    .{ .name = "kafka mechanism", .on = features.kafka, .pre = "{\"brokers\": [{\"name\": \"b\", \"kafka\": {\"sasl\": {\"username\": \"u\", \"password\": \"p\", \"mechanism\": \"", .post = "\"}}}]}", .first = "PLAIN", .expect = "config: brokers[0].kafka.sasl.mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512" },
+    .{ .name = "kafka acks", .on = features.kafka, .pre = "{\"brokers\": [{\"name\": \"b\", \"kafka\": {\"producer\": {\"acks\": \"", .post = "\"}}}]}", .first = "all", .expect = "config: brokers[0].kafka.producer.acks: none, leader or all" },
+    .{ .name = "kafka compression", .on = features.kafka, .pre = "{\"brokers\": [{\"name\": \"b\", \"kafka\": {\"producer\": {\"compression\": \"", .post = "\"}}}]}", .first = "none", .expect = "config: brokers[0].kafka.producer.compression: none, gzip, zstd or lz4" },
+    .{ .name = "nats retention", .on = features.nats, .pre = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"jetstream\": {\"streams\": [{\"name\": \"s\", \"retention\": \"", .post = "\"}]}}}]}", .first = "limits", .expect = "config: brokers[0].nats.jetstream.streams[0].retention: limits, interest or workqueue" },
+    .{ .name = "nats storage", .on = features.nats, .pre = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"jetstream\": {\"streams\": [{\"name\": \"s\", \"storage\": \"", .post = "\"}]}}}]}", .first = "file", .expect = "config: brokers[0].nats.jetstream.streams[0].storage: file or memory" },
+    .{ .name = "nats deliver_policy", .on = features.nats, .pre = "{\"brokers\": [{\"name\": \"b\", \"nats\": {\"jetstream\": {\"consumers\": [{\"stream\": \"s\", \"durable\": \"d\", \"deliver_policy\": \"", .post = "\"}]}}}]}", .first = "all", .expect = "config: brokers[0].nats.jetstream.consumers[0].deliver_policy: all, last, new or last_per_subject" },
+    .{ .name = "smtp tls_mode", .on = features.smtp, .pre = "{\"mail\": [{\"name\": \"a\", \"smtp\": {\"tls_mode\": \"", .post = "\"}}]}", .first = "auto", .expect = "config: mail[0].smtp.tls_mode: auto, starttls, implicit or none" },
+    .{ .name = "redis_stream ack", .on = features.redis, .pre = "{\"databases\": [{\"name\": \"d\", \"redis\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"redis_stream\": {\"keys\": [\"k\"], \"group\": {\"name\": \"g\", \"ack\": \"", .post = "\"}}}]}", .first = "auto", .expect = "config: watches[0].redis_stream.group.ack: auto or manual" },
+    .{ .name = "mongodb full_document", .on = features.mongodb, .pre = "{\"databases\": [{\"name\": \"d\", \"mongodb\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"mongodb\": {\"full_document\": \"", .post = "\"}}]}", .first = "default", .expect = "config: watches[0].mongodb.full_document: default, update_lookup, when_available or required" },
+    .{ .name = "mongodb full_document_before_change", .on = features.mongodb, .pre = "{\"databases\": [{\"name\": \"d\", \"mongodb\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"mongodb\": {\"full_document_before_change\": \"", .post = "\"}}]}", .first = "off", .expect = "config: watches[0].mongodb.full_document_before_change: off, when_available or required" },
+    .{ .name = "watch to type", .on = features.postgres, .pre = "{\"databases\": [{\"name\": \"d\", \"postgres\": {}}], \"watches\": [{\"name\": \"w\", \"database\": \"d\", \"postgres\": {\"channels\": [\"c\"]}, \"to\": [{\"ws\": \"room\", \"type\": \"", .post = "\"}]}]}", .first = "text", .expect = "config: watches[0].to[0].type: text or binary" },
+};
+
+/// Documents the rules above must still accept: unnamed listeners never
+/// collide, nats logins are at most one, and SMTP has no CA check.
+const accepted_rows = [_]struct { name: []const u8, on: bool = true, doc: []const u8 }{
+    .{ .name = "two unnamed listeners", .doc = "{\"listeners\": [{}, {}]}" },
+    .{ .name = "nats without a login", .on = features.nats, .doc = "{\"brokers\": [{\"name\": \"b\", \"nats\": {}}]}" },
+    .{ .name = "smtp with both ca fields", .on = features.smtp, .doc = "{\"mail\": [{\"name\": \"a\", \"smtp\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}" },
+};
+
+test "parse: every rule of check refuses with its fixed text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    for (refusal_rows) |row| {
+        if (!row.on) continue;
+        why.end = 0;
+        std.testing.expectError(error.Config, parse(a, row.doc, &why)) catch |err| {
+            std.debug.print("not refused: {s}\n", .{row.name});
+            return err;
+        };
+        std.testing.expectEqualStrings(row.expect, why.buffered()) catch |err| {
+            std.debug.print("wrong text: {s}\n", .{row.name});
+            return err;
+        };
+    }
+    for (option_rows) |row| {
+        if (!row.on) continue;
+        why.end = 0;
+        const bad = try std.mem.concat(a, u8, &.{ row.pre, "nope", row.post });
+        std.testing.expectError(error.Config, parse(a, bad, &why)) catch |err| {
+            std.debug.print("not refused: {s}\n", .{row.name});
+            return err;
+        };
+        std.testing.expectEqualStrings(row.expect, why.buffered()) catch |err| {
+            std.debug.print("wrong text: {s}\n", .{row.name});
+            return err;
+        };
+        _ = parse(a, try std.mem.concat(a, u8, &.{ row.pre, row.first, row.post }), &why) catch |err| {
+            std.debug.print("first option refused: {s}: {s}\n", .{ row.name, why.buffered() });
+            return err;
+        };
+    }
+    for (accepted_rows) |row| {
+        if (!row.on) continue;
+        why.end = 0;
+        _ = parse(a, row.doc, &why) catch |err| {
+            std.debug.print("refused: {s}: {s}\n", .{ row.name, why.buffered() });
             return err;
         };
     }

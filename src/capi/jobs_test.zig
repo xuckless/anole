@@ -290,6 +290,36 @@ test "capi jobs: stopping a worker with nothing out ends it" {
     engine.jobs.stop(r.e, wh);
 }
 
+test "capi jobs: the drain ends a worker once with JOB_WORKER_DRAINED, however it starts (#220)" {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    const Start = enum { stop_server, stop_server_then_drain, drain };
+    for (std.enums.values(Start)) |how| {
+        errdefer std.debug.print("row: {t}\n", .{how});
+        var r: Rig = undefined;
+        try r.create("");
+        defer r.deinit();
+        const wh = try engine.jobs.work(r.e, r.c, .{ .size = @sizeOf(abi.JobsWorkOptions) }, 9);
+        try r.start();
+        switch (how) {
+            .stop_server => r.e.testStopServer(),
+            .stop_server_then_drain => {
+                r.e.testStopServer();
+                // The hook went first: `drain` loses the phase change.
+                _ = try r.ev.waitFor(.draining, 0, 5000);
+                try r.e.drain();
+            },
+            // The server's own hook fires after and loses the phase change.
+            .drain => try r.e.drain(),
+        }
+        _ = try r.ev.waitFor(.stopped, 0, 5000);
+        try std.testing.expectEqual(@as(usize, 1), r.ev.count(.job_worker_end));
+        try std.testing.expectEqual(@as(usize, 1), r.ev.count(.draining));
+        const i = try r.ev.waitFor(.job_worker_end, 0, 0);
+        try std.testing.expectEqual(abi.JOB_WORKER_DRAINED, r.ev.as(abi.JobWorkerEndEvent, i).reason);
+        try std.testing.expectEqual(wh, r.ev.list.items[i].handle);
+    }
+}
+
 const HttpResult = struct { status: u16 = 0 };
 
 /// A GET carrying a trace context the server does not record (no tracing
@@ -600,22 +630,25 @@ test "capi jobs: while enqueue(opts.req) on another thread reads a gRPC call, it
     try std.testing.expectEqual(@as(u32, 0), code.load(.acquire));
 }
 
-/// A unary anole.test.Echo/Unary call over h2c carrying a traceparent,
+/// A unary anole.test.Echo/Unary call over h2c carrying a traceparent
+/// (and, with `deadline`, a far grpc-timeout, so the engine watches it),
 /// whose stream the client resets once `go` is set.
 const GrpcReset = struct {
     port: u16,
+    deadline: bool = false,
     go: std.atomic.Value(bool) = .init(false),
 
     fn run(g: *GrpcReset, io: std.Io) anyerror!void {
         const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = g.port });
         defer conn.close();
-        // An empty EchoRequest in one gRPC frame.
-        const s = try conn.request(&.{
+        const headers = [_]anole.h2.Header{
             .{ .name = ":method", .value = "POST" },                  .{ .name = ":path", .value = "/anole.test.Echo/Unary" },
             .{ .name = ":scheme", .value = "http" },                  .{ .name = ":authority", .value = "localhost" },
             .{ .name = "content-type", .value = "application/grpc" }, .{ .name = "te", .value = "trailers" },
-            .{ .name = "traceparent", .value = tp_unsampled },
-        }, .{ .body_bytes = &.{ 0, 0, 0, 0, 0 } });
+            .{ .name = "traceparent", .value = tp_unsampled },        .{ .name = "grpc-timeout", .value = "60S" },
+        };
+        // An empty EchoRequest in one gRPC frame.
+        const s = try conn.request(if (g.deadline) &headers else headers[0 .. headers.len - 1], .{ .body_bytes = &.{ 0, 0, 0, 0, 0 } });
         defer s.release();
         try wait.waitFlag(io, "the answer call holds the call", &g.go);
         s.cancel();
@@ -689,6 +722,61 @@ test "capi jobs: enqueue(opts.req) on a gRPC call reset while send_headers held 
     // The consumer's answer ends the orphaned call (nobody hears it).
     _ = try engine.grpc.send(r.e, call, "", false, true);
     try std.testing.expectEqualStrings("", r.ev.span(ji, job.traceparent));
+}
+
+test "capi grpc: destroy releases a call orphaned while send_headers held it, unwatched and told nothing" {
+    if (comptime !features.jobs or !features.grpc or !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const top = try std.fmt.allocPrint(alloc, ", \"grpc\": {{\"descriptor_set\": \"{s}\", \"services\": [{{\"name\": \"anole.test.Echo\", \"handler\": 10}}]}}", .{b64});
+    defer alloc.free(top);
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createWith("", "", top);
+    defer r.deinit();
+    try r.start();
+    const io = rt.io();
+    const tio = engine.threadedIo();
+    var g: GrpcReset = .{ .port = r.e.port(0), .deadline = true };
+    var f = try io.concurrent(GrpcReset.run, .{ &g, io });
+    defer f.cancel(io) catch {};
+    const call = r.ev.list.items[try r.ev.waitFor(.grpc_call, 0, 10000)].handle;
+    const x, const sl, _ = try engine.slotOfKind(r.e, call, .grpc_call);
+    // The call's deadline is watched.
+    try std.testing.expectEqual(@as(u32, 1), x.grpc.len);
+
+    // As above: send_headers holds the call while the client resets it,
+    // then hands the orphan back to `out`.
+    var hold: engine.TestPin = .{};
+    engine.test_answer_hold = &hold;
+    var sh: SendHeaders = .{ .r = &r, .call = call };
+    var t: ?std.Thread = try std.Thread.spawn(.{}, SendHeaders.run, .{&sh});
+    defer if (t) |th| {
+        hold.release.store(true, .release);
+        th.join();
+        engine.test_answer_hold = null;
+    };
+    try wait.waitFlag(tio, "send_headers holds the call", &hold.held);
+    g.go.store(true, .release);
+    try wait.waitFlag(tio, "the engine orphans the reset call", &sl.gone);
+    hold.release.store(true, .release);
+    t.?.join();
+    t = null;
+    engine.test_answer_hold = null;
+    try std.testing.expectEqual(@as(?anyerror, null), sh.result);
+
+    // `destroy`'s first step: the orphan is released and unwatched, its
+    // handle is GONE, and the consumer hears nothing.
+    r.e.abandon.store(true, .release);
+    for (r.e.execs) |*ex| ex.setEvent(&ex.kick);
+    try wait.waitEqual(tio, "the orphaned call is released", &r.e.inflight, 0);
+    try std.testing.expectEqual(@as(u32, 0), x.grpc.len);
+    try std.testing.expectError(error.Gone, engine.grpc.send(r.e, call, "", false, true));
+    try r.ev.pump(0);
+    try std.testing.expectEqual(@as(usize, 0), r.ev.count(.abort));
 }
 
 /// Handles handed by the polling thread, in order, to the two racing

@@ -5,7 +5,7 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
-S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247.
+S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247. S3 batch 3 does it for the HTTP/1.x server loop and the C ABI engine, and fixes #220.
 
 ### Changed
 
@@ -24,6 +24,9 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
   - Idle park: a shelf entry's lifecycle is one phase enum with a comptime table (the never-read `shelf` back pointer is gone).
   - Client: a pooled connection's role (HTTP/1, a dialed HTTP/2 session, an origin's HTTP/2 carrier, a view on a shared session) is one `Kind` union and an HTTP/2 origin's list membership one state; the dials in flight and the HTTP/1-only memory are one `Dials` type with its table; a response body is one `BodyState` union (unread, reader taken, cached).
   - WebSocket: a connection's flush-batch membership and flusher task and the write backstop are explicit states with declared tables; the four send variants go through one `sendFrame`, and the fragmentation state is one optional.
+- **The HTTP/1.x server loop and the C ABI engine as explicit state** (S3 batch 3). No behaviour change beyond the fixes below; include/ (anole.h, anole.abi.json, anole.schema.json) is unchanged.
+  - Server loop: a connection's in-flight count is one `count` on the connection (the `busy: *bool` thread through the loop and the HTTP/2 engine is gone); whether a request took it out of HTTP/1.x is one `Connection.mode` (http, upgraded, adopted, both) with a state x event table, changed only by `finishUpgrade`, `adopt` and `releaseAdopter`; `handleRequests` runs as named phases returning one step, the refusals go through `refuse`/`refuseHead`, and the three fixed replies are one table. `Forwarding` is gone: the proxied and secure facts are computed once per listener.
+  - C ABI engine: a request slot's owner (task, detached, orphan, abandoned) is one executor-local union with one `finish`; its flavour is one enum with comptime tables for the handle kind and record type, an upgrade's accept is one union, `Route.kind` one union. Areas: one record writer, one string dupe, one call error and one table-driven failure mapper for the seven connector areas; generation, liveness and handles once on `SlotTable`; one `Lane(Cmd)` with an explicit running state for the WebSocket and SSE publish lanes; the areas' init, open, close, destroy and drain one comptime declaration; the config checks shared helpers over one declared option list (refusal texts byte for byte as before).
 - **`Response.detached` is gone** (`anole.http` users): ask `res.isDetached()`; the engines read `res._detachment()`. `Response.WriteError` no longer contains `HeaderError` (`write()` can't fail on a full header table any more, #246).
 
 ### Fixed
@@ -32,11 +35,14 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
 - **HTTP/1.x header values lose their trailing spaces and tabs** (#247, RFC 9110 5.5), in requests and in client responses: `X-Trim: spaced   ` reached the handler with its spaces, and `Content-Length: 5 ` read as no length. HTTP/2 and HTTP/3 already refuse or drop such values.
 - **A detached response's task could be spawned into a connection group that was already joined** (#225): `Detached.attach` checked the connection under its lock, let go of the lock, and the caller spawned afterwards, so on `std.Io.Threaded` a teardown could join the group in between and the task outlived the connection. The spawn now happens under the connection's lock in both engines. HTTP/2 refuses an attach once its tasks are over; HTTP/3 never needs to, because its teardown aborts every still-detached response before it joins the group.
 - **Stopping a PostgreSQL watch no longer writes Terminate into a socket another task is writing to** (#221): the watch hub stops a connection with the pg.zig fork's new `Listener.interrupt` (a shutdown without Terminate), so a LISTEN, UNLISTEN or ping in flight can't be interleaved with it or blocked behind it. A listener says goodbye on close only if it was never interrupted.
+- **A drain started by the server (a signal, the console, a hand-off, a failing listener) now reaches the C ABI's own areas** (#220): it went only as far as the DRAINING record, so jobs, Kafka groups, webhooks, S3 and SMTP kept running and cut requests were reported as ABORT_CLIENT. Every drain now goes through one `beginDrain`, as `anole_server_drain` does.
+- **The HTTP/2 engine no longer swallows a cancel after a failed write**: shutting the socket after a failed or canceled write (`writeFailed`, `shutDrained`, `lingeringClose`) waited cancelably with a cancel already delivered, and a still-pending one was dropped by `catch {}` and left the socket open. They and the parked HTTP/1.x close use one uncancelable `Connection.shutdownBoth`.
 - The C ABI test of a WebSocket handshake past its deadline no longer races (#234): it runs on one executor, so a barrier request orders the check after the handshake's record instead of waiting for a delivery that may never come.
 
 ### Tests
 
 - An hq-interop round trip on aioquic's H0 ALPN, run by tests/h3/run.sh and CI; an HTTP/3 row for requests past the task cap (rejected unprocessed, stream credit returned); HTTP/2 rows for a response head too large to submit (whole, streamed, bare and on a tunnel: reset with INTERNAL_ERROR, the connection carries on).
+- test-flags builds without WebSocket or HTTP/3 compile again: the C ABI slot-size test reads those slots only with their features.
 
 ## 0.6.1 (2026-11-22)
 

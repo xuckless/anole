@@ -1240,7 +1240,7 @@ pub const Response = struct {
         if (self._lent != null or self._sink != null or self.headersSent() or self.head) return false;
         const conn = self._conn orelse return false;
         const pool = conn.write_pool orelse return false;
-        if (conn.upgraded or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
+        if (conn.mode.upgraded() or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
         const total = std.math.add(usize, w.end, needed) catch return false;
         if (total <= BodyBuffer.first_segment_len or total > pool.write_buffer_len -| head_room) return false;
         const lent = pool.takeWriteBuffer(@intFromPtr(conn)) catch return false;
@@ -1285,7 +1285,7 @@ pub const Response = struct {
         const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
         const conn = self._conn.?;
         const buf = conn.write_pool.?.writeBytes(lent);
-        if (first.data != buf[head_room..].ptr or conn.upgraded) return false;
+        if (first.data != buf[head_room..].ptr or conn.mode.upgraded()) return false;
         const w = conn.writer;
         // Between requests the server gives the writer's buffer back unless
         // it holds corked responses.
@@ -1865,7 +1865,7 @@ pub const Response = struct {
         };
         if (self._sink != null) return if (engine) |e| e.park != null else false;
         const conn = self._conn orelse return false;
-        return conn.adopter == null and !conn.upgraded and self.status != .switching_protocols;
+        return conn.mode.state == .http;
     }
 
     /// Writes the head (status and headers as set; chunked over HTTP/1.1)
@@ -1897,7 +1897,7 @@ pub const Response = struct {
         // memory for the adopter it stays parked and closes (`Phase`).
         self.keepalive = false;
         const h1 = Parked_H1.create(conn, chunked, owner) catch return error.OutOfMemory;
-        conn.adopter = &h1.adopter;
+        conn.adopt(&h1.adopter);
         return &h1.parked;
     }
 
@@ -2017,7 +2017,7 @@ pub const Response = struct {
         if (self._sink != null or !self.headersSent()) return error.Unsupported;
         // A 101, or a streamed 200 (a parked event stream).
         if (self.status != .switching_protocols and self._body_mode != .streaming and self._body_mode != .chunked) return error.Unsupported;
-        self._conn.?.adopter = adopter;
+        self._conn.?.adopt(adopter);
     }
 
     /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
@@ -2470,7 +2470,7 @@ pub const Response = struct {
         if (self._phase.writeDone()) return;
         // An upgrade's 101 went out with it, and the connection is the
         // upgraded protocol's: its writer is not this response's to flush.
-        if (self.status == .switching_protocols and self._sink == null and self._conn.?.upgraded) {
+        if (self._sink == null and self._conn.?.mode.upgraded()) {
             self._phase = self._phase.next(.begin_write);
             return;
         }
@@ -7049,22 +7049,26 @@ test "Response: canDetach and _canPark over every (phase, detach) cell" {
     }
 }
 
-test "Response: an HTTP/1.1 response parks only on a plain connection with no 101" {
+test "Response: an HTTP/1.1 response parks only on a connection still in plain HTTP/1.x" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var adopter: Adopter = .{ .serve = undefined, .release = undefined };
-    const Row = struct { name: []const u8, adopter: bool = false, upgraded: bool = false, status: http.Status = .ok, parks: bool };
+    const Row = struct { name: []const u8, events: []const Connection.Mode.Event = &.{}, status: http.Status = .ok, parks: bool };
+    // A 101 status set by hand with nothing written still parks: `_park`
+    // forces 200 itself, and the mode, not the status, says the
+    // connection left HTTP/1.x (research/s3/batch3/loopmode.md R3).
     const rows = [_]Row{
         .{ .name = "plain", .parks = true },
-        .{ .name = "adopted", .adopter = true, .parks = false },
-        .{ .name = "upgraded", .upgraded = true, .parks = false },
-        .{ .name = "101", .status = .switching_protocols, .parks = false },
+        .{ .name = "101 not written", .status = .switching_protocols, .parks = true },
+        .{ .name = "adopted", .events = &.{.{ .adopt = &adopter }}, .parks = false },
+        .{ .name = "upgraded", .events = &.{.finish_upgrade}, .parks = false },
+        .{ .name = "upgraded and adopted", .events = &.{ .finish_upgrade, .{ .adopt = &adopter } }, .parks = false },
+        .{ .name = "adopter released", .events = &.{ .{ .adopt = &adopter }, .release }, .parks = true },
     };
     for (rows) |row| {
         var connection: Connection = undefined;
         connection.initWriterForTesting(undefined);
-        if (row.adopter) connection.adopter = &adopter;
-        connection.upgraded = row.upgraded;
+        for (row.events) |ev| connection.mode = connection.mode.next(ev);
         var res = try Response._init(arena.allocator(), &connection, 32);
         res.status = row.status;
         std.testing.expectEqual(row.parks, res._canPark()) catch |err| {
