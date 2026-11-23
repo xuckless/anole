@@ -825,10 +825,13 @@ pub const OnlyOn = struct {
 /// prepare: `run`, Lambda INIT, `testing.client`; the one-shots (the helper
 /// routes) run on the move out of building or configured, `same` re-runs
 /// only the repeatable checks (OpenAPI, conflicts, `prepareStatic`).
-/// serve and end: `run` around its loop; a second `run` is unguarded, as
-/// it always was. `-` cannot happen (null, asserted). A failed prepare
-/// stays prepared; Lambda INIT stays prepared; the OpenAPI tool only
-/// configures. The connectors keep their own fact (`startConnectors`):
+/// serve and end: `run` around its loop. A `run` after one ended serves
+/// again, unguarded as it always was. A `run` that overlaps a serving one
+/// breaks run's contract (the `init` thread, one at a time): its end
+/// leaves stopped and the outer run's end hits a `-` cell (a panic in
+/// safe builds, undefined in ReleaseFast). `-` cannot happen otherwise
+/// (null, asserted). A failed prepare stays prepared; Lambda INIT stays
+/// prepared; the OpenAPI tool only configures. The connectors keep their own fact (`startConnectors`):
 /// the C ABI starts them while building.
 const Phase = enum {
     /// `init` named no listener: `pending` holds the options.
@@ -2956,7 +2959,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // Before the HTTP/3 endpoint and the core `serve` start as tasks on
             // other executors: it writes what their requests read.
             try self.server.prepareStatic();
-            self.startConnectors() catch return error.DatabaseUnavailable;
+            // A connector records its own cause; the resilience binding's
+            // failure (OutOfMemory) becomes the cause here.
+            self.startConnectors() catch |err| {
+                self.extras.failed_cause = self.extras.failed_cause orelse @errorName(err);
+                return error.DatabaseUnavailable;
+            };
         }
 
         /// Serves the OpenAPI document of this server's routes at
