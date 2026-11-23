@@ -7,7 +7,7 @@
 //!     state.kafka = try app.kafka(.{}); // KAFKA_BOOTSTRAP_SERVERS, else localhost:9092
 //!
 //!     fn publish(app: *App, req: *anole.Request, res: *anole.Response) !void {
-//!         try app.kafka.send(req, .{ .topic = "events", .key = "user-7", .value = req.body() });
+//!         try app.kafka.send(req, .{ .topic = "events", .key = "user-7", .value = try req.body() });
 //!         res.status = .accepted;
 //!     }
 //!

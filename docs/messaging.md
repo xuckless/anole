@@ -138,8 +138,9 @@ one passed on unrecorded); calls make
 
 ### Testing
 
-`anole.nats.core.testing.FakeServer` plays the server's side of the protocol
-for unit tests. Against a real server: `tests/nats/run.sh`, or
+Anole's own unit tests play the server's side of the protocol with a fake
+server (`src/nats/core/testing/FakeServer.zig`, not exported to apps).
+Against a real server: `tests/nats/run.sh`, or
 `zig build test -Dnats-test-url=nats://127.0.0.1:4222` (a nats-server started
 with `-js`).
 
@@ -185,7 +186,7 @@ ABI's `"brokers"` takes the same names with `_ms` on durations (see
 ### send and produce
 
 ```zig
-try kc.send(req, .{ .topic = "events", .key = "user-7", .value = req.body() });
+try kc.send(req, .{ .topic = "events", .key = "user-7", .value = try req.body() });
 const d = try kc.produce(req, .{ .topic = "events", .value = body }); // waits for the ack
 ```
 

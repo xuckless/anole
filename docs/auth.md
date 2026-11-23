@@ -331,7 +331,7 @@ app.use(try anole.session.Middleware.init(.{ .key = key }));
 ```
 
 ```zig
-var mem = anole.session.MemoryStore.init(gpa, app.io()); // then .store = mem.store()
+var mem = anole.session.MemoryStore.init(gpa, app.io(), .{}); // then .store = mem.store()
 const redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379 (docs/database.md)
 var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "anole:session:<id>" with the TTL
 var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
@@ -503,6 +503,14 @@ requests per `window`, with a bucket of `burst`, which defaults to
 `ratelimit.Middleware` sets the `RateLimit-Limit`, `RateLimit-Remaining` and
 `RateLimit-Reset` headers on every response. Once a bucket is empty, it
 answers 429 with `Retry-After`.
+
+`app.rateLimit(.{ .limit = 100 })` is the one-line form: a `MemoryLimiter`
+the server owns, for every route registered after it. `RateLimitOptions`
+takes `limit` (100), `window` (60 s), `burst` (0: `limit`), `max_entries`
+(10,000) and `key`: `.ip`, the client's address (the default), or
+`.{ .header = "X-Api-Key" }`, that header's value (requests without it share
+one bucket). For a policy per route, or a limiter on Redis, make the
+middleware yourself:
 
 ```zig
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle 5 minutes

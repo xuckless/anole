@@ -3461,8 +3461,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// GET `path`: an event stream subscribed to `options.topics`,
         /// where a `{name}` is the route parameter `name`
         /// (`"room:{room}"` on `/rooms/:room/events`; a name the path
-        /// lacks is a compile error). Over HTTP/1.1 and HTTP/2 an idle
-        /// subscriber holds no task. A handler that decides the topics
+        /// lacks is a compile error). Over HTTP/1.1, HTTP/2 and HTTP/3 an
+        /// idle subscriber holds no task. A handler that decides the topics
         /// itself calls `topics.serve`.
         ///
         ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });

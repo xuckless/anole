@@ -538,8 +538,9 @@ SIGUSR2, or `stop()`, starts a graceful drain:
 6. `run` returns once every connection is closed, or when
    `timeouts.shutdown` (10 s) runs out.
 
-Handlers that run for long can learn of the drain: `req.drain` is an
-`std.Io.Event` set when it starts, to wait on or test with `isSet()`. An
+Handlers that run for long can learn of the drain: `req.drain` is a
+`?*std.Io.Event` (null in a request the server did not build) set when it
+starts, to wait on or test with `isSet()`. An
 event stream that does neither never closes on its own, so with
 `timeouts.shutdown = null` it holds the drain open forever.
 
@@ -991,7 +992,8 @@ does not stop the copy, so Anole does what RFC 8470 asks of a server:
 
 - GET, HEAD and OPTIONS that arrive in 0-RTT run at once. Their headers
   carry `Early-Data: 1`, as a proxy would mark them, and
-  `anole.early_data.isEarly(req)` says so.
+  `anole.early_data.isEarly(req)` says so. `early_data.isSafe(method)` is
+  that list of methods, and `early_data.header` the field's name.
 - Every other method waits until the handshake completes. A replay never
   completes it (it lacks the client's keys), so a replayed POST never
   reaches its handler (the connection, and the POST held on it, end at
@@ -1376,12 +1378,20 @@ for arm64 and x86_64. See [lambda.md](lambda.md).
 Each bundled library sits behind a flag. `-Dprofile=minimal|web|full`
 (default `full`) sets them all, and single flags such as `-Dtls=none` or
 `-Dhttp3=false` override it; the README has the
-[table](../README.md#build-flags). Choose the profile where you add the
-dependency:
+[table](../README.md#build-flags). Choose them in `addApp`:
 
 ```zig
-const anole = b.dependency("anole", .{ .target = target, .optimize = optimize, .profile = .web });
+const app = @import("anole").addApp(b, .{
+    .name = "api",
+    .root_source_file = b.path("src/main.zig"),
+    .profile = .web,
+    .features = .{ .http3 = false },
+});
 ```
+
+`app.anole` is the dependency it made; reuse it (more executables,
+`addProtoGen`) rather than calling `b.dependency("anole", ...)` again: two
+instances of Anole in one build collide.
 
 `anole.features` holds the result at compile time. Asking `init` for a
 listener that is not built fails with `error.TlsNotBuilt` or

@@ -297,7 +297,8 @@ request's arena, so they outlive the call.
 When the columns and parameters are known only at run time (what the C ABI
 and the language bindings do), `with(opts).table(req, sql, params)` returns
 an `anole.db.Table` (column names, type OIDs, rows of `anole.db.Value`) and
-`with(opts).execValues(req, sql, params)` the rows changed, with `params` a
+`with(opts).execValues(req, sql, params)` an `anole.db.Changes` (`changes`,
+the rows changed, and for SQLite `last_insert_rowid`), with `params` a
 `[]const anole.db.Value`. Values come in PostgreSQL's text format: bool,
 the integer types and float4/float8 are converted, bytea becomes bytes,
 and everything else stays text (numeric exactly, dates as PostgreSQL prints
@@ -608,7 +609,7 @@ try tx.commit(req);
 ```
 
 On both SQL connectors a `Tx` also has `table(req, sql, values)` and
-`run(req, sql, values)` (columns and parameters known at run time) and
+`execValues(req, sql, values)` (columns and parameters known at run time) and
 `with(options)`, whose calls take `timeout` and `prepare`; `coalesce` and
 `cache` fail the call inside a transaction. A `Tx` used after `commit` or
 `rollback` fails with `error.Database` ("the transaction is over"), never
