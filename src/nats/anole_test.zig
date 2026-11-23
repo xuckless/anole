@@ -325,6 +325,45 @@ test "publish cap: past outbound_bytes a publish is ServiceUnavailable (outbound
     try testing.expect(!r.client.writable(&ctx));
 }
 
+test "lifecycle: start and drain run once; after a drain nothing begins, readiness fails, start is a no-op" {
+    var r: Rig = undefined;
+    try r.startWith(.{ .stall = true, .transcript = undefined }, .{});
+    defer r.deinit();
+    const Count = struct {
+        fn begin(c: *anyopaque) anyerror!void {
+            @as(*u32, @ptrCast(@alignCast(c))).* += 1;
+        }
+        fn free(_: *anyopaque) void {}
+    };
+    var begun: u32 = 0;
+    const hook: nats.Client.Hook = .{ .context = &begun, .begin = Count.begin, .free = Count.free };
+    var health: @import("../observe/root.zig").Health = .init(.{});
+    const now: Io.Clock.Timestamp = .now(r.rt.io(), .awake);
+    // Each row: an action, then the hooks begun so far and readiness (once
+    // checked: start adds its check once).
+    const rows = [_]struct { name: []const u8, act: enum { add, start, drain }, begun: u32, ready: bool }{
+        .{ .name = "hook before start waits", .act = .add, .begun = 0, .ready = true },
+        .{ .name = "start begins it", .act = .start, .begun = 1, .ready = true },
+        .{ .name = "second start is a no-op", .act = .start, .begun = 1, .ready = true },
+        .{ .name = "hook while serving begins at once", .act = .add, .begun = 2, .ready = true },
+        .{ .name = "drain", .act = .drain, .begun = 2, .ready = false },
+        .{ .name = "second drain", .act = .drain, .begun = 2, .ready = false },
+        .{ .name = "hook after drain is not begun", .act = .add, .begun = 2, .ready = false },
+        .{ .name = "start after drain is a no-op", .act = .start, .begun = 2, .ready = false },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        switch (row.act) {
+            .add => try r.client.addHook(hook),
+            .start => try r.client.start(null, null, &health),
+            .drain => r.client.drain(now),
+        }
+        try testing.expectEqual(row.begun, begun);
+        if (health.len > 0) try testing.expectEqual(row.ready, health.checks[0].ready(health.checks[0].ctx));
+    }
+    try testing.expectEqual(1, health.len);
+}
+
 fn pickOn(c: *nats.Client, out: *?*nats.core.Client) void {
     out.* = c.pick();
 }
