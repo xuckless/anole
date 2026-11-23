@@ -59,8 +59,18 @@ threadlocal var tl_tapped: bool = false;
 
 /// Never `.auto`: `setFormat` stores `.text` for it.
 var format_state: std.atomic.Value(Format) = .init(.text);
-/// Runtime level filter; the order matches std.log.Level.
+/// Runtime level filter: the least severe level let through, or none.
 const Gate = enum(u8) { err, warn, info, debug, none };
+const Levels = std.EnumSet(std.log.Level);
+const all: Levels = .initMany(&.{ .err, .warn, .info, .debug });
+const gate_of = std.EnumArray(std.log.Level, Gate).init(.{ .err = .err, .warn = .warn, .info = .info, .debug = .debug });
+const passes = std.EnumArray(Gate, Levels).init(.{
+    .err = .initMany(&.{.err}),
+    .warn = .initMany(&.{ .err, .warn }),
+    .info = .initMany(&.{ .err, .warn, .info }),
+    .debug = all,
+    .none = all,
+});
 var level_state: std.atomic.Value(Gate) = .init(.none);
 var sink_state: std.atomic.Value(?*const Callback) = .init(null);
 var service_buf: [64]u8 = undefined;
@@ -81,7 +91,7 @@ pub fn currentFormat() Format {
 }
 
 pub fn setLevel(l: ?std.log.Level) void {
-    level_state.store(if (l) |x| @fromBackingInt(@backingInt(x)) else .none, .release);
+    level_state.store(if (l) |x| gate_of.get(x) else .none, .release);
 }
 
 pub fn setService(name: ?[]const u8) void {
@@ -140,8 +150,7 @@ pub fn hasSink() bool {
 }
 
 fn enabled(level: std.log.Level) bool {
-    const l = level_state.load(.acquire);
-    return @backingInt(level) <= @backingInt(l);
+    return passes.get(level_state.load(.acquire)).contains(level);
 }
 
 fn now() std.Io.Timestamp {
