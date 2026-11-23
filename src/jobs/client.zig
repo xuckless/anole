@@ -27,6 +27,7 @@ const Duration = root.Duration;
 const Id = root.Id;
 const Kind = root.Kind;
 const Job = root.Job;
+const Stop = root.Stop;
 const Options = root.Options;
 const Error = root.Error;
 const Enqueued = root.Enqueued;
@@ -75,8 +76,16 @@ const JobBox = struct {
     seq: u64 = 0,
     task: ?placement.Task = null,
     started: std.Io.Clock.Timestamp = undefined,
-    lost: std.atomic.Value(bool) = .init(false),
-    interrupted: std.atomic.Value(bool) = .init(false),
+    /// A `Stop`, written only by `stopWith`.
+    stop: std.atomic.Value(u8) = .init(@backingInt(Stop.none)),
+
+    fn stopWith(box: *JobBox, s: Stop) void {
+        _ = box.stop.fetchMax(@backingInt(s), .acq_rel);
+    }
+
+    pub fn stopped(box: *const JobBox) Stop {
+        return @fromBackingInt(@intCast(box.stop.load(.acquire)));
+    }
 };
 
 const CronEntry = struct {
@@ -502,7 +511,7 @@ pub const Client = struct {
         if (self.runningTotal() > 0) {
             self.held_mutex.lockUncancelable(self.io);
             for (self.held.values()) |b| {
-                b.interrupted.store(true, .release);
+                b.stopWith(.interrupted);
                 if (b.task) |t| placement.cancelTask(t);
             }
             self.held_mutex.unlock(self.io);
@@ -878,8 +887,7 @@ pub const Client = struct {
             .client = self,
         };
         box.job.cron_name = cronNameOf(a, row.meta_json);
-        box.job.lost_flag = &box.lost;
-        box.job.interrupted_flag = &box.interrupted;
+        box.job.stop = &box.stop;
         box.job.timeout_ms = row.timeout_ms;
     }
 
@@ -967,21 +975,23 @@ pub const Client = struct {
         const base: store.Finish = .{ .id = row.id, .attempt = row.attempt, .to = .completed, .finished_at = t };
         var plan: Plan = .{ .f = base, .outcome = .completed };
         const o = job.outcome;
-        const interrupted = box.interrupted.load(.acquire);
-        const lost = box.lost.load(.acquire);
         if (job.completed_in and result != error.Canceled) {
             if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, .completed, took(self, box));
             return .completed;
         }
 
-        if (lost) {
-            log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
-            return .lost;
-        }
         // A handler that returned before the drain's cancel reached it has
         // finished: its outcome stands.
         const failed = if (result) |_| false else |_| true;
-        if (interrupted and failed) {
+        const put_back = switch (box.stopped()) {
+            .lost, .admin_cancelled => {
+                log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
+                return .lost;
+            },
+            .interrupted => failed,
+            .none => false,
+        };
+        if (put_back) {
             plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
             log.info("{s} interrupted by shutdown; put back", .{job.id_text});
         } else if (result) |_| {
@@ -1269,9 +1279,7 @@ pub const Client = struct {
         defer self.held_mutex.unlock(self.io);
         for (lost.items, cancelled) |l, c| {
             const b = self.held.get(l.seq) orelse continue;
-            // Set before `lost`, which the run may see and return on.
-            if (c) b.job.admin_cancelled.store(true, .release);
-            b.lost.store(true, .release);
+            b.stopWith(if (c) .admin_cancelled else .lost);
             if (b.task) |t| placement.cancelTask(t);
         }
     }
@@ -1699,7 +1707,7 @@ test "jobs: a heartbeat waiting on the store does not hold up a run's start" {
             release.set(io_);
             try beat.await(io_);
             // The lookup was the lost run's: the heartbeat marked it lost.
-            try std.testing.expect(lost.lost.load(.acquire));
+            try std.testing.expectEqual(Stop.lost, lost.stopped());
         }
     };
     const zio = @import("zio");
@@ -1770,7 +1778,7 @@ test "jobs: an admin cancel the heartbeat finds at a run's start reaches the run
         }
 
         fn handler(_: ?*anyopaque, job: *Job) anyerror!void {
-            seen = job.admin_cancelled.load(.acquire);
+            seen = job.stopReason() == .admin_cancelled;
             return job.io.checkCancel();
         }
 
@@ -1834,6 +1842,25 @@ test "jobs: a run's end leaves a newer run of the same job held" {
     try HeldStub.run(T.check);
 }
 
+test "jobs: a run's stop only rises: the most severe cause wins in any order" {
+    const rows = [_]struct { name: []const u8, calls: []const Stop, want: Stop }{
+        .{ .name = "never stopped", .calls = &.{}, .want = .none },
+        .{ .name = "drain, then lost lease", .calls = &.{ .interrupted, .lost }, .want = .lost },
+        .{ .name = "lost lease, then drain", .calls = &.{ .lost, .interrupted }, .want = .lost },
+        .{ .name = "admin cancel, then drain", .calls = &.{ .admin_cancelled, .interrupted }, .want = .admin_cancelled },
+        .{ .name = "admin cancel, then lost lease", .calls = &.{ .admin_cancelled, .lost }, .want = .admin_cancelled },
+        .{ .name = "drain twice", .calls = &.{ .interrupted, .interrupted }, .want = .interrupted },
+    };
+    for (rows) |r| {
+        var box: JobBox = .{ .client = undefined, .queue = undefined, .arena_state = undefined, .row = undefined };
+        for (r.calls) |c| box.stopWith(c);
+        std.testing.expectEqual(r.want, box.stopped()) catch |e| {
+            std.debug.print("row: {s}\n", .{r.name});
+            return e;
+        };
+    }
+}
+
 test "jobs: the heartbeat stops a lost run whose job was claimed again" {
     const T = struct {
         fn check(io: std.Io) anyerror!void {
@@ -1860,8 +1887,8 @@ test "jobs: the heartbeat stops a lost run whose job was claimed again" {
             // The store renews only the newer claim.
             HeldStub.renew = &[_]store.Held{.{ .id = 7, .attempt = 2 }};
             try client.heartbeatOnce();
-            try std.testing.expect(old.lost.load(.acquire));
-            try std.testing.expect(!new.lost.load(.acquire));
+            try std.testing.expectEqual(Stop.lost, old.stopped());
+            try std.testing.expectEqual(Stop.none, new.stopped());
         }
     };
     try HeldStub.run(T.check);

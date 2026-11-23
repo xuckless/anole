@@ -20,7 +20,7 @@ fn drainNow(client: *root.Client, io: std.Io) void {
 fn interruptedRun(client: *root.Client, io: std.Io) bool {
     client.held_mutex.lockUncancelable(io);
     defer client.held_mutex.unlock(io);
-    for (client.held.values()) |b| if (b.interrupted.load(.acquire)) return true;
+    for (client.held.values()) |b| if (b.stopped() == .interrupted) return true;
     return false;
 }
 
@@ -124,7 +124,11 @@ const LateDrain = struct {
         // delivered at the next cancellation point after it).
         const prev = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(prev);
-        wait.waitFlag(io, "the run was interrupted", job.interrupted_flag.?) catch return error.NeverInterrupted;
+        wait.waitUntil(io, "the run was interrupted", job, struct {
+            fn set(j: *const root.Job) bool {
+                return j.stopReason() == .interrupted;
+            }
+        }.set) catch return error.NeverInterrupted;
     }
 };
 
