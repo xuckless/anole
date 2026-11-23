@@ -291,6 +291,26 @@ test "retry: a drop after the final dot is never tried again" {
     try testing.expectEqual(@as(usize, 0), h.fake.messageCount());
 }
 
+test "retry: a reused connection that fails after MAIL was accepted is not replaced, and is not given back" {
+    const Knob = enum { drop_after_mail, close_at_rcpt };
+    for (std.enums.values(Knob)) |knob| {
+        var h: Harness = undefined;
+        // One command at a time: MAIL is answered before RCPT goes out.
+        try h.init(.{ .pipelining = false }, .{});
+        defer h.deinit();
+        _ = try h.hello();
+        switch (knob) {
+            .drop_after_mail => h.fake.drop_after_mail.store(1, .release),
+            .close_at_rcpt => h.fake.close_at_rcpt.store(1, .release),
+        }
+        try testing.expectError(error.ServiceUnavailable, h.hello());
+        try testing.expectEqual(@as(usize, 2), h.fake.commandCount("MAIL"));
+        try testing.expectEqual(@as(u32, 1), h.fake.connections.load(.monotonic));
+        _ = try h.hello();
+        try testing.expectEqual(@as(u32, 2), h.fake.connections.load(.monotonic));
+    }
+}
+
 test "retry: a refused connection is tried again with retry and fails after the attempts" {
     const expected_log = errors.expectLog();
     defer expected_log.deinit();
