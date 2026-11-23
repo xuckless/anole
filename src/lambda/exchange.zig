@@ -61,8 +61,8 @@ pub const BufferedSink = struct {
     limit: usize,
     status: dusty.Status = .ok,
     headers: ?*const dusty.Headers = null,
-    seen_head: bool = false,
-    finished: bool = false,
+    /// How far the handler got: nothing, a head, the end.
+    head: enum { none, seen, finished } = .none,
     too_large: bool = false,
     trailers_dropped: bool = false,
     /// From `complete`.
@@ -113,7 +113,7 @@ pub const BufferedSink = struct {
         const self: *BufferedSink = @ptrCast(@alignCast(ptr));
         self.status = status;
         self.headers = headers;
-        self.seen_head = true;
+        self.head = .seen;
     }
 
     fn interimFn(_: *anyopaque, _: dusty.Status) std.Io.Writer.Error!void {}
@@ -126,7 +126,7 @@ pub const BufferedSink = struct {
     fn endFn(ptr: *anyopaque, trailers: ?*const dusty.Headers) std.Io.Writer.Error!void {
         const self: *BufferedSink = @ptrCast(@alignCast(ptr));
         if (trailers != null) self.trailers_dropped = true;
-        self.finished = true;
+        if (self.head == .seen) self.head = .finished;
     }
 
     fn writeErrorFn(_: *anyopaque) ?dusty.Response.SendError {
@@ -141,8 +141,7 @@ pub const BufferedSink = struct {
         const self: *BufferedSink = @ptrCast(@alignCast(ptr));
         self.status = status;
         self.headers = headers;
-        self.seen_head = true;
-        self.finished = true;
+        self.head = .finished;
         if (trailers != null) self.trailers_dropped = true;
         var total: usize = 0;
         for (parts) |p| total += p.len;
@@ -165,7 +164,7 @@ pub const BufferedSink = struct {
 
     /// Whether the handler wrote anything to the sink yet.
     pub fn touched(self: *const BufferedSink) bool {
-        return self.seen_head;
+        return self.head != .none;
     }
 };
 
@@ -187,8 +186,8 @@ pub const StreamSink = struct {
     inv: *const runtime.Invocation,
     source: lambda.Source,
     upload: ?dusty.Upload = null,
-    ended: bool = false,
-    err: ?anyerror = null,
+    /// `failed` keeps the error from opening or finishing the upload.
+    state: union(enum) { open, ended, failed: anyerror } = .open,
 
     pub fn sink(self: *StreamSink) dusty.Sink {
         return .{ .ptr = self, .vtable = &sink_vtable };
@@ -207,7 +206,7 @@ pub const StreamSink = struct {
     fn open(self: *StreamSink, status: dusty.Status, headers: *const dusty.Headers) std.Io.Writer.Error!void {
         if (self.upload != null) return;
         var up = self.rt.respondStream(self.inv, "application/vnd.awslambda.http-integration-response") catch |e| {
-            self.err = e;
+            self.state = .{ .failed = e };
             return error.WriteFailed;
         };
         errdefer up.abort();
@@ -229,11 +228,11 @@ pub const StreamSink = struct {
     }
 
     fn finish(self: *StreamSink, trailers: ?*const dusty.Headers) std.Io.Writer.Error!void {
-        if (self.ended) return;
-        self.ended = true;
+        if (self.state != .open) return;
+        self.state = .ended;
         var up = self.upload orelse return;
         self.rt.finishStream(&up, trailers) catch |e| {
-            self.err = e;
+            self.state = .{ .failed = e };
             return error.WriteFailed;
         };
     }
@@ -269,8 +268,8 @@ pub const StreamSink = struct {
     /// Ends an open stream with error trailers (the deadline passed, or the
     /// handler failed after the head).
     pub fn abortWith(self: *StreamSink, arena: std.mem.Allocator, error_type: []const u8, message: []const u8) void {
-        if (self.ended or self.upload == null) return;
-        self.ended = true;
+        if (self.state != .open or self.upload == null) return;
+        self.state = .ended;
         var up = self.upload.?;
         const trailers = runtime.Runtime.errorTrailers(arena, error_type, message) catch {
             up.abort();
@@ -401,10 +400,8 @@ pub fn Exchange(comptime Ctx: type) type {
             exchange: inmem.Exchange(Ctx),
             limit: std.Io.Clock.Timestamp,
             request_timeout: ?std.Io.Duration,
-            timed_out: bool = false,
-            canceled: bool = false,
-            /// An error after the head went out.
-            failed: bool = false,
+            /// Set once by `fail`; `failed` is an error after the head went out.
+            outcome: enum { ok, timed_out, canceled, failed } = .ok,
 
             fn task(self: *Run) void {
                 const io = self.core.io;
@@ -430,15 +427,15 @@ pub fn Exchange(comptime Ctx: type) type {
             fn fail(self: *Run, err: anyerror, timed: bool, timer: *Timer) void {
                 const res = &self.exchange.response;
                 if (err == error.Canceled) {
-                    if (timed and timer.auto.check(error.Canceled)) self.timed_out = true else self.canceled = true;
+                    if (timed and timer.auto.check(error.Canceled)) self.outcome = .timed_out else self.outcome = .canceled;
                     return;
                 }
                 if (timed and timer.auto.check(error.Canceled)) {
-                    self.timed_out = true;
+                    self.outcome = .timed_out;
                     return;
                 }
                 if (res.headersSent()) {
-                    self.failed = true;
+                    self.outcome = .failed;
                     return;
                 }
                 // As the HTTP/2 engine answers an error out of dispatch.
@@ -447,7 +444,7 @@ pub fn Exchange(comptime Ctx: type) type {
                 res.content_type = .text;
                 res.body = "500 Internal Server Error\n";
                 res.write() catch {
-                    self.failed = true;
+                    self.outcome = .failed;
                 };
             }
         };
@@ -570,7 +567,7 @@ pub fn Exchange(comptime Ctx: type) type {
             const remaining_ms = inv.deadline_ms - realMs(io) - cfg.deadline_margin.toMilliseconds();
             if (remaining_ms <= 0) {
                 // Past the deadline already: no dispatch.
-                return postTimeout(rt, inv, arena, plan, streaming, &buffered, &streamed, null);
+                return postTimeout(rt, inv, arena, plan);
             }
             const limit = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromMilliseconds(remaining_ms), .clock = .awake });
 
@@ -634,26 +631,26 @@ pub fn Exchange(comptime Ctx: type) type {
                     group.cancel(io);
                     return error.Canceled;
                 };
-                if (run.canceled) return error.Canceled;
             }
 
-            if (run.timed_out or run.failed) {
+            if (run.outcome == .canceled) return error.Canceled;
+            if (run.outcome != .ok) {
                 const touched = if (streaming) streamed.touched() else buffered.touched();
                 if (!touched and !res.headersSent()) {
                     // Nothing written yet: the status goes through the app's
                     // error mapping (JSON or text, as `errors` says).
-                    res.fail(if (run.timed_out) .gateway_timeout else .internal_server_error, "");
+                    res.fail(if (run.outcome == .timed_out) .gateway_timeout else .internal_server_error, "");
                     res.write() catch {};
                 } else if (streaming) {
-                    streamed.abortWith(arena, if (run.timed_out) "Function.Timeout" else "Function.StreamFailed", if (run.timed_out) "deadline passed" else "the handler failed after the response began");
+                    streamed.abortWith(arena, if (run.outcome == .timed_out) "Function.Timeout" else "Function.StreamFailed", if (run.outcome == .timed_out) "deadline passed" else "the handler failed after the response began");
                     return;
                 } else {
-                    return postTimeout(rt, inv, arena, plan, false, &buffered, &streamed, run);
+                    return postTimeout(rt, inv, arena, plan);
                 }
             }
 
             if (streaming) {
-                if (streamed.err) |e| return postFailure(if (e == error.Canceled) error.Canceled else error.RuntimeApiFailed);
+                if (streamed.state == .failed) return postFailure(if (streamed.state.failed == error.Canceled) error.Canceled else error.RuntimeApiFailed);
                 // An answer that reached no sink (a 413 or 431 written
                 // before the task) was written through it already.
                 return;
@@ -675,15 +672,7 @@ pub fn Exchange(comptime Ctx: type) type {
             inv: *const runtime.Invocation,
             arena: std.mem.Allocator,
             plan: Plan,
-            streaming: bool,
-            buffered: *BufferedSink,
-            streamed: *StreamSink,
-            run: ?*Run,
         ) AnswerError!void {
-            _ = streaming;
-            _ = buffered;
-            _ = streamed;
-            _ = run;
             if (plan.source == .event) return rt.fail(inv, "Function.Timeout", "deadline passed") catch |e| return postFailure(e);
             var headers = try plainHeaders(arena);
             return postBuffered(rt, inv, arena, plan, .{ .status = 504, .headers = &headers, .parts = &.{"504 Gateway Timeout\n"}, .head = false });
@@ -818,7 +807,7 @@ test "lambda exchange: the buffered sink keeps a complete answer, and caps a str
     const sink = s.sink();
     try testing.expect(sink.canComplete());
     try sink.complete(.created, &headers, 5, &.{ "he", "llo" }, null);
-    try testing.expect(s.finished and s.touched() and !s.too_large);
+    try testing.expect(s.head == .finished and s.touched() and !s.too_large);
     const out = s.result(false);
     try testing.expectEqual(@as(u16, 201), out.status);
     try testing.expectEqual(@as(usize, 2), out.parts.len);
@@ -832,7 +821,7 @@ test "lambda exchange: the buffered sink keeps a complete answer, and caps a str
     try testing.expectError(error.WriteFailed, tsink.body().writeAll("6789"));
     try testing.expect(t.too_large);
     try tsink.end(&headers);
-    try testing.expect(t.finished and t.trailers_dropped);
+    try testing.expect(t.head == .finished and t.trailers_dropped);
 
     // A `complete` over the cap fails as well.
     var u = BufferedSink.init(a, 4);
