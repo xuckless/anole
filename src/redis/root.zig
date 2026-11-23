@@ -1754,11 +1754,35 @@ const Effect = struct {
 
     const Change = enum { keep, set, clear };
 
-    /// Commands after which a connection must not serve another call as it
-    /// is.
-    const tainting = [_][]const u8{ "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE" };
+    /// What one command does to each flag.
+    const Delta = struct { multi: Change = .keep, watching: Change = .keep, tainted: Change = .keep };
+    const taints: Delta = .{ .tainted = .set };
+
+    /// Every command that touches a flag, by upper-cased name; extend by
+    /// adding a row. The tainting ones leave a connection that must not serve
+    /// another call as it is. CLIENT depends on its subcommand: see
+    /// `client_taints`.
+    const by_name = std.StaticStringMap(Delta).initComptime(.{
+        .{ "MULTI", Delta{ .multi = .set } },
+        .{ "EXEC", Delta{ .multi = .clear, .watching = .clear } },
+        .{ "DISCARD", Delta{ .multi = .clear, .watching = .clear } },
+        .{ "WATCH", Delta{ .watching = .set } },
+        .{ "UNWATCH", Delta{ .watching = .clear } },
+        .{ "SELECT", taints },
+        .{ "SUBSCRIBE", taints },
+        .{ "PSUBSCRIBE", taints },
+        .{ "SSUBSCRIBE", taints },
+        .{ "MONITOR", taints },
+        .{ "HELLO", taints },
+        .{ "AUTH", taints },
+        .{ "RESET", taints },
+        .{ "READONLY", taints },
+        .{ "READWRITE", taints },
+    });
     /// CLIENT's subcommands that change the connection.
-    const tainting_client = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH" };
+    const client_taints = std.StaticStringMap(void).initComptime(.{
+        .{"SETNAME"}, .{"SETINFO"}, .{"TRACKING"}, .{"CACHING"}, .{"REPLY"}, .{"NO-EVICT"}, .{"NO-TOUCH"},
+    });
 
     fn apply(self: Effect, s: Connection.State) Connection.State {
         return .{
@@ -1779,22 +1803,13 @@ const Effect = struct {
     /// The command named `name` comes next, `sub` its first argument (both
     /// upper-cased).
     fn add(self: *Effect, name: []const u8, sub: []const u8) void {
-        const eql = std.mem.eql;
-        if (eql(u8, name, "MULTI")) {
-            self.multi = .set;
-        } else if (eql(u8, name, "EXEC") or eql(u8, name, "DISCARD")) {
-            self.multi = .clear;
-            self.watching = .clear;
-        } else if (eql(u8, name, "WATCH")) {
-            self.watching = .set;
-        } else if (eql(u8, name, "UNWATCH")) {
-            self.watching = .clear;
-        } else if (eql(u8, name, "CLIENT")) {
-            for (tainting_client) |t| if (eql(u8, sub, t)) {
-                self.tainted = .set;
-            };
-        } else for (tainting) |t| {
-            if (eql(u8, name, t)) self.tainted = .set;
+        if (std.mem.eql(u8, name, "CLIENT")) {
+            if (client_taints.has(sub)) self.tainted = .set;
+            return;
+        }
+        const d = by_name.get(name) orelse return;
+        inline for (@typeInfo(Delta).@"struct".field_names) |f| {
+            if (@field(d, f) != .keep) @field(self, f) = @field(d, f);
         }
     }
 };
@@ -2180,6 +2195,53 @@ test "redis: a batch that leaves MULTI open or changes the session taints its co
     try testing.expect(!b3.finish().effect.apply(.{}).tainted);
     try b3.add(.{ "client", "setname", "worker" });
     try testing.expect(b3.finish().effect.apply(.{}).tainted);
+}
+
+test "redis: Effect.add equals the old if-chain for every name, subcommand and starting state" {
+    const Old = struct {
+        fn add(self: *Effect, name: []const u8, sub: []const u8) void {
+            const eql = std.mem.eql;
+            const tainting = [_][]const u8{ "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE" };
+            const tainting_client = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH" };
+            if (eql(u8, name, "MULTI")) {
+                self.multi = .set;
+            } else if (eql(u8, name, "EXEC") or eql(u8, name, "DISCARD")) {
+                self.multi = .clear;
+                self.watching = .clear;
+            } else if (eql(u8, name, "WATCH")) {
+                self.watching = .set;
+            } else if (eql(u8, name, "UNWATCH")) {
+                self.watching = .clear;
+            } else if (eql(u8, name, "CLIENT")) {
+                for (tainting_client) |t| if (eql(u8, sub, t)) {
+                    self.tainted = .set;
+                };
+            } else for (tainting) |t| {
+                if (eql(u8, name, t)) self.tainted = .set;
+            }
+        }
+    };
+    const names = [_][]const u8{ "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH", "CLIENT", "SELECT", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "MONITOR", "HELLO", "AUTH", "RESET", "READONLY", "READWRITE", "GET", "SET", "", "MULTIX", "EXE", "ABCDEFGHIJKLMNOP" };
+    const subs = [_][]const u8{ "SETNAME", "SETINFO", "TRACKING", "CACHING", "REPLY", "NO-EVICT", "NO-TOUCH", "ID", "", "SETNAMEX", "WATCH" };
+    for (names) |name| for (subs) |sub| for (std.enums.values(Effect.Change)) |m| for (std.enums.values(Effect.Change)) |w| for (std.enums.values(Effect.Change)) |t| {
+        var old: Effect = .{ .multi = m, .watching = w, .tainted = t };
+        var new = old;
+        Old.add(&old, name, sub);
+        new.add(name, sub);
+        testing.expectEqual(old, new) catch |err| {
+            std.debug.print("name '{s}' sub '{s}' from {any}\n", .{ name, sub, new });
+            return err;
+        };
+    };
+    var fx: Effect = .{};
+    fx.add("EXEC", "");
+    try testing.expectEqual(Effect{ .multi = .clear, .watching = .clear }, fx);
+    fx = .{};
+    fx.add("CLIENT", "SETNAME");
+    try testing.expectEqual(Effect{ .tainted = .set }, fx);
+    fx = .{};
+    fx.add("CLIENT", "ID");
+    try testing.expectEqual(Effect{}, fx);
 }
 
 test "redis: settings from a URL and REDIS_URL" {
