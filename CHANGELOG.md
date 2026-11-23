@@ -5,6 +5,10 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Fixed
+
+- A response whose headers fill `response.max_header_count` is answered, without the Content-Type that has no room, instead of dropping the connection (and logging `Malformed request`); the 500 for a handler that exceeds the limit is now sent too (closes #246).
+
 ### Removed
 
 - SAFETY.md and its rule regime, the safety lint (`zig build lint` and the CI `lint` job), the Debug safety checks (ranked lock wrappers, owner and teardown state checks, arena poisoning, allocation checks) with `zig build safety-test`, and qsbr. Release builds behave as before. The test infrastructure stays and moved to `src/testing` (the test runner, the never-reuse allocator, the `debug_cancel` swallowed-cancel check, the hang and crash probes); `allocUninit` and the spin lock are in `src/mem.zig`.

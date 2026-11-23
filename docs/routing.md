@@ -717,7 +717,9 @@ two, is a 400 (RFC 9112).
 
 `response.max_header_count` (64) caps the headers a response can carry,
 those the server adds included; past it `res.header` fails with
-`TooManyHeaders`. `res.addHeader` adds one that may repeat (`Vary`,
+`TooManyHeaders`; a response whose table is full still goes out, without
+the Content-Type the server would have added (a `res.content_type` that does
+not fit logs a warning). `res.addHeader` adds one that may repeat (`Vary`,
 `Link`). Both tables start with room for 16 and grow to their limits, so
 add response headers through `res.header` and `res.addHeader` rather than
 to `res.headers` directly, which only has the room it has grown to. HTTP/2's limits are in `ServerOptions.http2`

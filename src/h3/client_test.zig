@@ -252,6 +252,12 @@ fn hugeHead(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "big head";
 }
 
+/// GET /full-table: as many headers as `response.max_header_count` allows.
+fn fullTable(_: *dusty.Request, res: *dusty.Response) !void {
+    for (0..(dusty.ServerConfig{}).response.max_header_count) |i| try res.header(try std.fmt.allocPrint(res.arena, "x-full-{d}", .{i}), "v");
+    res.body = "ok";
+}
+
 /// GET /fields: the request's cookie, then every `x-multi` value.
 /// The request's host (`req.host()`), or "-" when it has none.
 fn hostOf(req: *dusty.Request, res: *dusty.Response) !void {
@@ -396,6 +402,7 @@ const Fixture = struct {
         http.router.get("/download", download);
         http.router.get("/ahead", ahead);
         http.router.get("/huge-head", hugeHead);
+        http.router.get("/full-table", fullTable);
         http.router.get("/fields", fields);
         http.router.get("/host", hostOf);
         http.router.get("/hold", holdHandler);
@@ -1199,6 +1206,22 @@ test "h3 client: a 90 KiB response head fails under the default max_header_list_
     const body = try get(conn, "/huge-head", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("big head", body);
+}
+
+test "h3 server: a response with as many headers as the limit allows is answered, not reset" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    for ([_][]const u8{ "/full-table", "/hello" }) |path| {
+        const body = try get(conn, path, gpa);
+        defer gpa.free(body);
+        try std.testing.expect(body.len > 0);
+    }
 }
 
 test "h3 server: cookie crumbs are joined with \"; \", other repeated fields all kept" {

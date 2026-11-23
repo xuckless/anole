@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
+const log = std.log.scoped(.anole);
 const Request = @import("request.zig").Request;
 const beneath = @import("beneath.zig");
 const placement = @import("placement.zig");
@@ -1108,10 +1109,11 @@ pub const Response = struct {
     /// a fixed buffer running out, say -- comes back as `Unexpected`.
     pub const SendError = Connection.WriteError || error{ Unexpected, WriteTimeout };
 
-    /// What `write` can fail with. `ContentLengthMismatch` is a body of
+    /// What `write` can fail with. No `HeaderError` among it: a head with no
+    /// room for its Content-Type goes out without it. `ContentLengthMismatch` is a body of
     /// another length than a handler-set Content-Length promises;
     /// `InvalidContentLength` is such a header that is not a number.
-    pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
+    pub const WriteError = SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
     /// The headers a response starts with room for: enough for most, so
     /// that an ordinary one takes little of the arena. The table grows to
@@ -2384,7 +2386,7 @@ pub const Response = struct {
     /// Sends the headers ahead of a body that is not buffered: a stream,
     /// or a protocol upgrade. A buffered body goes out with its headers in
     /// `write`, once its length is known.
-    fn writeHeader(self: *Response) WriteError!void {
+    fn writeHeader(self: *Response) (HeaderError || WriteError)!void {
         if (self.headersSent()) return;
         try self.applyContentType();
         self._phase = self._phase.next(.send_head);
@@ -2501,10 +2503,15 @@ pub const Response = struct {
         // settled the headers when it sent them. `begin_write` keeps it.
         const send_header = !self._phase.headOut();
         if (send_header) {
-            try self.applyContentType();
+            // The table is full: the handler's response is still good, so it
+            // goes out without a Content-Type rather than not at all.
+            self.applyContentType() catch log.warn(
+                "response has no room for its Content-Type, sent without it (response.max_header_count)",
+                .{},
+            );
             if (self._default_content_type) |default| {
                 if (self.file == null and self.bodyLen() > 0 and self.headers.get("Content-Type") == null) {
-                    try self.header("Content-Type", default.toContentType());
+                    self.header("Content-Type", default.toContentType()) catch {};
                 }
             }
             const compression = self.negotiateCompression();
@@ -5463,6 +5470,60 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\noops"));
 }
 
+test "Response: a Content-Type with no room is left out, not an error" {
+    const Source = enum { default, content_type, header_first };
+    const max = 4;
+    const rows = [_]struct { name: []const u8, source: Source, fillers: usize, has_type: bool }{
+        .{ .name = "default, fits", .source = .default, .fillers = max - 1, .has_type = true },
+        .{ .name = "content_type, fits", .source = .content_type, .fillers = max - 1, .has_type = true },
+        .{ .name = "explicit header first, full table", .source = .header_first, .fillers = max - 1, .has_type = true },
+        .{ .name = "default, full", .source = .default, .fillers = max, .has_type = false },
+        .{ .name = "content_type, full", .source = .content_type, .fillers = max, .has_type = false },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, max);
+        response._default_content_type = .text;
+        switch (row.source) {
+            .default => {},
+            .content_type => response.content_type = .json,
+            .header_first => try response.header("Content-Type", "text/csv"),
+        }
+        const names = [_][]const u8{ "X-0", "X-1", "X-2", "X-3" };
+        for (names[0..row.fillers]) |n| try response.header(n, "v");
+        response.body = "hi";
+        try response.write();
+
+        const written = conn_writer.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(row.has_type, std.mem.indexOf(u8, written, "Content-Type: ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhi"));
+    }
+}
+
+test "Response: write cannot fail with a header error" {
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (comptime std.meta.fieldNames(ErrorSetOf(Response.write))) |written| {
+        inline for (comptime std.meta.fieldNames(Response.HeaderError)) |header_err| {
+            try std.testing.expect(!std.mem.eql(u8, written, header_err));
+        }
+    }
+    const has_too_many = inline for (comptime std.meta.fieldNames(ErrorSetOf(Response.writeHeader))) |n| {
+        if (std.mem.eql(u8, n, "TooManyHeaders")) break true;
+    } else false;
+    try std.testing.expect(has_too_many);
+}
+
 test "Response: compress without room for its headers sends the body as it is" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7030,7 +7091,7 @@ test "Response: write after a stream's end adds nothing" {
     try std.testing.expectEqual(Phase.finished, response._phase);
 }
 
-test "Response: a write that failed before its head leaves the head open and sends nothing more" {
+test "Response: a write with no room for its Content-Type sends the head, and a second write sends nothing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buf: [1024]u8 = undefined;
@@ -7043,12 +7104,13 @@ test "Response: a write that failed before its head leaves the head open and sen
     response.content_type = .text;
     response.body = "x";
 
-    try std.testing.expectError(error.TooManyHeaders, response.write());
-    try std.testing.expectEqual(Phase.writing, response._phase);
-    try std.testing.expect(!response.headersSent());
-    try response.header("X-A", "3");
     try response.write();
-    try std.testing.expectEqual(@as(usize, 0), conn_writer.end);
+    try std.testing.expectEqual(Phase.finished, response._phase);
+    try std.testing.expect(response.headersSent());
+    const sent = conn_writer.end;
+    try std.testing.expect(sent > 0);
+    try response.write();
+    try std.testing.expectEqual(sent, conn_writer.end);
 }
 
 test "Response: write after the 101 sends nothing more" {
@@ -7078,7 +7140,7 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
     defer arena.deinit();
     var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
     const owner: Parked.Owner = .{ .gone = undefined, .ctx = undefined };
-    const Case = enum { parks, refused_at_headers, head_fails, no_memory, after_failed_write };
+    const Case = enum { parks, refused_at_headers, head_fails, no_memory };
     const Row = struct { case: Case, err: ?anyerror, phase: Phase, can_park: bool, keepalive: bool };
     const rows = [_]Row{
         .{ .case = .parks, .err = null, .phase = .parked, .can_park = false, .keepalive = false },
@@ -7088,10 +7150,6 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
         .{ .case = .head_fails, .err = error.WriteFailed, .phase = .head_sent, .can_park = false, .keepalive = true },
         // The adopter could not be made: parked, and the connection closes.
         .{ .case = .no_memory, .err = error.OutOfMemory, .phase = .parked, .can_park = false, .keepalive = false },
-        // A `write` failed before its head (`writing`), then the park's
-        // `stream` sends it: parked, so the server leaves the connection
-        // to the adopter.
-        .{ .case = .after_failed_write, .err = null, .phase = .parked, .can_park = false, .keepalive = false },
     };
     for (rows) |row| {
         var small: [4]u8 = undefined;
@@ -7101,19 +7159,12 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
         var connection: Connection = undefined;
         connection.initWriterForTesting(if (row.case == .head_fails) &fixed else &sink.interface);
         connection.allocator = if (row.case == .no_memory) std.testing.failing_allocator else arena.allocator();
-        const full = row.case == .refused_at_headers or row.case == .after_failed_write;
+        const full = row.case == .refused_at_headers;
         var response = try Response._init(arena.allocator(), &connection, if (full) 2 else 32);
         if (full) {
             try response.header("X-A", "1");
             try response.header("X-B", "2");
             response.content_type = .text;
-        }
-        if (row.case == .after_failed_write) {
-            response.body = "x";
-            try std.testing.expectError(error.TooManyHeaders, response.write());
-            try std.testing.expectEqual(Phase.writing, response._phase);
-            response.content_type = null;
-            response.body = "";
         }
 
         const got = response._park(&request, owner);
