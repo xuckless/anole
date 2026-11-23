@@ -718,3 +718,13 @@ pub fn expectConsoleInfo(client: anytype, want: struct {
     try testing.expectEqual(want.pools, o.get("pools").?.array.items.len);
     return parsed;
 }
+
+/// One checkout of a pooled connection, shared by every copy of the by-value `Conn` that stands for it
+/// (pgxpool's idempotent Release): `acquire()` allocates one in the caller's arena.
+pub const Checkout = struct {
+    given_back: std.atomic.Value(bool) = .init(false),
+    /// True the first time only.
+    pub fn once(self: *Checkout) bool {
+        return !self.given_back.swap(true, .acq_rel);
+    }
+};
