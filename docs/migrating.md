@@ -1,5 +1,11 @@
 # Migrating
 
+## 0.6 to the next release
+
+| 0.6 | next |
+| --- | --- |
+| `files.get(c, key, opts)` and the 14 other s3 `Client` calls (`optional`, `open`, `serve`, `head`, `exists`, `put`, `upload`, `delete`, `deleteMany`, `list`, `iterate`, `copy`, `presign`, `multipart`) | `files.default().get(c, key, opts)`: the default bucket is the explicit view `Client.default()`; `bucket(name)` and `with(opts)` are unchanged, and `app.s3` and `Client.init` too |
+
 ## 0.4 to 0.5
 
 | 0.4 | 0.5 |

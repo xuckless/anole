@@ -5,8 +5,8 @@
 //! XML (research: design-connectors.md section 1.1).
 //!
 //!     const files = try app.s3(.{});          // AWS_* variables, S3_BUCKET
-//!     _ = try files.put(req, "avatars/1.png", .request, .{});   // the request body goes to S3
-//!     _ = try files.serve(req, res, "avatars/1.png", .{});      // and back
+//!     _ = try files.default().put(req, "avatars/1.png", .request, .{});   // the request body goes to S3
+//!     _ = try files.default().serve(req, res, "avatars/1.png", .{});      // and back
 //!
 //! A write returns once its bytes are buffered: `Upload.write` never waits
 //! for the network (`.busy` and `error.ServiceUnavailable` with code
@@ -853,54 +853,9 @@ pub const Client = struct {
         return .{ .client = self, .name = null, .call = opts };
     }
 
-    fn dflt(self: *Client) Bucket {
+    /// The default bucket (`Options.bucket`): `client.default().get(c, key, .{})`.
+    pub fn default(self: *Client) Bucket {
         return .{ .client = self, .name = null };
-    }
-
-    pub fn get(self: *Client, c: anytype, key: []const u8, opts: GetOptions) Error!Object {
-        return self.dflt().get(c, key, opts);
-    }
-    pub fn optional(self: *Client, c: anytype, key: []const u8, opts: GetOptions) Error!?Object {
-        return self.dflt().optional(c, key, opts);
-    }
-    pub fn open(self: *Client, c: anytype, key: []const u8, opts: GetOptions) Error!Download {
-        return self.dflt().open(c, key, opts);
-    }
-    pub fn serve(self: *Client, req: *anole.Request, res: *anole.Response, key: []const u8, opts: ServeOptions) Error!Meta {
-        return self.dflt().serve(req, res, key, opts);
-    }
-    pub fn head(self: *Client, c: anytype, key: []const u8, opts: GetOptions) Error!Meta {
-        return self.dflt().head(c, key, opts);
-    }
-    pub fn exists(self: *Client, c: anytype, key: []const u8) Error!bool {
-        return self.dflt().exists(c, key);
-    }
-    pub fn put(self: *Client, c: anytype, key: []const u8, body: Body, opts: PutOptions) PutError!Stored {
-        return self.dflt().put(c, key, body, opts);
-    }
-    pub fn upload(self: *Client, c: anytype, key: []const u8, opts: PutOptions) Error!*Upload {
-        return self.dflt().upload(c, key, opts);
-    }
-    pub fn delete(self: *Client, c: anytype, key: []const u8, opts: DeleteOptions) Error!void {
-        return self.dflt().delete(c, key, opts);
-    }
-    pub fn deleteMany(self: *Client, c: anytype, keys: []const []const u8) Error!DeleteResult {
-        return self.dflt().deleteMany(c, keys);
-    }
-    pub fn list(self: *Client, c: anytype, opts: ListOptions) Error!ListPage {
-        return self.dflt().list(c, opts);
-    }
-    pub fn iterate(self: *Client, c: anytype, opts: ListOptions) Lister {
-        return self.dflt().iterate(c, opts);
-    }
-    pub fn copy(self: *Client, c: anytype, from: Source, to_key: []const u8, opts: PutOptions) Error!Stored {
-        return self.dflt().copy(c, from, to_key, opts);
-    }
-    pub fn presign(self: *Client, c: anytype, method: PresignMethod, key: []const u8, opts: PresignOptions) Error![]const u8 {
-        return self.dflt().presign(c, method, key, opts);
-    }
-    pub fn multipart(self: *Client) Multipart {
-        return self.dflt().multipart();
     }
 
     // ---- Upload memory -----------------------------------------------------
