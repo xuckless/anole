@@ -1241,18 +1241,21 @@ test "kafka consumer: start, stop and join by phase; memberGone only for members
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
-    defer broker.deinit();
-    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    // A dead address: the member fails its sessions and backs off, a wait
+    // a cancel ends at once.
+    const client = try kafka.Client.init(gpa, io, .{ .brokers = &.{"127.0.0.1:1"}, .connect_timeout = .fromMilliseconds(300) });
     defer client.deinit();
-    const Row = struct { group: []const u8, stop_first: bool, stop: bool, spawned: usize, gone: bool };
+    // `deadline_ms` past any run: a join that misses the done event hangs.
+    const Row = struct { group: []const u8, stop_first: bool = false, stop: bool = false, cancel_joiner: bool = false, deadline_ms: i64 = 3_600_000, spawned: usize = 1, gone: ?bool = false };
     for ([_]Row{
         // A start after a stop spawns nothing; the join has nothing to wait for.
-        .{ .group = "stop-before-start", .stop_first = true, .stop = true, .spawned = 0, .gone = false },
+        .{ .group = "stop-before-start", .stop_first = true, .stop = true, .spawned = 0 },
         // The members exit on the stop: the join returns on the last one.
-        .{ .group = "start-stop-join", .stop_first = false, .stop = true, .spawned = 1, .gone = false },
-        // No stop, deadline now: the join cancels the running member.
-        .{ .group = "join-at-deadline", .stop_first = false, .stop = false, .spawned = 1, .gone = true },
+        .{ .group = "start-stop-join", .stop = true },
+        // No stop: the join waits out its deadline, then cancels the member.
+        .{ .group = "join-at-deadline", .deadline_ms = 5, .gone = null },
+        // No stop: the joiner is canceled, leaves its wait and cancels.
+        .{ .group = "joiner-canceled", .cancel_joiner = true, .gone = null },
     }) |row| {
         errdefer std.debug.print("row {s}\n", .{row.group});
         // Serving has not started: the consumer waits for its own start.
@@ -1262,10 +1265,23 @@ test "kafka consumer: start, stop and join by phase; memberGone only for members
         try c.start();
         try testing.expectEqual(row.spawned, c.members.len);
         if (row.stop) c.stop();
-        const now = std.Io.Clock.Timestamp.now(io, .awake);
-        c.join(if (row.stop) now.addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }) else now);
+        const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromMilliseconds(row.deadline_ms), .clock = .awake });
+        if (row.cancel_joiner) {
+            const Joiner = struct {
+                fn run(cc: *@import("consumer.zig").Consumer, at: std.Io.Clock.Timestamp, joining: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+                    joining.store(true, .release);
+                    cc.join(at);
+                }
+            };
+            var joining: std.atomic.Value(bool) = .init(false);
+            var joiner: std.Io.Group = .init;
+            try dusty.placement.concurrent(&joiner, io, .{ .executor = 1 }, Joiner.run, .{ c, deadline, &joining });
+            try wait.waitFlag(io, "the joiner runs", &joining);
+            joiner.cancel(io);
+        } else c.join(deadline);
         try testing.expectEqual(@as(u32, 0), c.active.load(.acquire));
-        try testing.expectEqual(row.gone, c.memberGone());
+        try testing.expect(c.members_done.isSet());
+        if (row.gone) |gone| try testing.expectEqual(gone, c.memberGone());
     }
 }
 

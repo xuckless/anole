@@ -348,9 +348,8 @@ pub const Consumer = struct {
     active: std.atomic.Value(u32) = .init(0),
     members_done: std.Io.Event = .unset,
 
-    /// created -> running (`start`), any -> stopping (`stop`); a start
-    /// after a stop spawns nothing. `Client` never runs a start
-    /// concurrently with a stop (its drain waits for the starts).
+    /// created -> running (`start`, by compare-and-swap), any -> stopping
+    /// (`stop`); a start after or racing a stop spawns nothing.
     const Phase = enum(u8) { created, running, stopping };
 
     /// The client's telemetry, once `Client.start` set it: stored once with
@@ -392,13 +391,18 @@ pub const Consumer = struct {
 
     /// Joins the group: spawns the member tasks.
     pub fn start(c: *Consumer) !void {
-        if (c.phase.load(.acquire) != .created) return;
-        c.members = try c.host.gpa.alloc(Member, c.opts.members);
-        for (c.members, 0..) |*m, i| m.* = .{ .consumer = c, .index = i };
+        const members = try c.host.gpa.alloc(Member, c.opts.members);
+        for (members, 0..) |*m, i| m.* = .{ .consumer = c, .index = i };
         // Counted before the phase says running, so `memberGone` never sees
         // running with members still to spawn.
-        _ = c.active.fetchAdd(@intCast(c.members.len), .acq_rel);
-        c.phase.store(.running, .release);
+        _ = c.active.fetchAdd(@intCast(members.len), .acq_rel);
+        if (c.phase.cmpxchgStrong(.created, .running, .acq_rel, .acquire) != null) {
+            // A stop (or another start) came first: spawn nothing.
+            c.host.gpa.free(members);
+            c.membersEnded(@intCast(members.len));
+            return;
+        }
+        c.members = members;
         for (c.members, 0..) |*m, i| {
             placement.concurrent(&c.group, c.host.io, .{ .executor = m.index }, memberMain, .{m}) catch {
                 c.membersEnded(@intCast(c.members.len - i));
