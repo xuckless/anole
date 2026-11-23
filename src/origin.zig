@@ -38,6 +38,7 @@ pub fn check(origin: []const u8, host: ?[]const u8, origins: Origins) bool {
         .any => return true,
         .same_origin => {},
         .list => |list| for (list) |entry| {
+            if (entry.len == 0) continue;
             if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, origin, " \t"), entry)) return true;
         },
     }
@@ -114,6 +115,13 @@ test "origin: a list adds origins to the request's own, and any lets everything 
     try std.testing.expect(!check("https://evil.example", "api.example.com", list));
     try std.testing.expect(!check("https://app.example.com:444", "api.example.com", list));
     try std.testing.expect(check("https://evil.example", "api.example.com", .any));
+
+    // Empty entries in .list (e.g. an unset runtime CORS_ORIGIN) are ignored
+    // and never match an empty Origin header.
+    const with_empty: Origins = .{ .list = &.{""} };
+    try std.testing.expect(check("https://api.example.com", "api.example.com", with_empty));
+    try std.testing.expect(!check("https://evil.example", "api.example.com", with_empty));
+    try std.testing.expect(!check("", "api.example.com", with_empty));
 }
 
 test "fuzz: origin checks" {

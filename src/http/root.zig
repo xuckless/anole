@@ -15,6 +15,8 @@ const dusty = @import("dusty");
 /// TLS setup of its own. `anole.Server` builds on it and exposes it as
 /// `app.server`.
 pub const Server = dusty.Server;
+/// Deterministic fake clock for tests (`anole.testing.Clock`).
+pub const Clock = dusty.Clock;
 /// The core server's settings: timeouts, limits, listeners, HTTP/2. Anole
 /// builds it from `anole.ServerOptions`; use that unless you drive the core
 /// alone.

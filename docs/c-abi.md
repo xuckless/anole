@@ -776,7 +776,7 @@ Zig options with no key, and why:
 | `blocking` | the ABI starts a pool when SQLite is configured |
 | `client` | no outbound client in the ABI |
 | `admission.window` | 1 s; the A/B and the metrics assume it |
-| `websocket.UpgradeOptions.max_message_size`, `timeout`, `deflate`, `drain_reason` | `limits.ws_max_message` applies to every socket; sockets have no deadline of their own; permessage-deflate runs on its defaults; the drain's close carries the default reason |
+| `websocket.UpgradeOptions.max_message_size`, `timeout`, `deflate`, `drain_reason`, `close_timeout` | `limits.ws_max_message` applies to every socket; sockets have no deadline of their own; permessage-deflate runs on its defaults; the drain's close carries the default reason and 5 s close-handshake timeout |
 | `websocket.UpgradeOptions.headers` | Zig only: the consumer passes headers per `anole_ws_accept` |
 
 The middleware keys follow the same rule for durations: `jwt.leeway_ms`

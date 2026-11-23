@@ -317,6 +317,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "errors", .json = "errors", .kind = .same },
     .{ .zig = "error_handler", .omitted = "a function: the language answers its own errors (`anole_fail`)" },
     .{ .zig = "executors", .json = "executors", .kind = .custom, .note = "0 is `.auto`, n is `.exact(n)`" },
+    .{ .zig = "clock", .omitted = "Zig test helper (`anole.testing.Clock`); not part of the C ABI config" },
     .{ .zig = "io_engine", .json = "io_engine", .kind = .same },
     .{ .zig = "max_stack_size", .omitted = "stacks run Anole's native work only, never language handlers; the default fits the bundled code" },
     .{ .zig = "raise_fd_limit", .omitted = "always on under the ABI" },
@@ -369,6 +370,7 @@ pub const websocket_options = [_]Entry{
     .{ .zig = "deflate", .omitted = "permessage-deflate runs on its defaults" },
     .{ .zig = "close_on_drain", .json = "routes[].websocket.close_on_drain" },
     .{ .zig = "drain_reason", .omitted = "the drain's close carries the default reason" },
+    .{ .zig = "close_timeout", .omitted = "the close handshake runs on its default (5 s)" },
     .{ .zig = "subprotocols", .json = "routes[].websocket.subprotocols", .note = "\"accept\": \"auto\" only; with \"consumer\" the application picks in anole_ws_accept" },
     .{ .zig = "headers", .omitted = "Zig only: the consumer passes headers per accept (anole_ws_accept_options.headers)" },
 };

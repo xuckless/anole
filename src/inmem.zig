@@ -33,6 +33,8 @@ pub fn Exchange(comptime Ctx: type) type {
             listener: *const dusty.Listener,
             version: struct { u8, u8 } = .{ 1, 1 },
             id: []const u8 = "",
+            /// Overrides `core.io` for the request and response (e.g. a test clock).
+            io: ?std.Io = null,
         };
 
         pub const Ready = enum { ready, answered };
@@ -44,7 +46,7 @@ pub fn Exchange(comptime Ctx: type) type {
         /// already wrote an error (413, 431) to the sink. `self` must not
         /// move afterwards.
         pub fn init(self: *Self, core: *dusty.Server(Ctx), arena: std.mem.Allocator, sink: dusty.Sink, spec: Spec) !Ready {
-            const io = core.io;
+            const io = spec.io orelse core.io;
             self.body_reader = .fixed(spec.body);
             self.request = .{
                 .arena = arena,

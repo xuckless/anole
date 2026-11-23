@@ -1295,3 +1295,121 @@ test "WebSocket over HTTP/2 on the new engine: permessage-deflate keeps its buff
     try std.testing.expectEqual(@as(u16, 200), client.status);
     try test_wait.waitFlag(io, "the deflate handler saw its buffers apart from the arena", &deflate_apart);
 }
+
+var h2_close_done: std.atomic.Value(usize) = .init(0);
+
+fn h2ShortClose(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+    var ws = (try websocket.upgrade(req, res, .{ .close_timeout = .fromMilliseconds(150) })) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer {
+        ws.deinit();
+        _ = h2_close_done.fetchAdd(1, .acq_rel);
+    }
+    while (true) {
+        const msg = ws.receive() catch return;
+        switch (msg.type) {
+            .text => {
+                if (std.mem.eql(u8, msg.data, "close")) {
+                    try ws.close(.going_away, "bye");
+                } else {
+                    try ws.send(msg.type, msg.data);
+                }
+            },
+            .close => return,
+            else => {},
+        }
+    }
+}
+
+test "WebSocket over HTTP/2: drain cuts an unresponsive client after close_timeout, not timeout.shutdown" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    h2_close_done.store(0, .release);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
+        // No drain deadline: only close_timeout can end the socket.
+        .timeout = .{ .shutdown = null },
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", h2ShortClose);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try client.sendFrame(.text, "hi");
+    try std.testing.expectEqualStrings("hi", try client.nextFrame(&op, &buf));
+
+    var drain = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(io_));
+        }
+    }.run, .{ &server_future, io });
+    defer drain.cancel(io) catch {};
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
+    // Never answer the close: close_timeout cancels the stream task.
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+    try drain.await(io);
+    try std.testing.expectEqual(@as(usize, 1), h2_close_done.load(.acquire));
+}
+
+test "WebSocket over HTTP/2: handler ws.close cuts an unresponsive client after close_timeout" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    h2_close_done.store(0, .release);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", h2ShortClose);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try client.sendFrame(.text, "close");
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
+    try std.testing.expectEqualStrings("bye", closing[2..]);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+    try test_wait.waitAtLeast(io, "h2 handler exited after close_timeout", &h2_close_done, 1);
+}
