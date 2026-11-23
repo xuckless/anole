@@ -15,8 +15,11 @@ commit=$2
 vars=(SERVER CLIENT SERVER_WWW SERVER_DOWNLOADS CLIENT_WWW CLIENT_DOWNLOADS CERTS REQUESTS_SERVER REQUESTS_CLIENT)
 pattern=$(printf '^%s=\\|' "${vars[@]}")
 pattern=${pattern%\\|}
+# Read first, so a failed show stops the script (set -e); only grep's
+# no-match is tolerated.
+base=$(git -C "$runner" show "$commit:empty.env")
 {
-  git -C "$runner" show "$commit:empty.env" | grep -v "$pattern" || true
+  printf %s "$base" | grep -v "$pattern" || true
   # Names that stop never uses: any non-empty value (images need a valid name).
   for v in "${vars[@]}"; do
     case $v in
