@@ -970,10 +970,6 @@ pub const Connection = struct {
 
     pub const isPeerGone = Transport.isPeerGone;
 
-    /// Whether a read or write on this connection failed because the peer
-    /// is gone. Asked instead of judging an error by its name: a handler's
-    /// own `EndOfStream`, from a file or from a std helper at the end of
-    /// the body, is spelled like a disconnect and is not one.
     /// Records what a PROXY protocol header named about the connection.
     pub fn setProxied(self: *Connection, header: proxy_protocol.Header) void {
         self.proxied_peer = header.source;
@@ -987,6 +983,10 @@ pub const Connection = struct {
         return unmapIpv4(self.proxied_peer orelse self.stream.socket.address);
     }
 
+    /// Whether a read or write on this connection failed because the peer
+    /// is gone. Asked instead of judging an error by its name: a handler's
+    /// own `EndOfStream`, from a file or from a std helper at the end of
+    /// the body, is spelled like a disconnect and is not one.
     pub fn peerGone(self: *Connection) bool {
         if (self.getWriteError()) |e| if (isPeerGone(e)) return true;
         if (self.getReadError()) |e| if (isPeerGone(e)) return true;
