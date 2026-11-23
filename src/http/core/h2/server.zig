@@ -2274,7 +2274,11 @@ pub fn Engine(comptime Ctx: type) type {
             conn: *Conn,
             arena: LocalArena,
             node: std.DoublyLinkedList.Node = .{},
-            /// The protocol stream; null once it closed.
+            /// The protocol stream; null once it closed (`onStreamClose`,
+            /// under `Conn.lock`). Its facts are read through it, never
+            /// copied: whether the response head went is its
+            /// `flags.head_sent`. A fact the engine reads after the close
+            /// is the engine's own field below.
             cs: ?*PStream = null,
             id: u31 = 0,
 
@@ -2297,6 +2301,11 @@ pub fn Engine(comptime Ctx: type) type {
             scheme: []const u8 = "",
             protocol: []const u8 = "",
             headers: std.ArrayList(Field) = .empty,
+            /// The declared TOTAL (it sizes the body buffer and caps the
+            /// window raises after DATA came), not the core's
+            /// `content_left` (what is left, falling with each DATA): set
+            /// once at the head's end from that value, under `Conn.lock`
+            /// (`onHeadersEnd`).
             content_length: ?u64 = null,
 
             // The request body.
@@ -2304,7 +2313,11 @@ pub fn Engine(comptime Ctx: type) type {
             body_buf: BodyBuf = .{},
             recv: ReqBody = .receiving,
             /// Reset (by either side), or the connection is gone: a latch,
-            /// set only by `Conn.streamGone`.
+            /// set only by `Conn.streamGone`, under `Conn.lock`. The
+            /// engine's own, not the core's closed state: it is set with
+            /// the core stream still open (`sendReset` before
+            /// `proto.reset`, a connection gone) and on a clean close of an
+            /// unended response, and read after the core stream is gone.
             reset: bool = false,
             /// What is left of the window `discarding` drops.
             discard_left: usize = 0,
@@ -2325,6 +2338,13 @@ pub fn Engine(comptime Ctx: type) type {
             canceled: bool = false,
 
             // The response.
+            /// Changed only through `Resp.next` (or the value saved before
+            /// a failed submit put back), under `Conn.lock`. The engine's
+            /// own, not the core's `answered`: `.ended` is set before the
+            /// submit and kept or rolled back on failure edges the core
+            /// sees otherwise, `.waiting` has no core fact, and both are
+            /// read after the core stream is gone (`cancelHandler`,
+            /// `H2Parked.release`).
             resp: Resp = .open,
             status: http.Status = .ok,
             resp_fields: []hpack.Field = &.{},
