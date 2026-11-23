@@ -268,6 +268,9 @@ pub const Stream = struct {
     const MoreCmd = struct {
         pub const Result = void;
         s: *Stream,
+        /// The reply said the cursor is exhausted (id 0); the caller closes
+        /// it once `execute` is done with the borrowed collection name.
+        exhausted: bool = false,
 
         pub fn body(self: *MoreCmd, b: *bson.Builder, _: *Exchange) !void {
             const s = self.s;
@@ -289,7 +292,7 @@ pub const Stream = struct {
                 else => return error.InvalidReply,
             };
             try s.takeBatch(batch, cur);
-            if ((sdam.intOf(cur.get("id")) orelse 0) == 0) s.closeCursor(false);
+            self.exhausted = (sdam.intOf(cur.get("id")) orelse 0) == 0;
         }
 
         /// A failed getMore leaves no cursor to kill; the error is noted
@@ -376,6 +379,7 @@ pub const Stream = struct {
             s.closeCursor(false);
             return err;
         };
+        if (cmd.exhausted) s.closeCursor(false);
     }
 
     /// Ends the cursor: killCursors when `kill` (best effort, whatever the

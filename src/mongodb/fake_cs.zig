@@ -355,7 +355,7 @@ test "change stream: startAfter is used again on a resume before any event, resu
     try testing.expectEqualStrings("start", tokenData(stage.get("startAfter").?.document));
 }
 
-test "change stream: a batch with only a postBatchResumeToken resumes with resumeAfter, whatever the open's options" {
+test "change stream: a batch with only a postBatchResumeToken resumes with resumeAfter" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -396,6 +396,31 @@ test "change stream: a reply with cursor id 0 leaves no cursor: no killCursors, 
     try testing.expect((try s.next()) == null);
     s.deinit();
     try testing.expectEqual(@as(u32, 0), fake.killed.load(.monotonic));
+}
+
+test "change stream: killCursors once for an open cursor; a getMore reply with id 0 closes it without a kill" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io, &.{
+        .{ .batch = .{ .ids = &.{} } },
+        .{ .batch = .{ .ids = &.{1}, .cursor = 0 } },
+    });
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    var open_s = try client.collection("users").watch(cs.ChangeEvent, &c, .{}, .{ .max_await = .fromMilliseconds(20) });
+    open_s.deinit();
+    try testing.expectEqual(@as(u32, 1), fake.killed.load(.monotonic));
+    var s = try client.collection("users").watch(cs.ChangeEvent, &c, .{}, .{ .max_await = .fromMilliseconds(20) });
+    try testing.expectEqualStrings("t1", tokenData((try s.next()).?._id));
+    try testing.expect((try s.next()) == null);
+    s.deinit();
+    try testing.expectEqual(@as(u32, 1), fake.killed.load(.monotonic));
 }
 
 test "change stream: startAtOperationTime comes from the open's operationTime when there is no token" {
