@@ -5489,24 +5489,30 @@ test "Server: a late connector gets the app's metrics and health, as one made be
     const registry = app.metrics(.{});
     const health = app.health(.{});
     try app.startConnectors();
-    // Rows: constructor made after startConnectors; its system label must show in the pool series.
-    const rows = .{
-        .{ features.sqlite, "sqlite" },
-        .{ features.postgres, "postgresql" },
-        .{ features.redis, "redis" },
+    const expect = struct {
+        fn late(registry_: *observe.metrics.Registry, health_: *observe.Health, before: usize, comptime system: []const u8) !void {
+            var buf: [64 * 1024]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            try registry_.render(&w);
+            try std.testing.expect(std.mem.find(u8, w.buffered(), "anole_db_pool_connections{system=\"" ++ system ++ "\"") != null);
+            try std.testing.expectEqual(before + 1, health_.len);
+        }
     };
-    inline for (rows) |row| if (comptime row[0]) {
+    if (comptime features.sqlite) {
         const before = health.len;
-        if (comptime std.mem.eql(u8, row[1], "sqlite")) _ = try app.sqlite(":memory:");
-        if (comptime std.mem.eql(u8, row[1], "postgresql")) _ = try app.postgres(.{ .url = "postgres://u@127.0.0.1:1/d", .environ = .empty });
-        if (comptime std.mem.eql(u8, row[1], "redis")) _ = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
-        var buf: [64 * 1024]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        try registry.render(&w);
-        const want = "anole_db_pool_connections{system=\"" ++ row[1] ++ "\"";
-        try std.testing.expect(std.mem.find(u8, w.buffered(), want) != null);
-        try std.testing.expectEqual(before + 1, health.len);
-    };
+        _ = try app.sqlite(":memory:");
+        try expect.late(registry, health, before, "sqlite");
+    }
+    if (comptime features.postgres) {
+        const before = health.len;
+        _ = try app.postgres(.{ .url = "postgres://u@127.0.0.1:1/d", .environ = .empty });
+        try expect.late(registry, health, before, "postgresql");
+    }
+    if (comptime features.redis) {
+        const before = health.len;
+        _ = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
+        try expect.late(registry, health, before, "redis");
+    }
 }
 
 test "Server: a connector's late start runs through addConnector (stub rows)" {
@@ -5524,10 +5530,10 @@ test "Server: a connector's late start runs through addConnector (stub rows)" {
             self.deinits += 1;
         }
     };
-    const rows = [_]struct { name: []const u8, started_first: bool, fail: bool, want_err: bool, want_starts: u32 }{
-        .{ .name = "before startConnectors: registered, not started", .started_first = false, .fail = false, .want_err = false, .want_starts = 0 },
-        .{ .name = "after startConnectors: started once with the app's metrics and health", .started_first = true, .fail = false, .want_err = false, .want_starts = 1 },
-        .{ .name = "after, start fails: error returned, entry stays, nothing freed", .started_first = true, .fail = true, .want_err = true, .want_starts = 1 },
+    const rows = [_]struct { name: []const u8, started_first: bool, fail: bool, want_starts: u32 }{
+        .{ .name = "before startConnectors: registered, not started", .started_first = false, .fail = false, .want_starts = 0 },
+        .{ .name = "after startConnectors: started once with the app's metrics and health", .started_first = true, .fail = false, .want_starts = 1 },
+        .{ .name = "after, start fails: error returned, entry stays, nothing freed", .started_first = true, .fail = true, .want_starts = 1 },
     };
     for (rows) |row| {
         var app = try Server(void).init(std.testing.allocator, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
@@ -5537,8 +5543,7 @@ test "Server: a connector's late start runs through addConnector (stub rows)" {
         if (row.started_first) try app.startConnectors();
         const result = app.addConnector(Stub, &stub);
         errdefer std.debug.print("row: {s}\n", .{row.name});
-        try std.testing.expectEqual(row.want_err, std.meta.isError(result));
-        if (row.want_err) try std.testing.expectError(error.ServiceUnavailable, result);
+        if (row.fail) try std.testing.expectError(error.ServiceUnavailable, result) else try result;
         try std.testing.expectEqual(row.want_starts, stub.starts);
         try std.testing.expect(row.want_starts == 0 or stub.saw_args);
         try std.testing.expectEqual(@as(usize, 1), app.extras.connectors.items.len);
