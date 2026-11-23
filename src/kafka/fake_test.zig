@@ -719,6 +719,25 @@ test "kafka producer: after a producer id reset, the broker refuses no batch as 
     try testing.expectEqual(@as(i64, 4), broker.count("ids", 1));
 }
 
+test "kafka producer: a failed InitProducerId leaves no fetch pending, the next send gets an id" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{});
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    broker.fail_init_pid.store(1, .release);
+    // The first fetch fails; the send retries and a later fetch succeeds.
+    const r = try client.produce(&c, .{ .topic = "ids", .value = "a", .partition = 0 });
+    try testing.expectEqual(@as(i32, 0), r.partition);
+    try testing.expectEqual(@as(u32, 0), broker.fail_init_pid.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), broker.count("ids", 0));
+}
+
 /// An allocator that fails the `fail_at`-th allocation made by the thread
 /// that armed it (other threads pass through), counting from the arming.
 const FailNth = struct {
@@ -1216,6 +1235,108 @@ test "kafka: a consumer added once a drain began is refused" {
     spawned.let(io);
     try result.wait(io);
     try wait.waitFlag(io, "the drain returned", &drained);
+}
+
+test "kafka client: start, consume and drain by phase; each consumer is started once, by start or by consume" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    // `spawned`: the members of the last consumer added; null: none, or refused.
+    const Row = struct { act: enum { add, start, drain }, phase: @FieldType(kafka.Client, "phase"), spawned: ?usize = 0 };
+    for ([_]struct { suppress: bool, rows: []const Row }{
+        .{
+            .suppress = false,
+            .rows = &.{
+                .{ .act = .add, .phase = .idle },
+                .{ .act = .start, .phase = .serving, .spawned = 1 },
+                .{ .act = .start, .phase = .serving, .spawned = 1 }, // start twice starts once
+                .{ .act = .add, .phase = .serving, .spawned = 1 }, // started by consume, not again by start
+                .{ .act = .drain, .phase = .drained, .spawned = 1 },
+                .{ .act = .drain, .phase = .drained, .spawned = 1 }, // drain twice drains once
+                .{ .act = .add, .phase = .drained, .spawned = null },
+            },
+        },
+        .{
+            .suppress = false,
+            .rows = &.{ // drain before start: the consumer added first is never started
+                .{ .act = .add, .phase = .idle },
+                .{ .act = .drain, .phase = .drained },
+                .{ .act = .start, .phase = .drained },
+            },
+        },
+        .{ .suppress = true, .rows = &.{
+            .{ .act = .add, .phase = .idle },
+            .{ .act = .start, .phase = .serving },
+            .{ .act = .add, .phase = .serving },
+        } },
+    }, 0..) |s, si| {
+        const client = try kafka.Client.init(gpa, io, .{ .brokers = &.{"127.0.0.1:1"}, .connect_timeout = .fromMilliseconds(300) });
+        defer client.deinit();
+        client.suppress_consumers = s.suppress;
+        var last: ?*@import("consumer.zig").Consumer = null;
+        for (s.rows, 0..) |row, ri| {
+            errdefer std.debug.print("scenario {d} row {d}\n", .{ si, ri });
+            switch (row.act) {
+                .add => last = client.consumeRaw(.{ .group = "g", .topics = &.{"t"}, .heartbeat_interval = .fromMilliseconds(100) }, Joined.on, null) catch |err| blk: {
+                    try testing.expectEqual(error.Closing, err);
+                    break :blk null;
+                },
+                .start => try client.start(null, null, null),
+                .drain => client.drain(std.Io.Clock.Timestamp.now(io, .awake)),
+            }
+            try testing.expectEqual(row.phase, client.phase);
+            try testing.expectEqual(row.spawned, if (last) |c| c.members.len else null);
+            try testing.expectEqual(@as(u32, 0), client.starting);
+        }
+    }
+}
+
+test "kafka consumer: start, stop and join by phase; memberGone only for members that ended while running" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    // A dead address: the member fails its sessions and backs off, a wait
+    // a cancel ends at once.
+    const client = try kafka.Client.init(gpa, io, .{ .brokers = &.{"127.0.0.1:1"}, .connect_timeout = .fromMilliseconds(300) });
+    defer client.deinit();
+    // `deadline_ms` past any run: a join that misses the done event hangs.
+    const Row = struct { group: []const u8, stop_first: bool = false, stop: bool = false, cancel_joiner: bool = false, deadline_ms: i64 = 3_600_000, spawned: usize = 1, gone: ?bool = false };
+    for ([_]Row{
+        // A start after a stop spawns nothing; the join has nothing to wait for.
+        .{ .group = "stop-before-start", .stop_first = true, .stop = true, .spawned = 0 },
+        // The members exit on the stop: the join returns on the last one.
+        .{ .group = "start-stop-join", .stop = true },
+        // No stop: the join waits out its deadline, then cancels the member.
+        .{ .group = "join-at-deadline", .deadline_ms = 5, .gone = null },
+        // No stop: the joiner is canceled, leaves its wait and cancels.
+        .{ .group = "joiner-canceled", .cancel_joiner = true, .gone = null },
+    }) |row| {
+        errdefer std.debug.print("row {s}\n", .{row.group});
+        // Serving has not started: the consumer waits for its own start.
+        const c = try client.consumeRaw(.{ .group = row.group, .topics = &.{"phases"}, .heartbeat_interval = .fromMilliseconds(100) }, Joined.on, null);
+        if (row.stop_first) c.stop();
+        try c.start();
+        try c.start();
+        try testing.expectEqual(row.spawned, c.members.len);
+        if (row.stop) c.stop();
+        const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromMilliseconds(row.deadline_ms), .clock = .awake });
+        if (row.cancel_joiner) {
+            const Joiner = struct {
+                fn run(cc: *@import("consumer.zig").Consumer, at: std.Io.Clock.Timestamp, joining: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+                    joining.store(true, .release);
+                    cc.join(at);
+                }
+            };
+            var joining: std.atomic.Value(bool) = .init(false);
+            var joiner: std.Io.Group = .init;
+            try dusty.placement.concurrent(&joiner, io, .{ .executor = 1 }, Joiner.run, .{ c, deadline, &joining });
+            try wait.waitFlag(io, "the joiner runs", &joining);
+            joiner.cancel(io);
+        } else c.join(deadline);
+        try testing.expectEqual(@as(u32, 0), c.active.load(.acquire));
+        try testing.expect(c.members_done.isSet());
+        if (row.gone) |gone| try testing.expectEqual(gone, c.memberGone());
+    }
 }
 
 /// A waiting append on the executor: `err` is its failure.
