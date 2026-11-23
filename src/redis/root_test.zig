@@ -735,18 +735,21 @@ test "redis: a pooled connection that breaks before sending, while the server is
     const pool = &client.pools.pools[0];
     try testing.expectEqual(@as(usize, 0), pool.open);
     // A failed dial gives its place back and wakes the call waiting for it:
-    // a 503 for both, never a pool_timeout.
+    // a 503 for both from a refused dial, never a pool_timeout.
     const Other = struct {
-        fn incr(cl: *Client, o_io: std.Io) redis.Error!i64 {
+        fn incr(cl: *Client, o_io: std.Io) !void {
             var o_arena: std.heap.ArenaAllocator = .init(testing.allocator);
             defer o_arena.deinit();
             var o_c: db.Ctx = .{ .io = o_io, .arena = o_arena.allocator() };
-            return cl.incr(&o_c, "n");
+            try testing.expectError(error.ServiceUnavailable, cl.incr(&o_c, "n"));
+            try testing.expectStringStartsWith(db.lastError(&o_c).?.message, "cannot connect to");
         }
     };
     var other = try io.concurrent(Other.incr, .{ client, io });
+    defer other.cancel(io) catch {};
     try testing.expectError(error.ServiceUnavailable, client.incr(&c, "n"));
-    try testing.expectError(error.ServiceUnavailable, other.await(io));
+    try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to");
+    try other.await(io);
     try testing.expectEqual(@as(usize, 0), pool.open);
 }
 
