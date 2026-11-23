@@ -76,6 +76,7 @@ const codec = @import("anole_websocket_codec").server;
 /// `receive` hands over messages still compressed; `Socket` inflates.
 const H2Socket = @import("h2_socket.zig").H2Socket;
 const origin = @import("../origin.zig");
+const fanout = @import("../fanout.zig");
 /// Which pages may open a socket (`UpgradeOptions.allowed_origins`).
 pub const Origins = origin.Origins;
 
@@ -264,7 +265,7 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
 };
 
 /// The HTTP version a `Socket` runs over.
-pub const HttpVersion = enum { http1, http2, http3 };
+pub const HttpVersion = fanout.HttpVersion;
 
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
@@ -531,7 +532,7 @@ pub const Socket = struct {
         Rooms.leaveEvery(self);
         if (self._gauged) {
             self._gauged = false;
-            dusty.gauges.add(self.io, gaugeOf(self._http_version), -1);
+            dusty.gauges.add(self.io, ws_gauge.get(self._http_version), -1);
         }
         if (self._admission) |a| {
             self._admission = null;
@@ -832,7 +833,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         socket._close_watch = watch;
     }
     socket._gauged = true;
-    dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
+    dusty.gauges.add(req.io, ws_gauge.get(socket._http_version), 1);
     if (req._ws_admission == .held) {
         socket._admission = adm;
         req._ws_admission = .moved;
@@ -855,13 +856,7 @@ pub noinline fn overloaded(req: *dusty.Request, res: *dusty.Response, a: *dusty.
     return error.ServiceUnavailable;
 }
 
-fn gaugeOf(v: HttpVersion) dusty.gauges.Kind {
-    return switch (v) {
-        .http1 => .ws_h1,
-        .http2 => .ws_h2,
-        .http3 => .ws_h3,
-    };
-}
+const ws_gauge: std.EnumArray(HttpVersion, dusty.gauges.Kind) = .init(.{ .http1 = .ws_h1, .http2 = .ws_h2, .http3 = .ws_h3 });
 
 /// Deinitializes `socket` and frees what `openSocket` took from `owner`.
 fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
@@ -1578,27 +1573,18 @@ pub const Rooms = struct {
         type: MessageType,
         len: usize,
 
+        const shared = fanout.Shared(Payload);
+        pub const bytes = shared.bytes;
+        pub const retain = shared.retain;
+        pub const release = shared.release;
+
         pub fn create(allocator: std.mem.Allocator, msg_type: MessageType, message: []const u8) !*Payload {
-            const block = try allocator.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + message.len);
-            const p: *Payload = @ptrCast(block.ptr);
-            p.* = .{ .refs = .init(1), .type = msg_type, .len = message.len };
-            @memcpy(block[@sizeOf(Payload)..], message);
-            return p;
+            return shared.alloc(allocator, .{ .refs = .init(1), .type = msg_type, .len = message.len }, message);
         }
 
-        pub fn bytes(p: *const Payload) []const u8 {
-            const base: [*]const u8 = @ptrCast(p);
-            return base[@sizeOf(Payload)..][0..p.len];
-        }
-
-        fn cost(p: *const Payload) usize {
-            return p.len + 64;
-        }
-
-        pub fn release(p: *Payload, allocator: std.mem.Allocator) void {
-            if (p.refs.fetchSub(1, .acq_rel) != 1) return;
-            const base: [*]align(@alignOf(Payload)) u8 = @ptrCast(p);
-            allocator.free(base[0 .. @sizeOf(Payload) + p.len]);
+        /// What it counts against a member's queue.
+        pub fn cost(p: *const Payload) usize {
+            return p.len + fanout.item_overhead;
         }
     };
 
@@ -1617,10 +1603,7 @@ pub const Rooms = struct {
         /// Closed for not keeping up (`Options.on_full = .close`): its
         /// sender ends the connection as it stops.
         overflowed: bool = false,
-        /// Messages waiting, from `head` on.
-        queue: std.ArrayList(*Payload) = .empty,
-        head: usize = 0,
-        queued_bytes: usize = 0,
+        queue: fanout.Queue(Payload) = .{},
         /// A sender task is started or running; it alone takes from the
         /// queue.
         running: bool = false,
@@ -1635,47 +1618,15 @@ pub const Rooms = struct {
         left: bool = false,
         sender: std.Io.Group = .init,
 
-        fn pop(m: *Member) ?*Payload {
-            if (m.head == m.queue.items.len) return null;
-            const p = m.queue.items[m.head];
-            m.head += 1;
-            m.queued_bytes -= p.cost();
-            if (m.head == m.queue.items.len) {
-                m.queue.clearRetainingCapacity();
-                m.head = 0;
-            } else if (m.head >= 64 and m.head * 2 >= m.queue.items.len) {
-                const rest = m.queue.items[m.head..];
-                std.mem.copyForwards(*Payload, m.queue.items[0..rest.len], rest);
-                m.queue.items.len = rest.len;
-                m.head = 0;
-            }
-            return p;
-        }
-
-        fn dropQueue(m: *Member, allocator: std.mem.Allocator) void {
-            for (m.queue.items[m.head..]) |p| p.release(allocator);
-            m.queue.clearRetainingCapacity();
-            m.head = 0;
-            m.queued_bytes = 0;
-        }
-
         /// Gets nothing more, and the send under way is canceled. Under
         /// the mutex.
         fn close(m: *Member, allocator: std.mem.Allocator) void {
             m.broken = true;
             m.overflowed = true;
-            m.dropQueue(allocator);
+            m.queue.drop(allocator);
             if (m.running) if (m.task) |t| placement.cancelTask(t);
         }
     };
-
-    /// The most queued messages a member's sender writes before one flush.
-    const send_round = 64;
-
-    /// Members a broadcast notes on the stack for starting their senders;
-    /// the 65th one needing a start borrows from the allocator (a room whose
-    /// members are running, the usual case, never does).
-    const stack_snapshot = 64;
 
     /// No rooms yet. `allocator` holds the room names, members and queued
     /// messages; it must be thread-safe when sockets on several executors
@@ -1727,7 +1678,7 @@ pub const Rooms = struct {
             var it = r.rooms.iterator();
             while (it.next()) |entry| {
                 var queued: u64 = 0;
-                for (entry.value_ptr.items) |m| queued += m.queued_bytes;
+                for (entry.value_ptr.items) |m| queued += m.queue.queued_bytes;
                 if (!first.*) try w.writeByte(',');
                 first.* = false;
                 try w.print("{{\"name\":{f},\"members\":{d},\"queued_bytes\":{d},\"closed_slow\":{d}}}", .{
@@ -1824,7 +1775,7 @@ pub const Rooms = struct {
         }
         m.room = "";
         m.left = true;
-        m.dropQueue(self.allocator);
+        m.queue.drop(self.allocator);
     }
 
     /// Waits for the senders of `members` (detached, chained through
@@ -1867,7 +1818,6 @@ pub const Rooms = struct {
     }
 
     fn freeMember(self: *Rooms, m: *Member) void {
-        m.dropQueue(self.allocator);
         m.queue.deinit(self.allocator);
         self.allocator.destroy(m);
     }
@@ -1954,7 +1904,7 @@ pub const Rooms = struct {
     pub fn broadcastPayload(self: *Rooms, room: []const u8, payload: *Payload, except: ?*Socket) usize {
         const io = self.io;
 
-        var stack: [stack_snapshot]*Member = undefined;
+        var stack: [fanout.stack_snapshot]*Member = undefined;
         var buf: []*Member = &stack;
         var heap: []*Member = &.{};
         defer self.allocator.free(heap);
@@ -1974,16 +1924,15 @@ pub const Rooms = struct {
             var n: usize = 0;
             for (members) |m| {
                 if (m.socket == except or m.broken or m.left) continue;
-                if (m.queued_bytes > 0 and m.queued_bytes + payload.cost() > self.options.max_queued_bytes) {
+                if (!m.queue.admits(payload, self.options.max_queued_bytes)) {
                     if (self.options.on_full == .close) if (m.sending_since) |since| {
                         const stuck = since.untilNow(io).raw.toMilliseconds();
                         if (stuck >= self.options.close_after_ms) m.close(self.allocator);
                     };
                     continue;
                 }
-                m.queue.append(self.allocator, payload) catch continue;
-                _ = payload.refs.fetchAdd(1, .monotonic);
-                m.queued_bytes += payload.cost();
+                m.queue.push(self.allocator, payload) catch continue;
+                payload.retain();
                 reached += 1;
                 if (m.running) continue;
                 m.running = true;
@@ -2028,12 +1977,8 @@ pub const Rooms = struct {
             // Everything queued, up to a round's worth, goes out in one
             // flush: the member's socket gets one write for a run of
             // messages, not one each.
-            var round: [send_round]*Payload = undefined;
-            var n: usize = 0;
-            while (n < round.len) {
-                round[n] = m.pop() orelse break;
-                n += 1;
-            }
+            var round: [fanout.send_round]*Payload = undefined;
+            const n = m.queue.popRound(&round);
             if (n == 0) break;
             m.sending_since = .now(io, .awake);
             self.mutex.unlock(io);
@@ -2056,7 +2001,7 @@ pub const Rooms = struct {
             m.sending_since = null;
             if (!sent) {
                 m.broken = true;
-                m.dropQueue(self.allocator);
+                m.queue.drop(self.allocator);
             }
         }
         // Closed for not keeping up while still in its room: its

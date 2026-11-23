@@ -9,6 +9,7 @@
 //! hub's mutex.
 
 const std = @import("std");
+const fanout = @import("../fanout.zig");
 
 /// One event as queued for subscribers, shared by every queue it is in
 /// and by the replay ring: one allocation, the bytes right behind the
@@ -24,17 +25,13 @@ pub const Payload = struct {
 
     pub const Kind = enum(u8) { event, heartbeat, end, gap, retry };
 
-    pub fn create(gpa: std.mem.Allocator, kind: Kind, bytes: []const u8) std.mem.Allocator.Error!*Payload {
-        const block = try gpa.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + bytes.len);
-        const p: *Payload = @ptrCast(block.ptr);
-        p.* = .{ .refs = .init(1), .seq = 0, .kind = kind, .id_len = 0, .id_buf = undefined, .len = bytes.len };
-        @memcpy(block[@sizeOf(Payload)..], bytes);
-        return p;
-    }
+    const shared = fanout.Shared(Payload);
+    pub const body = shared.bytes;
+    pub const retain = shared.retain;
+    pub const release = shared.release;
 
-    pub fn body(p: *const Payload) []const u8 {
-        const base: [*]const u8 = @ptrCast(p);
-        return base[@sizeOf(Payload)..][0..p.len];
+    pub fn create(gpa: std.mem.Allocator, kind: Kind, bytes: []const u8) std.mem.Allocator.Error!*Payload {
+        return shared.alloc(gpa, .{ .refs = .init(1), .seq = 0, .kind = kind, .id_len = 0, .id_buf = undefined, .len = bytes.len }, bytes);
     }
 
     /// The `id: ...\n` line, empty when the payload has none.
@@ -44,17 +41,7 @@ pub const Payload = struct {
 
     /// What it counts against a subscriber's queue and the replay budget.
     pub fn cost(p: *const Payload) usize {
-        return p.len + p.id_len + 64;
-    }
-
-    pub fn retain(p: *Payload) void {
-        _ = p.refs.fetchAdd(1, .monotonic);
-    }
-
-    pub fn release(p: *Payload, gpa: std.mem.Allocator) void {
-        if (p.refs.fetchSub(1, .acq_rel) != 1) return;
-        const base: [*]align(@alignOf(Payload)) u8 = @ptrCast(p);
-        gpa.free(base[0 .. @sizeOf(Payload) + p.len]);
+        return p.len + p.id_len + fanout.item_overhead;
     }
 
     /// Sets the ID line to `id: <epoch>-<seq>\n`.

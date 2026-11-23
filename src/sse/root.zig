@@ -23,6 +23,7 @@ const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
 const observe_metrics = @import("../observe/metrics.zig");
+const fanout = @import("../fanout.zig");
 pub const replay = @import("replay.zig");
 pub const out_mod = @import("out.zig");
 
@@ -51,7 +52,7 @@ pub const SendError = error{ OutOfMemory, InvalidEventField, Full, Closed };
 /// Why a subscriber ended (`ServeOptions.on_close`, ABI `ANOLE_SSE_CLOSED_*`).
 pub const CloseReason = enum { client_gone, slow, drain, closed, server };
 
-pub const HttpVersion = enum { http1, http2, http3 };
+pub const HttpVersion = fanout.HttpVersion;
 
 /// The longest topic name.
 pub const max_topic_len = 255;
@@ -64,10 +65,8 @@ fn validField(s: []const u8) bool {
     return std.mem.indexOfAny(u8, s, "\r\n") == null;
 }
 
-/// The most queued events a sender writes in one go.
-const send_round = 64;
-/// Subscribers a publish notes on the stack for starting their senders.
-const stack_snapshot = 64;
+const send_round = fanout.send_round;
+const stack_snapshot = fanout.stack_snapshot;
 /// Precomputed retry values for the drain (S12).
 const drain_spread = 16;
 
@@ -411,7 +410,7 @@ pub const Topics = struct {
                     self.checkStuck(sub, now);
                     continue;
                 }
-                if (sub.queued_bytes > 0 and sub.queued_bytes + p.cost() > self.options.max_queued_bytes) {
+                if (!sub.queue.admits(p, self.options.max_queued_bytes)) {
                     if (self.options.on_full == .drop) {
                         _ = self.n_dropped.fetchAdd(1, .monotonic);
                         continue;
@@ -426,9 +425,8 @@ pub const Topics = struct {
                     }
                     continue;
                 }
-                sub.queue.append(self.gpa, p) catch continue;
+                sub.queue.push(self.gpa, p) catch continue;
                 p.retain();
-                sub.queued_bytes += p.cost();
                 reached += 1;
                 if (!sub.claimSender()) continue;
                 if (buf) |b| {
@@ -474,9 +472,8 @@ pub const Topics = struct {
             _ = self.n_gaps.fetchAdd(1, .monotonic);
             for (t.members.items) |sub| {
                 if (!sub.accepts()) continue;
-                sub.queue.append(self.gpa, body) catch continue;
+                sub.queue.push(self.gpa, body) catch continue;
                 body.retain();
-                sub.queued_bytes += body.cost();
                 if (sub.claimSender()) {
                     started.append(self.gpa, sub) catch {
                         sub.running = false;
@@ -680,7 +677,6 @@ pub const Topics = struct {
     }
 
     fn freeSubscriber(self: *Topics, sub: *Subscriber) void {
-        for (sub.queue.items[sub.head..]) |p| p.release(self.gpa);
         sub.queue.deinit(self.gpa);
         sub.memberships.deinit(self.gpa);
         self.gpa.destroy(sub);
@@ -712,7 +708,7 @@ pub const Topics = struct {
     fn abandon(self: *Topics, io: std.Io, sub: *Subscriber) void {
         self.mutex.lockUncancelable(io);
         self.unlinkLocked(sub);
-        sub.dropQueue(self.gpa);
+        sub.queue.drop(self.gpa);
         self.mutex.unlock(io);
     }
 
@@ -727,7 +723,7 @@ pub const Topics = struct {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             sub.armed = true;
-            launch = sub.head < sub.queue.items.len and sub.claimSender();
+            launch = sub.queue.len() > 0 and sub.claimSender();
         }
         if (launch) self.startSender(io, sub);
         self.ensureTickers(io, sub);
@@ -800,8 +796,7 @@ pub const Topics = struct {
 
     /// Appends `p` (the caller's reference is consumed on success).
     fn enqueueLocked(self: *Topics, sub: *Subscriber, p: *Payload) error{OutOfMemory}!void {
-        try sub.queue.append(self.gpa, p);
-        sub.queued_bytes += p.cost();
+        try sub.queue.push(self.gpa, p);
     }
 
     fn queueDrainEnd(self: *Topics, sub: *Subscriber) error{OutOfMemory}!void {
@@ -916,13 +911,11 @@ pub const Topics = struct {
         sub.close_reason = reason;
         if (count_slow) _ = self.n_closed_slow.fetchAdd(1, .monotonic);
         self.end_payload.retain();
-        sub.queue.append(self.gpa, self.end_payload) catch {
+        sub.queue.push(self.gpa, self.end_payload) catch {
             self.end_payload.release(self.gpa);
             // No room even for that: it is stuck, and aborted below.
             sub.phase = .{ .ending = .abort };
-            return;
         };
-        sub.queued_bytes += self.end_payload.cost();
     }
 
     /// A sender stuck on an ending subscriber past `close_after` is
@@ -985,11 +978,7 @@ pub const Topics = struct {
         pass: while (true) {
             while (sub.writable()) {
                 var round: [send_round]*Payload = undefined;
-                var n: usize = 0;
-                while (n < round.len) {
-                    round[n] = sub.pop() orelse break;
-                    n += 1;
-                }
+                const n = sub.queue.popRound(&round);
                 if (n == 0) break;
                 sub.sending_since_ms = self.nowMs();
                 self.mutex.unlock(io);
@@ -1040,12 +1029,12 @@ pub const Topics = struct {
                     if (canceled and sub.abortRequested()) aborted = true;
                     // Once left, it stays left.
                     if (sub.phase != .left) sub.phase = .broken;
-                    sub.dropQueue(self.gpa);
+                    sub.queue.drop(self.gpa);
                     break;
                 }
                 if (has_end) {
                     ended = true;
-                    sub.dropQueue(self.gpa);
+                    sub.queue.drop(self.gpa);
                     break;
                 }
             }
@@ -1060,7 +1049,7 @@ pub const Topics = struct {
                 }
             }
             self.mutex.lockUncancelable(io);
-            if (!ended and !aborted and !canceled and sub.writable() and sub.head < sub.queue.items.len) {
+            if (!ended and !aborted and !canceled and sub.writable() and sub.queue.len() > 0) {
                 in_burst = false;
                 continue :pass;
             }
@@ -1131,7 +1120,7 @@ pub const Topics = struct {
             else => null,
         } };
         self.unlinkLocked(sub);
-        sub.dropQueue(self.gpa);
+        sub.queue.drop(self.gpa);
         const canceled = self.awaitSender(io, sub);
         self.mutex.unlock(io);
         _ = self.closed_by[@backingInt(reason)].fetchAdd(1, .monotonic);
@@ -1256,8 +1245,7 @@ pub const Topics = struct {
                 if (hb_ms) |hb| {
                     if (sub.accepts() and sub.armed and now_ms - sub.last_write_ms >= hb) {
                         self.heartbeat_payload.retain();
-                        if (sub.queue.append(self.gpa, self.heartbeat_payload)) |_| {
-                            sub.queued_bytes += self.heartbeat_payload.cost();
+                        if (sub.queue.push(self.gpa, self.heartbeat_payload)) |_| {
                             sub.last_write_ms = now_ms;
                             if (n < stack.len and sub.claimSender()) {
                                 stack[n] = sub;
@@ -1387,9 +1375,7 @@ pub const Subscriber = struct {
     index: u32,
     out: Out = undefined,
     has_out: bool = false,
-    queue: std.ArrayList(*Payload) = .empty,
-    head: usize = 0,
-    queued_bytes: usize = 0,
+    queue: fanout.Queue(Payload) = .{},
     /// A sender is started or running; it alone takes from the queue. Not
     /// part of `phase`: a sender may exist in every phase but `over`.
     /// Set only through `claimSender`. Under the hub's mutex.
@@ -1510,30 +1496,6 @@ pub const Subscriber = struct {
         return e % hub.execs.len;
     }
 
-    fn pop(sub: *Subscriber) ?*Payload {
-        if (sub.head == sub.queue.items.len) return null;
-        const p = sub.queue.items[sub.head];
-        sub.head += 1;
-        sub.queued_bytes -= p.cost();
-        if (sub.head == sub.queue.items.len) {
-            sub.queue.clearRetainingCapacity();
-            sub.head = 0;
-        } else if (sub.head >= 64 and sub.head * 2 >= sub.queue.items.len) {
-            const rest = sub.queue.items[sub.head..];
-            std.mem.copyForwards(*Payload, sub.queue.items[0..rest.len], rest);
-            sub.queue.items.len = rest.len;
-            sub.head = 0;
-        }
-        return p;
-    }
-
-    fn dropQueue(sub: *Subscriber, gpa: std.mem.Allocator) void {
-        for (sub.queue.items[sub.head..]) |p| p.release(gpa);
-        sub.queue.clearRetainingCapacity();
-        sub.head = 0;
-        sub.queued_bytes = 0;
-    }
-
     /// Joins `topic`; events published after this returns reach the stream.
     pub fn join(sub: *Subscriber, topic: []const u8, opts: JoinOptions) JoinError!void {
         const hub = sub.hub;
@@ -1547,7 +1509,7 @@ pub const Subscriber = struct {
             hub.joinLocked(sub, topic) catch |err| return err;
             if (opts.last > 0) {
                 hub.queueReplayLocked(sub, null, opts.last) catch return error.OutOfMemory;
-                start = sub.head < sub.queue.items.len and sub.claimSender();
+                start = sub.queue.len() > 0 and sub.claimSender();
             }
         }
         if (start) hub.startSender(io, sub);
@@ -1605,10 +1567,9 @@ pub const Subscriber = struct {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
             if (!sub.accepts() or sub.gone.load(.acquire)) return error.Closed;
-            if (admission == .capped and sub.queued_bytes > 0 and sub.queued_bytes + p.cost() > hub.options.max_queued_bytes) return error.Full;
-            sub.queue.append(hub.gpa, p) catch return error.OutOfMemory;
+            if (admission == .capped and !sub.queue.admits(p, hub.options.max_queued_bytes)) return error.Full;
+            sub.queue.push(hub.gpa, p) catch return error.OutOfMemory;
             p.retain();
-            sub.queued_bytes += p.cost();
             launch = sub.claimSender();
         }
         if (launch) hub.startSender(io, sub);

@@ -603,7 +603,7 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     // had stopped), so the end waited for it forever, and the reason
     // became `closed`.
     const running = sub.running;
-    const queued = sub.queue.items.len - sub.head;
+    const queued = sub.queue.len();
     const reason = sub.close_reason;
     h.hub.mutex.unlock(io);
     try std.testing.expect(!running);
