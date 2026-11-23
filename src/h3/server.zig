@@ -183,13 +183,17 @@ const Seat = enum(u8) {
 
     const Event = enum { handoff, retire, give_up };
 
-    /// The table above.
+    /// The table above, state by event: every cell is listed, every change
+    /// is a row.
+    const table = std.EnumArray(Seat, std.EnumArray(Event, Seat)).init(.{
+        .accepting = .init(.{ .handoff = .driven, .retire = .accepting, .give_up = .given_up }),
+        .given_up = .init(.{ .handoff = .given_up, .retire = .given_up, .give_up = .given_up }),
+        .driven = .init(.{ .handoff = .driven, .retire = .retired, .give_up = .driven }),
+        .retired = .init(.{ .handoff = .retired, .retire = .retired, .give_up = .retired }),
+    });
+
     fn next(from: Seat, ev: Event) Seat {
-        return switch (ev) {
-            .handoff => if (from == .accepting) .driven else from,
-            .retire => if (from == .driven) .retired else from,
-            .give_up => if (from == .accepting) .given_up else from,
-        };
+        return table.get(from).get(ev);
     }
 
     fn handedOver(s: Seat) bool {
@@ -2913,11 +2917,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
 
                 /// The response holds the stream (`.response`).
+                const owns_stream = std.EnumArray(Tag, bool).init(.{
+                    .head = false,
+                    .awaiting_body = false,
+                    .started = false,
+                    .attached = true,
+                    .parked = true,
+                    .ended = false,
+                    .endpoint = false,
+                    .detached = true,
+                });
+
                 fn owns(p: Phase) bool {
-                    return switch (p) {
-                        .detached, .attached, .parked => true,
-                        .head, .awaiting_body, .started, .ended, .endpoint => false,
-                    };
+                    return owns_stream.get(@as(Tag, p));
                 }
 
                 /// On the endpoint task: writes pass the stream's cap.

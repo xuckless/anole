@@ -260,45 +260,44 @@ pub const ClientConnection = struct {
         closed,
         handshake_timeout,
 
+        /// The table above, state by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(State, std.EnumArray(StateEvent, State)).init(.{
+            .handshaking = .init(.{ .handshake_done = .open, .goaway = .closing, .shut = .closed, .handshake_timeout = .handshake_timeout }),
+            .open = .init(.{ .handshake_done = .open, .goaway = .closing, .shut = .closed, .handshake_timeout = .closed }),
+            .closing = .init(.{ .handshake_done = .closing, .goaway = .closing, .shut = .closed, .handshake_timeout = .closed }),
+            .closed = .init(.{ .handshake_done = .closed, .goaway = .closed, .shut = .closed, .handshake_timeout = .closed }),
+            .handshake_timeout = .init(.{ .handshake_done = .handshake_timeout, .goaway = .handshake_timeout, .shut = .handshake_timeout, .handshake_timeout = .handshake_timeout }),
+        });
+
+        /// What each state allows, one row per state.
+        ///   accepting:   new requests may go out (`isOpen`, `request`, the
+        ///                425 resend).
+        ///   established: past the handshake and not ended.
+        ///   ended:       over: no QUIC calls, no stream close to wait for.
+        const Traits = struct { accepting: bool, established: bool, ended: bool };
+        const traits = std.EnumArray(State, Traits).init(.{
+            .handshaking = .{ .accepting = true, .established = false, .ended = false },
+            .open = .{ .accepting = true, .established = true, .ended = false },
+            .closing = .{ .accepting = false, .established = true, .ended = false },
+            .closed = .{ .accepting = false, .established = false, .ended = true },
+            .handshake_timeout = .{ .accepting = false, .established = false, .ended = true },
+        });
+
         fn next(state: State, event: StateEvent) State {
-            return switch (state) {
-                .handshaking => switch (event) {
-                    .handshake_done => .open,
-                    .goaway => .closing,
-                    .shut => .closed,
-                    .handshake_timeout => .handshake_timeout,
-                },
-                .open, .closing => switch (event) {
-                    .handshake_done => state,
-                    .goaway => .closing,
-                    .shut, .handshake_timeout => .closed,
-                },
-                .closed, .handshake_timeout => state,
-            };
+            return table.get(state).get(event);
         }
 
-        /// New requests may go out (`isOpen`, `request`, the 425 resend).
         fn accepting(state: State) bool {
-            return switch (state) {
-                .handshaking, .open => true,
-                .closing, .closed, .handshake_timeout => false,
-            };
+            return traits.get(state).accepting;
         }
 
-        /// Past the handshake and not ended.
         fn established(state: State) bool {
-            return switch (state) {
-                .open, .closing => true,
-                .handshaking, .closed, .handshake_timeout => false,
-            };
+            return traits.get(state).established;
         }
 
-        /// Over: no QUIC calls, no stream close to wait for.
         fn ended(state: State) bool {
-            return switch (state) {
-                .closed, .handshake_timeout => true,
-                .handshaking, .open, .closing => false,
-            };
+            return traits.get(state).ended;
         }
     };
 
@@ -1862,43 +1861,45 @@ pub const Stream = struct {
         stopped,
         stopped_closed,
 
-        fn next(send: Send, event: SendEvent) Send {
-            return switch (event) {
-                .submit_body => if (send == .unsent) .open else send,
-                .submit_bodyless => if (send == .unsent) .closed else send,
-                .close_send => switch (send) {
-                    .open => .closed,
-                    .stopped => .stopped_closed,
-                    .unsent, .closed, .stopped_closed => send,
-                },
-                .stop => switch (send) {
-                    .open => .stopped,
-                    .closed => .stopped_closed,
-                    .unsent, .stopped, .stopped_closed => send,
-                },
-                .restart => switch (send) {
-                    .stopped => .open,
-                    .stopped_closed => .closed,
-                    .unsent, .open, .closed => send,
-                },
-            };
-        }
+        /// The table above, state by event: every cell is listed, every
+        /// change is a row.
+        const table = std.EnumArray(Send, std.EnumArray(SendEvent, Send)).init(.{
+            .unsent = .init(.{ .submit_body = .open, .submit_bodyless = .closed, .close_send = .unsent, .stop = .unsent, .restart = .unsent }),
+            .open = .init(.{ .submit_body = .open, .submit_bodyless = .open, .close_send = .closed, .stop = .stopped, .restart = .open }),
+            .closed = .init(.{ .submit_body = .closed, .submit_bodyless = .closed, .close_send = .closed, .stop = .stopped_closed, .restart = .closed }),
+            .stopped = .init(.{ .submit_body = .stopped, .submit_bodyless = .stopped, .close_send = .stopped_closed, .stop = .stopped, .restart = .open }),
+            .stopped_closed = .init(.{ .submit_body = .stopped_closed, .submit_bodyless = .stopped_closed, .close_send = .stopped_closed, .stop = .stopped_closed, .restart = .closed }),
+        });
 
         /// The caller ended the body (or there is none): nghttp3 gets the
         /// end once the queue is sent.
-        fn ended(send: Send) bool {
-            return switch (send) {
-                .closed, .stopped_closed => true,
-                .unsent, .open, .stopped => false,
-            };
-        }
+        const is_ended = std.EnumArray(Send, bool).init(.{
+            .unsent = false,
+            .open = false,
+            .closed = true,
+            .stopped = false,
+            .stopped_closed = true,
+        });
 
         /// The server sent STOP_SENDING.
+        const is_stopped = std.EnumArray(Send, bool).init(.{
+            .unsent = false,
+            .open = false,
+            .closed = false,
+            .stopped = true,
+            .stopped_closed = true,
+        });
+
+        fn next(send: Send, event: SendEvent) Send {
+            return table.get(send).get(event);
+        }
+
+        fn ended(send: Send) bool {
+            return is_ended.get(send);
+        }
+
         fn isStopped(send: Send) bool {
-            return switch (send) {
-                .stopped, .stopped_closed => true,
-                .unsent, .open, .closed => false,
-            };
+            return is_stopped.get(send);
         }
     };
 
