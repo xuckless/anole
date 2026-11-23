@@ -591,7 +591,8 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     // Its sender runs here, by hand, as the fallback's own task runs it
     // (S3): between the failed write and the end there is a window.
     h.hub.mutex.lockUncancelable(io);
-    sub.fallback = true;
+    const out = sub.mode.hub_sender;
+    sub.mode = .{ .fallback = out };
     h.hub.mutex.unlock(io);
     f.fail_with = error.Gone;
     _ = try h.hub.publish("t", .{ .data = "x" });
