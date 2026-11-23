@@ -2205,14 +2205,15 @@ test "websocket: a read block from an empty pool is new and counted while held" 
 }
 
 test "websocket: the upgraded window grows, narrows and releases in each mode" {
-    // name, request read buffer, reader's view in it, mode small, mode grown
-    const rows = [_]struct { []const u8, usize, usize, std.meta.Tag(UpgradedWindow.Mode), std.meta.Tag(UpgradedWindow.Mode) }{
-        .{ "widen: the read buffer holds a block", 4 * read_block_len, 2048, .widen_small, .widen_wide },
-        .{ "block: the read buffer is too small to widen", 4096, 2048, .block_small, .block_held },
-        .{ "widen: a view already at the end stays", 4 * read_block_len, 4 * read_block_len, .widen_small, .widen_small },
+    // name, request read buffer, reader's view in it, mode small, grown, released
+    const Tag = std.meta.Tag(UpgradedWindow.Mode);
+    const rows = [_]struct { []const u8, usize, usize, Tag, Tag, Tag }{
+        .{ "widen: the read buffer holds a block", 4 * read_block_len, 2048, .widen_small, .widen_wide, .widen_wide },
+        .{ "block: the read buffer is too small to widen", 4096, 2048, .block_small, .block_held, .block_small },
+        .{ "widen: a view already at the end stays", 4 * read_block_len, 4 * read_block_len, .widen_small, .widen_small, .widen_small },
     };
     for (rows) |row| {
-        const name, const buffer_len, const view_len, const small, const wide = row;
+        const name, const buffer_len, const view_len, const small, const wide, const released = row;
         errdefer std.debug.print("row: {s}\n", .{name});
         const buffer = try std.heap.page_allocator.alloc(u8, buffer_len);
         defer std.heap.page_allocator.free(buffer);
@@ -2222,31 +2223,29 @@ test "websocket: the upgraded window grows, narrows and releases in each mode" {
         conn.reader = &r;
         const held = _readBlocksHeld();
         var w: UpgradedWindow = .init(&conn, &r);
-        // Twice: a window narrowed grows again.
-        for (0..2) |round| {
-            try std.testing.expectEqual(small, std.meta.activeTag(w.mode));
-            r.end = r.buffer.len; // a read filled the window
+        try std.testing.expectEqual(small, std.meta.activeTag(w.mode));
+        r.end = r.buffer.len; // a read filled the window
+        w.between(&r);
+        try std.testing.expectEqual(wide, std.meta.activeTag(w.mode));
+        try std.testing.expectEqual(@intFromBool(wide == .block_held), _readBlocksHeld() - held);
+        // Seven quiet waits keep it grown, the eighth narrows it.
+        for (0..8) |i| {
+            r.end = 0;
             w.between(&r);
-            try std.testing.expectEqual(wide, std.meta.activeTag(w.mode));
-            try std.testing.expectEqual(@intFromBool(wide == .block_held), _readBlocksHeld() - held);
-            if (round == 1) break;
-            // Seven quiet waits keep it grown, the eighth narrows it.
-            for (0..8) |i| {
-                r.end = 0;
-                w.between(&r);
-                try std.testing.expectEqual(if (i < 7) wide else small, std.meta.activeTag(w.mode));
-            }
-            try std.testing.expectEqual(@intFromBool(wide != small), w.narrowed);
-            try std.testing.expectEqual(w.small.len, r.buffer.len);
+            try std.testing.expectEqual(if (i < 7) wide else small, std.meta.activeTag(w.mode));
         }
-        // As the socket goes, with 3 bytes buffered; twice gives back once.
+        try std.testing.expectEqual(@intFromBool(wide != small), w.narrowed);
+        try std.testing.expectEqual(w.small.len, r.buffer.len);
+        // Grown again, then released as the socket goes with 3 bytes buffered.
+        r.end = r.buffer.len;
+        w.between(&r);
         @memcpy(r.buffer[0..3], "abc");
         r.end = 3;
         const view = r.buffer;
-        for (0..2) |_| w.release(&r);
+        w.release(&r);
         try std.testing.expectEqual(held, _readBlocksHeld());
-        try std.testing.expectEqual(if (wide == .block_held) small else wide, std.meta.activeTag(w.mode));
-        try std.testing.expectEqual(if (wide == .block_held) w.small.ptr else view.ptr, r.buffer.ptr);
+        try std.testing.expectEqual(released, std.meta.activeTag(w.mode));
+        try std.testing.expectEqual(if (released == small) w.small.ptr else view.ptr, r.buffer.ptr);
         try std.testing.expectEqualStrings("abc", r.buffered());
     }
 }
