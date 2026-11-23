@@ -972,9 +972,6 @@ pub const Client = struct {
         const job = &box.job;
         const row = box.row;
         const t = self.now();
-        const base: store.Finish = .{ .id = row.id, .attempt = row.attempt, .to = .completed, .finished_at = t };
-        var plan: Plan = .{ .f = base, .outcome = .completed };
-        const o = job.outcome;
         if (job.completed_in and result != error.Canceled) {
             if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, .completed, took(self, box));
             return .completed;
@@ -982,35 +979,18 @@ pub const Client = struct {
 
         // A handler that returned before the drain's cancel reached it has
         // finished: its outcome stands.
-        const failed = if (result) |_| false else |_| true;
-        const put_back = switch (box.stopped()) {
+        const stop = box.stopped();
+        switch (stop) {
             .lost, .admin_cancelled => {
                 log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
                 return .lost;
             },
-            .interrupted => failed,
-            .none => false,
-        };
-        if (put_back) {
-            plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
-            log.info("{s} interrupted by shutdown; put back", .{job.id_text});
-        } else if (result) |_| {
-            switch (o.kind) {
-                .none => {},
-                .snooze => plan = self.planSnooze(row, t, o.delay),
-                .discard => plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = "Discarded", .message = o.reason } }, .outcome = .dead },
-                .retry_in => plan = self.planFailure(row, def, t, "RetryRequested", o.explanation, o.delay),
-            }
-        } else |err| {
-            const err_name = errorType(err);
-            switch (o.kind) {
-                .discard => plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = err_name, .message = if (o.reason.len > 0) o.reason else o.explanation } }, .outcome = .dead },
-                .snooze => plan = self.planSnooze(row, t, o.delay),
-                else => plan = self.planFailure(row, def, t, err_name, o.explanation, if (o.kind == .retry_in) o.delay else null),
-            }
+            .none, .interrupted => {},
         }
+        const failure: ?anyerror = if (result) |_| null else |e| e;
+        const decided = self.plan(row, def, t, job.outcome, failure, stop);
 
-        switch (self.writeOutcome(plan.f, job.id_text)) {
+        switch (self.writeOutcome(decided.f, job.id_text)) {
             .saved => {},
             .not_held => {
                 log.info("{s}: no longer held; its result was dropped", .{job.id_text});
@@ -1018,25 +998,12 @@ pub const Client = struct {
             },
             .failed => {
                 if (self.metrics) |mm| mm.onUnsaved(row.queue, row.kind);
-                return plan.outcome;
+                return decided.outcome;
             },
         }
-        if (self.metrics) |mm| {
-            const label: metrics_mod.Outcome = if (result) |_| switch (plan.outcome) {
-                .completed => .completed,
-                .retried => .retried,
-                .dead => .dead,
-                .snoozed => .snoozed,
-                else => .interrupted,
-            } else |err| if (err == error.Timeout or err == error.Canceled) .timeout else switch (plan.outcome) {
-                .retried => .retried,
-                .dead => .dead,
-                .snoozed => .snoozed,
-                else => .interrupted,
-            };
-            mm.onFinished(row.queue, row.kind, label, took(self, box));
-        }
-        if (plan.outcome == .dead) {
+        if (decided.outcome == .interrupted) log.info("{s} interrupted by shutdown; put back", .{job.id_text});
+        if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, label(decided.outcome, failure), took(self, box));
+        if (decided.outcome == .dead) {
             // Tests expect dead jobs; an error line would fail them.
             if (builtin.is_test) log.info("{s} {s} is dead after {d} attempts", .{ job.id_text, row.kind, row.attempt }) else log.err("{s} {s} is dead after {d} attempts", .{ job.id_text, row.kind, row.attempt });
             if (self.options.on_dead) |hook| {
@@ -1044,11 +1011,45 @@ pub const Client = struct {
                     if (rowToInfo(box.arena_state.allocator(), dead_row)) |info| hook.call(hook.context, &info) else |_| {}
                 }
             }
-        } else if (plan.outcome == .retried) {
+        } else if (decided.outcome == .retried) {
             log.warn("{s} {s} failed (attempt {d} of {d}); next try scheduled", .{ job.id_text, row.kind, row.attempt, row.max_attempts });
         }
-        return plan.outcome;
+        return decided.outcome;
     }
+
+    /// What a finished run becomes: a pure decision, no store, metrics or log.
+    fn plan(self: *Client, row: store.Row, def: Kind, t: Time, o: Job.Outcome, failure: ?anyerror, stop: Stop) Plan {
+        const err = failure orelse {
+            return switch (o.kind) {
+                .none => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .completed, .finished_at = t }, .outcome = .completed },
+                .snooze => self.planSnooze(row, t, o.delay),
+                .discard => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = "Discarded", .message = o.reason } }, .outcome = .dead },
+                .retry_in => self.planFailure(row, def, t, "RetryRequested", o.explanation, o.delay),
+            };
+        };
+        if (stop == .interrupted) return .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
+        const err_name = errorType(err);
+        return switch (o.kind) {
+            .discard => .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = err_name, .message = if (o.reason.len > 0) o.reason else o.explanation } }, .outcome = .dead },
+            .snooze => self.planSnooze(row, t, o.delay),
+            .none, .retry_in => self.planFailure(row, def, t, err_name, o.explanation, if (o.kind == .retry_in) o.delay else null),
+        };
+    }
+
+    /// The metrics label of a run: a timeout or cancel error says `timeout`
+    /// whatever was planned, else the plan's outcome (a lost write counts as interrupted).
+    fn label(outcome: Outcome, failure: ?anyerror) metrics_mod.Outcome {
+        if (failure) |e| if (e == error.Timeout or e == error.Canceled) return .timeout;
+        return label_of.get(outcome);
+    }
+    const label_of: std.EnumArray(Outcome, metrics_mod.Outcome) = .init(.{
+        .completed = .completed,
+        .retried = .retried,
+        .dead = .dead,
+        .snoozed = .snoozed,
+        .interrupted = .interrupted,
+        .lost = .interrupted,
+    });
 
     const Written = enum { saved, not_held, failed };
 
@@ -1889,6 +1890,73 @@ test "jobs: the heartbeat stops a lost run whose job was claimed again" {
             try client.heartbeatOnce();
             try std.testing.expectEqual(Stop.lost, old.stopped());
             try std.testing.expectEqual(Stop.none, new.stopped());
+        }
+    };
+    try HeldStub.run(T.check);
+}
+
+test "jobs: settle plan and label" {
+    const T = struct {
+        const Row = struct {
+            name: []const u8,
+            o: Job.Outcome = .{},
+            failure: ?anyerror = null,
+            stop: Stop = .none,
+            attempt: u16 = 1,
+            to: store.State,
+            outcome: Client.Outcome,
+            label: metrics_mod.Outcome,
+            delta: i8 = 0,
+            err: ?[]const u8 = null,
+            message: []const u8 = "",
+        };
+        const rows = [_]Row{
+            .{ .name = "ok", .to = .completed, .outcome = .completed, .label = .completed },
+            .{ .name = "ok snooze 0", .o = .{ .kind = .snooze }, .to = .available, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "ok snooze 5s", .o = .{ .kind = .snooze, .delay = .fromSeconds(5) }, .to = .scheduled, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "ok discard", .o = .{ .kind = .discard, .reason = "why" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Discarded", .message = "why" },
+            .{ .name = "ok retry_in", .o = .{ .kind = .retry_in, .delay = .fromSeconds(5), .explanation = "x" }, .to = .retrying, .outcome = .retried, .label = .retried, .err = "RetryRequested", .message = "x" },
+            .{ .name = "ok retry_in at max", .o = .{ .kind = .retry_in }, .attempt = 3, .to = .dead, .outcome = .dead, .label = .dead, .err = "RetryRequested" },
+            .{ .name = "err", .failure = error.Boom, .to = .retrying, .outcome = .retried, .label = .retried, .err = "Boom" },
+            .{ .name = "err at max", .failure = error.Boom, .attempt = 3, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom" },
+            .{ .name = "err discard reason", .failure = error.Boom, .o = .{ .kind = .discard, .reason = "r", .explanation = "e" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom", .message = "r" },
+            .{ .name = "err discard explanation", .failure = error.Boom, .o = .{ .kind = .discard, .explanation = "e" }, .to = .dead, .outcome = .dead, .label = .dead, .err = "Boom", .message = "e" },
+            .{ .name = "err snooze", .failure = error.Boom, .o = .{ .kind = .snooze, .delay = .fromSeconds(5) }, .to = .scheduled, .outcome = .snoozed, .label = .snoozed, .delta = -1 },
+            .{ .name = "err retry_in", .failure = error.Boom, .o = .{ .kind = .retry_in, .delay = .fromSeconds(7) }, .to = .retrying, .outcome = .retried, .label = .retried, .err = "Boom" },
+            .{ .name = "err timeout", .failure = error.Timeout, .to = .retrying, .outcome = .retried, .label = .timeout, .err = "Timeout" },
+            .{ .name = "err timeout at max", .failure = error.Timeout, .attempt = 3, .to = .dead, .outcome = .dead, .label = .timeout, .err = "Timeout" },
+            .{ .name = "drain + err", .failure = error.Boom, .stop = .interrupted, .to = .available, .outcome = .interrupted, .label = .interrupted, .delta = -1 },
+            .{ .name = "drain + canceled", .failure = error.Canceled, .stop = .interrupted, .to = .available, .outcome = .interrupted, .label = .timeout, .delta = -1 },
+            .{ .name = "drain + ok", .stop = .interrupted, .to = .completed, .outcome = .completed, .label = .completed },
+        };
+
+        fn check(io: std.Io) anyerror!void {
+            var vt: store.VTable = undefined;
+            const client = try HeldStub.client(io, &vt);
+            defer client.deinit();
+            const t: Time = .fromMillis(1000);
+            const def: Kind = .{ .name = "t" };
+            for (rows) |r| {
+                errdefer std.debug.print("row: {s}\n", .{r.name});
+                var row = HeldStub.row(7, r.attempt);
+                row.max_attempts = 3;
+                const p = client.plan(row, def, t, r.o, r.failure, r.stop);
+                try std.testing.expectEqual(r.to, p.f.to);
+                try std.testing.expectEqual(r.outcome, p.outcome);
+                try std.testing.expectEqual(r.delta, p.f.attempt_delta);
+                try std.testing.expectEqual(r.label, Client.label(p.outcome, r.failure));
+                if (r.to == .retrying or r.to == .scheduled) try std.testing.expect(p.f.run_at.?.toMillis() > t.toMillis());
+                if (r.to == .available) try std.testing.expect(p.f.run_at.?.toMillis() == t.toMillis());
+                const e = p.f.add_error orelse {
+                    try std.testing.expect(r.err == null);
+                    continue;
+                };
+                try std.testing.expectEqualStrings(r.err.?, e.@"error");
+                try std.testing.expectEqualStrings(r.message, e.message);
+            }
+            try std.testing.expectEqual(metrics_mod.Outcome.interrupted, Client.label(.lost, null));
+            try std.testing.expectEqual(metrics_mod.Outcome.timeout, Client.label(.dead, error.Timeout));
+            try std.testing.expectEqual(metrics_mod.Outcome.dead, Client.label(.dead, error.Boom));
         }
     };
     try HeldStub.run(T.check);
