@@ -753,6 +753,17 @@ const MonitorEnd = struct {
     fn close(client: *mongodb.Client) void {
         client.deinit();
     }
+
+    /// Opens and closes at once on executor 0, where the monitor is
+    /// spawned: nothing yields between, so the server is retired before
+    /// its monitor ever ran.
+    fn openAndClose(fake: *Fake, io: std.Io, failure: *?anyerror) void {
+        const client = open(io, fake) catch |err| {
+            failure.* = err;
+            return;
+        };
+        client.deinit();
+    }
 };
 
 test "mongodb: closing the client while a monitor ends frees the monitor's connection once" {
@@ -790,6 +801,17 @@ test "mongodb: closing the client while a monitor ends frees the monitor's conne
     try testing.expect(MonitorEnd.held.load(.acquire));
     try testing.expect(!MonitorEnd.timed_out.load(.acquire));
     try testing.expect(MonitorEnd.closed.load(.acquire));
+
+    // Retired before its monitor started (new -> retired): the monitor
+    // never starts, so it sends no hello and has nothing to close.
+    MonitorEnd.closed.store(false, .release);
+    const hellos = fake.hellos.load(.acquire);
+    var failure: ?anyerror = null;
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, MonitorEnd.openAndClose, .{ &fake, io, &failure });
+    try group.await(io);
+    if (failure) |err| return err;
+    try testing.expectEqual(hellos, fake.hellos.load(.acquire));
+    try testing.expect(!MonitorEnd.closed.load(.acquire));
 }
 
 /// One task's finds on a client of the two fakes.

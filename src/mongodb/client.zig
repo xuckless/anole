@@ -129,23 +129,45 @@ pub const Server = struct {
     generation: std.atomic.Value(u32) = .init(0),
     /// Wakes the monitor for a check now.
     check_now: std.Io.Event = .unset,
-    /// Left the topology, or the client is closing: its connections close
-    /// when they come back and no monitor starts for it. Any thread.
-    retired: std.atomic.Value(bool) = .init(false),
+    /// Written by `startMonitoring` and `retire` alone; read any thread.
+    life: std.atomic.Value(Life) = .init(.new),
     /// Guards `monitor`: the monitor sets it as it starts and clears it
     /// before it returns, so whoever cancels it under this lock knows it
     /// has not returned (`placement.currentTask`'s contract).
     task_lock: std.Io.Mutex = .init,
     monitor: ?placement.Task = null,
-    /// Under `Client.mutex`: the links of the servers whose monitors a
-    /// `syncServers` starts or stops, walked after the unlock
-    /// (`applyChanges`). A server is new once and removed once, so each
-    /// list holds it at most once.
-    start_next: ?*Server = null,
-    stop_next: ?*Server = null,
+
+    /// `new`: no monitor has started (one may be spawned). `monitoring`:
+    /// its monitor started (`monitor` is its task until it returns).
+    /// `retired`: left the topology, or the client is closing: its
+    /// connections close when they come back, no monitor starts, a running
+    /// one ends. Retirement is final.
+    const Life = enum(u8) { new, monitoring, retired };
 
     fn pool(s: *Server, io: std.Io) *Pool {
         return s.pools.get(io);
+    }
+
+    inline fn isRetired(s: *const Server) bool {
+        return s.life.load(.acquire) == .retired;
+    }
+
+    /// The monitor, as it starts: new -> monitoring, its task published
+    /// under `task_lock`. False when the server was retired first.
+    fn startMonitoring(s: *Server, io: std.Io) bool {
+        s.task_lock.lockUncancelable(io);
+        defer s.task_lock.unlock(io);
+        if (s.life.cmpxchgStrong(.new, .monitoring, .acq_rel, .acquire) != null) return false;
+        s.monitor = placement.currentTask(io);
+        return true;
+    }
+
+    /// Any life -> retired (again is a no-op), then wakes the monitor. A
+    /// monitor that started is canceled by whoever retired it, after its
+    /// locks are released (`stopMonitor`); one spawned later never starts.
+    fn retire(s: *Server, io: std.Io) void {
+        s.life.store(.retired, .release);
+        s.check_now.set(io);
     }
 };
 
@@ -325,6 +347,8 @@ pub const Client = struct {
         // Nothing spawned yet: on a failure the servers made so far are
         // freed here, with no monitor running (an allocation failed).
         if (changes.failed) |err| {
+            var owned = changes;
+            owned.deinit(gpa);
             for (self.servers.items) |s| self.freeServer(s);
             self.servers.deinit(gpa);
             return err;
@@ -549,13 +573,10 @@ pub const Client = struct {
         self.guard.deinit();
         self.endSessions();
         self.mutex.lockUncancelable(io);
-        // No monitor starts from now on (`applyChanges`), and those running
-        // end at their next check of `retired`.
+        // No monitor starts from now on, and those running end at their
+        // next check of `life` (or the group's cancel below).
         self.closing.store(true, .release);
-        for (self.servers.items) |s| {
-            s.retired.store(true, .release);
-            s.check_now.set(io);
-        }
+        for (self.servers.items) |s| s.retire(io);
         // Read under the lock: a monitor's `apply` may grow `servers` until
         // the cancel below. A `Server` itself lives until `freeServer`.
         const hold: if (builtin.is_test) ?*Server else void = if (builtin.is_test)
@@ -597,12 +618,18 @@ pub const Client = struct {
     /// What `syncServers` collected under `mutex`, for `applyChanges`
     /// after the unlock.
     const Changes = struct {
-        /// New servers, whose monitors start (linked by `start_next`).
-        start: ?*Server = null,
-        /// Servers that left, whose monitors stop (linked by `stop_next`).
-        stop: ?*Server = null,
+        /// New servers, whose monitors start.
+        start: std.ArrayList(*Server) = .empty,
+        /// Servers that left (the topology's `takeRemoved`, null where it
+        /// had none), whose monitors stop.
+        stop: []?*anyopaque = &.{},
         /// An allocation that failed; what was collected before it applies.
         failed: ?anyerror = null,
+
+        fn deinit(changes: *Changes, gpa: std.mem.Allocator) void {
+            changes.start.deinit(gpa);
+            gpa.free(changes.stop);
+        }
     };
 
     /// Under `mutex`: a `Server` for every server of the topology that has
@@ -614,27 +641,29 @@ pub const Client = struct {
         var changes: Changes = .{};
         for (self.topology.servers.items) |*ts| {
             if (ts.context == null) {
+                // Room first: a server made is in `start`, so its monitor
+                // starts (the next sync tries again otherwise).
+                changes.start.ensureUnusedCapacity(self.gpa, 1) catch |err| {
+                    changes.failed = err;
+                    continue;
+                };
                 const s = self.newServer(ts.description.address) catch |err| {
                     changes.failed = err;
                     continue;
                 };
                 ts.context = s;
-                s.start_next = changes.start;
-                changes.start = s;
+                // First seen while the client closes (a monitor's `apply`
+                // after `deinit` retired the others): retired too.
+                if (self.closing.load(.acquire)) s.retire(self.io);
+                changes.start.appendAssumeCapacity(s);
             }
             const s: *Server = @ptrCast(@alignCast(ts.context.?));
             s.generation.store(ts.generation, .release);
         }
         if (self.topology.takeRemoved()) |removed| {
-            defer self.gpa.free(removed);
-            for (removed) |ctx| {
-                const s: *Server = @ptrCast(@alignCast(ctx orelse continue));
-                // Seen at once by `stale` and by the monitor's loop.
-                s.retired.store(true, .release);
-                s.check_now.set(self.io);
-                s.stop_next = changes.stop;
-                changes.stop = s;
-            }
+            changes.stop = removed;
+            // Seen at once by `stale` and by the monitor's loop.
+            for (removed) |ctx| if (ctx) |c| @as(*Server, @ptrCast(@alignCast(c))).retire(self.io);
         } else |err| changes.failed = err;
         if (self.topology.takeCheckRequests()) |checks| {
             defer {
@@ -650,16 +679,18 @@ pub const Client = struct {
     }
 
     /// After `mutex`'s unlock: starts the monitors of `changes.start` (none
-    /// once the client is closing) and stops those of `changes.stop`.
+    /// for a server retired meanwhile, as all are once the client is
+    /// closing), stops those of `changes.stop` and frees the lists.
     fn applyChanges(self: *Client, changes: Changes) void {
+        var owned = changes;
+        defer owned.deinit(self.gpa);
         if (changes.failed) |err| log.warn("mongodb: topology update: {t}", .{err});
-        var next = changes.start;
-        while (next) |s| {
-            next = s.start_next;
-            if (self.closing.load(.acquire)) continue;
+        for (changes.start.items) |s| {
+            if (s.isRetired()) continue;
             // May yield (a busy executor); nothing is locked here. A spawn
-            // into the group while `deinit` cancels it fails, and `deinit`
-            // retired the server already.
+            // into the group while `deinit` cancels it fails, for a server
+            // retired already (by `deinit`, or by `syncServers` once the
+            // client is closing).
             placement.concurrent(&self.group, self.io, .{ .executor = 0 }, monitor, .{s}) catch |err| {
                 log.warn("mongodb {s}: monitor not started: {t}", .{ s.address.text, err });
             };
@@ -668,17 +699,13 @@ pub const Client = struct {
                 f(self.io);
             };
         }
-        next = changes.stop;
-        while (next) |s| {
-            next = s.stop_next;
-            stopMonitor(s);
-        }
+        for (changes.stop) |ctx| if (ctx) |c| stopMonitor(@ptrCast(@alignCast(c)));
     }
 
     /// Stops the monitor of a retired server: a cancel ends its blocked
     /// `hello` or heartbeat wait (server-monitoring.md: "clients MUST
     /// cancel" in-progress checks). No wait; any thread. Off zio (no task
-    /// to cancel) it ends at its next check of `retired`.
+    /// to cancel) it ends at its next check of `life`.
     fn stopMonitor(s: *Server) void {
         const io = s.client.io;
         s.task_lock.lockUncancelable(io);
@@ -790,13 +817,8 @@ pub const Client = struct {
     fn monitor(s: *Server) std.Io.Cancelable!void {
         const self = s.client;
         const io = self.io;
-        {
-            s.task_lock.lockUncancelable(io);
-            defer s.task_lock.unlock(io);
-            // Stopped before it started.
-            if (s.retired.load(.acquire)) return;
-            s.monitor = placement.currentTask(io);
-        }
+        // Retired before it started.
+        if (!s.startMonitoring(io)) return;
         // The monitor's connection is its own (a local): nothing else ever
         // touches it, so it closes it last, once.
         var connection: ?*Connection = null;
@@ -808,13 +830,13 @@ pub const Client = struct {
             if (builtin.is_test) if (test_monitor_closed) |f| f(s);
         }
         var known = false;
-        while (!s.retired.load(.acquire)) {
+        while (!s.isRetired()) {
             const started: std.Io.Clock.Timestamp = .now(io, .awake);
             var d = try self.check(s, &connection);
             // A server that was known gets one more try on a fresh
             // connection before it is called Unknown.
-            if (d == null and known and !s.retired.load(.acquire)) d = try self.check(s, &connection);
-            if (s.retired.load(.acquire)) return;
+            if (d == null and known and !s.isRetired()) d = try self.check(s, &connection);
+            if (s.isRetired()) return;
             const description = d orelse sdam.unknown(self.gpa, s.address.text, "server check failed", null) catch null;
             if (description) |desc| {
                 known = desc.type != .unknown;
@@ -954,7 +976,7 @@ pub const Client = struct {
             var sum: internal.PoolStat = .{ .max = 0, .open = 0, .idle = 0 };
             var unlimited = false;
             for (servers) |s| {
-                if (s.retired.load(.acquire)) continue;
+                if (s.isRetired()) continue;
                 const p = &s.pools.pools[i];
                 p.mutex.lockUncancelable(io);
                 const stat: internal.PoolStat = .{ .max = p.max, .open = p.total, .idle = p.idle.items.len };
@@ -1000,7 +1022,7 @@ pub const Client = struct {
     }
 
     fn stale(self: *Client, s: *Server, c: *Connection, io: std.Io) bool {
-        if (c.generation != s.generation.load(.acquire) or s.retired.load(.acquire)) return true;
+        if (c.generation != s.generation.load(.acquire) or s.isRetired()) return true;
         if (self.options.idle_timeout) |max| {
             if (c.last_used.durationTo(.now(io, .awake)).raw.nanoseconds > max.nanoseconds) return true;
         }
@@ -1511,4 +1533,52 @@ test "classify: codes to classes" {
         .{ null, "not master", .unavailable },
         .{ null, "something", .other },
     }) |case| try testing.expectEqual(case[2], classify(.{ .code = case[0], .message = case[1], .reply = doc }));
+}
+
+/// The close test's hook: with every server retired by `deinit`, a hello
+/// naming a new member reaches the client, as from a monitor whose check
+/// passed its retired check before `deinit` ran.
+const CloseJoin = struct {
+    var life: ?Server.Life = null;
+
+    fn hold(s: *Server) void {
+        const self = s.client;
+        var b: bson.Builder = .init(testing.allocator);
+        defer b.deinit();
+        const d = hello(&b, s.address.text) catch return;
+        self.apply(d);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const ts = self.topology.find("127.0.0.1:2") orelse return;
+        life = @as(*Server, @ptrCast(@alignCast(ts.context.?))).life.load(.acquire);
+    }
+
+    fn hello(b: *bson.Builder, me: []const u8) !*sdam.Description {
+        try b.begin();
+        try b.append("isWritablePrimary", .{ .boolean = true });
+        try b.append("setName", .{ .string = "rs0" });
+        try b.beginArray("hosts");
+        try b.append("", .{ .string = me });
+        try b.append("", .{ .string = "127.0.0.1:2" });
+        try b.end();
+        try b.append("me", .{ .string = me });
+        try b.append("setVersion", .{ .int32 = 1 });
+        try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+        try b.append("maxWireVersion", .{ .int32 = 21 });
+        try b.append("ok", .{ .double = 1 });
+        try b.end();
+        return sdam.describe(testing.allocator, me, .{ .bytes = b.bytes() }, 0);
+    }
+};
+
+test "mongodb: a member first seen while the client closes is retired, its monitor never starts" {
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const client = try Client.init(testing.allocator, rt.io(), .{ .url = "mongodb://127.0.0.1:1/app?replicaSet=rs0" });
+    CloseJoin.life = null;
+    test_close_hold = CloseJoin.hold;
+    defer test_close_hold = null;
+    client.deinit();
+    try testing.expectEqual(@as(?Server.Life, .retired), CloseJoin.life);
 }
