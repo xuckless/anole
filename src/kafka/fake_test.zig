@@ -1237,6 +1237,38 @@ test "kafka: a consumer added once a drain began is refused" {
     try wait.waitFlag(io, "the drain returned", &drained);
 }
 
+test "kafka client: start, consume and drain by phase; each consumer is started once, by start or by consume" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    // `spawned`: the members of the last consumer added; null: none, or refused.
+    const Row = struct { act: enum { add, start, drain }, phase: @FieldType(kafka.Client, "phase"), spawned: ?usize = 0 };
+    for ([_]struct { suppress: bool, rows: []const Row }{
+        .{ .suppress = false, .rows = &.{ .{ .act = .add, .phase = .idle }, .{ .act = .start, .phase = .serving, .spawned = 1 }, .{ .act = .start, .phase = .serving, .spawned = 1 }, .{ .act = .add, .phase = .serving, .spawned = 1 }, .{ .act = .drain, .phase = .drained, .spawned = 1 }, .{ .act = .drain, .phase = .drained, .spawned = 1 }, .{ .act = .add, .phase = .drained, .spawned = null } } },
+        .{ .suppress = false, .rows = &.{ .{ .act = .drain, .phase = .drained, .spawned = null }, .{ .act = .start, .phase = .drained, .spawned = null }, .{ .act = .add, .phase = .drained, .spawned = null } } },
+        .{ .suppress = true, .rows = &.{ .{ .act = .add, .phase = .idle }, .{ .act = .start, .phase = .serving }, .{ .act = .add, .phase = .serving } } },
+    }, 0..) |s, si| {
+        const client = try kafka.Client.init(gpa, io, .{ .brokers = &.{"127.0.0.1:1"}, .connect_timeout = .fromMilliseconds(300) });
+        defer client.deinit();
+        client.suppress_consumers = s.suppress;
+        var last: ?*@import("consumer.zig").Consumer = null;
+        for (s.rows, 0..) |row, ri| {
+            errdefer std.debug.print("scenario {d} row {d}\n", .{ si, ri });
+            switch (row.act) {
+                .add => last = client.consumeRaw(.{ .group = "g", .topics = &.{"t"}, .heartbeat_interval = .fromMilliseconds(100) }, Joined.on, null) catch |err| blk: {
+                    try testing.expectEqual(error.Closing, err);
+                    break :blk null;
+                },
+                .start => try client.start(null, null, null),
+                .drain => client.drain(std.Io.Clock.Timestamp.now(io, .awake)),
+            }
+            try testing.expectEqual(row.phase, client.phase);
+            try testing.expectEqual(row.spawned, if (last) |c| c.members.len else null);
+            try testing.expectEqual(@as(u32, 0), client.starting);
+        }
+    }
+}
+
 test "kafka consumer: start, stop and join by phase; memberGone only for members that ended while running" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
