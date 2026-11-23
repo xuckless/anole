@@ -57,8 +57,10 @@ impls = json.load(open(p))
 impls["anole"] = {"image": "anole-wt-interop:latest", "url": "https://github.com/xuckless/anole", "role": "server"}
 json.dump(impls, open(p, "w"), indent=2)
 PY
+"$here/../empty-env.sh" "$work/runner" "$runner_commit"
 python3 -m venv "$work/venv"
-"$work/venv/bin/pip" install -q -r "$work/runner/requirements.txt"
+# The runner's own requirements.txt, pinned with hashes here.
+"$work/venv/bin/pip" install -q --require-hashes -r "$here/../requirements.txt"
 
 cd "$work/runner"
 status=0

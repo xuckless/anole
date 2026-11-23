@@ -548,7 +548,7 @@ jobs:
       # Not a gate yet: the browser images have not been run against Anole
       # (they are x86_64 only, and were built on an arm64 Mac).
       - name: tests/interop/webtransport/run.sh chrome,firefox
-        if: steps.tshark.outputs.available == 'true'
+        if: ${{ !cancelled() && steps.tshark.outputs.available == 'true' }}
         continue-on-error: true
         run: tests/interop/webtransport/run.sh chrome,firefox
         env:
