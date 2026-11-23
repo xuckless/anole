@@ -281,15 +281,15 @@ const Field = struct { name: []const u8, value: []const u8 };
 
 /// An `EStream`'s response side, one value. Every change is a row here:
 /// add a phase or an event as a row of `next`, never as a flag beside it.
+/// Whether the final head is out is the core's fact
+/// (`PStream.flags.head_sent`, set by `proto.submitHead` on success), not a
+/// phase here.
 ///
-///   state      head        end      wait        drained
-///   none       head_sent   ended    none        none
-///   head_sent  head_sent   ended    head_sent   head_sent
-///   ended      ended       ended    waiting     ended
-///   waiting    waiting     waiting  waiting     ended
+///   state    end      wait     drained
+///   open     ended    open     open
+///   ended    ended    waiting  ended
+///   waiting  waiting  waiting  ended
 ///
-/// head:    the final head (no END_STREAM) is in `proto` (`submitHeadOnce`;
-///          a 1xx `interim` is no event).
 /// end:     the last frame is about to be submitted (`complete`, `end`,
 ///          `endChain`). Before the submit: END_STREAM on a stream whose
 ///          peer half is closed closes it inside the call, and
@@ -299,30 +299,28 @@ const Field = struct { name: []const u8, value: []const u8 };
 ///          a send deadline (`finishHandler`).
 /// drained: those frames are out, or never will be (`Conn.sendDone`).
 ///
-/// `head` and `end` in ended/waiting are not reached (a response ends
-/// once, before its handler is done); a late one keeps `waiting`, so
-/// `send_waits` stays right. `wait` outside `ended` is a no-op (a handler
-/// that returned without ending is reset, not waited for), and so is
-/// `drained` outside `waiting`. A submit that fails is no event: the value
-/// saved before it is put back. A reset is no phase either: the
-/// stream-level `EStream.reset` is read by the request side too, and an
-/// ended response that is reset must still read as ended (`cancelHandler`,
+/// `end` in ended/waiting is not reached (a response ends once, before its
+/// handler is done); a late one keeps `waiting`, so `send_waits` stays
+/// right. `wait` outside `ended` is a no-op (a handler that returned
+/// without ending is reset, not waited for), and so is `drained` outside
+/// `waiting`. A submit that fails is no event: the value saved before it
+/// is put back. A reset is no phase either: the stream-level
+/// `EStream.reset` is read by the request side too, and an ended response
+/// that is reset must still read as ended (`cancelHandler`,
 /// `onStreamClose`). The values make `isEnded` one compare.
 pub const Resp = enum(u8) {
-    none = 0,
-    head_sent = 1,
-    ended = 2,
-    waiting = 3,
+    open = 0,
+    ended = 1,
+    waiting = 2,
 
-    pub const Event = enum { head, end, wait, drained };
+    pub const Event = enum { end, wait, drained };
 
     /// The table above, state by event: every cell is listed, every change
     /// is a row.
     const table = std.EnumArray(Resp, std.EnumArray(Event, Resp)).init(.{
-        .none = .init(.{ .head = .head_sent, .end = .ended, .wait = .none, .drained = .none }),
-        .head_sent = .init(.{ .head = .head_sent, .end = .ended, .wait = .head_sent, .drained = .head_sent }),
-        .ended = .init(.{ .head = .ended, .end = .ended, .wait = .waiting, .drained = .ended }),
-        .waiting = .init(.{ .head = .waiting, .end = .waiting, .wait = .waiting, .drained = .ended }),
+        .open = .init(.{ .end = .ended, .wait = .open, .drained = .open }),
+        .ended = .init(.{ .end = .ended, .wait = .waiting, .drained = .ended }),
+        .waiting = .init(.{ .end = .waiting, .wait = .waiting, .drained = .ended }),
     });
 
     pub fn next(r: Resp, ev: Event) Resp {
@@ -332,11 +330,6 @@ pub const Resp = enum(u8) {
     /// The last frame is submitted (or being submitted).
     pub fn isEnded(r: Resp) bool {
         return @backingInt(r) >= @backingInt(Resp.ended);
-    }
-
-    /// The final head went to `proto`.
-    pub fn headOut(r: Resp) bool {
-        return r != .none;
     }
 };
 
@@ -2331,7 +2324,7 @@ pub fn Engine(comptime Ctx: type) type {
             canceled: bool = false,
 
             // The response.
-            resp: Resp = .none,
+            resp: Resp = .open,
             status: http.Status = .ok,
             resp_fields: []hpack.Field = &.{},
             /// A streamed body's blocks: the writer fills `blocks[cur]`.
@@ -3784,9 +3777,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// The head with no END_STREAM, once. Under the lock.
             fn submitHeadOnce(self: *StreamSink, s: *PStream) std.Io.Writer.Error!void {
                 const es = self.es;
-                if (es.resp.headOut()) return;
+                if (s.flags.head_sent) return;
                 es.conn.proto.submitHead(s, @intCast(@backingInt(es.status)), es.resp_fields, false) catch |err| return self.submitFailed(err);
-                es.resp = es.resp.next(.head);
             }
 
             /// Submits what the writer holds as one DATA part (by
@@ -3806,7 +3798,7 @@ pub fn Engine(comptime Ctx: type) type {
                     defer conn.unlock();
                     const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                     if (es.reset) return self.fail(error.ConnectionResetByPeer);
-                    const head_new = !es.resp.headOut();
+                    const head_new = !s.flags.head_sent;
                     try self.submitHeadOnce(s);
                     if (n == 0) {
                         if (!head_new) return;
@@ -3945,7 +3937,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // stream), then `.ended` before the submits, as in
                 // `complete`: the last one may close the stream inside the
                 // call. A failure puts the phase from before the end back.
-                const bare = !es.resp.headOut() and part.len == 0 and trailer_fields == null;
+                const bare = !s.flags.head_sent and part.len == 0 and trailer_fields == null;
                 if (!bare) try self.submitHeadOnce(s);
                 const before = es.resp;
                 es.resp = before.next(.end);
@@ -4090,7 +4082,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const s = es.cs orelse return self.fail(error.ConnectionResetByPeer);
                 if (es.reset) return self.fail(error.ConnectionResetByPeer);
                 // As in `end`: the head first, then `.ended`.
-                const bare = !es.resp.headOut() and trailer_fields == null;
+                const bare = !s.flags.head_sent and trailer_fields == null;
                 if (!bare) try self.submitHeadOnce(s);
                 const before = es.resp;
                 es.resp = before.next(.end);

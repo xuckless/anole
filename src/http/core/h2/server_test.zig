@@ -1592,40 +1592,32 @@ test "h2 engine: a response head that can't be submitted is reset with INTERNAL_
     }
 }
 
-test "h2 engine: Resp, the response side: every state x event cell, and its predicates" {
+test "h2 engine: Resp, the response side: every state x event cell, and its predicate" {
     const R = engine.Resp;
     const rows = [_]struct { from: R, ev: R.Event, to: R }{
-        .{ .from = .none, .ev = .head, .to = .head_sent },
-        .{ .from = .none, .ev = .end, .to = .ended },
-        .{ .from = .none, .ev = .wait, .to = .none },
-        .{ .from = .none, .ev = .drained, .to = .none },
-        .{ .from = .head_sent, .ev = .head, .to = .head_sent },
-        .{ .from = .head_sent, .ev = .end, .to = .ended },
-        .{ .from = .head_sent, .ev = .wait, .to = .head_sent },
-        .{ .from = .head_sent, .ev = .drained, .to = .head_sent },
-        .{ .from = .ended, .ev = .head, .to = .ended },
+        .{ .from = .open, .ev = .end, .to = .ended },
+        .{ .from = .open, .ev = .wait, .to = .open },
+        .{ .from = .open, .ev = .drained, .to = .open },
         .{ .from = .ended, .ev = .end, .to = .ended },
         .{ .from = .ended, .ev = .wait, .to = .waiting },
         .{ .from = .ended, .ev = .drained, .to = .ended },
-        .{ .from = .waiting, .ev = .head, .to = .waiting },
         .{ .from = .waiting, .ev = .end, .to = .waiting },
         .{ .from = .waiting, .ev = .wait, .to = .waiting },
         .{ .from = .waiting, .ev = .drained, .to = .ended },
     };
+    try expectEqual(std.enums.values(R).len * std.enums.values(R.Event).len, rows.len);
     for (rows) |row| {
         errdefer std.debug.print("{t} x {t}\n", .{ row.from, row.ev });
         try expectEqual(row.to, row.from.next(row.ev));
     }
-    const preds = [_]struct { r: R, ended: bool, head_out: bool }{
-        .{ .r = .none, .ended = false, .head_out = false },
-        .{ .r = .head_sent, .ended = false, .head_out = true },
-        .{ .r = .ended, .ended = true, .head_out = true },
-        .{ .r = .waiting, .ended = true, .head_out = true },
+    const preds = [_]struct { r: R, ended: bool }{
+        .{ .r = .open, .ended = false },
+        .{ .r = .ended, .ended = true },
+        .{ .r = .waiting, .ended = true },
     };
     for (preds) |row| {
         errdefer std.debug.print("{t}\n", .{row.r});
         try expectEqual(row.ended, row.r.isEnded());
-        try expectEqual(row.head_out, row.r.headOut());
     }
 }
 
