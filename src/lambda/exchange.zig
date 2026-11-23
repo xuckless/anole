@@ -113,7 +113,7 @@ pub const BufferedSink = struct {
         const self: *BufferedSink = @ptrCast(@alignCast(ptr));
         self.status = status;
         self.headers = headers;
-        self.head = .seen;
+        if (self.head == .none) self.head = .seen;
     }
 
     fn interimFn(_: *anyopaque, _: dusty.Status) std.Io.Writer.Error!void {}
