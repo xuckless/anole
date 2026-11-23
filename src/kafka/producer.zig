@@ -1553,11 +1553,11 @@ const WaitRace = struct {
 
 test "kafka producer: resetPidLocked clears only a ready id of the seen generation" {
     const ready: Producer.IdState = .{ .ready = .{ .id = 7, .epoch = 1 } };
-    const rows = [_]struct { state: Producer.IdState, seen: u32, cleared: bool }{
-        .{ .state = ready, .seen = 3, .cleared = true },
-        .{ .state = ready, .seen = 2, .cleared = false },
-        .{ .state = .fetching, .seen = 3, .cleared = false },
-        .{ .state = .none, .seen = 3, .cleared = false },
+    const rows = [_]struct { state: Producer.IdState, seen: u32, want: Producer.IdState }{
+        .{ .state = ready, .seen = 3, .want = .none },
+        .{ .state = ready, .seen = 2, .want = ready },
+        .{ .state = .fetching, .seen = 3, .want = .fetching },
+        .{ .state = .none, .seen = 3, .want = .none },
     };
     for (rows) |row| {
         var p: Producer = .{
@@ -1572,7 +1572,7 @@ test "kafka producer: resetPidLocked clears only a ready id of the seen generati
         };
         defer p.gens.deinit(testing.allocator);
         p.resetPidLocked(row.seen);
-        try testing.expectEqual(row.cleared, (p.ids == .none) != (row.state == .none));
+        try testing.expectEqualDeep(row.want, p.ids);
     }
 }
 

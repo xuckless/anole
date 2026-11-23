@@ -719,6 +719,25 @@ test "kafka producer: after a producer id reset, the broker refuses no batch as 
     try testing.expectEqual(@as(i64, 4), broker.count("ids", 1));
 }
 
+test "kafka producer: a failed InitProducerId leaves no fetch pending, the next send gets an id" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{});
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    broker.fail_init_pid.store(1, .release);
+    // The first fetch fails; the send retries and a later fetch succeeds.
+    const r = try client.produce(&c, .{ .topic = "ids", .value = "a", .partition = 0 });
+    try testing.expectEqual(@as(i32, 0), r.partition);
+    try testing.expectEqual(@as(u32, 0), broker.fail_init_pid.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), broker.count("ids", 0));
+}
+
 /// An allocator that fails the `fail_at`-th allocation made by the thread
 /// that armed it (other threads pass through), counting from the arming.
 const FailNth = struct {

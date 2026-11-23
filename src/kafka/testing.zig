@@ -93,6 +93,8 @@ pub const FakeBroker = struct {
     /// partition, storing nothing.
     fail_produce: std.atomic.Value(u32) = .init(0),
     fail_code: std.atomic.Value(i16) = .init(6),
+    /// The next N InitProducerId requests are answered with an error.
+    fail_init_pid: std.atomic.Value(u32) = .init(0),
     /// The next N Produce requests are stored, and the connection is dropped
     /// before the answer.
     drop_after_store: std.atomic.Value(u32) = .init(0),
@@ -377,12 +379,13 @@ pub const FakeBroker = struct {
                 try out.i32_(b.listener.socket.address.getPort());
             },
             .init_producer_id => {
+                const failing = takeOne(&b.fail_init_pid);
                 b.mutex.lockUncancelable(b.io);
                 const pid = b.next_pid;
                 b.next_pid += 1;
                 b.mutex.unlock(b.io);
                 try out.i32_(0);
-                try out.i16_(0);
+                try out.i16_(if (failing) b.fail_code.load(.acquire) else 0);
                 try out.i64_(pid);
                 try out.i16_(0);
             },
