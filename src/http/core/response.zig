@@ -573,7 +573,7 @@ const BodyWriterState = enum(u8) { none, open, open_buffering };
 ///   building   head_sent   writing      =           =
 ///   head_sent  =           finished     finished    parked
 ///   writing    finished    =            =           =
-///   finished   =           =            =           =
+///   finished   =           =            =           parked
 ///   parked     =           =            =           =
 ///
 /// `=`: no change. The events: `send_head` where the head is committed,
@@ -582,6 +582,9 @@ const BodyWriterState = enum(u8) { none, open, open_buffering };
 /// its 101 branch; `end_stream` in `StreamingBodyWriter.end`; `park` in
 /// `_park` and `parkAfterHead`, only once their `stream(&.{})` succeeded (a
 /// failed one leaves `building` or `head_sent`, as `stream` left it).
+/// `finished` x `park` is reached only from `writing`: `_canPark` lets a
+/// park start there (the head is not out), and its `stream(&.{})` moves
+/// writing -> finished before the `park`, which must still park it.
 /// Unreachable cells keep the state, their callers refuse first:
 /// `end_stream` needs an open stream, so a head; `park` runs `stream` first;
 /// a second `send_head` is refused by `stream`, skipped by `writeHeader`
@@ -614,7 +617,7 @@ pub const Phase = enum(u8) {
         .building = .init(.{ .send_head = .head_sent, .begin_write = .writing, .end_stream = .building, .park = .building }),
         .head_sent = .init(.{ .send_head = .head_sent, .begin_write = .finished, .end_stream = .finished, .park = .parked }),
         .writing = .init(.{ .send_head = .finished, .begin_write = .writing, .end_stream = .writing, .park = .writing }),
-        .finished = .initFill(.finished),
+        .finished = .init(.{ .send_head = .finished, .begin_write = .finished, .end_stream = .finished, .park = .parked }),
         .parked = .initFill(.parked),
     });
 
@@ -6820,7 +6823,7 @@ test "Phase: every (phase, event) pair" {
         .{ .from = .finished, .event = .send_head, .to = .finished },
         .{ .from = .finished, .event = .begin_write, .to = .finished },
         .{ .from = .finished, .event = .end_stream, .to = .finished },
-        .{ .from = .finished, .event = .park, .to = .finished },
+        .{ .from = .finished, .event = .park, .to = .parked },
 
         .{ .from = .parked, .event = .send_head, .to = .parked },
         .{ .from = .parked, .event = .begin_write, .to = .parked },
@@ -7075,7 +7078,7 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
     defer arena.deinit();
     var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
     const owner: Parked.Owner = .{ .gone = undefined, .ctx = undefined };
-    const Case = enum { parks, refused_at_headers, head_fails, no_memory };
+    const Case = enum { parks, refused_at_headers, head_fails, no_memory, after_failed_write };
     const Row = struct { case: Case, err: ?anyerror, phase: Phase, can_park: bool, keepalive: bool };
     const rows = [_]Row{
         .{ .case = .parks, .err = null, .phase = .parked, .can_park = false, .keepalive = false },
@@ -7085,6 +7088,10 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
         .{ .case = .head_fails, .err = error.WriteFailed, .phase = .head_sent, .can_park = false, .keepalive = true },
         // The adopter could not be made: parked, and the connection closes.
         .{ .case = .no_memory, .err = error.OutOfMemory, .phase = .parked, .can_park = false, .keepalive = false },
+        // A `write` failed before its head (`writing`), then the park's
+        // `stream` sends it: parked, so the server leaves the connection
+        // to the adopter.
+        .{ .case = .after_failed_write, .err = null, .phase = .parked, .can_park = false, .keepalive = false },
     };
     for (rows) |row| {
         var small: [4]u8 = undefined;
@@ -7094,11 +7101,19 @@ test "Response: an HTTP/1.1 park, its failures, and write after it" {
         var connection: Connection = undefined;
         connection.initWriterForTesting(if (row.case == .head_fails) &fixed else &sink.interface);
         connection.allocator = if (row.case == .no_memory) std.testing.failing_allocator else arena.allocator();
-        var response = try Response._init(arena.allocator(), &connection, if (row.case == .refused_at_headers) 2 else 32);
-        if (row.case == .refused_at_headers) {
+        const full = row.case == .refused_at_headers or row.case == .after_failed_write;
+        var response = try Response._init(arena.allocator(), &connection, if (full) 2 else 32);
+        if (full) {
             try response.header("X-A", "1");
             try response.header("X-B", "2");
             response.content_type = .text;
+        }
+        if (row.case == .after_failed_write) {
+            response.body = "x";
+            try std.testing.expectError(error.TooManyHeaders, response.write());
+            try std.testing.expectEqual(Phase.writing, response._phase);
+            response.content_type = null;
+            response.body = "";
         }
 
         const got = response._park(&request, owner);
@@ -7202,7 +7217,7 @@ test "Response sink: a relocate that fails puts the offer back" {
 }
 
 test "Response: the phase and detach value do not grow the response" {
-    // 464 before them (x86_64 Debug, every feature on), with five bools
-    // and three pointers in their place.
+    // 464 before and after them (x86_64 Debug, every feature on): five
+    // bools and three pointers became one u8 enum and a 24-byte union.
     try std.testing.expect(@sizeOf(Response) <= 464);
 }

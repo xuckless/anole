@@ -403,7 +403,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 Fields starting with `_` (`req._parser`, `res._conn`, ...) and
 `X.internal` / `X.Driver` declarations are Anole's: the engines use them, and
 they change without notice. Ask `res.headersSent()` rather than reading
-`res._headers_written`; `ws.httpVersion()` and `ws.isClosed()` rather than a
+`res._phase`; `ws.httpVersion()` and `ws.isClosed()` rather than a
 socket's internals.
 
 | Field or method | What it holds |
