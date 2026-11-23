@@ -378,6 +378,8 @@ fn messagesAcrossParking(secure: bool) !void {
     try c.send(0x1, "one");
     try c.expectText("one");
     try f.waitParked(1);
+    // Parked, it stays in flight for the drain until it closes.
+    try std.testing.expectEqual(1, f.server.busy.load(.acquire).count);
 
     for (0..3) |_| {
         // Woken by the next message, parked again after it.
@@ -416,6 +418,12 @@ fn messagesAcrossParking(secure: bool) !void {
     try std.testing.expectEqual(1000, last_close_code.load(.acquire));
     try std.testing.expect(c.hungUp());
     try std.testing.expectEqual(0, f.server.parkedConnections());
+    // Its close gave the count back.
+    try wait.waitUntil(f.io, "the closed socket gave its count back", &f.server, struct {
+        fn idle(s: *const Server) bool {
+            return s.busy.load(.acquire).count == 0;
+        }
+    }.idle);
 }
 
 test "WebSocket callbacks: messages, ping and close across parking" {
@@ -472,6 +480,8 @@ test "WebSocket callbacks: with parking off, the socket waits on its task" {
         try c.send(0x1, "again");
         try c.expectText("again");
     }
+    // On its task after the 101, in flight for the drain.
+    try std.testing.expectEqual(1, f.server.busy.load(.acquire).count);
     try wait.expectStays(f.io, "no socket parks with parking off", &f.server, struct {
         fn parkedIsZero(s: *const Server) bool {
             return s.parkedConnections() == 0;
@@ -545,6 +555,8 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
     }
     defer for (&clients) |*c| c.close(f.io);
     try f.waitParked(clients.len);
+    // Parked, each is in flight for the drain.
+    try std.testing.expectEqual(clients.len, f.server.busy.load(.acquire).count);
 
     var stopper = try f.io.concurrent(struct {
         fn run(fx: *Fixture) void {
@@ -560,6 +572,7 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
     stopper.await(f.io);
     try std.testing.expectEqual(3, closed.load(.acquire));
     for (&clients) |*c| try std.testing.expect(c.hungUp());
+    try std.testing.expectEqual(0, f.server.busy.load(.acquire).count);
 }
 
 test "WebSocket callbacks: stopping the server closes parked sockets" {

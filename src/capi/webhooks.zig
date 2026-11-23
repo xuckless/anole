@@ -38,7 +38,7 @@ const Wh = if (features.webhooks) anole.webhooks else struct {
     pub const StatusEvent = void;
 };
 
-pub const CallError = error{ Invalid, State, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 /// Engine-wide state (`Engine.webhooks_state`).
 pub const State = struct {
@@ -48,17 +48,6 @@ pub const State = struct {
     watcher: ?*Consumer = null,
     watcher_ud: u64 = 0,
     draining: std.atomic.Value(bool) = .init(false),
-
-    pub fn init(s: *State, first_gen: u32) void {
-        _ = first_gen;
-        s.* = .{};
-    }
-
-    /// No handles of its own: nothing to bound.
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
-    }
 
     pub fn deinit(s: *State) void {
         s.client = if (features.webhooks) null else {};
@@ -71,15 +60,6 @@ pub const ExecState = struct {
 
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
-    }
-
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
     }
 };
 
@@ -133,7 +113,7 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     e.jobs_state.webhooks_admin = &adminOp;
 }
 
-/// The drain started (`anole_server_drain`, once).
+/// The drain started (however it started; once; never waits).
 pub fn draining(e: *Engine) void {
     e.webhooks_state.draining.store(true, .release);
 }
@@ -152,18 +132,6 @@ pub fn destroy(e: *Engine) void {
 // ---------------------------------------------------------------------------
 // Records
 
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
-
 const PublishedData = struct {
     user_data: u64,
     status: i32 = abi.OK,
@@ -179,7 +147,7 @@ fn publishedRecord(d: PublishedData) ![]align(8) u8 {
     const Ev = abi.WebhookPublishedEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + d.message_id.len + d.message.len, .webhook_published, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = d.user_data;
     ev.status = d.status;
     ev.http_status = d.http_status;
@@ -195,7 +163,7 @@ fn statusRecord(user_data: u64, what: u32, last_status: u16, owner: []const u8, 
     const Ev = abi.WebhookStatusEvent;
     const rec = try engine.newRecord(@sizeOf(Ev) + owner.len + endpoint.len + message.len + err_text.len, .webhook_status, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
+    var w: engine.Writer = .{ .rec = rec, .at = @sizeOf(Ev) };
     ev.user_data = user_data;
     ev.what = what;
     ev.last_status = last_status;
@@ -353,13 +321,7 @@ pub fn publish(e: *Engine, c: *Consumer, m: abi.WebhookOut, user_data: u64) Call
             .endpoint = endpoint,
             .timestamp_ms = m.timestamp_ms,
         }, .{}) catch return error.OutOfMemory;
-        db.txSubmit(e, m.tx, .webhook_publish, text, &.{}, .{ .size = @sizeOf(abi.DbOptions) }, user_data) catch |err| return switch (err) {
-            error.Invalid => error.Invalid,
-            error.State => error.State,
-            error.OutOfMemory => error.OutOfMemory,
-            error.Unsupported => error.Unsupported,
-            error.Gone => error.Gone,
-        };
+        db.txSubmit(e, m.tx, .webhook_publish, text, &.{}, .{ .size = @sizeOf(abi.DbOptions) }, user_data) catch |err| return err;
         arena.deinit();
         return;
     }

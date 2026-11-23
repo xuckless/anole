@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
+const log = std.log.scoped(.anole);
 const Request = @import("request.zig").Request;
 const beneath = @import("beneath.zig");
 const placement = @import("placement.zig");
@@ -491,15 +492,197 @@ pub const BodyWriter = struct {
     pub fn end(self: *BodyWriter) Error!void {
         // Idempotent, so `defer body.end() catch {}` alongside an explicit
         // `end` on the success path is harmless rather than a second body.
-        if (!self.res._body_writer_open) return;
-        self.res._body_writer_open = false;
-        self.res._body_writer_buffering = false;
+        if (!self.res.closeBodyWriter()) return;
         // Cannot fail: see `flush`.
         self.interface.flush() catch unreachable;
         // A write that failed was reported then; the body is not complete
         // for having stopped.
         if (self.err) |err| return err;
     }
+};
+
+/// How a response's body is framed on the wire (RFC 9112 §6), one value.
+/// Every move is a row here; add a framing as a state, not as a flag.
+///
+///   state            stream()            _upgradeWebSocket
+///   buffered         forStream(..)       streaming
+///   chunked          x                   x
+///   streaming        forStream(..) *     x
+///   declared_length  x                   x
+///
+/// x: not reached. Both run only while the head is not out (`stream` through
+/// `checkBodyNotStarted`, the upgrade through `header`), and `resetBody`
+/// refuses once it is. The mode is set before its head is written, so a
+/// mode but `buffered` means the head is out only once that write succeeded.
+/// *: `_upgradeWebSocket` sets `streaming` and then its head can still fail
+/// (`writeHeader` -> `applyContentType` -> TooManyHeaders), leaving
+/// `streaming` with the head not out; an error path's `stream()` then moves
+/// it again (kept as before: the old `_chunked` won over `_streaming`). Every
+/// other mode is set once and never goes back. Every other event only reads it:
+/// `writer`, both `end`s (the terminator for `chunked`), `resetBody`,
+/// `clearWriter`, `write` with an abandoned writer (keepalive off for a
+/// `declared_length` not met), `adopt` (a 200 only for `chunked` or
+/// `streaming`), `_park` (its `chunked` flag).
+const BodyMode = enum(u8) {
+    /// Not streamed: the head carries the body's length when `write`
+    /// sends both (the handler's own Content-Length, if set).
+    buffered,
+    /// Transfer-Encoding: chunked.
+    chunked,
+    /// Unframed by us: a sink's protocol frames it, an HTTP/1.0 body ends
+    /// with the connection, or the 101's upgraded protocol owns it.
+    streaming,
+    /// The handler's Content-Length header; `Response.content_length` has
+    /// the number.
+    declared_length,
+
+    /// `stream()`'s framing: a declared length first, then a sink's own
+    /// framing, then HTTP/1.0's close, else chunked.
+    fn forStream(declared: bool, sink: bool, http10: bool) BodyMode {
+        if (declared) return .declared_length;
+        if (sink or http10) return .streaming;
+        return .chunked;
+    }
+};
+
+/// The body writer a response has handed out and not ended, one value.
+/// Every move is a cell here; add a writer kind as a state, not a flag.
+///
+///   state           writer()          stream()          close
+///   none            open_buffering    open              none (no-op)
+///   open            = BodyWriterOpen  = BodyWriterOpen  none
+///   open_buffering  = BodyWriterOpen  = BodyWriterOpen  none
+///
+/// claim (`startBody`) is refused by `checkBodyNotStarted` before it moves,
+/// in this order: BodyWriterOpen, HeadersAlreadySent, BodyAlreadySet.
+/// close (`closeBodyWriter`) is `BodyWriter.end`, `StreamingBodyWriter.end`,
+/// `resetBody`, `write` with a writer the handler abandoned, `_park` and
+/// `parkAfterHead`; in `none` it is a no-op, which makes `end` idempotent.
+/// Kept as they were: `open` stays after a `stream()` that failed before its
+/// head (until `resetBody` or `write`); both `end`s are one event, so a stale
+/// `BodyWriter` ended after `resetBody` + `stream()` closes the stream's claim;
+/// `StreamingBodyWriter.end` in `open_buffering` is not reached (a stream
+/// exists only after its head, and `writer()` is refused after it).
+/// `clearWriter` reads it (spares an `open_buffering` writer's bytes), as do
+/// `json`, `memoryBodyLen` and `checkBodyNotStarted`.
+const BodyWriterState = enum(u8) { none, open, open_buffering };
+
+/// Where a response is in its life, one value. Every change is a cell of
+/// `next`; add a state or an event as a row there, never as a flag beside it.
+///
+///   phase      send_head   begin_write  end_stream  park
+///   building   head_sent   writing      =           =
+///   head_sent  =           finished     finished    parked
+///   writing    finished    =            =           =
+///   finished   =           =            =           parked
+///   parked     =           =            =           =
+///
+/// `=`: no change. The events: `send_head` where the head is committed,
+/// just before it is sent, so a failed send leaves it out (`stream`,
+/// `writeHeader`, `write`'s own head); `begin_write` at `write`'s entry and
+/// its 101 branch; `end_stream` in `StreamingBodyWriter.end`; `park` in
+/// `_park` and `parkAfterHead`, only once their `stream(&.{})` succeeded (a
+/// failed one leaves `building` or `head_sent`, as `stream` left it).
+/// `finished` x `park` is reached only from `writing`: `_canPark` lets a
+/// park start there (the head is not out), and its `stream(&.{})` moves
+/// writing -> finished before the `park`, which must still park it.
+/// Unreachable cells keep the state, their callers refuse first:
+/// `end_stream` needs an open stream, so a head; `park` runs `stream` first;
+/// a second `send_head` is refused by `stream`, skipped by `writeHeader`
+/// and `write`; `begin_write` and `end_stream` in `writing` and after are
+/// stopped by `writeDone`; no handler runs (so no `park`) while `write`
+/// is on the stack. `writing` is a `write` that began with the head not
+/// out: it stays when that write fails before its head (TooManyHeaders),
+/// so a second `write` sends nothing while `headersSent` stays false.
+/// `parked` stays when h1's `Parked_H1.create` fails after it: the head is
+/// out, keepalive is off, and the connection closes. `resetBody`, `fail`,
+/// `problem`, `header`, `addHeader`, `setCookie` refuse or do nothing once
+/// `headOut`; `deinit` does not change the phase.
+pub const Phase = enum(u8) {
+    /// Nothing on the wire; status, headers and body can still change.
+    building,
+    /// The head is out or committed (a stream, an event stream, the 101);
+    /// the body is going.
+    head_sent,
+    /// `write` began, its head not committed yet.
+    writing,
+    /// `write` or `end` ran: nothing more is sent.
+    finished,
+    /// `_park` sent the head; the parked stream owns the output.
+    parked,
+
+    pub const Event = enum { send_head, begin_write, end_stream, park };
+
+    const Row = std.EnumArray(Event, Phase);
+    const table = std.EnumArray(Phase, Row).init(.{
+        .building = .init(.{ .send_head = .head_sent, .begin_write = .writing, .end_stream = .building, .park = .building }),
+        .head_sent = .init(.{ .send_head = .head_sent, .begin_write = .finished, .end_stream = .finished, .park = .parked }),
+        .writing = .init(.{ .send_head = .finished, .begin_write = .writing, .end_stream = .writing, .park = .writing }),
+        .finished = .init(.{ .send_head = .finished, .begin_write = .finished, .end_stream = .finished, .park = .parked }),
+        .parked = .initFill(.parked),
+    });
+
+    const Facts = struct {
+        /// The head is out: `headersSent`.
+        head_out: bool,
+        /// `write` does nothing more.
+        write_done: bool,
+    };
+    const facts = std.EnumArray(Phase, Facts).init(.{
+        .building = .{ .head_out = false, .write_done = false },
+        .head_sent = .{ .head_out = true, .write_done = false },
+        .writing = .{ .head_out = false, .write_done = true },
+        .finished = .{ .head_out = true, .write_done = true },
+        .parked = .{ .head_out = true, .write_done = true },
+    });
+
+    pub fn next(p: Phase, ev: Event) Phase {
+        return table.get(p).get(ev);
+    }
+    pub fn headOut(p: Phase) bool {
+        return facts.get(p).head_out;
+    }
+    pub fn writeDone(p: Phase) bool {
+        return facts.get(p).write_done;
+    }
+};
+
+/// What a response may do with its engine (HTTP/2, HTTP/3), one value.
+/// Every change is a cell here; add a mode as a variant, not a flag.
+///
+///   value        install       block    detach     relocate fails  finish/abort
+///   unavailable  full|park_only blocked  -          -               -
+///   park_only    =             blocked  detached*  park_only       =
+///   full         =             blocked  detached   full            =
+///   blocked      =             =        -          -               -
+///   detached     =             =        -          -               =
+///
+/// `-`: refused before it moves (`canDetach`, `_canPark`). install is
+/// `_offerDetach`, once, by the engine on a fresh response; block is
+/// `_blockDetach`, from each middleware that is not detach-safe (the engine
+/// goes with it: every use of it is behind `canDetach` or `_canPark`, both
+/// false once blocked; `detached` stays, it already wins every guard);
+/// detach is `detachUnchecked`, set before `relocate` (which copies the
+/// response) and put back to the saved value if that fails; *: a
+/// `park_only` offer detaches only for `_park`. The engine's ctx lives in
+/// the offer, then in `Detached.engine_ctx` (the live copy `relocate`
+/// returns): nothing reads a response-side one after the detach.
+pub const Detach = union(enum) {
+    /// No engine: HTTP/1.x, tests.
+    unavailable,
+    /// A middleware that is not detach-safe ran.
+    blocked,
+    /// An HTTP/2 or HTTP/3 stream on its own task: `_park` only, so
+    /// `canDetach` stays false and the C ABI's detaching, which is for
+    /// requests on the reader, is unchanged.
+    park_only: Offer,
+    /// On the reader: `detach` and `_park`.
+    full: Offer,
+    /// `detach`, or a sink's `_park`, took it.
+    detached: *Detached,
+
+    pub const Offer = struct { engine: *const Detached.Engine, ctx: *anyopaque };
+    pub const Mode = enum { full, park_only };
 };
 
 /// Writes a response body straight to the connection as it is produced.
@@ -579,7 +762,7 @@ pub const StreamingBodyWriter = struct {
         // the peer (or a proxy reusing the connection) as the start of the
         // next response. Nothing of this write goes out, and the
         // connection is not reused.
-        if (self.res.content_length) |declared| if (!self.res._chunked and total > declared -| self.res.body_sent) {
+        if (self.res.content_length) |declared| if (total > declared -| self.res.body_sent) {
             self.res.keepalive = false;
             self.err = error.ContentLengthMismatch;
             return error.WriteFailed;
@@ -607,12 +790,11 @@ pub const StreamingBodyWriter = struct {
         const res = self.res;
         // Idempotent: a second `end` must not write a second terminator,
         // which the peer would read as the start of the next message.
-        if (!res._body_writer_open) return;
-        res._body_writer_open = false;
+        if (!res.closeBodyWriter()) return;
         // From here the bytes already sent are the response, whatever
         // happens next, so `write` must not add a terminator or a body to
         // them.
-        res._written = true;
+        res._phase = res._phase.next(.end_stream);
         // If this does not finish cleanly the body is not framed the way
         // its headers promised, and the connection cannot carry another
         // response.
@@ -626,7 +808,7 @@ pub const StreamingBodyWriter = struct {
         } else {
             try res.resolve(self.interface.flush());
         }
-        if (res._chunked and res.sendsBody()) try res.resolve(res._conn.?.writer.writeAll("0\r\n\r\n"));
+        if (res._body_mode == .chunked and res.sendsBody()) try res.resolve(res._conn.?.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.finish(res.bodyOut()));
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
@@ -814,25 +996,28 @@ pub const Response = struct {
     /// (HTTP/2 does, for gRPC status among others); over HTTP/1.x they are
     /// dropped.
     trailers: ?http.Headers = null,
-    _written: bool = false,
-    _headers_written: bool = false,
+    /// Where the response is; see `Phase`. Moved only by `Phase.next`.
+    _phase: Phase = .building,
     keepalive: bool = true,
-    _chunked: bool = false,
-    _streaming: bool = false,
+    /// How the body is framed on the wire; see `BodyMode`. Moved only by
+    /// `setBodyMode`. A mode but `buffered` does not by itself mean the head
+    /// is out (a failed 101 head leaves `streaming`, see `BodyMode`), so
+    /// `memoryBodyLen` keeps its `headersSent` test; `handOverLent` and
+    /// `sendBody` run only once the head is being sent.
+    _body_mode: BodyMode = .buffered,
+    /// The body writer handed out and not ended; see `BodyWriterState`.
+    /// Moved only by `startBody` and `closeBodyWriter`.
+    _body_writer: BodyWriterState = .none,
     /// The request was a HEAD, so the headers go out describing the body
     /// a GET would have sent, and the body itself does not. Set by the
     /// server; a handler writes its body either way and does not have to
     /// know.
     head: bool = false,
-    /// A body writer was handed out and has not been ended yet.
-    _body_writer_open: bool = false,
-    /// The open body writer is a `BodyWriter`, whose length the response
-    /// only learns when it ends.
-    _body_writer_buffering: bool = false,
     /// The request was HTTP/1.0, so the peer does not understand chunked
     /// encoding. Set by the server.
     http10: bool = false,
-    /// Length declared before streaming, if any. On the response rather
+    /// Length declared before streaming, if any: set with `_body_mode`
+    /// `.declared_length`, null in every other mode. On the response rather
     /// than the writer so that `write` can still tell whether the body
     /// that went out matched it, even if the writer was abandoned.
     content_length: ?usize = null,
@@ -882,23 +1067,10 @@ pub const Response = struct {
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
-    /// Set by an engine that can finish this response with no task waiting
-    /// for it (HTTP/2 and HTTP/3 requests that run on the reader): see
-    /// `detach`.
-    _detach_engine: ?*const Detached.Engine = null,
-    _detach_ctx: ?*anyopaque = null,
-    /// A middleware that is not detach-safe ran (`Detached`): `detach` is
-    /// refused.
-    _detach_blocked: bool = false,
-    /// Set by `detach`.
-    detached: ?*Detached = null,
-    /// The engine offers `detach` to `_park` only (an HTTP/2 or HTTP/3 stream on its
-    /// own task): `canDetach` stays false, so the C ABI's detaching, which
-    /// is for requests on the reader, is unchanged.
-    _detach_park_only: bool = false,
-    /// `_park` ran: the response is a parked stream's, and `write` does
-    /// nothing more.
-    _parked: bool = false,
+    /// What the response may do with an engine that can finish it with no
+    /// task waiting for it (HTTP/2 and HTTP/3): see `Detach`, `detach`,
+    /// `_park`.
+    _detach: Detach = .unavailable,
     /// HTTP/1.x: the next request is already buffered behind this one, so
     /// a whole in-memory body stays in the connection's write buffer
     /// instead of being flushed at its end; it goes out with the responses
@@ -937,10 +1109,11 @@ pub const Response = struct {
     /// a fixed buffer running out, say -- comes back as `Unexpected`.
     pub const SendError = Connection.WriteError || error{ Unexpected, WriteTimeout };
 
-    /// What `write` can fail with. `ContentLengthMismatch` is a body of
+    /// What `write` can fail with. No `HeaderError` among it: a head with no
+    /// room for its Content-Type goes out without it. `ContentLengthMismatch` is a body of
     /// another length than a handler-set Content-Length promises;
     /// `InvalidContentLength` is such a header that is not a number.
-    pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
+    pub const WriteError = SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
     /// The headers a response starts with room for: enough for most, so
     /// that an ordinary one takes little of the arena. The table grows to
@@ -1018,7 +1191,7 @@ pub const Response = struct {
     /// Whether the head has gone out, so the status and headers can no longer
     /// change (a stream, an event stream or a file has started).
     pub fn headersSent(self: *const Response) bool {
-        return self._headers_written;
+        return self._phase.headOut();
     }
 
     /// Whether the peer went away, so a failure is not the handler's fault.
@@ -1064,10 +1237,10 @@ pub const Response = struct {
     /// writer holds corked responses (this one goes out behind them), or
     /// the body cannot go out that way.
     fn promote(self: *Response, w: *std.Io.Writer, needed: usize) bool {
-        if (self._lent != null or self._sink != null or self._headers_written or self.head) return false;
+        if (self._lent != null or self._sink != null or self.headersSent() or self.head) return false;
         const conn = self._conn orelse return false;
         const pool = conn.write_pool orelse return false;
-        if (conn.upgraded or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
+        if (conn.mode.upgraded() or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
         const total = std.math.add(usize, w.end, needed) catch return false;
         if (total <= BodyBuffer.first_segment_len or total > pool.write_buffer_len -| head_room) return false;
         const lent = pool.takeWriteBuffer(@intFromPtr(conn)) catch return false;
@@ -1108,11 +1281,11 @@ pub const Response = struct {
     noinline fn handOverLent(self: *Response) bool {
         const lent = self._lent orelse return false;
         // `write` sends the buffer only when it holds anything, else `body`.
-        if (!self.sendsBody() or self._chunked or self._streaming or self.body_buffer.len() == 0) return false;
+        if (!self.sendsBody() or self._body_mode != .buffered or self.body_buffer.len() == 0) return false;
         const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
         const conn = self._conn.?;
         const buf = conn.write_pool.?.writeBytes(lent);
-        if (first.data != buf[head_room..].ptr or conn.upgraded) return false;
+        if (first.data != buf[head_room..].ptr or conn.mode.upgraded()) return false;
         const w = conn.writer;
         // Between requests the server gives the writer's buffer back unless
         // it holds corked responses.
@@ -1227,7 +1400,7 @@ pub const Response = struct {
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
-        if (self._headers_written) return error.HeadersAlreadySent;
+        if (self.headersSent()) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
@@ -1239,7 +1412,7 @@ pub const Response = struct {
     /// `Content-Length` never repeats: a second one replaces the first.
     /// The names `header` refuses, this refuses too.
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
-        if (self._headers_written) return error.HeadersAlreadySent;
+        if (self.headersSent()) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
@@ -1254,8 +1427,7 @@ pub const Response = struct {
     ///
     /// Call `end` on the result before returning from the handler.
     pub fn writer(self: *Response) http.MisuseError!BodyWriter {
-        try self.startBody();
-        self._body_writer_buffering = true;
+        try self.startBody(.open_buffering);
         // Without the memory, the first write fails the same way.
         self.body_buffer.reserveFirst(self.arena) catch {};
         return .init(self);
@@ -1270,7 +1442,7 @@ pub const Response = struct {
     /// The headers are on the wire when this returns, so nothing can change
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
-        try self.startBody();
+        try self.startBody(.open);
         // Everything that can fail comes before anything is committed: a
         // handler that gets an error from here still has open headers,
         // and the error response written in their place must not inherit
@@ -1290,24 +1462,17 @@ pub const Response = struct {
             }
         else
             null;
-        self._headers_written = true;
+        self._phase = self._phase.next(.send_head);
 
         if (compression != .off) self.addVary();
         if (compression.isCoding()) self.markCompressed(compression);
-        if (declared) |len| {
-            self.content_length = len;
-        } else if (self._sink != null) {
-            // The protocol under a sink frames the body itself.
-            self._streaming = true;
-        } else if (self.http10) {
-            // Chunked encoding came with HTTP/1.1. Before it, a body of
-            // unknown length ends when the connection does. A response
-            // that sends no body needs no such end.
-            self._streaming = true;
-            if (self.sendsBody()) self.keepalive = false;
-        } else {
-            self._chunked = true;
-        }
+        const mode: BodyMode = .forStream(declared != null, self._sink != null, self.http10);
+        self.setBodyMode(mode);
+        self.content_length = declared;
+        // Chunked encoding came with HTTP/1.1. Before it, a body of
+        // unknown length ends when the connection does. A response that
+        // sends no body needs no such end.
+        if (mode == .streaming and self._sink == null and self.sendsBody()) self.keepalive = false;
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
         // A sink sizes its body writer once the head is recorded, on its
         // first `body()` after it. Taken here, on the handler's task: the
@@ -1321,22 +1486,37 @@ pub const Response = struct {
 
     /// A body can be started: no writer open, no head sent, no body set.
     fn checkBodyNotStarted(self: *const Response) http.MisuseError!void {
-        if (self._body_writer_open) return error.BodyWriterOpen;
-        if (self._headers_written) return error.HeadersAlreadySent;
+        if (self._body_writer != .none) return error.BodyWriterOpen;
+        if (self.headersSent()) return error.HeadersAlreadySent;
         if (self.body.len != 0 or self.body_buffer.len() != 0) return error.BodyAlreadySet;
     }
 
-    fn startBody(self: *Response) http.MisuseError!void {
+    /// Claims the body for a writer of `kind` (`.open` for a stream,
+    /// `.open_buffering` for a `BodyWriter`): `BodyWriterState`'s claim.
+    fn startBody(self: *Response, kind: BodyWriterState) http.MisuseError!void {
         try self.checkBodyNotStarted();
-        self._body_writer_open = true;
+        self._body_writer = kind;
+    }
+
+    /// `BodyWriterState`'s close: true if a writer was open.
+    fn closeBodyWriter(self: *Response) bool {
+        const was_open = self._body_writer != .none;
+        self._body_writer = .none;
+        return was_open;
+    }
+
+    /// `BodyMode`'s move, while the head is not out: from `buffered`, or from
+    /// `streaming` after a 101 whose head failed (see `BodyMode`).
+    fn setBodyMode(self: *Response, mode: BodyMode) void {
+        self._body_mode = mode;
     }
 
     /// Throws away the body written so far. Not while a body writer is
     /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
         // A buffering writer is open: its bytes are its own.
-        if (self._body_writer_buffering) return;
-        self.clearBody(self._body_writer_open);
+        if (self._body_writer == .open_buffering) return;
+        self.clearBody(self._body_writer == .open);
     }
 
     /// Forgets the body. One in a write buffer (`promote`) gives it back
@@ -1360,13 +1540,10 @@ pub const Response = struct {
     /// wire the framing is already promised and the body cannot be
     /// swapped.
     pub fn resetBody(self: *Response) error{HeadersAlreadySent}!void {
-        if (self._headers_written) return error.HeadersAlreadySent;
+        if (self.headersSent()) return error.HeadersAlreadySent;
         // An open writer is abandoned with the body: `end` on it does
         // nothing once it is no longer the open one.
-        const writer_open = self._body_writer_open;
-        self._body_writer_open = false;
-        self._body_writer_buffering = false;
-        self.clearBody(writer_open);
+        self.clearBody(self.closeBodyWriter());
         self.body = "";
         self.closeFile();
         // Everything that described the old body has to go with it.
@@ -1407,7 +1584,7 @@ pub const Response = struct {
         });
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
-        if (self._body_writer_buffering) return error.BodyWriterOpen;
+        if (self._body_writer == .open_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
         const json_formatter = std.json.fmt(value, options);
@@ -1416,7 +1593,7 @@ pub const Response = struct {
     }
 
     fn jsonOut(self: *Response, value: anytype, options: json_out.Options) !void {
-        if (self._body_writer_buffering) return error.BodyWriterOpen;
+        if (self._body_writer == .open_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
         try json_out.write(&w.interface, value, options);
@@ -1433,7 +1610,7 @@ pub const Response = struct {
     ///
     /// The default `detail` of a problem with `errors` counts them.
     pub fn problem(self: *Response, p: http.Problem) void {
-        if (self._headers_written) return;
+        if (self.headersSent()) return;
         self.resetBody() catch return;
         self.status = p.status;
         self.content_type = .problem_json;
@@ -1457,7 +1634,7 @@ pub const Response = struct {
     /// Does nothing once the headers are on the wire: a started response
     /// cannot become another.
     pub fn fail(self: *Response, status: http.Status, message: []const u8) void {
-        if (self._headers_written) return;
+        if (self.headersSent()) return;
         self.resetBody() catch return;
         self.status = status;
         if (self.answersJson()) {
@@ -1632,7 +1809,7 @@ pub const Response = struct {
     /// .{ .path = "/", .max_age = .fromSeconds(86400) })`. Fails once the
     /// headers have gone out, or on a name or value a cookie cannot carry.
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
-        if (self._headers_written) return error.HeadersAlreadySent;
+        if (self.headersSent()) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
@@ -1673,20 +1850,22 @@ pub const Response = struct {
     /// Whether `detach` would work: the engine supports it, nothing has
     /// gone out, and every middleware the request passed is detach-safe.
     pub fn canDetach(self: *const Response) bool {
-        return self._detach_engine != null and !self._detach_park_only and !self._detach_blocked and self.detached == null and !self._headers_written;
+        return self._detach == .full and !self._phase.headOut();
     }
 
     /// Whether `_park` would work: an engine that parks (HTTP/1.1 with a
     /// connection to adopt, HTTP/2, HTTP/3) and no middleware on the way that is
     /// not detach-safe. Internal.
     pub fn _canPark(self: *const Response) bool {
-        if (self._detach_blocked or self._parked or self._headers_written or self.detached != null) return false;
-        if (self._sink != null) {
-            const engine = self._detach_engine orelse return false;
-            return engine.park != null;
-        }
+        if (self._phase.headOut()) return false;
+        const engine: ?*const Detached.Engine = switch (self._detach) {
+            .park_only, .full => |o| o.engine,
+            .unavailable => null,
+            .blocked, .detached => return false,
+        };
+        if (self._sink != null) return if (engine) |e| e.park != null else false;
         const conn = self._conn orelse return false;
-        return conn.adopter == null and !conn.upgraded and self.status != .switching_protocols;
+        return conn.mode.state == .http;
     }
 
     /// Writes the head (status and headers as set; chunked over HTTP/1.1)
@@ -1709,16 +1888,16 @@ pub const Response = struct {
         var w = self.stream(&.{}) catch return error.WriteFailed;
         _ = &w;
         // The head is out and the writer is the park's from here.
-        self._body_writer_open = false;
-        self._written = true;
-        self._parked = true;
+        _ = self.closeBodyWriter();
+        self._phase = self._phase.next(.park);
         conn.finishUpgrade();
-        const chunked = self._chunked;
+        const chunked = self._body_mode == .chunked;
         // The connection is the parked stream's: the server hands it to
-        // the adopter instead of waiting for a next request.
+        // the adopter instead of waiting for a next request. Without the
+        // memory for the adopter it stays parked and closes (`Phase`).
         self.keepalive = false;
         const h1 = Parked_H1.create(conn, chunked, owner) catch return error.OutOfMemory;
-        conn.adopter = &h1.adopter;
+        conn.adopt(&h1.adopter);
         return &h1.parked;
     }
 
@@ -1736,8 +1915,8 @@ pub const Response = struct {
             return error.WriteFailed;
         };
         _ = &w;
-        self._body_writer_open = false;
-        self._parked = true;
+        _ = self.closeBodyWriter();
+        self._phase = self._phase.next(.park);
         return p;
     }
 
@@ -1749,7 +1928,34 @@ pub const Response = struct {
     /// middleware that does work after `next.call()` puts it off with
     /// `onFinish` instead.
     pub fn isDetached(self: *const Response) bool {
-        return self.detached != null;
+        return self._detach == .detached;
+    }
+
+    /// The `Detached` that `detach` (or a sink's `_park`) made, if any:
+    /// for the engines and hooks.
+    pub fn _detachment(self: *const Response) ?*Detached {
+        return switch (self._detach) {
+            .detached => |d| d,
+            .unavailable, .blocked, .park_only, .full => null,
+        };
+    }
+
+    /// The engine's offer (`Detach`'s install), once, on a fresh response.
+    pub fn _offerDetach(self: *Response, engine: *const Detached.Engine, ctx: *anyopaque, mode: Detach.Mode) void {
+        const offer: Detach.Offer = .{ .engine = engine, .ctx = ctx };
+        self._detach = switch (mode) {
+            .full => .{ .full = offer },
+            .park_only => .{ .park_only = offer },
+        };
+    }
+
+    /// A middleware that is not detach-safe ran (`Detach`'s block): `detach`
+    /// and `_park` are refused from here.
+    pub fn _blockDetach(self: *Response) void {
+        switch (self._detach) {
+            .detached => {},
+            .unavailable, .blocked, .park_only, .full => self._detach = .blocked,
+        }
     }
 
     /// Detaches the response from the handler (see `Detached`): the handler
@@ -1766,17 +1972,24 @@ pub const Response = struct {
     }
 
     fn detachUnchecked(self: *Response, req: *Request, owner: Detached.Owner) error{OutOfMemory}!*Detached {
+        const saved = self._detach;
+        const offer = switch (saved) {
+            .park_only, .full => |o| o,
+            // `canDetach` and `_canPark` refuse these.
+            .unavailable, .blocked, .detached => unreachable,
+        };
         const d = try self.arena.create(Detached);
         d.* = .{
             .request = req,
             .response = self,
-            .engine = self._detach_engine.?,
-            .engine_ctx = self._detach_ctx.?,
+            .engine = offer.engine,
+            .engine_ctx = offer.ctx,
             .owner = owner,
         };
-        self.detached = d;
+        // Before `relocate`, which copies the response.
+        self._detach = .{ .detached = d };
         d.engine_ctx = d.engine.relocate(d) catch |err| {
-            self.detached = null;
+            self._detach = saved;
             return err;
         };
         return d;
@@ -1787,7 +2000,7 @@ pub const Response = struct {
     /// place of the work the middleware would have done after `next()`.
     /// `f` lives in the request's arena or longer.
     pub fn onFinish(self: *Response, f: *Detached.Finisher) void {
-        const d = self.detached orelse return;
+        const d = self._detachment() orelse return;
         f.next = null;
         if (d.last) |l| l.next = f else d.first = f;
         d.last = f;
@@ -1801,10 +2014,10 @@ pub const Response = struct {
     /// the handler does, `adopter.release` runs when the connection closes.
     /// The request and this response end with the handler.
     pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
-        if (self._sink != null or !self._headers_written) return error.Unsupported;
+        if (self._sink != null or !self.headersSent()) return error.Unsupported;
         // A 101, or a streamed 200 (a parked event stream).
-        if (self.status != .switching_protocols and !(self._streaming or self._chunked)) return error.Unsupported;
-        self._conn.?.adopter = adopter;
+        if (self.status != .switching_protocols and self._body_mode != .streaming and self._body_mode != .chunked) return error.Unsupported;
+        self._conn.?.adopt(adopter);
     }
 
     /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
@@ -1827,7 +2040,7 @@ pub const Response = struct {
         try self.header("Upgrade", "websocket");
         try self._putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
-        self._streaming = true;
+        self.setBodyMode(.streaming);
         // The connection is a WebSocket's from here: small windows, and the
         // request buffers' other pages back to the OS, the 101 included. It
         // cannot serve another request after that.
@@ -1908,8 +2121,8 @@ pub const Response = struct {
         self._request.?._applyLazyDeadline(null);
     }
 
-    /// Puts `content_type` into the headers. Before `headers_written` is
-    /// set, so it goes through the same door as every other header rather
+    /// Puts `content_type` into the headers. Before the head is committed
+    /// (`Phase`'s send_head), so it goes through the same door as every other header rather
     /// than around it.
     fn applyContentType(self: *Response) HeaderError!void {
         if (self.content_type) |content_type| {
@@ -2157,7 +2370,8 @@ pub const Response = struct {
         total: usize,
     ) std.Io.Writer.Error!void {
         const out = self.bodyOut();
-        if (self._chunked) {
+        const chunked = self._body_mode == .chunked;
+        if (chunked) {
             // 16 hex digits covers any usize, plus the CRLF.
             var size_buf: [18]u8 = undefined;
             try out.writeAll(std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable);
@@ -2165,17 +2379,17 @@ pub const Response = struct {
         try out.writeAll(pending);
         for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
         try out.splatBytesAll(data[data.len - 1], splat);
-        if (self._chunked) try out.writeAll("\r\n");
+        if (chunked) try out.writeAll("\r\n");
         try out.flush();
     }
 
     /// Sends the headers ahead of a body that is not buffered: a stream,
     /// or a protocol upgrade. A buffered body goes out with its headers in
     /// `write`, once its length is known.
-    fn writeHeader(self: *Response) WriteError!void {
-        if (self._headers_written) return;
+    fn writeHeader(self: *Response) (HeaderError || WriteError)!void {
+        if (self.headersSent()) return;
         try self.applyContentType();
-        self._headers_written = true;
+        self._phase = self._phase.next(.send_head);
         return self.resolve(self.sendHeaderAlone(self.bodyOut()));
     }
 
@@ -2236,16 +2450,14 @@ pub const Response = struct {
         // Framing, for a status that has a body to frame. RFC 9112 §6.1
         // and RFC 9110 §8.6 forbid both headers on a 1xx or 204; a HEAD
         // still reports the length its GET would have.
-        if (statusHasBody(self.status)) {
-            if (self._chunked) {
-                try w.writeAll("Transfer-Encoding: chunked\r\n");
-            } else if (!self._streaming) {
-                // Write Content-Length if not manually set (skip for streaming responses like SSE)
-                const has_content_length = self.headers.get("Content-Length") != null;
-                // The length and the end of the head, in one write.
-                if (!has_content_length) return writeLengthTail(w, self.bodyLen());
-            }
-        }
+        if (statusHasBody(self.status)) switch (self._body_mode) {
+            // The length and the end of the head, in one write, unless the
+            // handler set its own Content-Length (always, when declared).
+            .buffered, .declared_length => if (self.headers.get("Content-Length") == null) return writeLengthTail(w, self.bodyLen()),
+            .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
+            // Framed by the sink, by the close, or by the upgraded protocol.
+            .streaming => {},
+        };
 
         // End of headers (applies to both chunked and non-chunked)
         try w.writeAll("\r\n");
@@ -2255,24 +2467,20 @@ pub const Response = struct {
     /// out, and the body. The server calls it after the handler; a
     /// second call does nothing.
     pub fn write(self: *Response) WriteError!void {
-        if (self._written or self._parked) {
-            return;
-        }
+        if (self._phase.writeDone()) return;
         // An upgrade's 101 went out with it, and the connection is the
         // upgraded protocol's: its writer is not this response's to flush.
-        if (self.status == .switching_protocols and self._sink == null and self._conn.?.upgraded) {
-            self._written = true;
+        if (self._sink == null and self._conn.?.mode.upgraded()) {
+            self._phase = self._phase.next(.begin_write);
             return;
         }
         // A handler that failed part way through may never have called
         // `end`. Its buffer is gone, so whatever it held is lost either
         // way; recover rather than take the process down, and make sure a
         // started body is still framed correctly.
-        if (self._body_writer_open) {
-            self._body_writer_open = false;
-            // A body writer that was never ended goes out as far as it was
-            // last flushed, framed to match.
-            self._body_writer_buffering = false;
+        // A body writer that was never ended goes out as far as it was last
+        // flushed, framed to match.
+        if (self.closeBodyWriter()) {
             // Streaming under way with a declared length: whatever the
             // writer still held is gone with the handler's buffer, so the
             // body is short. Nothing can make it match the length we
@@ -2281,26 +2489,29 @@ pub const Response = struct {
             // needs no such care: `sendBody` terminates it, and a
             // truncated but well framed body is one the peer can finish,
             // though a gzipped one will not decode to the end.
-            if (self._headers_written and !self._chunked) {
-                if (self.content_length) |declared| {
-                    if (self.body_sent != declared) self.keepalive = false;
-                }
+            if (self.content_length) |declared| {
+                if (self.body_sent != declared) self.keepalive = false;
             }
             // If nothing was sent yet, a buffered body lives in the arena
             // and is still good, so leave it be: an error handler that
             // built a replacement has already cleared it.
         }
-        self._written = true;
+        self._phase = self._phase.next(.begin_write);
         defer self.closeFile();
 
         // Already false for a chunked response: the streaming writer
-        // settled the headers when it sent them.
-        const send_header = !self._headers_written;
+        // settled the headers when it sent them. `begin_write` keeps it.
+        const send_header = !self._phase.headOut();
         if (send_header) {
-            try self.applyContentType();
+            // The table is full: the handler's response is still good, so it
+            // goes out without a Content-Type rather than not at all.
+            self.applyContentType() catch log.warn(
+                "response has no room for its Content-Type, sent without it (response.max_header_count)",
+                .{},
+            );
             if (self._default_content_type) |default| {
                 if (self.file == null and self.bodyLen() > 0 and self.headers.get("Content-Type") == null) {
-                    try self.header("Content-Type", default.toContentType());
+                    self.header("Content-Type", default.toContentType()) catch {};
                 }
             }
             const compression = self.negotiateCompression();
@@ -2308,14 +2519,14 @@ pub const Response = struct {
             if (compression.isCoding()) {
                 if (self.status == .not_modified) self.markCompressed(compression) else self.compressBody(compression);
             }
-            self._headers_written = true;
+            self._phase = self._phase.next(.send_head);
         }
 
         // A length promised by a Content-Length the handler set itself: a
         // body of another length cannot be framed as promised, and the
         // connection cannot carry another response after it.
         // A streamed body is the streaming writer's to account for.
-        if (self.sendsBody() and !self._chunked and !self._streaming and self.content_length == null) {
+        if (self.sendsBody() and self._body_mode == .buffered) {
             if (try self.declaredLength()) |declared| {
                 if (self.bodyLen() != declared) {
                     self.keepalive = false;
@@ -2459,7 +2670,7 @@ pub const Response = struct {
     /// `copyBody` takes its bytes. Null for any other: a file, a stream,
     /// a body writer still open, or headers already sent.
     pub fn memoryBodyLen(self: *const Response) ?usize {
-        if (self.file != null or self._headers_written or self._body_writer_open or self._streaming or self._chunked) return null;
+        if (self.file != null or self.headersSent() or self._body_writer != .none or self._body_mode != .buffered) return null;
         return self.bodyLen();
     }
 
@@ -2487,7 +2698,7 @@ pub const Response = struct {
     /// sentinel, as anything writing to a `std.Io.Writer` does; `write`
     /// resolves it.
     fn sendBody(self: *Response, w: *std.Io.Writer, send_header: bool) std.Io.Writer.Error!void {
-        if (self._chunked) {
+        if (self._body_mode == .chunked) {
             // A streaming writer sent the headers; all that is left is the
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
@@ -2497,7 +2708,7 @@ pub const Response = struct {
 
         if (send_header) {
             try self.sendHeader(w);
-        } else if (self._streaming or self.content_length != null) {
+        } else if (self._body_mode != .buffered) {
             // A stream's head is out with its framing (a declared length,
             // close-delimited, or the sink's), and what it sent is the
             // body. One abandoned before `end` stays short: a `body` set
@@ -2536,8 +2747,15 @@ pub const Response = struct {
     /// no body.
     fn headLength(self: *const Response) ?usize {
         if (!statusHasBody(self.status)) return null;
-        if (self._streaming or self._chunked) return self.content_length;
-        return self.bodyLen();
+        return switch (self._body_mode) {
+            .buffered => self.bodyLen(),
+            .chunked, .streaming => null,
+            // Kept as it was: bodyLen(), not `content_length`, so a
+            // declared stream reports what is buffered (0), against the
+            // doc above and sink.zig's. No wire byte depends on it; h3's
+            // `length_hint` sizes the stream's buffer from it.
+            .declared_length => self.bodyLen(),
+        };
     }
 };
 
@@ -2762,6 +2980,14 @@ const head_cases = [_]HeadCase{
     .{ .headers = &.{.{ "Content-Length", "2" }}, .body = "hi", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 2\r\n\r\nhi" },
     .{ .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" },
     .{ .head = true, .body = "hello", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 5\r\n\r\n" },
+    // Streams, by framing: a declared length goes out as it is, HTTP/1.0
+    // ends by closing, a HEAD or a 204/304 sends no body and no framing.
+    .{ .headers = &.{.{ "Content-Length", "3" }}, .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\nabc" },
+    .{ .http10 = true, .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Connection: close\r\n\r\nabc" },
+    .{ .head = true, .headers = &.{.{ "Content-Length", "3" }}, .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\n" },
+    .{ .head = true, .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Transfer-Encoding: chunked\r\n\r\n" },
+    .{ .status = .no_content, .stream = true, .body = "abc", .expected = "HTTP/1.1 204 No Content\r\n" ++ masked_date_line ++ "\r\n" },
+    .{ .status = .not_modified, .stream = true, .body = "abc", .expected = "HTTP/1.1 304 Not Modified\r\n" ++ masked_date_line ++ "\r\n" },
     .{ .headers = &.{.{ "Date", "Sun, 06 Nov 1994 08:49:37 GMT" }}, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 1\r\n\r\nx" },
     .{ .send_date = false, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx" },
     .{ .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 0\r\n\r\n" },
@@ -3816,6 +4042,29 @@ test "Response: a WebSocket upgrade whose 101 fails reports the real error, not 
     try request.headers.put("Sec-WebSocket-Version", "13");
     try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
     try std.testing.expectError(error.ConnectionResetByPeer, response._upgradeWebSocket(&request));
+}
+
+test "Response: a WebSocket upgrade's 101 is byte-for-byte what it was" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [16]u8 = undefined;
+    var sink: CountingSink = .init(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined, .method = .get, .io = std.testing.io, .headers = try http.Headers.init(arena.allocator(), 8) };
+    try request.headers.put("Upgrade", "websocket");
+    try request.headers.put("Connection", "Upgrade");
+    try request.headers.put("Sec-WebSocket-Version", "13");
+    // RFC 6455 §1.3's example key and its accept value.
+    try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    _ = (try response._upgradeWebSocket(&request)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", sink.sent());
+    // The 101's connection can be adopted, as a streamed 200's can.
+    var adopter: Adopter = .{ .serve = undefined, .release = undefined };
+    try response.adopt(&adopter);
 }
 
 test "Response: a write that recorded no cause reports Unexpected" {
@@ -5221,6 +5470,63 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\noops"));
 }
 
+test "Response: a Content-Type with no room is left out, not an error" {
+    const Source = enum { default, content_type, header_first };
+    const max = 4;
+    // `head` is the whole wire form when the table has room: what the
+    // response sent before the Content-Type had a way to be left out.
+    const rows = [_]struct { name: []const u8, source: Source, fillers: usize, has_type: bool, head: ?[]const u8 = null }{
+        .{ .name = "default, fits", .source = .default, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: 2\r\n\r\nhi" },
+        .{ .name = "content_type, fits", .source = .content_type, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nhi" },
+        .{ .name = "explicit header first, full table", .source = .header_first, .fillers = max - 1, .has_type = true, .head = "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nX-0: v\r\nX-1: v\r\nX-2: v\r\nContent-Length: 2\r\n\r\nhi" },
+        .{ .name = "default, full", .source = .default, .fillers = max, .has_type = false },
+        .{ .name = "content_type, full", .source = .content_type, .fillers = max, .has_type = false },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, max);
+        response._default_content_type = .text;
+        switch (row.source) {
+            .default => {},
+            .content_type => response.content_type = .json,
+            .header_first => try response.header("Content-Type", "text/csv"),
+        }
+        const names = [_][]const u8{ "X-0", "X-1", "X-2", "X-3" };
+        for (names[0..row.fillers]) |n| try response.header(n, "v");
+        response.body = "hi";
+        try response.write();
+
+        const written = conn_writer.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(row.has_type, std.mem.indexOf(u8, written, "Content-Type: ") != null);
+        try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhi"));
+        if (row.head) |head| try std.testing.expectEqualStrings(head, written);
+    }
+}
+
+test "Response: write cannot fail with a header error" {
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (comptime std.meta.fieldNames(ErrorSetOf(Response.write))) |written| {
+        inline for (comptime std.meta.fieldNames(Response.HeaderError)) |header_err| {
+            try std.testing.expect(!std.mem.eql(u8, written, header_err));
+        }
+    }
+    const has_too_many = inline for (comptime std.meta.fieldNames(ErrorSetOf(Response.writeHeader))) |n| {
+        if (std.mem.eql(u8, n, "TooManyHeaders")) break true;
+    } else false;
+    try std.testing.expect(has_too_many);
+}
+
 test "Response: compress without room for its headers sends the body as it is" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6085,6 +6391,302 @@ test "misuse: a writer while a stream is open is BodyWriterOpen; after the head,
     try std.testing.expectError(error.HeadersAlreadySent, response.resetBody());
 }
 
+test "BodyMode.forStream: a declared length first, then a sink, then HTTP/1.0, else chunked" {
+    const Row = struct { declared: bool, sink: bool, http10: bool, expected: BodyMode };
+    const rows = [_]Row{
+        .{ .declared = false, .sink = false, .http10 = false, .expected = .chunked },
+        .{ .declared = false, .sink = false, .http10 = true, .expected = .streaming },
+        .{ .declared = false, .sink = true, .http10 = false, .expected = .streaming },
+        .{ .declared = false, .sink = true, .http10 = true, .expected = .streaming },
+        .{ .declared = true, .sink = false, .http10 = false, .expected = .declared_length },
+        .{ .declared = true, .sink = false, .http10 = true, .expected = .declared_length },
+        .{ .declared = true, .sink = true, .http10 = false, .expected = .declared_length },
+        .{ .declared = true, .sink = true, .http10 = true, .expected = .declared_length },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {any}\n", .{row});
+        try std.testing.expectEqual(row.expected, BodyMode.forStream(row.declared, row.sink, row.http10));
+    }
+}
+
+/// How a body-writer table row reaches its state, through the public API.
+const BodyStart = enum { none, stream_open, writer_open, head_out, body_set, writer_open_body_set, head_out_body_set };
+
+test "Response: body writer claims and refusals, every state" {
+    const Event = enum { writer, stream, reset_body, json };
+    const Row = struct { start: BodyStart, event: Event, expected: ?anyerror };
+    const rows = [_]Row{
+        .{ .start = .none, .event = .writer, .expected = null },
+        .{ .start = .none, .event = .stream, .expected = null },
+        .{ .start = .none, .event = .reset_body, .expected = null },
+        .{ .start = .none, .event = .json, .expected = null },
+        .{ .start = .stream_open, .event = .writer, .expected = error.BodyWriterOpen },
+        .{ .start = .stream_open, .event = .stream, .expected = error.BodyWriterOpen },
+        .{ .start = .stream_open, .event = .reset_body, .expected = error.HeadersAlreadySent },
+        .{ .start = .stream_open, .event = .json, .expected = error.HeadersAlreadySent },
+        .{ .start = .writer_open, .event = .writer, .expected = error.BodyWriterOpen },
+        .{ .start = .writer_open, .event = .stream, .expected = error.BodyWriterOpen },
+        .{ .start = .writer_open, .event = .reset_body, .expected = null },
+        .{ .start = .writer_open, .event = .json, .expected = error.BodyWriterOpen },
+        .{ .start = .head_out, .event = .writer, .expected = error.HeadersAlreadySent },
+        .{ .start = .head_out, .event = .stream, .expected = error.HeadersAlreadySent },
+        .{ .start = .head_out, .event = .reset_body, .expected = error.HeadersAlreadySent },
+        .{ .start = .head_out, .event = .json, .expected = error.HeadersAlreadySent },
+        .{ .start = .body_set, .event = .writer, .expected = error.BodyAlreadySet },
+        .{ .start = .body_set, .event = .stream, .expected = error.BodyAlreadySet },
+        .{ .start = .body_set, .event = .reset_body, .expected = null },
+        .{ .start = .body_set, .event = .json, .expected = null },
+        // Refusal order, when two apply: an open writer, then the head, then a body.
+        .{ .start = .writer_open_body_set, .event = .writer, .expected = error.BodyWriterOpen },
+        .{ .start = .writer_open_body_set, .event = .stream, .expected = error.BodyWriterOpen },
+        .{ .start = .head_out_body_set, .event = .writer, .expected = error.HeadersAlreadySent },
+        .{ .start = .head_out_body_set, .event = .stream, .expected = error.HeadersAlreadySent },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {t} x {t}\n", .{ row.start, row.event });
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        var body_buf: [64]u8 = undefined;
+        switch (row.start) {
+            .none => {},
+            .stream_open => _ = try response.stream(&body_buf),
+            .writer_open => _ = try response.writer(),
+            .head_out => {
+                var w = try response.stream(&body_buf);
+                try w.end();
+            },
+            .body_set => response.body = "x",
+            .writer_open_body_set => {
+                _ = try response.writer();
+                response.body = "x";
+            },
+            .head_out_body_set => {
+                var w = try response.stream(&body_buf);
+                try w.end();
+                response.body = "x";
+            },
+        }
+        const head_out = response.headersSent();
+        var second_buf: [64]u8 = undefined;
+        const result: anyerror!void = switch (row.event) {
+            .writer => if (response.writer()) |_| {} else |err| err,
+            .stream => if (response.stream(&second_buf)) |_| {} else |err| err,
+            .reset_body => response.resetBody(),
+            .json => response.json(.{ .ok = true }),
+        };
+        if (row.expected) |expected| {
+            try std.testing.expectError(expected, result);
+            // A refusal changes nothing that went out.
+            try std.testing.expectEqual(head_out, response.headersSent());
+        } else try result;
+    }
+}
+
+test "Response: a second end is a no-op, for every kind of body writer" {
+    const Row = struct { name: []const u8, length: ?[]const u8 = null, buffering: bool = false, expected: []const u8 };
+    const rows = [_]Row{
+        .{ .name = "buffering", .buffering = true, .expected = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc" },
+        .{ .name = "chunked stream", .expected = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" },
+        .{ .name = "declared stream", .length = "3", .expected = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc" },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        if (row.length) |len| try response.header("Content-Length", len);
+        if (row.buffering) {
+            var w = try response.writer();
+            try w.interface.writeAll("abc");
+            try w.end();
+            try w.end();
+        } else {
+            var body_buf: [64]u8 = undefined;
+            var w = try response.stream(&body_buf);
+            try w.interface.writeAll("abc");
+            try w.end();
+            try w.end();
+        }
+        try response.write();
+        try std.testing.expectEqualStrings(row.expected, conn_writer.buffered());
+        try std.testing.expect(response.keepalive);
+    }
+}
+
+test "Response: a writer the handler abandoned is closed by write, keepalive by framing" {
+    const Row = struct { name: []const u8, length: ?[]const u8 = null, http10: bool = false, buffering: bool = false, keepalive: bool, ends_with: []const u8 };
+    const rows = [_]Row{
+        .{ .name = "buffering", .buffering = true, .keepalive = true, .ends_with = "Content-Length: 3\r\n\r\nabc" },
+        .{ .name = "chunked stream", .keepalive = true, .ends_with = "3\r\nabc\r\n0\r\n\r\n" },
+        .{ .name = "declared stream, short", .length = "5", .keepalive = false, .ends_with = "Content-Length: 5\r\n\r\nabc" },
+        .{ .name = "declared stream, whole", .length = "3", .keepalive = true, .ends_with = "Content-Length: 3\r\n\r\nabc" },
+        .{ .name = "HTTP/1.0 stream", .http10 = true, .keepalive = false, .ends_with = "Connection: close\r\n\r\nabc" },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        response.http10 = row.http10;
+        if (row.length) |len| try response.header("Content-Length", len);
+        var body_buf: [64]u8 = undefined;
+        if (row.buffering) {
+            var w = try response.writer();
+            try w.interface.writeAll("abc");
+            try w.interface.flush();
+        } else {
+            var w = try response.stream(&body_buf);
+            try w.interface.writeAll("abc");
+            try w.interface.flush();
+        }
+        // The handler returns without `end`.
+        try response.write();
+        try std.testing.expectEqual(row.keepalive, response.keepalive);
+        try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), row.ends_with));
+        // Closed: a body writer is no longer open.
+        try std.testing.expectError(error.HeadersAlreadySent, response.writer());
+    }
+}
+
+test "Response: a stream that failed before its head keeps its claim until resetBody or write" {
+    for ([_]bool{ true, false }) |reset| {
+        errdefer std.debug.print("reset: {}\n", .{reset});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        try response.header("Content-Length", "abc");
+        var body_buf: [64]u8 = undefined;
+        try std.testing.expectError(error.InvalidContentLength, response.stream(&body_buf));
+        try std.testing.expect(!response.headersSent());
+        try std.testing.expectError(error.BodyWriterOpen, response.writer());
+        try std.testing.expectError(error.BodyWriterOpen, response.stream(&body_buf));
+        if (reset) {
+            try response.resetBody();
+            var w = try response.writer();
+            try w.interface.writeAll("oops");
+            try w.end();
+        } else {
+            // The stream's claim is not a buffering writer's, so json is
+            // not refused; the error handler drops the bad header itself.
+            try response.json(.{ .ok = false });
+            _ = response.headers.remove("Content-Length");
+        }
+        response.status = .internal_server_error;
+        try response.write();
+        const expected: []const u8 = if (reset) "Content-Length: 4\r\n\r\noops" else "Content-Length: 12\r\n\r\n{\"ok\":false}";
+        try std.testing.expect(std.mem.startsWith(u8, conn_writer.buffered(), "HTTP/1.1 500"));
+        try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), expected));
+        try std.testing.expect(response.keepalive);
+    }
+}
+
+test "Response: clearWriter spares an open buffering writer's bytes, and clears them once it is ended" {
+    for ([_]bool{ true, false }) |open| {
+        errdefer std.debug.print("open: {}\n", .{open});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        var w = try response.writer();
+        try w.interface.writeAll("ab");
+        if (open) {
+            response.clearWriter();
+            try w.end();
+        } else {
+            try w.end();
+            response.clearWriter();
+            response.body = "z";
+        }
+        try response.write();
+        const expected: []const u8 = if (open) "Content-Length: 2\r\n\r\nab" else "Content-Length: 1\r\n\r\nz";
+        try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), expected));
+    }
+}
+
+test "Response: framing readers, by framing" {
+    const Framing = enum { buffered, writer_open, chunked, http10, declared };
+    const Row = struct { framing: Framing, memory_len: ?usize, adopt: bool, terminator: bool };
+    const rows = [_]Row{
+        .{ .framing = .buffered, .memory_len = 3, .adopt = false, .terminator = false },
+        .{ .framing = .writer_open, .memory_len = null, .adopt = false, .terminator = false },
+        .{ .framing = .chunked, .memory_len = null, .adopt = true, .terminator = true },
+        .{ .framing = .http10, .memory_len = null, .adopt = true, .terminator = false },
+        .{ .framing = .declared, .memory_len = null, .adopt = false, .terminator = false },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("row: {t}\n", .{row.framing});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        var body_buf: [64]u8 = undefined;
+        switch (row.framing) {
+            .buffered => response.body = "abc",
+            .writer_open => {
+                var w = try response.writer();
+                try w.interface.writeAll("abc");
+            },
+            .chunked, .http10, .declared => {
+                response.http10 = row.framing == .http10;
+                if (row.framing == .declared) try response.header("Content-Length", "3");
+                var w = try response.stream(&body_buf);
+                try w.interface.writeAll("abc");
+                try w.interface.flush();
+            },
+        }
+        try std.testing.expectEqual(row.memory_len, response.memoryBodyLen());
+        var adopter: Adopter = .{ .serve = undefined, .release = undefined };
+        if (row.adopt) try response.adopt(&adopter) else try std.testing.expectError(error.Unsupported, response.adopt(&adopter));
+        try response.write();
+        try std.testing.expectEqual(row.terminator, std.mem.endsWith(u8, conn_writer.buffered(), "\r\n0\r\n\r\n"));
+    }
+}
+
+test "Response sink: a declared-length stream passes its Content-Length through and sends the body unframed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    try response.header("Content-Length", "5");
+    var buf: [8]u8 = undefined;
+    var body = try response.stream(&buf);
+    // The head's length argument is not asserted: a declared stream
+    // reports what is buffered (respbody note, issue line), not 5.
+    try std.testing.expectEqual(@as(usize, 1), ts.heads);
+    try std.testing.expectEqualStrings("5", response.headers.get("Content-Length").?);
+    try body.interface.writeAll("hello");
+    try body.end();
+    try response.write();
+
+    try std.testing.expectEqualStrings("hello", ts.body());
+    try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
 fn expectProblemBody(p: http.Problem, expected: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6262,4 +6864,418 @@ test "json: other std.json options keep std.json's bytes" {
     try expectStdJson(value, .{ .emit_nonportable_numbers_as_strings = true });
     // Non-finite floats stay std.json's on a type without renames.
     try expectStdJson(.{ std.math.nan(f64), std.math.inf(f32), -std.math.inf(f64) }, .{});
+}
+
+test "Phase: every (phase, event) pair" {
+    const Row = struct { from: Phase, event: Phase.Event, to: Phase };
+    const rows = [_]Row{
+        .{ .from = .building, .event = .send_head, .to = .head_sent },
+        .{ .from = .building, .event = .begin_write, .to = .writing },
+        .{ .from = .building, .event = .end_stream, .to = .building },
+        .{ .from = .building, .event = .park, .to = .building },
+
+        .{ .from = .head_sent, .event = .send_head, .to = .head_sent },
+        .{ .from = .head_sent, .event = .begin_write, .to = .finished },
+        .{ .from = .head_sent, .event = .end_stream, .to = .finished },
+        .{ .from = .head_sent, .event = .park, .to = .parked },
+
+        .{ .from = .writing, .event = .send_head, .to = .finished },
+        .{ .from = .writing, .event = .begin_write, .to = .writing },
+        .{ .from = .writing, .event = .end_stream, .to = .writing },
+        .{ .from = .writing, .event = .park, .to = .writing },
+
+        .{ .from = .finished, .event = .send_head, .to = .finished },
+        .{ .from = .finished, .event = .begin_write, .to = .finished },
+        .{ .from = .finished, .event = .end_stream, .to = .finished },
+        .{ .from = .finished, .event = .park, .to = .parked },
+
+        .{ .from = .parked, .event = .send_head, .to = .parked },
+        .{ .from = .parked, .event = .begin_write, .to = .parked },
+        .{ .from = .parked, .event = .end_stream, .to = .parked },
+        .{ .from = .parked, .event = .park, .to = .parked },
+    };
+    var seen = std.EnumArray(Phase, std.EnumArray(Phase.Event, u8)).initFill(.initFill(0));
+    for (rows) |row| {
+        seen.getPtr(row.from).getPtr(row.event).* += 1;
+        try std.testing.expectEqual(row.to, row.from.next(row.event));
+    }
+    for (std.enums.values(Phase)) |p| for (std.enums.values(Phase.Event)) |ev| {
+        try std.testing.expectEqual(@as(u8, 1), seen.get(p).get(ev));
+    };
+
+    // The facts are the old (`_headers_written`, `_written or _parked`)
+    // pair; `headersSent` reads the first.
+    const Fact = struct { phase: Phase, head_out: bool, write_done: bool };
+    const facts = [_]Fact{
+        .{ .phase = .building, .head_out = false, .write_done = false },
+        .{ .phase = .head_sent, .head_out = true, .write_done = false },
+        .{ .phase = .writing, .head_out = false, .write_done = true },
+        .{ .phase = .finished, .head_out = true, .write_done = true },
+        .{ .phase = .parked, .head_out = true, .write_done = true },
+    };
+    for (facts) |f| {
+        try std.testing.expectEqual(f.head_out, f.phase.headOut());
+        try std.testing.expectEqual(f.write_done, f.phase.writeDone());
+        var res: Response = undefined;
+        res._phase = f.phase;
+        try std.testing.expectEqual(f.head_out, res.headersSent());
+    }
+}
+
+/// An engine for the detach rows: `relocate` leaves the response where it
+/// is (or fails), `park` hands out one inert `Parked`.
+const TestEngine = struct {
+    var parked: Parked = .{ .vtable = undefined };
+
+    fn relocate(d: *Detached) error{OutOfMemory}!*anyopaque {
+        return d.engine_ctx;
+    }
+    fn relocateFails(_: *Detached) error{OutOfMemory}!*anyopaque {
+        return error.OutOfMemory;
+    }
+    fn end(_: *Detached, _: anyerror!void) void {}
+    fn attach(_: *Detached, _: Detached.Spawn) Detached.AttachError!void {}
+    fn enter(_: *Detached) void {}
+    fn park(_: *Detached, _: Parked.Owner) error{ OutOfMemory, WriteFailed }!*Parked {
+        return &parked;
+    }
+
+    const parks: Detached.Engine = .{ .relocate = relocate, .end = end, .attach = attach, .enter = enter, .park = park };
+    const no_park: Detached.Engine = .{ .relocate = relocate, .end = end, .attach = attach, .enter = enter };
+    const fails: Detached.Engine = .{ .relocate = relocateFails, .end = end, .attach = attach, .enter = enter, .park = park };
+};
+
+test "Detach: install and block over every value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = try Response._init(arena.allocator(), &connection, 32);
+    var ctx: u8 = 0;
+    var d: Detached = undefined;
+    const offer: Detach.Offer = .{ .engine = &TestEngine.parks, .ctx = &ctx };
+    const Tag = std.meta.Tag(Detach);
+
+    // install, on the fresh response the engines call it on.
+    for ([_]struct { mode: Detach.Mode, to: Tag }{
+        .{ .mode = .full, .to = .full },
+        .{ .mode = .park_only, .to = .park_only },
+    }) |row| {
+        res._detach = .unavailable;
+        res._offerDetach(offer.engine, offer.ctx, row.mode);
+        try std.testing.expectEqual(row.to, std.meta.activeTag(res._detach));
+        const got = switch (res._detach) {
+            .full, .park_only => |o| o,
+            .unavailable, .blocked, .detached => unreachable,
+        };
+        try std.testing.expectEqual(offer, got);
+    }
+
+    // block, from each value: refuses detach and park from there, but
+    // a detached response stays detached.
+    const rows = [_]struct { from: Detach, to: Tag }{
+        .{ .from = .unavailable, .to = .blocked },
+        .{ .from = .blocked, .to = .blocked },
+        .{ .from = .{ .park_only = offer }, .to = .blocked },
+        .{ .from = .{ .full = offer }, .to = .blocked },
+        .{ .from = .{ .detached = &d }, .to = .detached },
+    };
+    for (rows) |row| {
+        res._detach = row.from;
+        res._blockDetach();
+        try std.testing.expectEqual(row.to, std.meta.activeTag(res._detach));
+        try std.testing.expect(!res.canDetach());
+        try std.testing.expect(!res._canPark());
+    }
+    try std.testing.expectEqual(@as(?*Detached, &d), res._detachment());
+
+    // And for a sink, whose park needs the engine.
+    var ts: TestSink = undefined;
+    ts.init();
+    var sink_res = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    sink_res._offerDetach(offer.engine, offer.ctx, .full);
+    try std.testing.expect(sink_res.canDetach() and sink_res._canPark());
+    sink_res._blockDetach();
+    try std.testing.expect(!sink_res.canDetach() and !sink_res._canPark());
+}
+
+test "Response: canDetach and _canPark over every (phase, detach) cell" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var d: Detached = undefined;
+    var ctx: u8 = 0;
+
+    // The grid of the note, for the phases with the head not out
+    // (`building`, `writing`); with it out every answer is false.
+    const Tag = std.meta.Tag(Detach);
+    const Cell = struct { detach: Tag, can_detach: bool, park_sink: bool, park_sink_no_park: bool, park_h1: bool };
+    const cells = [_]Cell{
+        .{ .detach = .unavailable, .can_detach = false, .park_sink = false, .park_sink_no_park = false, .park_h1 = true },
+        .{ .detach = .blocked, .can_detach = false, .park_sink = false, .park_sink_no_park = false, .park_h1 = false },
+        .{ .detach = .park_only, .can_detach = false, .park_sink = true, .park_sink_no_park = false, .park_h1 = true },
+        .{ .detach = .full, .can_detach = true, .park_sink = true, .park_sink_no_park = false, .park_h1 = true },
+        .{ .detach = .detached, .can_detach = false, .park_sink = false, .park_sink_no_park = false, .park_h1 = false },
+    };
+    const Context = enum { sink, sink_no_park, h1 };
+    for (std.enums.values(Context)) |context| {
+        var res = switch (context) {
+            .sink, .sink_no_park => try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32),
+            .h1 => try Response._init(arena.allocator(), &connection, 32),
+        };
+        const engine: *const Detached.Engine = if (context == .sink_no_park) &TestEngine.no_park else &TestEngine.parks;
+        const offer: Detach.Offer = .{ .engine = engine, .ctx = &ctx };
+        for (cells) |cell| for (std.enums.values(Phase)) |phase| {
+            res._phase = phase;
+            res._detach = switch (cell.detach) {
+                .unavailable => .unavailable,
+                .blocked => .blocked,
+                .park_only => .{ .park_only = offer },
+                .full => .{ .full = offer },
+                .detached => .{ .detached = &d },
+            };
+            const open = !phase.headOut();
+            const park = switch (context) {
+                .sink => cell.park_sink,
+                .sink_no_park => cell.park_sink_no_park,
+                .h1 => cell.park_h1,
+            };
+            try std.testing.expectEqual(open and cell.can_detach, res.canDetach());
+            try std.testing.expectEqual(open and park, res._canPark());
+        };
+    }
+}
+
+test "Response: an HTTP/1.1 response parks only on a connection still in plain HTTP/1.x" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var adopter: Adopter = .{ .serve = undefined, .release = undefined };
+    const Row = struct { name: []const u8, events: []const Connection.Mode.Event = &.{}, status: http.Status = .ok, parks: bool };
+    // A 101 status set by hand with nothing written still parks: `_park`
+    // forces 200 itself, and the mode, not the status, says the
+    // connection left HTTP/1.x (research/s3/batch3/loopmode.md R3).
+    const rows = [_]Row{
+        .{ .name = "plain", .parks = true },
+        .{ .name = "101 not written", .status = .switching_protocols, .parks = true },
+        .{ .name = "adopted", .events = &.{.{ .adopt = &adopter }}, .parks = false },
+        .{ .name = "upgraded", .events = &.{.finish_upgrade}, .parks = false },
+        .{ .name = "upgraded and adopted", .events = &.{ .finish_upgrade, .{ .adopt = &adopter } }, .parks = false },
+        .{ .name = "adopter released", .events = &.{ .{ .adopt = &adopter }, .release }, .parks = true },
+    };
+    for (rows) |row| {
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(undefined);
+        for (row.events) |ev| connection.mode = connection.mode.next(ev);
+        var res = try Response._init(arena.allocator(), &connection, 32);
+        res.status = row.status;
+        std.testing.expectEqual(row.parks, res._canPark()) catch |err| {
+            std.debug.print("row {s}\n", .{row.name});
+            return err;
+        };
+    }
+}
+
+test "Response: write after a stream's end adds nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+
+    var stream_buf: [64]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    try w.interface.writeAll("hello");
+    try w.end();
+    const sent = conn_writer.end;
+    response.body = "more";
+    try response.write();
+    try std.testing.expectEqual(sent, conn_writer.end);
+    try std.testing.expectEqual(Phase.finished, response._phase);
+}
+
+test "Response: a write with no room for its Content-Type sends the head, and a second write sends nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 2);
+    try response.header("X-A", "1");
+    try response.header("X-B", "2");
+    response.content_type = .text;
+    response.body = "x";
+
+    try response.write();
+    try std.testing.expectEqual(Phase.finished, response._phase);
+    try std.testing.expect(response.headersSent());
+    const sent = conn_writer.end;
+    try std.testing.expect(sent > 0);
+    try response.write();
+    try std.testing.expectEqual(sent, conn_writer.end);
+}
+
+test "Response: write after the 101 sends nothing more" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [16]u8 = undefined;
+    var sink: CountingSink = .init(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined, .method = .get, .io = std.testing.io, .headers = try http.Headers.init(arena.allocator(), 8) };
+    try request.headers.put("Upgrade", "websocket");
+    try request.headers.put("Connection", "Upgrade");
+    try request.headers.put("Sec-WebSocket-Version", "13");
+    try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    _ = (try response._upgradeWebSocket(&request)) orelse return error.TestUnexpectedResult;
+    const sent = sink.sent().len;
+    response.body = "more";
+    try response.write();
+    try std.testing.expectEqual(sent, sink.sent().len);
+    try std.testing.expectEqual(Phase.finished, response._phase);
+}
+
+test "Response: an HTTP/1.1 park, its failures, and write after it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    const owner: Parked.Owner = .{ .gone = undefined, .ctx = undefined };
+    const Case = enum { parks, refused_at_headers, head_fails, no_memory };
+    const Row = struct { case: Case, err: ?anyerror, phase: Phase, can_park: bool, keepalive: bool };
+    const rows = [_]Row{
+        .{ .case = .parks, .err = null, .phase = .parked, .can_park = false, .keepalive = false },
+        // `stream` fails before the head: nothing committed, still parkable.
+        .{ .case = .refused_at_headers, .err = error.WriteFailed, .phase = .building, .can_park = true, .keepalive = true },
+        // The head was committed and its send failed: not parked.
+        .{ .case = .head_fails, .err = error.WriteFailed, .phase = .head_sent, .can_park = false, .keepalive = true },
+        // The adopter could not be made: parked, and the connection closes.
+        .{ .case = .no_memory, .err = error.OutOfMemory, .phase = .parked, .can_park = false, .keepalive = false },
+    };
+    for (rows) |row| {
+        var small: [4]u8 = undefined;
+        var buf: [16]u8 = undefined;
+        var fixed: std.Io.Writer = .fixed(&small);
+        var sink: CountingSink = .init(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(if (row.case == .head_fails) &fixed else &sink.interface);
+        connection.allocator = if (row.case == .no_memory) std.testing.failing_allocator else arena.allocator();
+        const full = row.case == .refused_at_headers;
+        var response = try Response._init(arena.allocator(), &connection, if (full) 2 else 32);
+        if (full) {
+            try response.header("X-A", "1");
+            try response.header("X-B", "2");
+            response.content_type = .text;
+        }
+
+        const got = response._park(&request, owner);
+        if (row.err) |e| try std.testing.expectError(e, got) else _ = try got;
+        try std.testing.expectEqual(row.phase, response._phase);
+        try std.testing.expectEqual(row.can_park, response._canPark());
+        try std.testing.expectEqual(row.keepalive, response.keepalive);
+        if (row.phase == .parked) {
+            const sent = sink.sent().len;
+            response.body = "more";
+            try response.write();
+            try std.testing.expectEqual(sent, sink.sent().len);
+        }
+    }
+}
+
+test "Response sink: write after a park sends nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+    var ctx: u8 = 0;
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    response._offerDetach(&TestEngine.parks, &ctx, .park_only);
+
+    const p = try response._park(&request, .{ .gone = undefined, .ctx = undefined });
+    try std.testing.expectEqual(&TestEngine.parked, p);
+    try std.testing.expectEqual(Phase.parked, response._phase);
+    try std.testing.expect(response.isDetached());
+    try std.testing.expectEqual(@as(usize, 1), ts.heads);
+    response.body = "more";
+    try response.write();
+    try std.testing.expectEqual(@as(usize, 1), ts.heads);
+    try std.testing.expectEqual(@as(usize, 0), ts.ends);
+}
+
+test "Response sink: detach on a full offer, and the values it refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+    var ctx: u8 = 0;
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    const owner: Detached.Owner = .{ .abort = undefined, .ctx = undefined };
+    const offer: Detach.Offer = .{ .engine = &TestEngine.parks, .ctx = &ctx };
+
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    response._offerDetach(offer.engine, offer.ctx, .full);
+    const d = try response.detach(&request, owner);
+    try std.testing.expect(response.isDetached());
+    try std.testing.expectEqual(@as(?*Detached, d), response._detachment());
+    try std.testing.expectEqual(@as(*anyopaque, &ctx), d.engine_ctx);
+    try std.testing.expect(!response.canDetach());
+    var f1: Detached.Finisher = .{ .func = undefined };
+    var f2: Detached.Finisher = .{ .func = undefined };
+    response.onFinish(&f1);
+    response.onFinish(&f2);
+    try std.testing.expectEqual(@as(?*Detached.Finisher, &f1), d.first);
+    try std.testing.expectEqual(@as(?*Detached.Finisher, &f2), f1.next);
+    try std.testing.expectEqual(@as(?*Detached.Finisher, &f2), d.last);
+
+    const Tag = std.meta.Tag(Detach);
+    const Row = struct { detach: Detach, phase: Phase = .building, tag: Tag };
+    const rows = [_]Row{
+        .{ .detach = .{ .park_only = offer }, .tag = .park_only },
+        .{ .detach = .unavailable, .tag = .unavailable },
+        .{ .detach = .blocked, .tag = .blocked },
+        .{ .detach = .{ .full = offer }, .phase = .head_sent, .tag = .full },
+        .{ .detach = .{ .detached = d }, .tag = .detached },
+    };
+    for (rows) |row| {
+        var res = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+        res._detach = row.detach;
+        res._phase = row.phase;
+        try std.testing.expectError(error.Unsupported, res.detach(&request, owner));
+        try std.testing.expectEqual(row.tag, std.meta.activeTag(res._detach));
+        try std.testing.expectEqual(row.phase, res._phase);
+    }
+}
+
+test "Response sink: a relocate that fails puts the offer back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+    var ctx: u8 = 0;
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+
+    for ([_]Detach.Mode{ .full, .park_only }) |mode| {
+        var res = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+        res._offerDetach(&TestEngine.fails, &ctx, mode);
+        const saved = res._detach;
+        switch (mode) {
+            .full => try std.testing.expectError(error.OutOfMemory, res.detach(&request, .{ .abort = undefined, .ctx = undefined })),
+            .park_only => try std.testing.expectError(error.OutOfMemory, res._park(&request, .{ .gone = undefined, .ctx = undefined })),
+        }
+        try std.testing.expectEqual(saved, res._detach);
+        try std.testing.expectEqual(Phase.building, res._phase);
+    }
+}
+
+test "Response: the phase and detach value do not grow the response" {
+    // 464 before and after them (x86_64 Debug, every feature on): five
+    // bools and three pointers became one u8 enum and a 24-byte union.
+    try std.testing.expect(@sizeOf(Response) <= 464);
 }

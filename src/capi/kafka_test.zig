@@ -8,6 +8,7 @@ const std = @import("std");
 const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const engine_test = @import("engine_test.zig");
 const abi = engine.abi;
 const features = anole.features;
 const FakeBroker = if (features.kafka) anole.kafka.testing.FakeBroker else void;
@@ -84,6 +85,41 @@ const Rig = struct {
         alloc.free(r.json);
     }
 };
+
+test "capi kafka: a drain the console starts (App.stop) tells every group to end DRAINED (#220)" {
+    if (comptime !features.kafka) return error.SkipZigTest;
+    // SAFETY: `start` sets every field.
+    var r: Rig = undefined;
+    // SAFETY: `start` sets every element.
+    var cs: [1]*engine.Consumer = undefined;
+    try r.start(&cs);
+    defer r.deinit();
+    defer r.stop();
+    const topics = [_]abi.Str{.of("orders")};
+    _ = try engine.kafka.subscribe(r.log(), cs[0], .{
+        .size = @sizeOf(abi.KafkaSubscribeOptions),
+        .group = .of("g"),
+        .topics = &topics,
+        .ntopics = topics.len,
+        .rebalance_timeout_ms = 1000,
+    }, 5);
+    var probe: engine_test.DrainProbe = .{ .e = r.e, .check = struct {
+        /// Every live group is draining (one that already ended has left
+        /// the table; `subscribe` added the group before the stop).
+        fn draining(e: *engine.Engine) bool {
+            const st = &e.kafka_state;
+            st.groups.acquire();
+            defer st.groups.release();
+            for (st.groups.entries.items) |*entry| {
+                if (entry.live and !entry.value.draining.load(.acquire)) return false;
+            }
+            return true;
+        }
+    }.draining };
+    probe.add();
+    r.e.testStopServer();
+    try probe.expectHeld();
+}
 
 fn out(topic: []const u8, key: []const u8, value: []const u8, flags: u32) abi.KafkaOut {
     return .{ .size = @sizeOf(abi.KafkaOut), .topic = .of(topic), .key = .of(key), .value = value.ptr, .len = value.len, .flags = flags };

@@ -47,18 +47,6 @@ pub const State = struct {
     mails: []Mail = &.{},
     made: bool = false,
 
-    pub fn init(s: *State, first_gen: u32) void {
-        _ = s;
-        _ = first_gen;
-    }
-
-    /// The highest generation handed out (`Engine.destroy`): none, a mail
-    /// server has no handles.
-    pub fn maxGen(s: *State) u32 {
-        _ = s;
-        return 0;
-    }
-
     pub fn deinit(s: *State) void {
         if (s.mails.len > 0) gpa.free(s.mails);
         s.mails = &.{};
@@ -87,16 +75,6 @@ pub const ExecState = struct {
 
     pub fn cancel(st: *ExecState, io: std.Io) void {
         st.work.cancel(io);
-    }
-
-    /// The highest generation handed out (`Engine.destroy`).
-    pub fn maxGen(st: *const ExecState) u32 {
-        _ = st;
-        return 0;
-    }
-
-    pub fn deinit(st: *ExecState) void {
-        _ = st;
     }
 };
 
@@ -184,8 +162,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
-/// The drain started (`anole_server_drain`, once): no new send is taken;
-/// those in flight finish, and the client closes with the server.
+/// The drain started (however it started; once; never waits): no new send
+/// is taken; those in flight finish, and the client closes with the server.
 pub fn draining(e: *Engine) void {
     if (comptime !features.smtp) return;
     for (e.smtp_state.mails) |*m| if (m.client) |c| c.stopAccepting();
@@ -196,21 +174,15 @@ pub fn close(e: *Engine) void {
     for (e.smtp_state.mails) |*m| m.open.store(false, .release);
 }
 
-/// `anole_server_destroy`: frees what a stopped server still holds.
-pub fn destroy(e: *Engine) void {
-    _ = e;
-}
-
 pub fn find(e: *Engine, name: []const u8) ?*Mail {
     const mails = e.smtp_state.ensure(e) catch return null;
-    for (mails) |*m| if (std.mem.eql(u8, m.config.name, name)) return m;
-    return null;
+    return engine.findByName(Mail, mails, name);
 }
 
 // ---------------------------------------------------------------------------
 // Sending
 
-pub const CallError = error{ Invalid, State, OutOfMemory, Unsupported, Gone };
+pub const CallError = engine.CallError;
 
 /// Why a call is `Invalid`, for `anole_last_error`.
 pub const Why = struct {
@@ -313,10 +285,6 @@ const max_list = 1000;
 const max_headers = 128;
 const max_attachments = 256;
 
-fn dupeStr(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error![]const u8 {
-    return a.dupe(u8, s.slice());
-}
-
 /// `null` for `{NULL,0}`, else a copy (possibly empty).
 fn dupeOpt(a: std.mem.Allocator, s: abi.Str) std.mem.Allocator.Error!?[]const u8 {
     if (s.ptr == null) return null;
@@ -331,7 +299,7 @@ fn dupeList(a: std.mem.Allocator, list: ?[*]const abi.Str, n: usize, why: *Why, 
     }
     const src = (list orelse return error.Invalid)[0..n];
     const out = try a.alloc([]const u8, n);
-    for (src, out) |s, *o| o.* = try dupeStr(a, s);
+    for (src, out) |s, *o| o.* = try engine.dupeStr(a, s);
     return out;
 }
 
@@ -343,7 +311,7 @@ fn copyMessage(a: std.mem.Allocator, m: abi.SmtpMessage, why: *Why) CallError!an
         .to = try dupeList(a, m.to, m.nto, why, "to"),
         .cc = try dupeList(a, m.cc, m.ncc, why, "cc"),
         .bcc = try dupeList(a, m.bcc, m.nbcc, why, "bcc"),
-        .subject = try dupeStr(a, m.subject),
+        .subject = try engine.dupeStr(a, m.subject),
         .text = try dupeOpt(a, m.text),
         .html = try dupeOpt(a, m.html),
         .envelope_from = try dupeOpt(a, m.envelope_from),
@@ -356,7 +324,7 @@ fn copyMessage(a: std.mem.Allocator, m: abi.SmtpMessage, why: *Why) CallError!an
         }
         const src = (m.headers orelse return error.Invalid)[0..m.nheaders];
         const hs = try a.alloc(anole.smtp.Header, src.len);
-        for (src, hs) |h, *o| o.* = .{ try dupeStr(a, h.name), try dupeStr(a, h.value) };
+        for (src, hs) |h, *o| o.* = .{ try engine.dupeStr(a, h.name), try engine.dupeStr(a, h.value) };
         out.headers = hs;
     }
     if (m.nattachments > 0) {
@@ -385,15 +353,15 @@ fn copyMessage(a: std.mem.Allocator, m: abi.SmtpMessage, why: *Why) CallError!an
                 return error.Invalid;
             }
             o.* = .{
-                .filename = try dupeStr(a, s.filename),
+                .filename = try engine.dupeStr(a, s.filename),
                 .content_type = try dupeOpt(a, s.content_type),
                 .content = if (has_path)
-                    .{ .file = try dupeStr(a, s.path) }
+                    .{ .file = try engine.dupeStr(a, s.path) }
                 else if (s.len == 0)
                     .{ .bytes = "" }
                 else
                     .{ .bytes = try a.dupe(u8, (s.data orelse return error.Invalid)[0..s.len]) },
-                .content_id = if (s.content_id.len > 0) try dupeStr(a, s.content_id) else null,
+                .content_id = if (s.content_id.len > 0) try engine.dupeStr(a, s.content_id) else null,
             };
         }
         out.attachments = atts;
@@ -482,7 +450,7 @@ pub fn sendRaw(m: *Mail, c: ?*Consumer, envelope_from: abi.Str, recipients: ?[*]
         };
     }
     q.body = .{ .raw = .{
-        .envelope_from = try dupeStr(a, envelope_from),
+        .envelope_from = try engine.dupeStr(a, envelope_from),
         .to = to,
         .bytes = try a.dupe(u8, bytes),
     } };
@@ -569,18 +537,6 @@ fn task(x: *Exec, q: *Req) std.Io.Cancelable!void {
 // ---------------------------------------------------------------------------
 // Records
 
-const Writer = struct {
-    rec: []u8,
-    at: usize,
-
-    fn put(w: *Writer, bytes: []const u8) abi.Span {
-        if (bytes.len == 0) return .{};
-        @memcpy(w.rec[w.at..][0..bytes.len], bytes);
-        defer w.at += bytes.len;
-        return .{ .off = @intCast(w.at), .len = @intCast(bytes.len) };
-    }
-};
-
 const Rejected = if (features.smtp) anole.smtp.Rejected else struct {
     address: []const u8,
     code: u16,
@@ -608,7 +564,7 @@ fn resultRecord(r: ResultData) ![]align(8) u8 {
     const bytes_off = rejected_off + r.rejected.len * @sizeOf(abi.SmtpRejected);
     const rec = try engine.newRecord(bytes_off + bytes, .smtp_result, 0);
     const ev: *Ev = @ptrCast(rec.ptr);
-    var w: Writer = .{ .rec = rec, .at = bytes_off };
+    var w: engine.Writer = .{ .rec = rec, .at = bytes_off };
     ev.user_data = r.user_data;
     ev.status = r.status;
     ev.http_status = r.http_status;

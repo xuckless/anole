@@ -6,6 +6,7 @@ const std = @import("std");
 const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const engine_test = @import("engine_test.zig");
 const config = @import("config.zig");
 const abi = engine.abi;
 const features = anole.features;
@@ -98,6 +99,21 @@ const Rig = struct {
         alloc.free(r.json);
     }
 };
+
+test "capi smtp: a drain the console starts (App.stop) stops the client taking sends while the server drains (#220)" {
+    if (comptime !features.smtp) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.start(.{});
+    defer r.deinit();
+    var probe: engine_test.DrainProbe = .{ .e = r.e, .check = struct {
+        fn draining(e: *engine.Engine) bool {
+            return engine.smtp.find(e, "mail").?.client.?.draining.load(.acquire);
+        }
+    }.draining };
+    probe.add();
+    r.e.testStopServer();
+    try probe.expectHeld();
+}
 
 fn strs(comptime list: []const []const u8) [list.len]abi.Str {
     var out: [list.len]abi.Str = undefined;

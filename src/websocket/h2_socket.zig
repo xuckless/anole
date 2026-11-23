@@ -138,7 +138,7 @@ pub const H2Socket = struct {
             if (message) |msg| return msg;
             if (result.message == .need_more) {
                 // The batch ends where reading would wait for the peer.
-                if (self.batch.deferred.load(.monotonic)) try self.flushDeferred();
+                if (self.batch.isHeld()) try self.flushDeferred();
                 reader.fillMore() catch |err| switch (err) {
                     // The stream ended without a close frame.
                     error.EndOfStream => return error.ConnectionClosed,
@@ -358,7 +358,7 @@ pub const H2Socket = struct {
     fn flushDeferred(self: *H2Socket) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        if (!self.batch.isHeld() or self.closed) return;
         self.batch.flushing();
         if (self.sink) |sink| return sink.kickOut();
         self.out.interface.flush() catch return self.out.err orelse error.WriteFailed;

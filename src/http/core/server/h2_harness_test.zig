@@ -518,6 +518,11 @@ pub const Handlers = struct {
     pub fn hello(_: *dusty.Request, res: *dusty.Response) !void {
         try res.print(.text, "hello", .{});
     }
+    /// As many headers as `response.max_header_count` allows, and a body.
+    pub fn fullTable(_: *dusty.Request, res: *dusty.Response) !void {
+        for (0..(dusty.ServerConfig{}).response.max_header_count) |i| try res.header(try std.fmt.allocPrint(res.arena, "x-full-{d}", .{i}), "v");
+        res.body = "ok";
+    }
     pub fn user(req: *dusty.Request, res: *dusty.Response) !void {
         try std.testing.expectEqual(@as(u8, 2), req.version_major);
         try res.print(.text, "user {s}", .{req.params.get("id").?});
@@ -745,6 +750,7 @@ pub fn Fixture(comptime E: type) type {
                 .http2 = .{ .enable_connect_protocol = true },
             }, {});
             self.server.router.get("/hello", Handlers.hello);
+            self.server.router.get("/full", Handlers.fullTable);
             self.server.router.get("/file", sendFileHandler);
             self.server.router.get("/fields", Handlers.fields);
             self.server.router.get("/users/:id", Handlers.user);

@@ -358,8 +358,7 @@ const Fixture = struct {
 
     fn serve(fx: *Fixture) anyerror!void {
         defer fx.served.store(true, .release);
-        var busy = false;
-        try E.serve(&fx.server, &fx.listener, false, &fx.connection, &busy);
+        try E.serve(&fx.server, &fx.listener, false, &fx.connection);
     }
 
     /// The client hangs up; the engine sees the end and returns.

@@ -380,6 +380,108 @@ fn uriPath(uri: Uri) []const u8 {
     return path;
 }
 
+/// The dials in progress, and which origins last dialed to HTTP/1.1.
+///
+/// Why: N concurrent first requests to an origin that turns out to speak
+/// HTTP/2 must share ONE dial (one connection), so the first dialer for a
+/// key leads and the others wait. But if that origin speaks only HTTP/1.1
+/// nothing can be shared, and the same wait would run N dials strictly in
+/// series; so a dial that ended on HTTP/1.1 is remembered (`h1_memory`, a
+/// few origins) and requests to that key dial at once, in parallel.
+///
+/// The state of a key is derived, never stored (`stateOf`; h1 first):
+///   idle    no ticket listed, no live memory
+///   dialing a ticket is listed
+///   h1      memory live: now < until (at `until` it is expired)
+///
+/// | event                 | idle                     | dialing            | h1                 |
+/// |-----------------------|--------------------------|--------------------|--------------------|
+/// | enter                 | lead: ticket listed      | wait(generation)   | direct: no ticket  |
+/// | end, h2 or failed     | (only a leader ends)     | idle, gen + 1      | (cannot overlap)   |
+/// | end, h1               | (only a leader ends)     | h1, gen + 1        | (cannot overlap)   |
+/// | clock reaches `until` | -                        | -                  | idle, lazily       |
+///
+/// Only a leader ends a dial, and a key in h1 is never listed, so the
+/// cells marked so cannot occur. `end` unlists, notes the memory and bumps
+/// the generation in one critical section, then wakes (notify last); a
+/// waiter that read generation g never sleeps once it moved. All state is
+/// under `mutex`, which is never held across a wait. The memory is
+/// `slots` entries: a key refreshes its own slot, else replaces the slot
+/// that expires first (an expired one before any live one).
+const Dials = struct {
+    mutex: std.Io.Mutex = .init,
+    tickets: std.DoublyLinkedList = .{},
+    gen: std.atomic.Value(u32) = .init(0),
+    h1: [slots]H1 = @splat(.{}),
+
+    const slots = 8;
+    const h1_memory: std.Io.Duration = .fromSeconds(60);
+
+    const H1 = struct { key: u64 = 0, until: std.Io.Timestamp = .{ .nanoseconds = 0 } };
+    const KeyState = enum { idle, dialing, h1 };
+    const Ticket = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        key: u64,
+    };
+    /// lead: dial, then `end`. wait: sleep on the generation, then retry.
+    /// direct: dial without a ticket.
+    const Verdict = union(enum) { lead, wait: u32, direct };
+
+    /// The caller holds `mutex`.
+    fn stateOf(self: *Dials, key: u64, now: std.Io.Timestamp) KeyState {
+        for (self.h1) |e| if (e.key == key and now.nanoseconds < e.until.nanoseconds) return .h1;
+        var node = self.tickets.first;
+        while (node) |n| : (node = n.next) {
+            const other: *Ticket = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
+            if (other.key == key) return .dialing;
+        }
+        return .idle;
+    }
+
+    fn enter(self: *Dials, io: std.Io, ticket: *Ticket, now: std.Io.Timestamp) Verdict {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        switch (self.stateOf(ticket.key, now)) {
+            .h1 => return .direct,
+            .dialing => return .{ .wait = self.gen.load(.acquire) },
+            .idle => {
+                self.tickets.append(&ticket.node);
+                return .lead;
+            },
+        }
+    }
+
+    fn wait(self: *Dials, io: std.Io, gen: u32) std.Io.Cancelable!void {
+        try io.futexWait(u32, &self.gen.raw, gen);
+    }
+
+    /// The leader's end, whatever the outcome; `h1_at` is when the dial
+    /// ended on HTTP/1.1, null if it ended on h2 or failed.
+    fn end(self: *Dials, io: std.Io, ticket: *Ticket, h1_at: ?std.Io.Timestamp) void {
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.tickets.remove(&ticket.node);
+            if (h1_at) |at| self.note(ticket.key, at.addDuration(h1_memory));
+            _ = self.gen.fetchAdd(1, .release);
+        }
+        io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
+    }
+
+    /// The caller holds `mutex`.
+    fn note(self: *Dials, key: u64, until: std.Io.Timestamp) void {
+        var slot = &self.h1[0];
+        for (&self.h1) |*e| {
+            if (e.key == key) {
+                e.until = until;
+                return;
+            }
+            if (e.until.nanoseconds < slot.until.nanoseconds) slot = e;
+        }
+        slot.* = .{ .key = key, .until = until };
+    }
+};
+
 /// Pool of idle connections for reuse: one per executor (`Client.pools`).
 ///
 /// `acquire`/`release` are safe to call from multiple tasks running in
@@ -408,14 +510,10 @@ pub const ConnectionPool = struct {
     /// Whether `reap` is running or about to (guarded by `mutex`).
     reaping: bool = false,
     /// HTTP/2 origins with requests in flight (their carrier connections
-    /// are out of `idle`), and dials in progress that may end in one; both
-    /// guarded by `mutex`.
+    /// are out of `idle`), guarded by `mutex`; and the dials in progress
+    /// that may end in one (`Dials`, with its own lock).
     origins: std.DoublyLinkedList = .{},
-    dialing: std.DoublyLinkedList = .{},
-    dial_gen: std.atomic.Value(u32) = .init(0),
-    /// Origins whose last dial ended on HTTP/1.1 (a few; a ring).
-    h1_seen: [8]struct { key: u64 = 0, until: std.Io.Timestamp = .{ .nanoseconds = 0 } } = @splat(.{}),
-    h1_next: usize = 0,
+    dialing: Dials = .{},
     drains: std.Io.Group = .init,
     reaper: std.Io.Group = .init,
 
@@ -467,7 +565,6 @@ pub const ConnectionPool = struct {
         // be done by now).
         if (comptime has_h2_client) while (self.origins.popFirst()) |node| {
             const origin: *H2Origin = @alignCast(@fieldParentPtr("node", node)); // SAFETY: `node` is that field of a live container, so the parent is aligned
-            origin.listed = false;
             destroy(self, origin.carrier);
         };
     }
@@ -482,7 +579,10 @@ pub const ConnectionPool = struct {
     }
 
     fn destroy(self: *ConnectionPool, conn: *Connection) void {
-        const origin = if (comptime has_h2_client) conn.carrier_of else null;
+        const origin: ?*H2Origin = if (comptime has_h2_client) switch (conn.kind) {
+            .h2_carrier => |o| o,
+            .h1, .h2_dialed, .h2_view => null,
+        } else null;
         conn.deinit();
         self.allocator.destroy(conn);
         if (comptime has_h2_client) if (origin) |o| self.allocator.destroy(o);
@@ -555,53 +655,50 @@ pub const ConnectionPool = struct {
             while (node) |n| : (node = n.next) {
                 const o: *H2Origin = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
                 if (!o.carrier.matches(remote_host, remote_port, protocol, null)) continue;
-                if (!o.carrier.h2.?.isOpen()) continue;
+                if (!o.session.isOpen()) continue;
                 o.refs += 1;
                 break :found o;
             }
             return null;
         };
-        return self.makeView(origin) catch |err| {
-            self.dropView(origin, false);
-            return err;
-        };
+        return self.makeView(origin);
     }
 
     /// A carrier taken from `idle` becomes an active origin, and the
     /// request's handle on it.
     fn promote(self: *ConnectionPool, carrier: *Connection) !*Connection {
-        const origin = carrier.carrier_of.?;
+        const origin = carrier.kind.h2_carrier;
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             origin.refs = 1;
-            origin.listed = true;
-            self.origins.append(&origin.node);
+            origin.move(&self.origins, .open);
         }
-        return self.makeView(origin) catch |err| {
-            self.dropView(origin, false);
-            return err;
-        };
+        return self.makeView(origin);
     }
 
     /// A newly dialed HTTP/2 connection becomes the carrier of an origin,
-    /// and the first request's handle on it.
+    /// and the first request's handle on it. Without memory for the origin
+    /// the dialed connection is closed: nothing else holds it.
     fn adoptCarrier(self: *ConnectionPool, carrier: *Connection) !*Connection {
-        const origin = try self.allocator.create(H2Origin);
-        origin.* = .{ .carrier = carrier, .refs = 1, .listed = true };
-        carrier.carrier_of = origin;
+        const origin = self.allocator.create(H2Origin) catch |err| {
+            self.destroy(carrier);
+            return err;
+        };
+        origin.* = .{ .carrier = carrier, .session = carrier.kind.h2_dialed, .refs = 1, .state = .unlisted };
+        carrier.kind = .{ .h2_carrier = origin };
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            self.origins.append(&origin.node);
+            origin.move(&self.origins, .open);
         }
-        return self.makeView(origin) catch |err| {
-            self.dropView(origin, false);
-            return err;
-        };
+        return self.makeView(origin);
     }
 
+    /// A request's handle on `origin`, whose ref the caller took; on
+    /// failure the ref is dropped again.
     fn makeView(self: *ConnectionPool, origin: *H2Origin) !*Connection {
+        errdefer self.dropView(origin, false);
         const view = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(view);
         try view.initView(self, origin);
@@ -620,14 +717,9 @@ pub const ConnectionPool = struct {
             defer self.mutex.unlock(self.io);
             origin.refs -= 1;
             if (broken) carrier.closing = true;
-            if (origin.refs == 0 or broken) {
-                // A broken session takes no new requests: out of the list
-                // now, though requests on it still finish.
-                if (origin.listed) {
-                    self.origins.remove(&origin.node);
-                    origin.listed = false;
-                }
-            }
+            // A broken session takes no new requests: out of the list now,
+            // though requests on it still finish.
+            origin.move(&self.origins, if (broken) .broken else if (origin.refs == 0) .last else .keep);
             last = origin.refs == 0;
         }
         if (last) self.release(carrier);
@@ -636,25 +728,16 @@ pub const ConnectionPool = struct {
     /// Release a view (a request's handle on a shared HTTP/2 connection).
     fn releaseView(self: *ConnectionPool, view: *Connection) void {
         if (comptime !has_h2_client) return;
-        const origin = view.origin.?;
+        const handle = view.kind.h2_view;
         const broken = view.closing;
-        if (view.h2_stream) |st| st.release();
-        view.h2_stream = null;
+        switch (handle.request) {
+            .none => {},
+            .sent, .unprocessed => |st| st.release(),
+        }
         view.deinitView();
         self.allocator.destroy(view);
-        self.dropView(origin, broken);
+        self.dropView(handle.origin, broken);
     }
-
-    /// The first dial for an origin that may speak HTTP/2 is made once:
-    /// the others wait for it (`dial_gen` changes when a dial ends), then
-    /// find its connection, or dial for themselves if it came to HTTP/1.1
-    /// (remembered for `h1_memory`) or failed.
-    const DialTicket = struct {
-        node: std.DoublyLinkedList.Node = .{},
-        key: u64,
-    };
-
-    const h1_memory: std.Io.Duration = .fromSeconds(60);
 
     fn dialKey(remote_host: []const u8, port: u16, protocol: Protocol) u64 {
         var h: std.hash.Wyhash = .init(port);
@@ -666,61 +749,16 @@ pub const ConnectionPool = struct {
         return h.final();
     }
 
-    /// Whether a dial to this origin recently ended on HTTP/1.1, so
-    /// there is nothing to share and nothing to wait for.
-    fn knownH1(self: *ConnectionPool, key: u64) bool {
-        const now = std.Io.Timestamp.now(self.io, .awake);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (self.h1_seen) |e| if (e.key == key and now.nanoseconds < e.until.nanoseconds) return true;
-        return false;
-    }
-
-    fn noteH1(self: *ConnectionPool, key: u64) void {
-        const until = std.Io.Timestamp.now(self.io, .awake).addDuration(h1_memory);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (&self.h1_seen) |*e| if (e.key == key) {
-            e.until = until;
-            return;
-        };
-        self.h1_seen[self.h1_next % self.h1_seen.len] = .{ .key = key, .until = until };
-        self.h1_next +%= 1;
-    }
-
-    /// Null: this task dials, and ends with `endDial`. Else the generation
-    /// to wait on (`waitDial`) until some dial ends.
-    fn beginDial(self: *ConnectionPool, ticket: *DialTicket) ?u32 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var node = self.dialing.first;
-        while (node) |n| : (node = n.next) {
-            const other: *DialTicket = @alignCast(@fieldParentPtr("node", n)); // SAFETY: `node` is that field of a live container, so the parent is aligned
-            if (other.key == ticket.key) return self.dial_gen.load(.acquire);
-        }
-        self.dialing.append(&ticket.node);
-        return null;
-    }
-
-    fn waitDial(self: *ConnectionPool, gen: u32) std.Io.Cancelable!void {
-        try self.io.futexWait(u32, &self.dial_gen.raw, gen);
-    }
-
-    fn endDial(self: *ConnectionPool, ticket: *DialTicket) void {
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            self.dialing.remove(&ticket.node);
-            _ = self.dial_gen.fetchAdd(1, .release);
-        }
-        self.io.futexWake(u32, &self.dial_gen.raw, std.math.maxInt(u32));
-    }
-
     /// Release a connection back to the pool, or close it if the pool is
     /// off or the connection is closing. A full pool (in all, or for the
     /// connection's host) closes its oldest idle connection to make room.
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
-        if (comptime has_h2_client) if (conn.origin != null) return self.releaseView(conn);
+        if (comptime has_h2_client) switch (conn.kind) {
+            .h2_view => return self.releaseView(conn),
+            // No origin to promote it by: never pooled.
+            .h2_dialed => return self.destroy(conn),
+            .h1, .h2_carrier => {},
+        };
         // Don't pool connections that are closing
         if (conn.closing or !self.pooling()) {
             self.destroy(conn);
@@ -870,13 +908,105 @@ pub const ConnectionPool = struct {
 /// handle (a "view": its own arena, parser and stream; the session is the
 /// carrier's). With the last handle gone the carrier goes back to the pool's
 /// idle list, and the next request makes it an origin again.
+///
+/// Who guards what: `refs`, `state` and the pool's `origins` list are the
+/// pool mutex's. `carrier` and `session` are written once in `adoptCarrier`
+/// before the origin is first linked, and only read after, so
+/// `acquireOrigin` reads them under the mutex without a race. The origin
+/// outlives its views because the carrier owns it: `ConnectionPool.destroy`
+/// frees it with the carrier, which no view outlives (refs > 0 keeps the
+/// carrier out of `idle`).
+///
+/// `state` x event (pool mutex held; `move` is the only writer, and links or
+/// unlinks `node` as the table says). Events: open = adopt or promote;
+/// keep = a view dropped, refs > 0 after, not broken; last = a view dropped,
+/// refs == 0 after; broken = a view dropped with the session no good (wins
+/// over last; `carrier.closing` is set). "freed" is the end, not a state:
+/// the origin goes with its carrier (idle eviction, `reap`, `closeIdle`, the
+/// last view's release of a closing carrier, pool `deinit`).
+///
+/// | state                         | open   | keep     | last              | broken            | freed |
+/// |-------------------------------|--------|----------|-------------------|-------------------|-------|
+/// | listed (linked, refs >= 1)    | listed (cannot happen: a listed carrier is not idle) | listed | unlisted, unlinked; the carrier is released | unlisted, unlinked; views finish | only at pool `deinit`, after `popFirst` unlinked it |
+/// | unlisted, refs == 0 (idle, or being released) | listed, linked, refs 1 (adopt, promote) | - (no views) | - (no views) | - (no views) | with the carrier |
+/// | unlisted, refs > 0 (draining) | - (the carrier is not idle) | unlisted | unlisted; the release destroys the carrier (closing) | unlisted | - (views out) |
+///
+/// The two unlisted rows are one value, told apart by `refs`.
 const H2Origin = if (has_h2_client) struct {
     node: std.DoublyLinkedList.Node = .{},
     carrier: *Connection,
+    session: *h2_client.ClientConnection,
     /// Handles in flight (guarded by the pool's mutex).
     refs: u32,
-    /// In the pool's `origins` list.
-    listed: bool,
+    state: State,
+
+    const State = enum { listed, unlisted };
+    const Event = enum { open, keep, last, broken };
+
+    /// Every move is a cell here; new behaviour is a row or a column, not a
+    /// branch in `dropView`.
+    const next = std.EnumArray(State, std.EnumArray(Event, State)).init(.{
+        .listed = .init(.{ .open = .listed, .keep = .listed, .last = .unlisted, .broken = .unlisted }),
+        .unlisted = .init(.{ .open = .listed, .keep = .unlisted, .last = .unlisted, .broken = .unlisted }),
+    });
+
+    /// `state` by `event`; `node` is in `origins` exactly while listed.
+    /// Pool mutex held.
+    fn move(self: *@This(), origins: *std.DoublyLinkedList, event: Event) void {
+        const new = next.get(self.state).get(event);
+        if (self.state == .unlisted and new == .listed) origins.append(&self.node);
+        if (self.state == .listed and new == .unlisted) origins.remove(&self.node);
+        self.state = new;
+    }
+} else void;
+
+/// A Connection's role, chosen once (`Connection.init`, `initView`) and
+/// moved only by `ConnectionPool.adoptCarrier`. Locks: T = the task that
+/// holds the connection, alone; P = the pool mutex.
+///
+/// | event                                | h1                     | h2_dialed                                  | h2_carrier                                         | h2_view |
+/// |--------------------------------------|------------------------|--------------------------------------------|----------------------------------------------------|---------|
+/// | dial ends (`init`, T)                | made when not h2       | made when ALPN or prior knowledge is h2   | -                                                  | -       |
+/// | adopt (`adoptCarrier`, T, P to link) | -                      | origin made, becomes h2_carrier; OOM: destroyed | - (adopted once)                              | -       |
+/// | promote from idle (`promote`, P)     | - (returned as is)     | - (never idle)                             | unchanged; origin opens; a view is made            | -       |
+/// | acquireOrigin (P)                    | -                      | -                                          | unchanged; found if listed and the session is open; refs + 1; a view is made | - |
+/// | makeView / initView (T)              | -                      | -                                          | -                                                  | made with request none; failure drops the ref (`dropView`, not broken) |
+/// | sendRequestH2 (T)                    | - (`sendRequest` h1)   | -                                          | -                                                  | `request` moves (`H2Request`) |
+/// | takeConnection result (T)            | `Dials.end` notes h1   | -                                          | -                                                  | nothing |
+/// | acquireConnection, no h2 (T)         | used                   | -                                          | released back to idle untouched, h1 dialed         | - |
+/// | `ConnectionPool.release` (T)         | pooled or destroyed    | destroyed, never pooled                    | closing or pool off: destroyed; else `reset`, idle (unlisted, refs 0) or destroyed if the session closed | `releaseView`: stream released once, view freed, `dropView` |
+/// | `Connection.release` (T)             | keep-alive rules, pool | -                                          | - (not handed to requests)                         | to the pool, no keep-alive rules |
+/// | `Connection.deinit` (T, `destroy`)   | buffers, socket        | session closed first                       | `origin.session` closed first                      | - (`deinitView`) |
+/// | `Connection.reset` (T, `release`)    | read buffer compacted  | - (destroyed before)                       | error when the session is closed                   | - (`releaseView`) |
+/// | `transport`                          | own                    | own                                        | own                                                | the carrier's |
+/// | `ConnectionPool.destroy` (T)         | freed                  | freed                                      | freed, then its origin (once)                      | - |
+/// | pool `deinit` (T)                    | idle ones destroyed    | -                                          | idle and listed ones destroyed, origin with them   | - (requests done) |
+const Kind = if (has_h2_client) union(enum) {
+    h1,
+    /// Dialed on h2, session adopted, not yet an origin's carrier: only
+    /// inside `dialConnection`, between `dialRaw` and `adoptCarrier`.
+    h2_dialed: *h2_client.ClientConnection,
+    /// Owns the socket, TLS state and session (`origin.session`); its
+    /// origin is freed with it.
+    h2_carrier: *H2Origin,
+    h2_view: View,
+} else union(enum) { h1 };
+
+/// A request's handle on a shared session (`origin.session`). One request
+/// per view: a retry or a redirect releases it and takes another.
+const View = if (has_h2_client) struct { origin: *H2Origin, request: H2Request = .none } else void;
+
+/// The view's request, the request task's alone (no lock).
+///
+/// | state            | sent                | send fails                         | head arrives | head fails: closed           | head fails: refused, unprocessed | head fails: other | release |
+/// |------------------|---------------------|------------------------------------|--------------|------------------------------|----------------------------------|-------------------|---------|
+/// | none             | sent(stream)        | none; closing, lost if ConnectionClosed | -       | -                            | -                                | -                 | nothing |
+/// | sent(stream)     | - (one per view)    | -                                  | sent; body from the stream | sent; closing, lost | unprocessed(stream); lost: retried once whatever the method | sent | stream released once |
+/// | unprocessed(st)  | -                   | -                                  | -            | -                            | -                                | -                 | stream released once |
+const H2Request = if (has_h2_client) union(enum) {
+    none,
+    sent: *h2_client.Stream,
+    unprocessed: *h2_client.Stream,
 } else void;
 
 /// A client connection that owns all resources for a request/response cycle.
@@ -942,18 +1072,8 @@ pub const Connection = struct {
     /// When it last went back to the pool (`ConnectionPool.idle_timeout`).
     pooled_at: std.Io.Timestamp = .{ .nanoseconds = 0 },
 
-    // When the handshake picked "h2": the session, which reads and writes the
-    // connection from then on, and the stream of the request in flight.
-    h2: if (has_h2_client) ?*h2_client.ClientConnection else void,
-    h2_stream: if (has_h2_client) ?*h2_client.Stream else void,
-    /// A request's handle on a shared HTTP/2 connection (a "view"): the
-    /// origin it belongs to. The session, socket and TLS state are the
-    /// carrier's.
-    origin: if (has_h2_client) ?*H2Origin else void = if (has_h2_client) null else {},
-    /// The last HTTP/2 request on this handle was provably not processed.
-    h2_unprocessed: bool = false,
-    /// The origin this connection carries (it owns the session).
-    carrier_of: if (has_h2_client) ?*H2Origin else void = if (has_h2_client) null else {},
+    /// Its role (`Kind`): HTTP/1, or HTTP/2 dialed, carrier or view.
+    kind: Kind = .h1,
 
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(
@@ -1009,13 +1129,7 @@ pub const Connection = struct {
         // Protocol and TLS initialization
         self.protocol = protocol;
         self.http_version = .http_1_1;
-        if (comptime has_h2_client) {
-            self.h2 = null;
-            self.h2_stream = null;
-            self.origin = null;
-            self.carrier_of = null;
-        }
-        self.h2_unprocessed = false;
+        self.kind = .h1;
 
         if (protocol == .https) {
             if (!build_options.use_tls) return error.TlsNotConfigured;
@@ -1086,10 +1200,10 @@ pub const Connection = struct {
             self.writer = &self.tls_writer.interface;
 
             if (comptime has_h2_client) if (self.http_version == .http_2) {
-                self.h2 = h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream) catch |err| {
+                self.kind = .{ .h2_dialed = h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream) catch |err| {
                     if (@hasDecl(tls.Connection, "deinit")) self.tls_conn.?.deinit();
                     return err;
-                };
+                } };
             };
         } else {
             self.tls_conn = null;
@@ -1110,7 +1224,7 @@ pub const Connection = struct {
             // Cleartext HTTP/2 with prior knowledge (`ClientOptions.h2c_hosts`).
             if (comptime has_h2_client) if (advertise_http2 and unix_socket_path == null) {
                 self.http_version = .http_2;
-                self.h2 = try h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream);
+                self.kind = .{ .h2_dialed = try h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream) };
             };
         }
     }
@@ -1153,11 +1267,7 @@ pub const Connection = struct {
         self.keep_alive = .{};
         self.idle_deadline = null;
         self.pooled_at = .{ .nanoseconds = 0 };
-        self.h2 = carrier.h2;
-        self.h2_stream = null;
-        self.origin = origin;
-        self.carrier_of = null;
-        self.h2_unprocessed = false;
+        self.kind = .{ .h2_view = .{ .origin = origin } };
         self.parsed_response = .{ .arena = self.arena.allocator() };
         try self.parser.init(&self.parsed_response, self.max_response_headers);
     }
@@ -1171,7 +1281,10 @@ pub const Connection = struct {
     /// the server rather than reimplemented, which is how the TLS layer's
     /// errors stopped being invisible here.
     pub fn transport(self: *Connection) Transport {
-        if (comptime has_h2_client) if (self.origin) |o| return o.carrier.transport();
+        if (comptime has_h2_client) switch (self.kind) {
+            .h2_view => |v| return v.origin.carrier.transport(),
+            .h1, .h2_dialed, .h2_carrier => {},
+        };
         const has_tls = build_options.use_tls and self.tls_conn != null;
         return .{
             .reader = self.reader,
@@ -1200,11 +1313,11 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         // The session's tasks use the TLS connection and the socket, so it
         // goes first.
-        if (comptime has_h2_client) if (self.h2) |session| {
-            if (self.h2_stream) |s| s.release();
-            self.h2_stream = null;
-            session.close();
-            self.h2 = null;
+        if (comptime has_h2_client) switch (self.kind) {
+            .h1 => {},
+            .h2_dialed => |session| session.close(),
+            .h2_carrier => |o| o.session.close(),
+            .h2_view => unreachable, // a view goes through `deinitView`
         };
         if (build_options.use_tls) {
             // See server.zig `Connection.deinit`: only a TLS module that owns
@@ -1238,14 +1351,12 @@ pub const Connection = struct {
         try self.parser.init(&self.parsed_response, self.max_response_headers);
         self.closing = false;
 
-        // HTTP/2: the stream goes (reset if its body is unread), and the
-        // connection stays while the server takes requests on it. The
-        // session owns the reader.
-        if (comptime has_h2_client) if (self.h2) |session| {
-            if (self.h2_stream) |st| st.release();
-            self.h2_stream = null;
-            if (!session.isOpen()) return error.ConnectionClosed;
-            return;
+        // HTTP/2: the connection stays while the server takes requests on
+        // it. The session owns the reader.
+        if (comptime has_h2_client) switch (self.kind) {
+            .h1 => {},
+            .h2_carrier => |o| if (!o.session.isOpen()) return error.ConnectionClosed else return,
+            .h2_dialed, .h2_view => unreachable, // `ConnectionPool.release` destroys or `releaseView`s them
         };
 
         // As part of reading body, we shrank the buffer
@@ -1292,7 +1403,7 @@ pub const Connection = struct {
     /// Whether the response body may still be on the wire. Over HTTP/2 it
     /// never is in the way: releasing the stream resets it.
     fn bodyPending(self: *Connection) bool {
-        if (comptime has_h2_client) if (self.h2 != null) return false;
+        if (self.kind != .h1) return false;
         return !self.parser.isBodyComplete();
     }
 
@@ -1303,12 +1414,12 @@ pub const Connection = struct {
         // Increment request count
         self.request_count +|= 1;
 
-        // HTTP/2: no keep-alive headers and no body to drain; `reset`
-        // releases the stream.
-        if (comptime has_h2_client) if (self.h2 != null) {
+        // HTTP/2: no keep-alive headers and no body to drain;
+        // `releaseView` releases the stream.
+        if (self.kind != .h1) {
             self.pool.release(self);
             return;
-        };
+        }
 
         // Check basic keep-alive from Connection header
         if (!self.parser.shouldKeepAlive()) {
@@ -1349,6 +1460,21 @@ pub const Connection = struct {
     }
 };
 
+/// Where a response body is: nobody has asked, a reader owns the wire, or
+/// the whole body is in memory (null when empty or bodyless). Every
+/// transition is in `ClientResponse.body` and `reader`.
+///
+///   state         body()                         reader()
+///   unread        read all -> cached(result)     setup ok -> reader_taken
+///                 (error: reader_taken)          (setup error: stays unread)
+///   reader_taken  debug assert, via reader()     debug assert (one per response)
+///   cached        return the bytes, no change    .fixed(bytes), no change
+const BodyState = union(enum) {
+    unread,
+    reader_taken,
+    cached: ?[]const u8,
+};
+
 /// HTTP client response.
 /// Call deinit() when done to release the connection.
 pub const ClientResponse = struct {
@@ -1360,14 +1486,11 @@ pub const ClientResponse = struct {
     max_response_size: usize,
     decompress: bool = true,
 
-    // Cached body (read lazily)
-    _body: ?[]const u8 = null,
-    _body_read: bool = false,
+    _body_state: BodyState = .unread,
 
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*ResponseBodyReader.Decode = null,
-    _body_reader_taken: bool = false,
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
@@ -1442,9 +1565,7 @@ pub const ClientResponse = struct {
     /// Content-Length sizes the buffer up front (capped at 16 KiB).
     /// Result is cached for subsequent calls.
     pub fn body(self: *ClientResponse) !?[]const u8 {
-        if (self._body_read) {
-            return self._body;
-        }
+        if (self._body_state == .cached) return self._body_state.cached;
 
         // Nothing to stage: the read streams straight into the arena.
         var no_buf: [0]u8 = .{};
@@ -1460,13 +1581,9 @@ pub const ClientResponse = struct {
             else => |e| return e,
         };
 
-        self._body_read = true;
-        if (result.len == 0) {
-            self._body = null;
-            return null;
-        }
-        self._body = result;
-        return result;
+        const bytes: ?[]const u8 = if (result.len == 0) null else result;
+        self._body_state = .{ .cached = bytes };
+        return bytes;
     }
 
     /// The response body: transfer framing undone, and the content coding
@@ -1487,15 +1604,15 @@ pub const ClientResponse = struct {
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
-        if (self._body_read) {
-            r.interface = .fixed(self._body orelse &.{});
+        if (self._body_state == .cached) {
+            r.interface = .fixed(self._body_state.cached orelse &.{});
             return r;
         }
 
         // The buffer belongs to the caller, so a second reader starts empty
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
-        std.debug.assert(!self._body_reader_taken); // one body reader per response
+        std.debug.assert(self._body_state != .reader_taken); // one body reader per response
 
         // A message complete at the head has no body, whatever the coding
         // headers say -- a HEAD response, a 204, a Content-Length of zero.
@@ -1511,7 +1628,7 @@ pub const ClientResponse = struct {
         // Claimed only once there is a reader to claim it for. A coding we
         // cannot undo fails above, and nothing was read; a caller that
         // handles that error has to be able to ask again.
-        self._body_reader_taken = true;
+        self._body_state = .reader_taken;
         return r;
     }
 };
@@ -2069,21 +2186,25 @@ pub const Client = struct {
             };
             if (p.acquire(host, port, protocol, unix_socket_path)) |c| {
                 reused.* = true;
-                if (comptime has_h2_client) if (c.carrier_of != null) return p.promote(c);
+                if (comptime has_h2_client) if (c.kind == .h2_carrier) return p.promote(c);
                 return c;
             }
             reused.* = false;
             if (comptime has_h2_client) if (advertise_http2 and unix_socket_path == null) {
-                var ticket: ConnectionPool.DialTicket = .{ .key = ConnectionPool.dialKey(host, port, protocol) };
-                if (!p.knownH1(ticket.key)) {
-                    if (p.beginDial(&ticket)) |gen| {
-                        try p.waitDial(gen);
+                var ticket: Dials.Ticket = .{ .key = ConnectionPool.dialKey(host, port, protocol) };
+                switch (p.dialing.enter(p.io, &ticket, std.Io.Timestamp.now(p.io, .awake))) {
+                    .wait => |gen| {
+                        try p.dialing.wait(p.io, gen);
                         continue;
-                    }
-                    defer p.endDial(&ticket);
-                    const conn = try self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
-                    if (conn.origin == null) p.noteH1(ticket.key);
-                    return conn;
+                    },
+                    .lead => {
+                        var h1_at: ?std.Io.Timestamp = null;
+                        defer p.dialing.end(p.io, &ticket, h1_at);
+                        const conn = try self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+                        if (conn.kind == .h1) h1_at = std.Io.Timestamp.now(p.io, .awake);
+                        return conn;
+                    },
+                    .direct => {},
                 }
             };
             return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
@@ -2104,7 +2225,7 @@ pub const Client = struct {
     ) !*Connection {
         const p = self.pool();
         if (p.acquire(host, port, protocol, unix_socket_path)) |conn| {
-            if (advertise_http2 or conn.http_version != .http_2) return conn;
+            if (advertise_http2 or conn.kind == .h1) return conn;
             // An HTTP/2 connection cannot carry what this is for (a
             // WebSocket upgrade); it stays for the next fetch.
             p.release(conn);
@@ -2125,7 +2246,10 @@ pub const Client = struct {
         advertise_http2: bool,
     ) !*Connection {
         const conn = try self.dialRaw(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
-        if (comptime has_h2_client) if (conn.http_version == .http_2) return conn.pool.adoptCarrier(conn);
+        if (comptime has_h2_client) switch (conn.kind) {
+            .h2_dialed => return conn.pool.adoptCarrier(conn),
+            .h1, .h2_carrier, .h2_view => {},
+        };
         return conn;
     }
 
@@ -2275,7 +2399,10 @@ pub const Client = struct {
             // Go's net/http. A request an HTTP/2 server provably did not
             // process (refused, or past its GOAWAY) goes again whatever
             // its method, once.
-            const unprocessed = lost and conn.h2_unprocessed;
+            const unprocessed = lost and if (comptime has_h2_client) switch (conn.kind) {
+                .h2_view => |v| v.request == .unprocessed,
+                .h1, .h2_dialed, .h2_carrier => false,
+            } else false;
             if (!lost or (!unprocessed and (!reused or !isReplayable(state.options)))) return err;
             conn.pool.release(conn);
             conn_released = true;
@@ -2437,7 +2564,13 @@ pub const Client = struct {
             .max_response_size = self.config.max_response_size,
             .decompress = state.options.decompress,
             .owner = conn,
-            .raw = if (comptime has_h2_client) if (conn.h2_stream) |st| .{ .reader = st.reader(), .err = h2BodyError } else null else null,
+            .raw = if (comptime has_h2_client) switch (conn.kind) {
+                .h2_view => |v| switch (v.request) {
+                    .sent, .unprocessed => |st| .{ .reader = st.reader(), .err = h2BodyError },
+                    .none => null,
+                },
+                .h1, .h2_dialed, .h2_carrier => null,
+            } else null,
         };
         // Under the request's deadline, which ends with this call. A body
         // left on the wire is the caller's to read, on the caller's time.
@@ -2557,14 +2690,15 @@ pub const Client = struct {
         // none of its own. The body goes out as the server takes it while
         // this waits for the head, so a server that answers as it reads
         // cannot stall the request.
-        const stream = conn.h2.?.request(fields.list.items, .{ .body_bytes = state.options.body, .timeout = .none }) catch |err| {
+        const view = &conn.kind.h2_view;
+        const stream = view.origin.session.request(fields.list.items, .{ .body_bytes = state.options.body, .timeout = .none }) catch |err| {
             // The server sent GOAWAY, or the connection failed, before
             // this request: none of it went out.
             conn.closing = true;
             lost.* = err == error.ConnectionClosed;
             return err;
         };
-        conn.h2_stream = stream;
+        view.request = .{ .sent = stream };
         stream.waitHead() catch |err| {
             // The connection went with nothing of the response: as an
             // HTTP/1.1 connection lost before the response, which a reused
@@ -2576,7 +2710,7 @@ pub const Client = struct {
             // Refused, or past the server's GOAWAY: it never ran, and
             // may go to another connection whatever it is.
             if (err == error.StreamReset and stream.unprocessed()) {
-                conn.h2_unprocessed = true;
+                view.request = .{ .unprocessed = stream };
                 lost.* = true;
             }
             return err;
@@ -3036,6 +3170,150 @@ test "uriHost: decodes escaped host and rejects a missing or oversized host" {
     }
 }
 
+const dials_t0: std.Io.Timestamp = .{ .nanoseconds = 1_000 };
+
+fn dialsAt(ns: i96) std.Io.Timestamp {
+    return .{ .nanoseconds = ns };
+}
+
+/// Locked read of a key's state, as `enter` takes it.
+fn dialsState(d: *Dials, key: u64, now: std.Io.Timestamp) Dials.KeyState {
+    d.mutex.lockUncancelable(std.testing.io);
+    defer d.mutex.unlock(std.testing.io);
+    return d.stateOf(key, now);
+}
+
+test "Dials: every (key state, event) cell" {
+    const io = std.testing.io;
+    const Verdict = Dials.Verdict;
+    const Row = struct {
+        name: []const u8,
+        /// How the key got to its state; a failed dial is `end(null)`, like an h2 one.
+        setup: enum { fresh, dialing, ended_h2, ended_h1 },
+        /// The state before the event, the verdict of `enter`, the state after it.
+        before: Dials.KeyState,
+        enter: std.meta.Tag(Verdict),
+        after_enter: Dials.KeyState,
+    };
+    const rows = [_]Row{
+        .{ .name = "idle enter leads", .setup = .fresh, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "dialing enter waits", .setup = .dialing, .before = .dialing, .enter = .wait, .after_enter = .dialing },
+        .{ .name = "end h2 or failed gives idle, the next leads", .setup = .ended_h2, .before = .idle, .enter = .lead, .after_enter = .dialing },
+        .{ .name = "end h1 gives h1, enter dials directly", .setup = .ended_h1, .before = .h1, .enter = .direct, .after_enter = .h1 },
+    };
+    for (rows) |row| {
+        var d: Dials = .{};
+        var leader: Dials.Ticket = .{ .key = 7 };
+        const gen0 = d.gen.load(.acquire);
+        switch (row.setup) {
+            .fresh => {},
+            .dialing => try std.testing.expect(d.enter(io, &leader, dials_t0) == .lead),
+            .ended_h2, .ended_h1 => {
+                try std.testing.expect(d.enter(io, &leader, dials_t0) == .lead);
+                d.end(io, &leader, if (row.setup == .ended_h1) dials_t0 else null);
+                try std.testing.expectEqual(gen0 + 1, d.gen.load(.acquire));
+                try std.testing.expect(d.tickets.first == null);
+            },
+        }
+        errdefer std.debug.print("row: {s}\n", .{row.name});
+        try std.testing.expectEqual(row.before, dialsState(&d, 7, dials_t0));
+        var other: Dials.Ticket = .{ .key = 7 };
+        const v = d.enter(io, &other, dials_t0);
+        try std.testing.expectEqual(row.enter, std.meta.activeTag(v));
+        if (v == .wait) {
+            // Never listed; the generation it waits on moves when the leader ends.
+            try std.testing.expectEqual(d.gen.load(.acquire), v.wait);
+            try std.testing.expect(d.tickets.first == &leader.node and leader.node.next == null);
+        }
+        try std.testing.expectEqual(row.after_enter, dialsState(&d, 7, dials_t0));
+        if (v == .wait) {
+            d.end(io, &leader, null);
+            try std.testing.expect(d.gen.load(.acquire) != v.wait);
+        }
+    }
+}
+
+test "Dials: a dial in flight for another key leaves an h1 key direct, and keys are independent" {
+    const io = std.testing.io;
+    var d: Dials = .{};
+    var h1_leader: Dials.Ticket = .{ .key = 1 };
+    try std.testing.expect(d.enter(io, &h1_leader, dials_t0) == .lead);
+    d.end(io, &h1_leader, dials_t0);
+    var k2: Dials.Ticket = .{ .key = 2 };
+    try std.testing.expect(d.enter(io, &k2, dials_t0) == .lead);
+    const gen = d.gen.load(.acquire);
+    var again: Dials.Ticket = .{ .key = 1 };
+    try std.testing.expect(d.enter(io, &again, dials_t0) == .direct);
+    try std.testing.expectEqual(gen, d.gen.load(.acquire));
+    try std.testing.expect(d.tickets.first == &k2.node and k2.node.next == null);
+    // Another host, port or protocol is another key.
+    const base = ConnectionPool.dialKey("example.com", 443, .https);
+    for ([_]u64{
+        ConnectionPool.dialKey("example.com", 8443, .https),
+        ConnectionPool.dialKey("example.org", 443, .https),
+        ConnectionPool.dialKey("example.com", 443, .http),
+    }) |key| {
+        try std.testing.expect(key != base);
+        var t: Dials.Ticket = .{ .key = key };
+        try std.testing.expect(d.enter(io, &t, dials_t0) == .lead);
+        d.end(io, &t, null);
+    }
+    d.end(io, &k2, null);
+}
+
+test "Dials: the h1 memory expires at its until and is bounded" {
+    const io = std.testing.io;
+    const mem = Dials.h1_memory.nanoseconds;
+    var d: Dials = .{};
+    var t: Dials.Ticket = .{ .key = 5 };
+    try std.testing.expect(d.enter(io, &t, dials_t0) == .lead);
+    d.end(io, &t, dials_t0);
+    const until = dials_t0.nanoseconds + mem;
+    // Live until the instant `until`: at it, it is expired.
+    for ([_]struct { at: i96, want: Dials.KeyState }{
+        .{ .at = until - 1, .want = .h1 },
+        .{ .at = until, .want = .idle },
+        .{ .at = until + 1, .want = .idle },
+    }) |row| try std.testing.expectEqual(row.want, dialsState(&d, 5, dialsAt(row.at)));
+
+    // Noting a key again refreshes its slot in place.
+    try std.testing.expect(d.enter(io, &t, dialsAt(until)) == .lead);
+    d.end(io, &t, dialsAt(until));
+    d.mutex.lockUncancelable(io);
+    d.note(5, dialsAt(until + 10));
+    d.mutex.unlock(io);
+    var holding: usize = 0;
+    for (d.h1) |e| if (e.key == 5) {
+        holding += 1;
+        try std.testing.expectEqual(until + 10, e.until.nanoseconds);
+    };
+    try std.testing.expectEqual(@as(usize, 1), holding);
+
+    // Nine distinct keys at increasing times: the earliest is replaced.
+    var f: Dials = .{};
+    for (0..Dials.slots + 1) |i| {
+        var tk: Dials.Ticket = .{ .key = 100 + i };
+        const at = dialsAt(dials_t0.nanoseconds + @as(i96, @intCast(i)));
+        try std.testing.expect(f.enter(io, &tk, at) == .lead);
+        f.end(io, &tk, at);
+    }
+    const now = dialsAt(dials_t0.nanoseconds + Dials.slots);
+    try std.testing.expectEqual(Dials.KeyState.idle, dialsState(&f, 100, now));
+    for (1..Dials.slots + 1) |i| try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&f, 100 + i, now));
+
+    // An expired slot goes before any live one.
+    var g: Dials = .{};
+    for (0..Dials.slots) |i| {
+        // Keys 0..3 noted long before; 4..7 just now (key 0 is the empty slot's key, so start at 1).
+        const at = if (i < 4) dials_t0 else dialsAt(dials_t0.nanoseconds + mem);
+        g.note(200 + i, at.addDuration(Dials.h1_memory));
+    }
+    const later = dialsAt(dials_t0.nanoseconds + mem + 5);
+    g.note(300, later.addDuration(Dials.h1_memory));
+    for (4..Dials.slots) |i| try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&g, 200 + i, later));
+    try std.testing.expectEqual(Dials.KeyState.h1, dialsState(&g, 300, later));
+}
+
 test "parseUrl: basic URL" {
     const uri = try parseUrl("http://example.com/path");
     var host_buf: [255]u8 = undefined;
@@ -3189,6 +3467,11 @@ test "ClientResponse.body: a body read that failed before it started can be aske
     // encoding, and asking twice must not trip the one-reader assert.
     try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
     try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+    // reader() itself leaves the state unread, so a third ask still errors.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.reader(&buf));
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.reader(&buf));
+    try std.testing.expectEqual(.unread, std.meta.activeTag(response._body_state));
 }
 
 test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
@@ -3990,4 +4273,30 @@ fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
         const final = out;
         break :blk &final;
     };
+}
+
+test "client: an h2 origin moves only by its table, linked in the pool's list exactly while listed" {
+    if (comptime !has_h2_client) return error.SkipZigTest;
+    const S = H2Origin.State;
+    const Row = struct { from: S, event: H2Origin.Event, to: S };
+    // The table in `H2Origin`'s doc comment, cell for cell.
+    const rows = [_]Row{
+        .{ .from = .listed, .event = .open, .to = .listed },
+        .{ .from = .listed, .event = .keep, .to = .listed },
+        .{ .from = .listed, .event = .last, .to = .unlisted },
+        .{ .from = .listed, .event = .broken, .to = .unlisted },
+        .{ .from = .unlisted, .event = .open, .to = .listed },
+        .{ .from = .unlisted, .event = .keep, .to = .unlisted },
+        .{ .from = .unlisted, .event = .last, .to = .unlisted },
+        .{ .from = .unlisted, .event = .broken, .to = .unlisted },
+    };
+    for (rows) |r| {
+        errdefer std.debug.print("{t} on {t}\n", .{ r.from, r.event });
+        var origins: std.DoublyLinkedList = .{};
+        var origin: H2Origin = .{ .carrier = undefined, .session = undefined, .refs = 1, .state = r.from }; // SAFETY: `move` reads neither
+        if (r.from == .listed) origins.append(&origin.node);
+        origin.move(&origins, r.event);
+        try std.testing.expectEqual(r.to, origin.state);
+        try std.testing.expectEqual(@as(usize, if (r.to == .listed) 1 else 0), origins.len());
+    }
 }

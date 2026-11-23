@@ -1495,7 +1495,7 @@ batch not answered within `rebalance_timeout_ms` goes stale (answering it is
 offsets are not committed). `ANOLE_EV_KAFKA_ASSIGN` follows the join.
 `anole_kafka_group_close` (or `anole_handle_release`) commits the done batches
 and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
-(`ANOLE_BROKER_END_CLOSED`, `_DRAINED` when `anole_server_drain` ended it,
+(`ANOLE_BROKER_END_CLOSED`, `_DRAINED` when the drain ended it,
 `_FAILED`). At the stop, groups end without events.
 
 `anole_kafka_find` looks a broker up by name and `anole_kafka_index` gives
@@ -1691,7 +1691,7 @@ run, `ANOLE_EV_JOB_CANCEL` says why (`ANOLE_JOB_CANCEL_TIMEOUT`, `_ADMIN`,
 `_LEASE_LOST`, `_DRAIN`) and the handle is over (`anole_job_finish` answers
 `ANOLE_E_GONE`). `anole_jobs_stop` ends a worker once its jobs are over
 (`ANOLE_EV_JOB_WORKER_END`; jobs it is handed meanwhile go back after a
-second); `anole_server_drain` stops them all (`ANOLE_JOB_WORKER_DRAINED`).
+second); the drain (however it started) stops them all (`ANOLE_JOB_WORKER_DRAINED`).
 
 **Admin.** `anole_jobs_admin` takes one JSON request and answers with
 `ANOLE_EV_JOBS_RESULT`, whose `json` is the answer and `http_status` what the
