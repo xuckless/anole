@@ -13,7 +13,7 @@ pub const WriteError = Parked.WriteError;
 
 /// The `fake` variant exists only in test builds (`noreturn` elsewhere), so
 /// production dispatch is two arms.
-const Fake = if (builtin.is_test) @import("out_fake.zig").Fake else noreturn;
+pub const Fake = if (builtin.is_test) @import("out_fake.zig").Fake else noreturn;
 
 pub const Out = union(enum) {
     parked: *Parked,
