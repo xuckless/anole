@@ -290,10 +290,11 @@ fn send(t: anytype, a: std.mem.Allocator, target: []const u8, kind: Kind, fault:
         .stripe => try std.fmt.allocPrint(a, "t={s},{s}v1={s}", .{ ts_text, junk[0 .. n_junk * 68], try macText(a, Sha256, key, &.{ ts_text, ".", body }, false) }),
         .github => try std.fmt.allocPrint(a, "sha256={s}", .{try macText(a, Sha256, key, &.{body}, false)}),
         .slack => try std.fmt.allocPrint(a, "v0={s}", .{try macText(a, Sha256, key, &.{ "v0:", ts_text, ":", body }, false)}),
-        .hmac_sha256 => try std.fmt.allocPrint(a, "sig={s}", .{try macText(a, Sha256, key, &.{body}, false)}),
-        .hmac_sha1 => try std.fmt.allocPrint(a, "sig={s}", .{try macText(a, std.crypto.auth.hmac.HmacSha1, key, &.{body}, false)}),
-        .hmac_sha512 => try std.fmt.allocPrint(a, "sig={s}", .{try macText(a, std.crypto.auth.hmac.sha2.HmacSha512, key, &.{body}, false)}),
-        .hmac_base64 => try std.fmt.allocPrint(a, "sig={s}", .{try macText(a, Sha256, key, &.{body}, true)}),
+        inline .hmac_sha256, .hmac_sha1, .hmac_sha512, .hmac_base64 => |k| try std.fmt.allocPrint(a, "sig={s}", .{try macText(a, switch (k) {
+            .hmac_sha1 => std.crypto.auth.hmac.HmacSha1,
+            .hmac_sha512 => std.crypto.auth.hmac.sha2.HmacSha512,
+            else => Sha256,
+        }, key, &.{body}, k == .hmac_base64)}),
         .standard => blk: {
             var buf: [47]u8 = undefined;
             break :blk try a.dupe(u8, try wh.sign.sign(key, "msg_1", ts, body, &buf));
