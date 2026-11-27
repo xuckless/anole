@@ -47,7 +47,7 @@ Column types: integers (`int2`, `int4`, `int8`, `oid`), `f32`/`f64`, `bool`, `[]
 
 Traps:
 - A `NULL` into a non-optional field is an error: make nullable columns `?T`.
-- SQL built at run time that seldom repeats: `app.db.with(.{ .prepare = false })`. Behind PgBouncer older than 1.21 in transaction mode, set `statement_cache_size = 0` (docs/database.md:383).
+- SQL built at run time that seldom repeats: `app.db.with(.{ .prepare = false })`. Behind PgBouncer older than 1.21 in transaction mode, set `statement_cache_size = 0` (docs/database.md:384).
 - Long statements (a migration, a background job): `app.db.with(.{ .timeout = .max })`; every call is otherwise bounded by `Options.timeout` (30 s) and the request's deadline.
 
 ## Transactions
@@ -79,7 +79,7 @@ try tx.commit(req);
 ```
 
 Traps:
-- Never send a bare `BEGIN` through `exec`: the next call may get another connection. A plain call that leaves a transaction open is rolled back and fails (docs/database.md:422). Use `begin` or `transaction`.
+- Never send a bare `BEGIN` through `exec`: the next call may get another connection. A plain call that leaves a transaction open is rolled back and fails (docs/database.md:423). Use `begin` or `transaction`.
 - Calls on a `Tx` are never cached or coalesced.
 
 ## Pooled connections and session state
@@ -89,7 +89,7 @@ Use: `anole.pg.Client.acquire`, `anole.pg.Conn` (`raw`, `release`), `anole.pg.Cl
 `acquire(req)` hands over pg.zig's connection (`conn.raw`: `query`, `row`, `prepare`...) for what the verbs don't cover.
 
 Traps:
-- Release a connection from `acquire` once, and before the arena of the request or `Ctx` given to `acquire` is reset or freed: the checkout record lives there (docs/database.md:412, src/pg/root.zig `Conn.checkout`). A second `release` does nothing and is logged.
+- Release a connection from `acquire` once, and before the arena of the request or `Ctx` given to `acquire` is reset or freed: the checkout record lives there (docs/database.md:413, src/pg/root.zig `Conn.checkout`). A second `release` does nothing and is logged.
 - A connection given back inside a transaction is rolled back and logged.
 - Session state (`SET`, `SET ROLE`, temp tables, advisory locks, `LISTEN`) is reset before the next request gets the connection (`reset_session = .auto`). `.auto` judges from the SQL text, so a function whose body runs `SET ROLE` or `set_config(..., false)` leaks to the next request. Switching roles for row-level security: use `.always`, or `SET LOCAL ROLE` inside a transaction.
 - `LISTEN`/`NOTIFY` feeds: use `app.watch` ([realtime](../realtime/index.md)) or `app.db.listener()`, not a pooled connection.

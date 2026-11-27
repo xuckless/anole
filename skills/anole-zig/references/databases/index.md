@@ -69,7 +69,7 @@ _ = try state.db.exec(&c, schema, .{});
 Traps:
 - `args` is a tuple (`.{ id, name }`). Values always go in `args`, never into the SQL text. With no arguments (`.{}`), PostgreSQL's and SQLite's `exec` run every statement in the text, so SQL built from input could run statements of its own (docs/database.md:114).
 - Struct fields take columns by name (rename with `AS`). A field the result lacks keeps its default, or the call fails with `error.MissingColumn`.
-- A database call suspends the handler's coroutine, not the thread. Don't mark such routes `anole.noWait` (docs/database.md:409). Blocking work of your own: [never block an executor](../runtime.md#never-block-an-executor).
+- A database call suspends the handler's coroutine, not the thread. Don't mark such routes `anole.noWait` (docs/database.md:410). Blocking work of your own: [never block an executor](../runtime.md#never-block-an-executor).
 - What the rows hold lives in the arena of `req` or the `Ctx`: [request arena and lifetimes](../runtime.md#request-arena-and-lifetimes).
 
 ## Errors are statuses
@@ -107,7 +107,7 @@ Use: `anole.db.Time`, `anole.db.Tls`, `anole.db.QueryOptions`, `anole.db.TxOptio
 
 - Each connector reads its URL from `.url`, else the environment (`.env` files too in development, src/db/url.zig): `DATABASE_URL` (then libpq's `PG*`), `MONGODB_URI`, `REDIS_URL`. SQLite takes a path. With `anole.config`, pass the secret through: `app.postgres(.{ .url = if (cfg.database_url) |u| u.expose() else null })` (templates/rest-postgres/src/main.zig).
 - Options share one vocabulary: `max_connections`, `acquire_timeout`, `connect_timeout`, `idle_timeout`, `timeout` (30 s per call), `connect_at_start`, `ping_timeout`, `breaker`, `retry`, `errors`, `cache`, `tls`, `name`. Durations are `anole.Duration` (`.fromSeconds(2)`), no unit suffix.
-- A pool per executor: `max_connections` is split between executors and a busy executor does not borrow from an idle one (docs/database.md:378). Size the total for the busiest.
+- A pool per executor: `max_connections` is split between executors and a busy executor does not borrow from an idle one (docs/database.md:379). Size the total for the busiest.
 - No connection opens before a handler needs one, so the server starts while the database comes up. `.connect_at_start = true` refuses to start without it.
 - `anole.db.Time` (microseconds since the epoch, UTC; RFC 3339 in JSON) reads timestamp columns and binds as a parameter. `Time.now(io)` for the current time.
 - Retries and the circuit breaker are built in: `with(.{ .retry = true })` reruns a statement on a transient failure, only for statements safe to repeat. Details: [resilience](../storage-email-clients/index.md).

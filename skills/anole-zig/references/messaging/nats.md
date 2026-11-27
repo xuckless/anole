@@ -66,4 +66,4 @@ Traps:
 - Default `connect_at_start = false`: the app starts without the server and `/readyz` reports not ready until connected. Set it `true` to fail the start instead.
 - `connections = .one` (default) keeps publish order across the whole app; `.per_executor` can reorder publishes made on different cores (docs/messaging.md#ordering-and-connections).
 - Key-value and the object store are not implemented (docs/messaging.md#jetstream).
-- docs/messaging.md#testing names `anole.nats.core.testing.FakeServer`, but `anole.nats.core` does not export `testing` on this branch: an app cannot reach it. Test against a real `nats-server -js` ([testing](../testing.md)).
+- Anole exports no fake NATS server to apps (docs/messaging.md#testing): test against a real `nats-server -js` ([testing](../testing.md)).

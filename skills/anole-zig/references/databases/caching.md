@@ -45,7 +45,7 @@ Traps:
 - The key is the statement and its arguments. Per-user data must take the user as an argument, never only from the session.
 - Not for statements with side effects (`nextval`, `INSERT ... RETURNING` through `one`): the statement runs once for every caller that shares it.
 - Errors are never kept (`NotFound` included). Empty results are kept unless `.keep_empty = false`; use false for cache-aside, or "missing" is served for `ttl` after the value exists.
-- Row types must be copyable (numbers, `bool`, enums, optionals, arrays, structs, tagged unions, slices of these). A row type with another pointer (`std.json.Value`) runs unshared, with a warning logged once (docs/database.md:1230; src/db/copy.zig `copyable`).
+- Row types must be copyable (numbers, `bool`, enums, optionals, arrays, structs, tagged unions, slices of these). A row type with another pointer (`std.json.Value`) runs unshared, with a warning logged once (docs/database.md:1231; src/db/copy.zig `copyable`).
 - Arguments compare by value: `5` as `u8` and as `i64` are one key, `"5"` is not.
 - Calls on a `Tx` are never shared; `coalesce` or `cache` inside a transaction fail the call.
 - A result larger than an executor's share of `max_bytes` is not kept.

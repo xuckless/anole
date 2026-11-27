@@ -7,7 +7,7 @@ Token buckets per key, with `RateLimit-*` headers on every response and 429 with
 
 ## One line for the whole app: `app.rateLimit`
 
-Use: `anole.App.rateLimit`, `anole.App.RateLimitOptions` (src/server.zig): `limit` (100), `window` (60 s), `burst` (0 means `limit`), `key` (`.ip` or `.{ .header = "..." }`), `max_entries` (10 000). An in-memory limiter the server owns, applied with `use`.
+Use: `anole.App.rateLimit`, `anole.App.RateLimitOptions` (src/server.zig): `limit` (100), `window` (60 s), `burst` (0 means `limit`), `key` (`.ip` or `.{ .header = "..." }`), `max_entries` (10 000). An in-memory limiter the server owns; it installs itself as middleware for every route registered after it, so call it before those routes (not through `use`).
 
 ```zig
 app.rateLimit(.{ .limit = 300 }); // 300 requests a minute per client address

@@ -37,6 +37,8 @@ for t in "${templates[@]}"; do
   dir="$work/$t"
   "$cli" new "$dir" --template "$t" --anole-path "$root"
   test -f "$dir/.env"   # every template writes a ready .env
+  test -f "$dir/.claude/skills/anole-zig/SKILL.md"   # and the agent skill, with its line in AGENTS.md
+  grep -q 'anole-zig' "$dir/AGENTS.md"
   (
     cd "$dir"
     "$zig" build
@@ -50,13 +52,16 @@ done
 
 # anole init: into an empty directory, and into an existing Zig project.
 echo "== anole init"
-mkdir "$work/init-empty" && (cd "$work/init-empty" && "$cli" init --template "${templates[0]}" --anole-path "$root" && test -f .env && "$zig" build)
+mkdir "$work/init-empty" && (cd "$work/init-empty" && "$cli" init --template "${templates[0]}" --anole-path "$root" && test -f .env && test -f .claude/skills/anole-zig/SKILL.md && "$zig" build)
 mkdir "$work/init-existing" && (
   cd "$work/init-existing"
   "$zig" init -m >/dev/null
   rm build.zig
+  printf '# Agents\n\nOur own rules.\n' > AGENTS.md
   "$cli" init --template "${templates[0]}" --anole-path "$root" --force
   grep -q '\.anole = ' build.zig.zon
+  test -f .claude/skills/anole-zig/SKILL.md
+  grep -q 'Our own rules' AGENTS.md && grep -q 'anole-zig' AGENTS.md   # the line is added, nothing is lost
   "$zig" build
 )
 echo "templates ok"

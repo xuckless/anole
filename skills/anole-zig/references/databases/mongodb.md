@@ -25,7 +25,7 @@ _ = state.db.collection("users").createIndex(&c, .{ .email = 1 }, .{ .unique = t
 ```
 
 Traps:
-- Not supported yet, refused at start: `mongodb+srv://` (use the standard `mongodb://host1,host2,host3/?replicaSet=...&tls=true` string), read preferences other than `primary`, `loadBalanced`, compression, GSSAPI/AWS/OIDC auth (docs/database.md:743).
+- Not supported yet, refused at start: `mongodb+srv://` (use the standard `mongodb://host1,host2,host3/?replicaSet=...&tls=true` string), read preferences other than `primary`, `loadBalanced`, compression, GSSAPI/AWS/OIDC auth (docs/database.md:744).
 - `app.db.collection(name)` is in the connection string's database, else `"test"`. Name another with `app.db.db("app").collection("users")`.
 - A standalone `mongod` works, without retryable writes and sessions. Retryable writes need a replica set.
 
@@ -79,7 +79,7 @@ A query with options: `users.find(User, req, .{ .tags = tag }, .{ .sort = .{ .na
 
 Traps:
 - No `exec`: writes return their own counts (`matched_count`, `modified_count`, `deleted_count`, `upserted_id`); `db(name).runCommand(req, command)` runs any command and returns a `bson.Document`.
-- No transactions yet: each call stands alone and is retried on its own (docs/database.md:806). Don't write multi-document invariants that need one.
+- No transactions yet: each call stands alone and is retried on its own (docs/database.md:807). Don't write multi-document invariants that need one.
 - `updateMany` and `deleteMany` are not retried after a network error (the spec says so).
 - An option a call does not take is a compile error that lists the ones it does: read it rather than guessing.
 - Errors: 11000 duplicate key, 112 write conflict are `Conflict` (409); no primary, auth failure, pool busy are `ServiceUnavailable` (503); 50 `MaxTimeMSExpired` or a call past its `timeout` is `GatewayTimeout` (504); the rest, document validation (121) included, `Database` (500).

@@ -44,6 +44,13 @@ Every template has `src/main.zig` with a `routes` function separate from
 `.env` is not) and a README. `zig build run` starts the app, `zig build test`
 runs the tests and `zig build openapi` writes `openapi.json`.
 
+Every project also gets the anole-zig agent skill in
+`.claude/skills/anole-zig/` (the copy in skills/anole-zig of the matching
+Anole release) and a line in `AGENTS.md` that tells coding agents to load it
+before they write server code. `anole init` adds that line to an `AGENTS.md`
+you have, and leaves a `.claude/skills/anole-zig/` you already installed as it
+is.
+
 There is no Dockerfile: a release build (`zig build -Doptimize=ReleaseSafe`)
 already runs in production mode, and [server.md](server.md) says how to deploy
 it.

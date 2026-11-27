@@ -41,7 +41,7 @@ const d = try kc.produce(req, .{ .topic = "events", .value = body }); // waits f
 Partitioning is Java's `murmur2(key) % partitions`; one producer per client, so one key keeps its order across executors.
 
 Traps:
-- `req.body()` returns `!?[]const u8`: write `.value = try req.body()`. docs/messaging.md:188 and the src/kafka/root.zig:10 doc comment omit the `try`.
+- `req.body()` returns `!?[]const u8`: write `.value = try req.body()`.
 - Use `send` for fire-and-forget, `produce` only when the caller must know the record landed. Neither blocks a thread ([writes return once buffered](../runtime.md#writes-return-once-buffered)).
 - At-least-once: a crash replays records since the last commit (every `commit_interval`). Make handlers idempotent (docs/messaging.md#consumer-groups).
 - A failing handler is retried in place, then produced to `dead_letter` if set (headers `anole-dlt-topic`, `-partition`, `-offset`, `-error`), else logged and skipped. Set `dead_letter` if a poison record must not vanish.

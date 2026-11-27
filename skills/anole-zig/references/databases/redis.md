@@ -18,7 +18,7 @@ _ = app.metrics(.{}); // the pool and command times too
 _ = app.health(.{}); // /readyz sends PING
 ```
 
-Trap: Redis Cluster and Sentinel are not supported; a URL with several hosts is refused (docs/database.md:940).
+Trap: Redis Cluster and Sentinel are not supported; a URL with several hosts is refused (docs/database.md:941).
 
 ## Commands and helpers
 
@@ -56,7 +56,7 @@ Arguments are a tuple: strings as they are, numbers in decimal, `bool` as 1/0, e
 
 Traps:
 - `set` returns false when `.nx` or `.xx` kept it from being set.
-- A blocking command (`BLPOP`, `XREAD BLOCK`) holds its pooled connection while it waits: give it a `with(.{ .timeout })` of its own or `acquire` one (docs/database.md:1091).
+- A blocking command (`BLPOP`, `XREAD BLOCK`) holds its pooled connection while it waits: give it a `with(.{ .timeout })` of its own or `acquire` one (docs/database.md:1092).
 - A canceled call closes its connection, since the reply may still be on its way.
 - Errors: `LOADING`, `READONLY`, `OOM`, `WRONGPASS`, no connection are `ServiceUnavailable` (503); a call past its timeout `GatewayTimeout` (504); `WRONGTYPE`, `ERR`, a reply that does not fit the type `Database` (500).
 
@@ -82,7 +82,7 @@ if (r[2] == .nil) return error.Conflict; // the key changed: nothing was set
 ```
 
 Traps:
-- Release the connection once, before the arena of the request or `Ctx` given to `acquire` is reset or freed: the pool's record of it lives there (docs/database.md:1043). Call nothing on it after.
+- Release the connection once, before the arena of the request or `Ctx` given to `acquire` is reset or freed: the pool's record of it lives there (docs/database.md:1044). Call nothing on it after.
 - A pipeline fails with its first error reply; errors inside EXEC's reply come back as `.err` replies.
 - A connection left inside MULTI or WATCH, on another database (SELECT), subscribed, or with `CLIENT SETNAME`/`CLIENT TRACKING` state is closed, not reused.
 

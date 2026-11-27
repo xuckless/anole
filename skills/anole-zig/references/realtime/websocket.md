@@ -92,7 +92,7 @@ Traps:
 - A socket outlives `timeouts.request`: `upgrade` replaces it with `UpgradeOptions.timeout` (none by default). For an idle limit call `req.setTimeout` before each wait. A timeout cuts the connection with no close frame.
 - `headers` may not set `Upgrade`, `Connection`, `Sec-WebSocket-*`, `Content-Length` or `Transfer-Encoding` (`error.InvalidHeaderName`); each subprotocol must be a token (`error.InvalidSubprotocol`).
 - A text message you send must be valid UTF-8; that is the caller's job. Incoming text is checked (close 1007).
-- On drain every socket gets close 1001 and the handler just returns; `ws.draining()` says the close came from the drain. Long-lived sockets hold the drain until `timeouts.shutdown` (10 s; examples/websocket/main.zig:122 says 30 s, which is stale).
+- On drain every socket gets close 1001 and the handler just returns; `ws.draining()` says the close came from the drain. Long-lived sockets hold the drain until `timeouts.shutdown` (10 s).
 - `send` is safe from other tasks beside the handler (a mutex keeps messages whole). To fan out to many sockets use [Rooms](rooms.md), not a loop of `send` calls. See [writes return once buffered](../runtime.md#writes-return-once-buffered).
 - A callback may wait (a database call), but messages queue behind it; never block the executor: [never block an executor](../runtime.md#never-block-an-executor).
 

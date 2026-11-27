@@ -94,7 +94,7 @@ try app.db.transaction(req, .{ .retries = 3 }, move, .{ req, from, to, amount })
 
 Traps:
 - A transaction holds the writer (`BEGIN IMMEDIATE`) until it ends: keep it short.
-- Inside a transaction call through the `Tx`, never the `Client`. A write on the `Client` from the task that holds the transaction (or an open `iterate` or `acquire` on the writer) fails at once with `error.Database` ("this task already holds the writer"), since it could only wait for itself (docs/database.md:593, src/sqlite/root.zig:347).
+- Inside a transaction call through the `Tx`, never the `Client`. A write on the `Client` from the task that holds the transaction (or an open `iterate` or `acquire` on the writer) fails at once with `error.Database` ("this task already holds the writer"), since it could only wait for itself (docs/database.md:594, src/sqlite/root.zig:347).
 - `begin(req, .{ .read_only = true })` is a snapshot on a reader.
 - A `Tx` used after `commit` or `rollback` fails with `error.Database`.
 
@@ -105,4 +105,4 @@ Use: `anole.sqlite.Client.acquire`, `anole.sqlite.Conn` (`run`, `release`), `ano
 `acquire(req)` holds the writer connection; `conn.run(func, args)` runs `func(driver_db, args...)` on the writer thread (user functions, blobs, backups).
 
 Traps:
-- Release it once, before the arena of the request or `Ctx` given to `acquire` is reset or freed: the checkout record lives there (docs/database.md:682). Call nothing on it after `release()`.
+- Release it once, before the arena of the request or `Ctx` given to `acquire` is reset or freed: the checkout record lives there (docs/database.md:683). Call nothing on it after `release()`.
