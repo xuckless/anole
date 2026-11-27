@@ -157,7 +157,7 @@ jobs:
           cache-key: release-grpc-interop
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7 (v7.0.0)
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7 (v7.0.0)
         with:
           go-version: stable
       - name: Build the interop server and client
