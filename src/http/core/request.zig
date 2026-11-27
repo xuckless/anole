@@ -15,6 +15,17 @@ const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
 const admission = @import("admission.zig");
+
+/// Where a body is, the server request's and the client response's alike:
+/// nobody has asked, a reader owns the wire, or the whole body is in
+/// memory (null when empty or bodyless).
+///
+/// | state \\ event | `reader()`                     | `body()`                    |
+/// |----------------|-------------------------------|-----------------------------|
+/// | `unread`       | decode set up -> `reader_taken` (setup fails: stays) | via `reader()`, read whole -> `cached` (empty: `null`); a request too big, shed or a read error: stays `reader_taken` |
+/// | `reader_taken` | request: `error.BodyReaderTaken`; client: debug assert (one reader per response) | the same |
+/// | `cached`       | a fixed reader over the bytes, state kept | the bytes       |
+pub const BodyState = union(enum) { unread, reader_taken, cached: ?[]const u8 };
 const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
@@ -176,14 +187,8 @@ pub const Request = struct {
     /// The server refused this request for its own load (a body over the
     /// budget): its 503 is logged at debug, not as a handler error.
     _shed: bool = false,
-    /// The body's one lifecycle; `_reset` returns every state to `unread`.
-    ///
-    /// | state \\ event | `reader()`                     | `body()`                    |
-    /// |----------------|-------------------------------|-----------------------------|
-    /// | `unread`       | decode set up -> `reader_taken` (setup fails: stays) | via `reader()`, read whole -> `cached` (empty: `null`); too big, shed or a read error: stays `reader_taken` |
-    /// | `reader_taken` | `error.BodyReaderTaken`       | `error.BodyReaderTaken`     |
-    /// | `cached`       | a fixed reader over the bytes, state kept | the bytes       |
-    _body_state: union(enum) { unread, reader_taken, cached: ?[]const u8 } = .unread,
+    /// The body's one lifecycle (`BodyState`); `_reset` returns every state to `unread`.
+    _body_state: BodyState = .unread,
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*RequestBodyReader.Decode = null,

@@ -1460,20 +1460,9 @@ pub const Connection = struct {
     }
 };
 
-/// Where a response body is: nobody has asked, a reader owns the wire, or
-/// the whole body is in memory (null when empty or bodyless). Every
+/// Where a response body is (`request.BodyState`, its table); every
 /// transition is in `ClientResponse.body` and `reader`.
-///
-///   state         body()                         reader()
-///   unread        read all -> cached(result)     setup ok -> reader_taken
-///                 (error: reader_taken)          (setup error: stays unread)
-///   reader_taken  debug assert, via reader()     debug assert (one per response)
-///   cached        return the bytes, no change    .fixed(bytes), no change
-const BodyState = union(enum) {
-    unread,
-    reader_taken,
-    cached: ?[]const u8,
-};
+const BodyState = request_mod.BodyState;
 
 /// HTTP client response.
 /// Call deinit() when done to release the connection.
