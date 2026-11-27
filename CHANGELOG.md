@@ -3,9 +3,25 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.7.0 (2026-11-27)
 
-S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place, plus three fixes. S3 batch 2 does the same for the HTTP/1 core (the response, the request body, the idle park, the client and the WebSocket send side) and fixes #246 and #247. S3 batch 3 does it for the HTTP/1.x server loop and the C ABI engine, and fixes #220. S3 batch 4 does it for the realtime hubs (WebSocket rooms, SSE topics), the WebSocket socket, gRPC (the server's response sink, the client channel and stream), the app server (one connector registration, one lifecycle phase, the route verbs on a root group) and the HTTP/2 follow-ups, with four fixes. S3 batch 5 does it for the data connectors' and the jobs' lifecycles (the query cache's flights, watches, the MongoDB change stream and topology, cron schedules, the jobs client and its runs), with five behaviour fixes. S3 batch 6 does it for the messaging connectors (NATS, Kafka), the services (S3, SMTP, Lambda), the console, the trace exporter and the DX code (OpenAPI, logging, validate, config), with seven behaviour fixes. S3 step 3 finishes the console's database and connection stats (#128) and gets the QUIC and WebTransport interop CI jobs working again (#243, #244). The S3 full-path batch replaces the SQLite, PostgreSQL and Redis lease counters with one checkout record per `acquire` and explicit transaction and rows states, frees a retired Redis connection at once, and turns the JWKS keyring's refresh and the webhook signature checks into declared tables, with one fix (#160).
+The end of S3, the simplification on the way to 1.0.0-rc: the transport, HTTP/1, server loop, C ABI engine, realtime, gRPC, connector and DX state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place. The bugs found on the way are fixed (below), the QUIC and WebTransport interop CI jobs are green again, and the anole-zig agent skill ships with the repository and `anole new`/`anole init`. Two Zig API changes need a line each (`Rooms`/`Topics` take `app.io()`, the s3 `Client` forwarders moved to `Bucket`): docs/migrating.md. The C ABI is unchanged.
+
+### Highlights
+
+On my box (i7-14700F), against main before S3 (61803e50). Instructions per request are fixed-count on 1 executor; req/s, CPU and RSS are a rested A/B on 5 executors, two passes (one per order), means.
+
+| Cell | before S3 | 0.7.0 |
+|---|---|---|
+| h2c baseline: user instructions per request | 11,910 | 11,631 (−2.3%) |
+| unary gRPC: user instructions per request | 20,857 | 20,634 (−1.1%) |
+| h2c json `/json/50`: CPU per request | 10.03 µs | 9.79 µs (−2.5%) |
+| h2 TLS json: CPU per request | 11.38 µs | 11.11 µs (−2.3%) |
+| unary gRPC: CPU per request | 1.97 µs | 1.93 µs (−2.2%) |
+| HTTP/1.1 json: req/s | 354.4k | 360.6k (+1.8%) |
+| static-h2: RSS | 606 MB | 548 MB (−9.5%) |
+
+Everything else (HTTP/3, h2c req/s, the WebSocket and WebTransport relay's CPU) is flat within noise, and RSS is flat or lower on every HttpArena cell. The one regression is the WebSocket over HTTP/1.1 relay's memory, below. Results: bench/results/20261127-s3-ab.
 
 ### Added
 
@@ -101,6 +117,12 @@ S3 batch 1: the HTTP/2 and HTTP/3 transport state that lived in scattered boolea
 - test-flags builds without WebSocket or HTTP/3 compile again: the C ABI slot-size test reads those slots only with their features.
 - WebTransport interop CI (#243): the handshake case closes its session and the datagram case spaces its answers, so both pass; after a timed-out case the runner's `docker compose stop` works again (its empty.env got a value for every variable), so the next case no longer captures the old container's ports.
 - QUIC interop CI (#244): the simulator waits for its packet captures before it exits, so the short cases (handshake, retry) keep both; the interop server sets no handshake deadline (the product's `handshake_timeout` default stays 10 s); the rebind checks pass when every new path has an answered PATH_CHALLENGE, not only its first. Known flakes left: quic-go with handshakeloss and handshakecorruption, documented in tests/interop/run.sh.
+
+### Known issues
+
+- The WebSocket over HTTP/1.1 relay holds about 8 MB more at 300 users than before S3 (+9%, about 27 KB per user; CPU flat; #276). WebSocket over HTTP/2 and HTTP/3 and WebTransport are flat.
+- WebTransport works with flupke in the interop runner but not yet with browsers (#262); the WebTransport datagram case is intermittent (#265).
+- quic-go's handshakeloss and handshakecorruption interop cases are flaky (tests/interop/run.sh).
 
 ## 0.6.1 (2026-11-22)
 

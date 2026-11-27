@@ -87,7 +87,7 @@ std/Io/Reader.zig before writing a parser by hand.
 Add Anole with `zig fetch`, pinned to a tag (docs/getting-started.md):
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.6.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.7.0
 ```
 
 `anole new` uses `zig fetch --save=anole <url>` (tools/anole/main.zig). The
