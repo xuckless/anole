@@ -410,6 +410,17 @@ fn append(q: *MessageQueue, io: Io, m: Message, pushed: *Pushed) void {
     q.not_empty.signal(io);
 }
 
+/// What `next` answers for each end once the queue is empty (null: it
+/// returns null); `.closed` answers at once, before the messages.
+const end_error = std.EnumArray(End, ?NextError).init(.{
+    .finished = null,
+    .slow_consumer = error.SlowConsumer,
+    .permission_denied = error.PermissionDenied,
+    .no_responders = error.NoResponders,
+    .disconnected = error.Disconnected,
+    .closed = error.ConnectionClosed,
+});
+
 /// Takes the oldest message, waiting for one until `timeout`. After the
 /// queue ends, the messages it holds come out first, then null or the
 /// error of its end; `.closed` fails at once.
@@ -424,21 +435,17 @@ pub fn next(q: *MessageQueue, io: Io, timeout: Io.Timeout) NextError!?Message {
     q.in_hand = false;
     while (true) {
         const how = q.endedAs();
-        if (how == .closed) return error.ConnectionClosed;
+        if (how == .closed) return end_error.get(.closed).?;
         if (q.messages.popFront()) |m| {
             q.bytes -= m.buffer.len;
             q.delivered += 1;
             q.in_hand = true;
             return m;
         }
-        if (how) |h| return switch (h) {
-            .finished => null,
-            .slow_consumer => error.SlowConsumer,
-            .permission_denied => error.PermissionDenied,
-            .no_responders => error.NoResponders,
-            .disconnected => error.Disconnected,
-            .closed => unreachable,
-        };
+        if (how) |h| {
+            if (end_error.get(h)) |err| return err;
+            return null;
+        }
         try q.not_empty.waitTimeout(io, &q.mutex, time.until(deadline));
     }
 }
