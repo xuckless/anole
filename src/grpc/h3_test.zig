@@ -577,3 +577,53 @@ test "grpc channel .h3: prior knowledge over a channel that owns its connection"
         }
     }.run);
 }
+
+test "grpc channel .h3: a replaced connection closes once the last call on it ends (#268)" {
+    try withServer(.{}, struct {
+        fn retired(channel: *grpc.Channel) usize {
+            const owned = channel._owned.?;
+            owned.mutex.lockUncancelable(channel.runtime());
+            defer owned.mutex.unlock(channel.runtime());
+            return owned.retired3.items.len;
+        }
+
+        fn run(env: *Env) !void {
+            var opts = env.options();
+            opts.port = env.udp().getPort();
+            opts.address = env.udp();
+            const channel = try grpc.Channel.connect(env.gpa, env.io, opts, .{ .http = .h3 });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state = newArena();
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            // Redials with no call left on the old connection: it closes
+            // as the call that replaced it ends.
+            for (0..3) |_| {
+                channel.h3.?.testGoaway();
+                const r = try client.unary("Unary", arena, .{ .message = "x" }, .{});
+                try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+                try std.testing.expectEqual(@as(usize, 0), retired(channel));
+            }
+            // A call under way on the replaced connection keeps it open.
+            var s = try client.stream("Bidi", arena, .{});
+            try s.send(.{ .message = "a" });
+            try std.testing.expectEqualStrings("a", (try s.receive()).?.message);
+            channel.h3.?.testGoaway();
+            _ = try client.unary("Unary", arena, .{ .message = "y" }, .{});
+            try std.testing.expectEqual(@as(usize, 1), retired(channel));
+            try s.send(.{ .message = "b" });
+            try std.testing.expectEqualStrings("b", (try s.receive()).?.message);
+            try s.closeSend();
+            while (try s.receive()) |_| {}
+            s.deinit();
+            try std.testing.expectEqual(@as(usize, 0), retired(channel));
+            // A canceled call gives its lease back too.
+            var c = try client.stream("Bidi", arena, .{});
+            c.cancel();
+            c.deinit();
+            try std.testing.expectEqual(@as(u32, 0), channel._owned.?.users.load(.seq_cst));
+            try std.testing.expectEqual(@as(u32, 5), channel.h3DialCount());
+        }
+    }.run);
+}

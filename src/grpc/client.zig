@@ -132,6 +132,10 @@ pub const Channel = struct {
 
     const Owned = struct {
         gpa: std.mem.Allocator,
+        /// The runtime its connections run on.
+        io: std.Io,
+        /// Calls under way (`lease`); the last to end closes `retired`.
+        users: std.atomic.Value(u32) = .init(0),
         options: h2.ConnectOptions,
         http: Http,
         http3: Http3,
@@ -143,7 +147,7 @@ pub const Channel = struct {
         redialing: bool = false,
         dialed: std.Io.Condition = .init,
         /// Connections replaced by a redial: they may still carry calls,
-        /// so they close with the channel.
+        /// so they close once no call is under way (`unlease`).
         retired: std.ArrayList(*h2.ClientConnection) = .empty,
         retired3: std.ArrayList(*H3Connection) = .empty,
         /// `.auto`: what is known about HTTP/3; every change is `H3State.next`.
@@ -188,7 +192,7 @@ pub const Channel = struct {
         errdefer gpa.destroy(self);
         const owned = try gpa.create(Owned);
         errdefer gpa.destroy(owned);
-        owned.* = .{ .gpa = gpa, .options = options, .http = channel.http, .http3 = channel.http3 };
+        owned.* = .{ .gpa = gpa, .io = io, .options = options, .http = channel.http, .http3 = channel.http3 };
         if (comptime features.http3) if (channel.http != .h2) {
             owned.cache = wire.h3.SessionCache.init(gpa, io);
         };
@@ -239,6 +243,7 @@ pub const Channel = struct {
 
     /// The runtime the channel's connections run on.
     pub fn runtime(self: *const Channel) std.Io {
+        if (self._owned) |o| return o.io;
         if (self.conn) |c| return c.io;
         if (comptime features.http3) if (self.h3) |c| return c.io;
         unreachable;
@@ -247,10 +252,43 @@ pub const Channel = struct {
     /// The transport the next call goes out on (a connection that is open;
     /// `.auto` may still switch at the call).
     pub fn transport(self: *Channel) Transport {
-        if (self.h3) |c| if (comptime features.http3) {
-            if (self.conn == null or c.isOpen()) return .h3;
+        self.lease();
+        defer self.unlease();
+        if (@atomicLoad(?*H3Connection, &self.h3, .seq_cst)) |c| if (comptime features.http3) {
+            if (@atomicLoad(?*h2.ClientConnection, &self.conn, .seq_cst) == null or c.isOpen()) return .h3;
         };
         return .h2;
+    }
+
+    /// A call's hold on an owned channel's connections, taken before it
+    /// reads a slot (`conn`, `h3`) and given back as it ends: a retired
+    /// connection is in no slot, so a call that leases after the retire
+    /// cannot reach it, and one that read it before had leased already.
+    /// With no lease out, nothing uses a retired connection. Sequentially
+    /// consistent, with the slots' stores and loads: a lease and a retire
+    /// see each other one way or the other.
+    fn lease(self: *Channel) void {
+        const owned = self._owned orelse return;
+        _ = owned.users.fetchAdd(1, .seq_cst);
+    }
+
+    /// The last lease out closes the retired connections, with the
+    /// channel's lock let go (an HTTP/3 close waits for QUIC's).
+    fn unlease(self: *Channel) void {
+        const owned = self._owned orelse return;
+        if (owned.users.fetchSub(1, .seq_cst) != 1) return;
+        owned.mutex.lockUncancelable(owned.io);
+        // A call leased since: its own unlease closes them.
+        if (owned.users.load(.seq_cst) != 0) return owned.mutex.unlock(owned.io);
+        var retired = owned.retired;
+        owned.retired = .empty;
+        var retired3 = owned.retired3;
+        owned.retired3 = .empty;
+        owned.mutex.unlock(owned.io);
+        for (retired.items) |c| c.close();
+        retired.deinit(owned.gpa);
+        if (comptime features.http3) for (retired3.items) |c| c.close();
+        retired3.deinit(owned.gpa);
     }
 
     /// HTTP/3 dials made (tests).
@@ -291,7 +329,7 @@ pub const Channel = struct {
         const retired = if (comptime t == .h2) &owned.retired else &owned.retired3;
         const io_ = self.runtime();
         while (true) {
-            const current = slot.*;
+            const current = @atomicLoad(@TypeOf(slot.*), slot, .seq_cst);
             if (current) |c| if (c.isOpen()) return c;
             owned.mutex.lockUncancelable(io_);
             defer owned.mutex.unlock(io_);
@@ -301,7 +339,7 @@ pub const Channel = struct {
                 owned.dialed.waitUncancelable(io_, &owned.mutex);
                 continue;
             }
-            // The defer unlocks on `continue` and `break` alike; `slot`'s plain reads are D2's race.
+            // The defer unlocks on `continue` and `break` alike.
             if (slot.* != current) continue;
             owned.redialing = true;
             break;
@@ -319,7 +357,7 @@ pub const Channel = struct {
         errdefer fresh.close();
         if (comptime t == .h3) owned.h3_dials += 1;
         if (slot.*) |old| try retired.append(owned.gpa, old);
-        slot.* = fresh;
+        @atomicStore(@TypeOf(slot.*), slot, fresh, .seq_cst);
         return fresh;
     }
 
@@ -334,7 +372,7 @@ pub const Channel = struct {
         // channel's let go. Another call dialed meanwhile: its connection is
         // the one to use, once it is seen open (it may have gone too).
         while (true) {
-            const current = self.h3;
+            const current = @atomicLoad(?*H3Connection, &self.h3, .seq_cst);
             if (current) |c| if (c.isOpen()) return c;
             testAutoH3BeforeLock(self);
             owned.mutex.lockUncancelable(io_);
@@ -369,7 +407,7 @@ pub const Channel = struct {
             break :retire c;
         } else |_| null;
         owned.h3 = owned.h3.next(if (fresh != null) .{ .dial_ok = port } else .{ .dial_failed = owned.retryAt(io_) });
-        self.h3 = fresh orelse return null;
+        @atomicStore(?*H3Connection, &self.h3, fresh orelse return null, .seq_cst);
         return fresh;
     }
 
@@ -773,6 +811,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         /// Drops the call, canceling it if it is still open.
         pub fn deinit(self: *Self) void {
             self.stream.release();
+            self.channel.unlease();
         }
 
         /// Cancels the call (RST_STREAM CANCEL); `deinit` still frees it.
@@ -977,6 +1016,9 @@ pub fn open(comptime Req: type, comptime Resp: type, channel: *Channel, method_p
 }
 
 fn openOn(comptime Req: type, comptime Resp: type, channel: *Channel, method_path: []const u8, arena: std.mem.Allocator, options: CallOptions, prefer_h2: bool) !Stream(Req, Resp) {
+    // Given back by the stream's `deinit`.
+    channel.lease();
+    errdefer channel.unlease();
     const conn = try channel.pick(prefer_h2);
     var headers: std.ArrayList(h2.Header) = .empty;
     try headers.appendSlice(arena, &.{
