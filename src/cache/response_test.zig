@@ -17,7 +17,7 @@ const alloc = std.testing.allocator;
 const testing = std.testing;
 
 /// How often each route's handler ran.
-var runs: [16]std.atomic.Value(u32) = @splat(.init(0));
+var runs: [22]std.atomic.Value(u32) = @splat(.init(0));
 /// Bumped by the middleware before the cache, on every request.
 var seq: std.atomic.Value(u32) = .init(0);
 
@@ -194,6 +194,41 @@ fn serve(app: *App, comptime check: anytype, extra: anytype) !void {
 }
 
 const ttl = ResponseCache.Options{ .ttl = .fromSeconds(60) };
+
+/// A handler that counts its runs in `runs[i]`, one per marker row.
+fn Marked(comptime i: usize) type {
+    return struct {
+        fn h(_: *Request, res: *Response) !void {
+            Routes.count(i);
+            res.body = "marked";
+        }
+    };
+}
+
+test "ResponseCache: cached keeps answers under doc and noWait in any order, and nothing else does (#267)" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.get("/m16", handlers.cached(ttl, Marked(16).h));
+    app.get("/m17", handlers.doc(.{ .summary = "s" }, handlers.cached(ttl, Marked(17).h)));
+    app.get("/m18", handlers.cached(ttl, handlers.doc(.{ .summary = "s" }, Marked(18).h)));
+    app.get("/m19", handlers.doc(.{ .summary = "s" }, handlers.cached(ttl, handlers.noWait(Marked(19).h))));
+    app.get("/m20", handlers.noWait(Marked(20).h));
+    app.get("/m21", handlers.doc(.{ .summary = "s" }, Marked(21).h));
+    const Check = struct {
+        // Row: counter (its route is /m<i>), runs after two identical GETs.
+        const rows = [_]struct { usize, u32 }{ .{ 16, 1 }, .{ 17, 1 }, .{ 18, 1 }, .{ 19, 1 }, .{ 20, 2 }, .{ 21, 2 } };
+        fn run(c: Ctx) !void {
+            for (rows) |row| {
+                errdefer std.debug.print("route /m{d}\n", .{row[0]});
+                const path = try std.fmt.allocPrint(c.arena, "/m{d}", .{row[0]});
+                _ = try c.get(.get, path, &.{});
+                _ = try c.get(.get, path, &.{});
+                try testing.expectEqual(row[1], ran(row[0]));
+            }
+        }
+    };
+    try serve(&app, Check.run, .{});
+}
 
 test "ResponseCache: a kept GET answers again without the handler, per query, for HEAD too, and never for a POST" {
     var app = try App.init(alloc, .{ .executors = .exact(1) });

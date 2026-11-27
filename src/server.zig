@@ -2347,10 +2347,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Adds `handler` at `path` on `target` (a group; the server's own verbs use its root group),
         /// behind a `ResponseCache` of its own when it is `anole.cached`.
         fn register(self: *Self, target: http.Router(Ctx).Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
-            const H = @TypeOf(handler);
             if (comptime features.openapi) if (method) |m| self.recordRoute(target, m, path, handler);
-            if (comptime handlers.isCached(H)) {
-                var settings: ResponseCache.Options = H.cache_options;
+            // Wherever `cached` sits among the markers (`doc(t, cached(o, h))`, #267).
+            if (comptime handlers.cacheOptions(handler)) |cache_options| {
+                var settings: ResponseCache.Options = cache_options;
                 // Named by its route in metrics.
                 if (settings.name == null) settings.name = std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{
                     target.prefix, path,

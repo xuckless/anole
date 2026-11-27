@@ -173,6 +173,12 @@ pub fn anyCached(comptime handler: anytype) bool {
     return Peel(handler).marks.cached != null;
 }
 
+/// The options of the outermost `cached` around `handler`, wherever it
+/// sits among the markers; null when none.
+pub fn cacheOptions(comptime handler: anytype) ?ResponseCache.Options {
+    return comptime Peel(handler).marks.cached;
+}
+
 /// The router options a handler as `Server` takes it implies.
 pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
     return .{ .no_wait = comptime anyNoWait(handler), .required_params = comptime typed.requiredParams(handler) };
@@ -321,6 +327,7 @@ test "peel: every nesting of the handler markers answers as before" {
         try std.testing.expectEqual(row[1], routeOptions(row[0]).no_wait);
         try std.testing.expectEqual(row[2] != 0, anyCached(row[0]));
         try std.testing.expectEqual(row[2], if (m.cached) |c| c.max_entries else 0);
+        try std.testing.expectEqual(row[2], if (cacheOptions(row[0])) |c| c.max_entries else 0);
         try std.testing.expectEqualStrings(row[3], routeDoc(row[0]).summary orelse "");
         try std.testing.expectEqualStrings("id", routeOptions(row[0]).required_params[0]);
         try std.testing.expect(@TypeOf(unwrap(row[0])) == *const @TypeOf(h));

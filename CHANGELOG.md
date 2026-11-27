@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Fixed
+
+- **An SSE stream served without a park (the handler's own task) no longer hangs its handler when a publish comes as the stream ends** (#266): the publish claimed a sender that nothing would run, and the end waited for it forever, leaking the connection and the subscriber. The end now lets that sender go, and a cancel caught while the stream waited is re-raised.
+- **An SSE stream whose park failed after a publish past `max_queued_bytes` now ends** (#263): the end that publish queued was dropped with the queue before the fallback took over, so the stream stayed open until the peer left. It now writes the open line, the replay and the end, with `on_close` reason `.slow` counted once.
+- **`anole.doc(texts, anole.cached(options, h))` caches** (#267): only an outermost `cached` installed the route's response cache, although the route's info and the OpenAPI document said it was cached; `doc` around `cached` on a POST route is now the same compile error as `cached` alone.
+- **A WebSocket send from a thread off zio's executors on a socket in a flush batch no longer starts a second flusher** (#270): the batch is now always held through its backstop once it has joined one, so its flusher task has one owner; before, the frames could also sit unflushed until the next send or read.
+- **A gRPC `Channel` that redials closes the connections it replaced** once the calls on them have ended (#268); it used to keep every one (sockets, buffers, QUIC state) until `close`, so a long-lived channel through GOAWAYs or network flaps grew without bound.
+
 ## 0.7.0 (2026-11-27)
 
 The end of S3, the simplification on the way to 1.0.0-rc: the transport, HTTP/1, server loop, C ABI engine, realtime, gRPC, connector and DX state that lived in scattered booleans is now one explicit value per concern, with its transitions declared in one place. The bugs found on the way are fixed (below), the QUIC and WebTransport interop CI jobs are green again, and the anole-zig agent skill ships with the repository and `anole new`/`anole init`. Two Zig API changes need a line each (`Rooms`/`Topics` take `app.io()`, the s3 `Client` forwarders moved to `Bucket`): docs/migrating.md. The C ABI is unchanged.

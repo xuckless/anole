@@ -615,6 +615,69 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
 }
 
+test "sse: a publish after the fallback's loop ended claims no sender its end waits for (#266)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    _ = try h.add(&.{"t"}, null);
+    try h.waitSettled(0);
+    const sub = h.subAt(0);
+    h.hub.mutex.lockUncancelable(io);
+    const out = sub.mode.hub_sender;
+    sub.mode = .{ .fallback = out };
+    h.hub.mutex.unlock(io);
+    // The fallback's loop is over (canceled); this publish claims a sender
+    // and only sets `wake`, which nothing waits on any more.
+    _ = try h.hub.publish("t", .{ .data = "late" });
+    h.hub.mutex.lockUncancelable(io);
+    const running = sub.life.sender() == .running;
+    h.hub.mutex.unlock(io);
+    try std.testing.expect(running);
+
+    // Before #266 this waited for that sender forever.
+    h.hub._finish(sub, .client_gone);
+    try std.testing.expectEqual(@as(u32, 1), h.closed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+}
+
+test "sse: a park that fails after a publish past the cap still ends the fallback's stream (#263)" {
+    const Row = struct { draining: bool, reason: root.CloseReason, slow: u64 };
+    for ([_]Row{
+        .{ .draining = false, .reason = .slow, .slow = 1 },
+        // queueDrainEnd queues the end again itself: one end, not two.
+        .{ .draining = true, .reason = .drain, .slow = 0 },
+    }) |row| {
+        errdefer std.debug.print("draining: {}\n", .{row.draining});
+        const h = try Harness.init(.{ .max_queued_bytes = 64, .replay = null, .retry = .fromSeconds(1), .drain_retry = null });
+        defer h.deinit();
+        if (row.draining) h.hub._drainNow();
+        const f = try gpa.create(Fake);
+        f.* = .init(gpa, io);
+        try h.fakes.append(gpa, f);
+        const rec = try gpa.create(Rec);
+        rec.* = .{ .h = h };
+        try h.recs.append(gpa, rec);
+        const opts: root.ServeOptions = .{ .topics = &.{"t"}, .context = rec, .on_close = Harness.onClose };
+        const sub = try h.hub._register(io, opts, null);
+        rec.sub = sub;
+        // Between the register and the failed park: past the cap, so the
+        // stream is to end after what it queued.
+        const big: [100]u8 = @splat('x');
+        _ = try h.hub.publish("t", .{ .data = &big });
+        try h.hub._fallBack(io, sub, f.out(), opts, null);
+        h.hub.mutex.lockUncancelable(io);
+        const queued = sub.queue.len();
+        h.hub.mutex.unlock(io);
+        // The open line and the end.
+        try std.testing.expectEqual(@as(usize, 2), queued);
+        try std.testing.expectEqual(Topics.SendOutcome.over, try h.hub.sendQueued(sub));
+        try std.testing.expect(f.ended);
+        try std.testing.expect(sub.life == .over);
+        h.hub._finish(sub, sub.close_reason);
+        try std.testing.expectEqual(@as(u32, @backingInt(row.reason)), h.last_reason.load(.acquire));
+        try std.testing.expectEqual(row.slow, h.hub.stats().closed_slow);
+    }
+}
+
 test "sse: routes: templates are checked against the path" {
     try std.testing.expect(root.templatesMatch("/rooms/:room/events", .{ .topics = &.{ "news", "room:{room}" } }));
     try std.testing.expect(!root.templatesMatch("/rooms/:id/events", .{ .topics = &.{"room:{room}"} }));
