@@ -610,10 +610,18 @@ pub const Topics = struct {
         // Canceled (the peer reset the stream, the server stopped) is the
         // peer going away; otherwise the hub ended the stream.
         var outcome: SendOutcome = .broken;
+        var canceled = false;
         while (true) {
-            sub.wake.wait(io) catch break;
+            // Both only fail with Canceled, re-raised after the end.
+            sub.wake.wait(io) catch {
+                canceled = true;
+                break;
+            };
             sub.wake.reset();
-            const o = self.sendQueued(sub) catch break;
+            const o = self.sendQueued(sub) catch {
+                canceled = true;
+                break;
+            };
             if (o != .idle) {
                 outcome = o;
                 break;
@@ -621,6 +629,7 @@ pub const Topics = struct {
         }
         const reason: CloseReason = if (outcome == .over) sub.close_reason else .client_gone;
         self.finishSubscriber(sub, reason);
+        if (canceled) io.recancel();
         if (fb.state == .aborted) return error.ResponseAborted;
     }
 
@@ -662,6 +671,11 @@ pub const Topics = struct {
         };
         self.arm(io, sub, opts, .{ .hub_sender = out });
         return sub;
+    }
+
+    /// Ends `sub` as `serveFallback` does after its loop, from a test.
+    pub fn _finish(self: *Topics, sub: *Subscriber, reason: CloseReason) void {
+        self.finishSubscriber(sub, reason);
     }
 
     /// The peer is gone, from a test or an engine without a callback.
@@ -1087,6 +1101,9 @@ pub const Topics = struct {
         self.mutex.lockUncancelable(io);
         const reason = reason_arg orelse sub.close_reason;
         _ = sub.transition(.finish);
+        // A fallback's caller is its sender, and its loop is over: a sender
+        // a publish claimed since then (#266) never runs, so it is let go.
+        if (sub.mode == .fallback) _ = sub.transition(.sender_idle);
         self.unlinkLocked(sub);
         sub.queue.drop(self.gpa);
         const canceled = self.awaitSender(io, sub);

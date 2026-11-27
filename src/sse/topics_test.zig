@@ -615,6 +615,30 @@ test "sse: close after a failed write does nothing: no sender claimed, the reaso
     try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
 }
 
+test "sse: a publish after the fallback's loop ended claims no sender its end waits for (#266)" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    _ = try h.add(&.{"t"}, null);
+    try h.waitSettled(0);
+    const sub = h.subAt(0);
+    h.hub.mutex.lockUncancelable(io);
+    const out = sub.mode.hub_sender;
+    sub.mode = .{ .fallback = out };
+    h.hub.mutex.unlock(io);
+    // The fallback's loop is over (canceled); this publish claims a sender
+    // and only sets `wake`, which nothing waits on any more.
+    _ = try h.hub.publish("t", .{ .data = "late" });
+    h.hub.mutex.lockUncancelable(io);
+    const running = sub.life.sender() == .running;
+    h.hub.mutex.unlock(io);
+    try std.testing.expect(running);
+
+    // Before #266 this waited for that sender forever.
+    h.hub._finish(sub, .client_gone);
+    try std.testing.expectEqual(@as(u32, 1), h.closed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+}
+
 test "sse: routes: templates are checked against the path" {
     try std.testing.expect(root.templatesMatch("/rooms/:room/events", .{ .topics = &.{ "news", "room:{room}" } }));
     try std.testing.expect(!root.templatesMatch("/rooms/:id/events", .{ .topics = &.{"room:{room}"} }));
