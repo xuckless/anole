@@ -2284,7 +2284,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Rate limiting for every route after it, with an in-memory limiter
         /// the server owns: `app.rateLimit(.{ .limit = 100 })` is 100
         /// requests a minute per client address, over the limit 429 with
-        /// `Retry-After`. Call it with `use`, before the routes.
+        /// `Retry-After`. It installs itself as middleware, so call it before the routes it should cover.
         pub fn rateLimit(self: *Self, opts: RateLimitOptions) void {
             const a = self.arena.allocator();
             const limiter = self.gpa.create(ratelimit.MemoryLimiter) catch @panic("OOM");
@@ -3461,8 +3461,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// GET `path`: an event stream subscribed to `options.topics`,
         /// where a `{name}` is the route parameter `name`
         /// (`"room:{room}"` on `/rooms/:room/events`; a name the path
-        /// lacks is a compile error). Over HTTP/1.1 and HTTP/2 an idle
-        /// subscriber holds no task. A handler that decides the topics
+        /// lacks is a compile error). Over HTTP/1.1, HTTP/2 and HTTP/3 an
+        /// idle subscriber holds no task. A handler that decides the topics
         /// itself calls `topics.serve`.
         ///
         ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });

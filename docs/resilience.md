@@ -39,6 +39,10 @@ counted: `anole_breaker_state{client,target}` (0 closed, 1 half-open, 2 open),
 | PostgreSQL, Redis, MongoDB | only calls marked `retry` | **on** |
 | SQLite | no | no (no network) |
 | NATS requests | only with `retry` (on no-responders) | no |
+| S3 | **on** (3 attempts; `with(.{ .retry = false })` for one call) | **on** |
+| SMTP | only `with(.{ .retry = true })`, never after the final "." | **on** |
+| Kafka | producer: until `delivery_timeout` (30 s), idempotent; consumer: a failed record, 10 attempts | no |
+| Webhooks | 10 attempts over about three days | **on**, per origin |
 
 Retries are opt-in: default-on retries multiply load during an outage. The
 retries that are always safe stay on: an HTTP request lost on a reused

@@ -37,7 +37,7 @@ pub const FetchOptions = struct {
     /// The request body, sent as it is; null for none.
     body: ?[]const u8 = null,
     /// The whole exchange, redirects included; null takes the client's
-    /// (none by default).
+    /// (`ServerOptions.client.timeout`, 30 s by default).
     timeout: ?std.Io.Timeout = null,
     /// Redirects to follow; null takes the client's setting.
     max_redirects: ?u8 = null,

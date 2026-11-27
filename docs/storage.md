@@ -90,7 +90,7 @@ An upload never holds a whole object. Up to `multipart_threshold` (default `part
 
 ### Presigned URLs
 
-`presign` is pure and synchronous: GET, PUT, HEAD, DELETE, and UPLOAD_PART (an upload id and a part number) for browser multipart uploads. The default expiry is 15 minutes, the longest 7 days. A PUT URL can sign `content_type` and an exact `content_length`, so a browser can only upload that many bytes. POST policies are not supported (R2 has none).
+`presign` makes no request: it signs in the call's arena (`c`) and fails with an error (a bad key or expiry, no credentials) rather than a URL. GET, PUT, HEAD, DELETE, and UPLOAD_PART (an upload id and a part number) for browser multipart uploads. The default expiry is 15 minutes, the longest 7 days. A PUT URL can sign `content_type` and an exact `content_length`, so a browser can only upload that many bytes. POST policies are not supported (R2 has none).
 
 ## Timeouts, retries, breaker
 

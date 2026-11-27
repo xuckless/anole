@@ -6,8 +6,8 @@
 //!     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
 //!     _ = try live.publish("orders", .{ .data = "{\"id\":7}" });
 //!
-//! A subscriber is a response nothing waits for: over HTTP/1.1 and
-//! HTTP/2 its stream is parked (`dusty.Parked`), so an idle subscriber holds
+//! A subscriber is a response nothing waits for: over HTTP/1.1, HTTP/2
+//! and HTTP/3 its stream is parked (`dusty.Parked`), so an idle subscriber holds
 //! no task, only a heap object, and a task exists only while it has events
 //! to write. A publish queues the event for every subscriber of the topic
 //! and returns; a sender task per subscriber with something queued then

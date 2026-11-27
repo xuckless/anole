@@ -175,7 +175,7 @@ pub const Table = struct {
     rows: []const []const Value,
 };
 
-/// What a write did (`run`): the rows it changed, and for SQLite the rowid
+/// What a write did (`execValues`): the rows it changed, and for SQLite the rowid
 /// of the last row inserted on the connection (0 for PostgreSQL: use
 /// `RETURNING` with `table`).
 pub const Changes = struct {
