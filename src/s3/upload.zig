@@ -117,7 +117,9 @@ pub const Upload = struct {
     part_size: usize,
     declared_len: ?u64,
 
-    mutex: std.atomic.Mutex = .unlocked,
+    /// Blocking: its sections allocate (#256). A C ABI host thread takes it
+    /// too (`copyIn`); zio parks a foreign thread on its own futex.
+    mutex: std.Io.Mutex = .init,
     cur: std.ArrayList(u8) = .empty,
     cur_charged: bool = false,
     ready: std.ArrayList(PartBuf) = .empty,
@@ -142,11 +144,11 @@ pub const Upload = struct {
     // ---- Locking ---------------------------------------------------------
 
     fn lock(self: *Upload) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.mutex.lockUncancelable(self.io);
     }
 
     fn unlock(self: *Upload) void {
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
     }
 
     // ---- The push API ------------------------------------------------------
