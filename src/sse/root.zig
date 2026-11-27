@@ -663,14 +663,30 @@ pub const Topics = struct {
     /// subscriber's end was asked for while it was opened (`on_open`
     /// closing it, a failed first write, `_gone` from another task).
     pub fn _attach(self: *Topics, io: std.Io, out: Out, opts: ServeOptions, last_header: ?[]const u8) !*Subscriber {
+        const sub = try self._register(io, opts, last_header);
+        self.arm(io, sub, opts, .{ .hub_sender = out });
+        return sub;
+    }
+
+    /// For tests: `serve` up to its park, a subscriber made and registered
+    /// with `opts.topics`, not armed yet (`_fallBack` or `_attach`'s arm).
+    pub fn _register(self: *Topics, io: std.Io, opts: ServeOptions, last_header: ?[]const u8) !*Subscriber {
         for (opts.topics) |t| if (!validTopic(t)) return error.InvalidTopic;
         const sub = try self.newSubscriber(io, .{ .context = opts.context, .on_close = opts.on_close });
         self.register(io, sub, opts, last_header) catch |err| {
             self.freeSubscriber(sub);
             return err;
         };
-        self.arm(io, sub, opts, .{ .hub_sender = out });
         return sub;
+    }
+
+    /// For tests: `serve` after a park that failed with `Unsupported`, up
+    /// to `serveFallback`'s loop: out of the hub, registered again, armed
+    /// over `out` in fallback mode. The test runs `sendQueued` by hand.
+    pub fn _fallBack(self: *Topics, io: std.Io, sub: *Subscriber, out: Out, opts: ServeOptions, last_header: ?[]const u8) !void {
+        self.abandon(io, sub);
+        try self.register(io, sub, opts, last_header);
+        self.arm(io, sub, opts, .{ .fallback = out });
     }
 
     /// Ends `sub` as `serveFallback` does after its loop, from a test.
@@ -705,6 +721,10 @@ pub const Topics = struct {
             try self.queueDrainEnd(sub);
         } else {
             try self.queueReplayLocked(sub, last_header, opts.last);
+            // The end a publish past the cap queued before a failed park
+            // went with the queue `abandon` dropped (#263): the queue
+            // carries it, so it goes in again, after the replay.
+            if (sub.life == .opening and sub.life.opening != null) self.pushEnd(sub);
         }
     }
 
@@ -913,6 +933,11 @@ pub const Topics = struct {
         if (!sub.transition(.end_queued)) return;
         sub.close_reason = reason;
         if (count_slow) _ = self.n_closed_slow.fetchAdd(1, .monotonic);
+        self.pushEnd(sub);
+    }
+
+    /// Queues the end of `sub`'s stream. Under the mutex.
+    fn pushEnd(self: *Topics, sub: *Subscriber) void {
         self.end_payload.retain();
         sub.queue.push(self.gpa, self.end_payload) catch {
             self.end_payload.release(self.gpa);
