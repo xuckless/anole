@@ -1061,7 +1061,7 @@ threadlocal var batching_task: usize = 0;
 /// | state  | queue (`hold`)       | pop (`Backstop.run`) | leave (`deinit`) |
 /// |--------|----------------------|----------------------|------------------|
 /// | free   | queued (join; the backstop may refuse: stays free) | unreachable: only queued batches are listed | free (never reached: `deinit` leaves only with a `home`) |
-/// | joined | queued (append, wake)| unreachable          | free             |
+/// | joined | queued (append, wake; off the executors too) | unreachable | free |
 /// | queued | queued (no re-append, no second wake: `queue` returns before the move) | joined | free (unlink) |
 ///
 /// Lock: `free` under the owner's write lock (only a sender joins),
@@ -1072,12 +1072,13 @@ threadlocal var batching_task: usize = 0;
 ///
 /// | state   | start (`hold`, `run`) | idle (`endIfIdle`)    | stop (`stopFlusher`) |
 /// |---------|-----------------------|-----------------------|----------------------|
-/// | none    | running (spawned; a failed spawn stays none, the caller learns) | none (no-op: a second flusher, see below) | none (no-op) |
+/// | none    | running (spawned; a failed spawn stays none, the caller learns) | none (no-op) | none (no-op) |
 /// | running | running (no spawn, the caller wakes it) | none (only when not Held; the task returns) | none (after awaiting the task) |
 ///
 /// Lock: while `member == .free` the owner's write lock (off zio's
 /// executors: such a flusher has no `home` and never goes idle); while
-/// joined or queued `home.mutex`. `stopFlusher` runs with nothing held and
+/// joined or queued `home.mutex`, from any thread: `hold` on a joined
+/// batch queues it on its backstop even off the executors. `stopFlusher` runs with nothing held and
 /// no reader running, and clears a free batch's task with no lock.
 ///
 /// Across the axes: `Backstop.run` pops, and if Held starts the flusher
@@ -1085,12 +1086,8 @@ threadlocal var batching_task: usize = 0;
 /// `leave` does not touch Task, and `deinit` cancels the flusher's group
 /// whatever Task says: a flusher past `endIfIdle` (Task none) is still
 /// returning, and its `Group` lives in this struct. Kept as today, not
-/// fixed here: a `hold` off zio's executors on a joined batch takes the
-/// thread path, writing Task under the write lock while `endIfIdle`
-/// writes it under `home.mutex`, so it and `Backstop.run` can both spawn
-/// a flusher; the second to go idle finds Task none and leaves it there
-/// (the none x idle no-op); and a flusher started off the executors
-/// keeps its null `home` (never idles) if the batch later joins.
+/// fixed here: a flusher started off the executors keeps its null `home`
+/// (never idles) if the batch later joins.
 pub const Batch = struct {
     /// Round: the reading task while the batch lasts; 0 when none.
     owner: std.atomic.Value(usize) = .init(0),
@@ -1190,7 +1187,9 @@ pub const Batch = struct {
         self.deferred.store(true, .monotonic);
         if (comptime builtin.is_test) if (!self.backstop_on) return true;
         self.start_flusher = Flusher(flushFn).start;
-        if (placement.currentExecutor(io) != null) {
+        // By the batch, not the thread: a joined batch's Task is
+        // `home.mutex`'s, from any thread (#270).
+        if (self.member != .free or placement.currentExecutor(io) != null) {
             if ((self.home orelse &Backstop.local).queue(self, io)) return true;
         } else if (self.startFlusher(io)) {
             self.wake.set(io);
@@ -2553,6 +2552,26 @@ test "WebSocket batch: a flusher goes idle only once its batch holds nothing" {
         try std.testing.expectEqual(r.ends, batch.endIfIdle(&b, io));
         try std.testing.expectEqual(r.task, batch.task);
         try std.testing.expectEqual(r.member, batch.member);
+        try expectInvariants(&b, &.{&batch}, io);
+    }
+}
+
+test "WebSocket batch: off zio's executors a hold on a joined batch queues it on its backstop, starting no flusher (#270)" {
+    const io = std.testing.io;
+    const flushFn = struct {
+        fn flush(_: *Batch) std.Io.Cancelable!void {}
+    }.flush;
+    for ([_]Batch.Membership{ .joined, .queued }) |member| {
+        errdefer std.debug.print("member: {s}\n", .{@tagName(member)});
+        // The states alone: no backstop task runs.
+        var b: Backstop = .{ .state = .running, .live = 1 };
+        var batch: Batch = .{ .member = member, .home = &b };
+        if (member == .queued) b.pending.append(&batch.node);
+        defer batch.deinit(io);
+        try std.testing.expect(batch.hold(io, flushFn));
+        try std.testing.expectEqual(.none, batch.task);
+        try std.testing.expectEqual(.queued, batch.member);
+        try std.testing.expect(batch.isHeld());
         try expectInvariants(&b, &.{&batch}, io);
     }
 }
