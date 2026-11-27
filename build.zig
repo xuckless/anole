@@ -925,6 +925,7 @@ pub fn build(b: *std.Build) void {
             .{ .file = "11_invalid_code_grammar", .contains = "e.g. 'users.name_taken'" },
             .{ .file = "12_rename_on_fallback_type", .contains = "structs, ?T and []const T" },
             .{ .file = "13_empty_path_on_server", .contains = "anole: route GET : must start with '/'" },
+            .{ .file = "14_doc_cached_on_post", .contains = "it cannot wrap a POST route" },
         };
         const ce_step = b.step("test-compile-errors", "Check that bad routes and calls are compile errors with the right message");
         for (cases) |c| {

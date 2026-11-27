@@ -355,7 +355,7 @@ pub fn checkRoute(comptime method: ?dusty.Method, comptime path: []const u8, com
     // Under a group, "" is the group's own path (`admin.post("", ..)`).
     const group_root = !whole_path and path.len == 0;
     if (comptime !group_root) if (comptime route_pattern.problem(path)) |p| @compileError(where ++ route_pattern.comptimeMessage(p));
-    if (comptime handlers.isCached(@TypeOf(handler))) {
+    if (comptime handlers.anyCached(handler)) {
         if (method) |m| if (m != .get and m != .head)
             @compileError(where ++ "anole.cached keeps GET and HEAD answers only; it cannot wrap a " ++ name ++ " route");
     }
