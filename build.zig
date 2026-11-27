@@ -1872,10 +1872,11 @@ pub fn build(b: *std.Build) void {
         const cli_options = b.addOptions();
         cli_options.addOption([]const u8, "version", @import("build.zig.zon").version);
         const templates_mod = b.createModule(.{ .root_source_file = b.path("templates/index.zig") });
+        const skills_mod = b.createModule(.{ .root_source_file = b.path("skills/index.zig") });
         const CliBuild = struct {
             /// `strip`: no debug information (the release binaries; null keeps
             /// the optimize mode's default).
-            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, strip: ?bool) *std.Build.Module {
+            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, skl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, strip: ?bool) *std.Build.Module {
                 const banner = bb.createModule(.{ .root_source_file = bb.path("src/banner/root.zig"), .target = tgt, .optimize = opt, .strip = strip });
                 return bb.createModule(.{
                     .root_source_file = bb.path("tools/anole/main.zig"),
@@ -1885,6 +1886,8 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "cli_options", .module = opts.createModule() },
                         .{ .name = "templates", .module = tmpl },
+                        // The agent skill new projects get (skills/anole-zig).
+                        .{ .name = "skills", .module = skl },
                         // The startup banner (src/banner, std only).
                         .{ .name = "banner", .module = banner },
                         // The live console's client and terminal UI (src/console/ui, std only).
@@ -1893,11 +1896,11 @@ pub fn build(b: *std.Build) void {
                 });
             }
         };
-        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
+        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, skills_mod, target, optimize, null) });
         const install_cli = b.addInstallArtifact(cli, .{});
         b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
 
-        const cli_tests = addSafeTest(b, .{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
+        const cli_tests = addSafeTest(b, .{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, skills_mod, target, optimize, null) });
         // The index test walks templates/ from the cwd: run it at the
         // repository root whatever directory zig build was started from.
         const run_cli_tests = b.addRunArtifact(cli_tests);
@@ -1916,10 +1919,21 @@ pub fn build(b: *std.Build) void {
         for (dist_targets, &files) |dt, *file| {
             // Stripped: the release binaries carry no debug information
             // (ReleaseSafe keeps it otherwise; the Linux ones were ~7x larger).
-            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe, true) });
+            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, skills_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe, true) });
             file.* = .{ .name = dt.name, .path = exe.getEmittedBin() };
         }
         distFiles(b, sums_exe, dist, "dist", "SHA256SUMS", &files);
+
+        // skill-test: every public name skills/anole-zig/apis.txt lists
+        // resolves in this build (all of them only with every feature on,
+        // the default profile).
+        const skill_tests = addSafeTest(b, .{ .name = "skill-test", .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/skill_apis_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "skills", .module = skills_mod } },
+        }) });
+        b.step("skill-test", "Check that every name in skills/anole-zig/apis.txt exists").dependOn(&b.addRunArtifact(skill_tests).step);
     }
 
     // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop

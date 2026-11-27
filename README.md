@@ -28,7 +28,7 @@ curl localhost:3000/      # {"hello":"world"}, OpenAPI page at /docs
 Or by hand, in a `zig init` project:
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.6.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.7.0
 ```
 
 ```zig
@@ -135,7 +135,7 @@ Examples run with `zig build run-<name>`: `hello`, `rest`, `websocket`, `grpc`, 
 
 ## Status
 
-Pre-1.0; the latest release is [0.6.1](CHANGELOG.md), and the API may still change. Next: hardening for 1.0, then the anole-node and anole-py bindings.
+Pre-1.0; the latest release is [0.7.0](CHANGELOG.md), and the API may still change. Next: performance fixes in 0.7.1 and 0.7.2, then 1.0.0-rc.1; the anole-node and anole-py bindings alongside.
 
 Anole stands on [zio](https://github.com/lalinsky/zio), [dusty](https://github.com/lalinsky/dusty) (adapted as its HTTP core), nghttp2 (its HTTP/2 rules, translated to Zig), ngtcp2, nghttp3 and BoringSSL. Bugs and ideas: [Issues](https://github.com/xuckless/anole/issues/new/choose); questions: [Discussions](https://github.com/xuckless/anole/discussions); security: [SECURITY.md](SECURITY.md).
 

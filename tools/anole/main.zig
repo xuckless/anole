@@ -1,6 +1,7 @@
 //! `anole`: the command line of the Anole framework. `anole new <dir>` makes a
 //! project from a template: `zig init -m` (name and fingerprint), the template
-//! files, and `zig fetch --save=anole` (the matching Anole tag). Std-only; it
+//! files, the anole-zig agent skill in .claude/skills/ with a pointer to it in
+//! AGENTS.md, and `zig fetch --save=anole` (the matching Anole tag). Std-only; it
 //! is never linked into an application.
 //!
 //!     anole new <dir> [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
@@ -15,6 +16,7 @@
 const std = @import("std");
 const options = @import("cli_options");
 const index = @import("templates");
+const skills = @import("skills");
 const banner = @import("banner");
 const console_cmd = @import("console.zig");
 
@@ -36,6 +38,11 @@ pub const exit_no_zig = 3;
 pub const exit_zig_failed = 4;
 
 const repo_url = "git+https://github.com/xuckless/anole";
+
+/// Where `anole new` and `anole init` write the agent skill, and the line
+/// they add to the project's AGENTS.md.
+const skill_dir = ".claude/skills/anole-zig";
+const agents_line = "This project uses Anole; agents: load the anole-zig skill in .claude/skills/anole-zig/ before writing server code.\n";
 
 /// The process environment, for NO_COLOR and the like.
 var environ: ?std.process.Environ = null;
@@ -124,6 +131,7 @@ const new_help =
     \\  --force              allow a non-empty directory (never overwrites a file)
     \\
     \\Every template writes a ready .env (copied from .env.example) unless one exists.
+    \\Each also writes the anole-zig agent skill into .claude/skills/ and a line about it into AGENTS.md.
     \\
 ;
 
@@ -264,6 +272,27 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, mode: 
         if (std.mem.eql(u8, f.path, ".env.example") and !exists(io, dir, ".env")) {
             try dir.writeFile(io, .{ .sub_path = ".env", .data = text });
         }
+    }
+    // The agent skill, unless the project has one (installed another way),
+    // and its line in AGENTS.md, added to one that lacks it.
+    if (exists(io, dir, skill_dir)) {
+        std.debug.print("anole {s}: {s} exists; left as it is\n", .{ cmd_name, skill_dir });
+    } else for (skills.anole_zig) |f| {
+        const path = try std.fs.path.join(gpa, &.{ skill_dir, f.path });
+        defer gpa.free(path);
+        try dir.createDirPath(io, std.fs.path.dirname(path).?);
+        try dir.writeFile(io, .{ .sub_path = path, .data = f.data });
+    }
+    const agents = dir.readFileAlloc(io, "AGENTS.md", gpa, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => try gpa.dupe(u8, ""),
+        else => return err,
+    };
+    defer gpa.free(agents);
+    if (std.mem.find(u8, agents, skill_dir) == null) {
+        const sep: []const u8 = if (agents.len == 0) "" else if (std.mem.endsWith(u8, agents, "\n")) "\n" else "\n\n";
+        const text = try std.mem.concat(gpa, u8, &.{ agents, sep, agents_line });
+        defer gpa.free(text);
+        try dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = text });
     }
 
     // 5. The dependency.
@@ -550,4 +579,24 @@ test "index lists every template file" {
     var indexed: usize = 0;
     for (index.templates) |t| indexed += t.files.len;
     try testing.expectEqual(found, indexed);
+}
+
+test "skill index lists every skill file" {
+    const io = testing.io;
+    var root = try Io.Dir.cwd().openDir(io, "skills/anole-zig", .{ .iterate = true });
+    defer root.close(io);
+    var walker = try root.walk(testing.allocator);
+    defer walker.deinit();
+    var found: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        found += 1;
+        for (skills.anole_zig) |f| {
+            if (std.mem.eql(u8, f.path, entry.path)) break;
+        } else {
+            std.debug.print("skills/anole-zig/{s} is not in skills/index.zig\n", .{entry.path});
+            return error.FileNotIndexed;
+        }
+    }
+    try testing.expectEqual(found, skills.anole_zig.len);
 }
