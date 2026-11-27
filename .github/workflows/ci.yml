@@ -58,7 +58,7 @@ jobs:
         with:
           version: 0.17.0
       - name: zig fmt --check
-        run: zig fmt --check build.zig build.zig.zon build src tests examples tools templates bench --exclude tests/grpc/gen --exclude examples/grpc/gen
+        run: zig fmt --check build.zig build.zig.zon build src tests examples tools templates skills bench --exclude tests/grpc/gen --exclude examples/grpc/gen
       # Every test gated on a live-server URL must be reached by a live
       # step's filter (TESTING.md, research/s15/test-audit.md T10).
       - name: Live-test coverage
@@ -85,9 +85,9 @@ jobs:
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      - name: Unit and smoke tests (default profile, every feature on)
+      - name: Unit and smoke tests (default profile, every feature on), and the skill's names (skills/anole-zig/apis.txt)
         timeout-minutes: 36
-        run: zig build test --test-timeout 120s --summary all
+        run: zig build test skill-test --test-timeout 120s --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
